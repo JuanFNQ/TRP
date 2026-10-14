@@ -4,7 +4,14 @@ A Rust rewrite, on Bevy, of the first-person character controller of the game Si
 
 **The code, how to build and run it, what works, and what was learned and how: [`TRP/README.md`](TRP/README.md).**
 
-Quick start (Windows, with Rust installed):
+## Requirements
+
+- **Windows 10 / 11**
+- **Escape From Tarkov** *(required)*: you must own your own copy of the game
+- **The Forge (Single Player Tushonka)** *(required)*: [Download installer](https://sp-mod.com/installer)
+- **S.T.A.L.K.E.R. Anomaly / GAMMA** *(optional)*
+
+Quick start:
 
 ```
 git clone https://github.com/JuanFNQ/TRP.git
