@@ -1,0 +1,11 @@
+[package]
+name = "trp-sim"
+description = "The character controller as a plain simulation: no engine types, no rendering"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+trp-data = { path = "../trp-data" }

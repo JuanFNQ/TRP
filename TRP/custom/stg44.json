@@ -1,0 +1,91 @@
+{
+  "about": "The Sturmgewehr 44, a weapon that is not the install's: its model lies in local/ (never in the repository), its rig and its animator are the FN SCAR-L's. Every figure here is accounted for in docs/spec/custom-weapons.md.",
+  "id": "66f0a5740000000000000044",
+  "name": "weapon_haenel_stg44_792x33",
+  "short_name": "StG 44",
+  "donor": "6184055050224f204c1da540",
+  "wanted": {
+    "about": "What this rifle asks of a donor, for `donor --rank custom/stg44.json`: centimetres from the middle of the trigger's blade (taken at y 7.5, z 11.0 of the model), ahead along the barrel and up; the handle is the cocking handle's knob, on the left.",
+    "kind": "rifle",
+    "worked_by": "left",
+    "side": "left",
+    "automatic": true,
+    "bore_up": 6.6,
+    "muzzle_ahead": 57.4,
+    "butt_behind": 35.5,
+    "magazine_ahead": 11.7,
+    "handle": [9.6, 9.0, -1.8]
+  },
+  "model": {
+    "file": "local/ExperimentalWeapon/STG44/source/STG44_Full.fbx",
+    "textures": "local/ExperimentalWeapon/STG44/textures",
+    "texture": "STG44_{material}_{map}.tga.png",
+    "origin": [42.05, -13.0, 0.0],
+    "texture_size": 2048,
+    "normal_green_down": false
+  },
+  "parts": [
+    { "model": "Body_Recievers", "bone": "weapon" },
+    { "model": "Stock", "bone": "weapon" },
+    { "model": "Barrel", "bone": "weapon" },
+    { "model": "Body_Sight", "bone": "weapon" },
+    { "model": "Body_Sight_Distance", "bone": "weapon" },
+    { "model": "Body_Safety", "bone": "weapon" },
+    { "model": "Body_Bolt", "bone": "weapon_bolt" },
+    { "model": "Body_Piston", "bone": "weapon_bolt" },
+    { "model": "Body_Trigger", "bone": "mod_trigger_group/mod_trigger", "pivot": [0.0, 9.442, 11.09] },
+    { "model": "Body_FiremodeButton_E", "bone": "mod_trigger_group/mod_selector", "pivot": [0.0, 11.33, 15.575] },
+    { "model": "Body_FiremodeButton_D", "bone": "mod_trigger_group/mod_selector", "pivot": [0.0, 11.33, 15.575] },
+    { "model": "Magazine", "bone": "mod_magazine", "pivot": [0.0, 12.7, -4.1] }
+  ],
+  "bones": [
+    { "name": "fireport", "parent": "weapon", "at": [0.0, 14.145, -46.42] },
+    { "name": "mod_align_rear", "parent": "weapon", "at": [0.0, 19.94, 0.4] },
+    { "name": "mod_align_front", "parent": "weapon", "at": [0.0, 19.98, -44.03] },
+    { "name": "mod_aim_camera", "parent": "weapon", "at": [0.0, 19.95, 34.45], "turn_as": "aim_camera" }
+  ],
+  "hands": {
+    "exponent": 3.0,
+    "holds": [
+      { "name": "the handguard", "bone": "weapon", "palms": [[45.9, -5.0, -6.0]], "shift": [5.6, 2.0, 0.9], "rest": true },
+      { "name": "the magazine", "bone": "mod_magazine", "palms": [[-9.9, -16.8, -8.2], [-9.8, -22.3, -2.8]] },
+      { "name": "the cocking handle", "bone": "weapon_bolt/mod_charge", "palms": [[-9.5, -3.3, -12.7]], "shift": [-6.9, 0.0, 1.1] }
+    ]
+  },
+  "built_weight": 4.6,
+  "template": {
+    "take": [
+      {
+        "from": "59d6088586f774275f37482f",
+        "props": [
+          "ammoCaliber", "defAmmo", "Chambers",
+          "RecoilAngle", "RecolDispersion", "RecoilCamera", "RecoilPosZMult",
+          "RecoilDampingHandRotation", "RecoilReturnSpeedHandRotation", "RecoilStableAngleIncreaseStep",
+          "RecoilStableIndexShot", "RecoilCategoryMultiplierHandRotation",
+          "RecoilReturnPathDampingHandRotation", "RecoilReturnPathOffsetHandRotation",
+          "ProgressRecoilAngleOnStable", "PostRecoilHorizontalRangeHandRotation", "PostRecoilVerticalRangeHandRotation",
+          "ShotsGroupSettings", "WeaponRecoilSettings", "ResetAfterShot", "CameraSnap"
+        ]
+      }
+    ],
+    "as_built": "59d6088586f774275f37482f",
+    "set": {
+      "isBoltCatch": false,
+      "Foldable": false,
+      "FoldedSlot": "",
+      "CompactHandling": false,
+      "bFirerate": 540,
+      "Width": 5,
+      "Height": 1
+    }
+  },
+  "magazine": {
+    "id": "66f0a5740000000000000045",
+    "name": "mag_stg44_haenel_std_792x33_30",
+    "short_name": "StG 44 30",
+    "clone": "61840bedd92c473c77021635",
+    "take": [
+      { "from": "59d625f086f774661516605d", "props": ["Cartridges", "Weight"] }
+    ]
+  }
+}

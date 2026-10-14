@@ -1,0 +1,15 @@
+[package]
+name = "trp-data"
+description = "Readers for a user's own Single Player Tushonka (SPT) install: the game's Unity bundles and SPT's database"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lz4_flex.workspace = true
+lzma-rs.workspace = true
+miniz_oxide.workspace = true
+png.workspace = true

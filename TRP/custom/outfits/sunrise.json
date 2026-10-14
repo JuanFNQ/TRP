@@ -1,0 +1,9 @@
+{
+  "id": "66f0a5740000000000000101",
+  "name": "outfit_stalker_sunrise",
+  "short_name": "Sunrise",
+  "donor": "5648a7494bdc2d9d488b4583",
+  "visual": "actors/stalker_neutral/stalker_neutral_2.ogf",
+  "world_visual": "dynamics/outfit/stalker_outfit.ogf",
+  "arms": "anomaly_weapons/hands/wpn_hand_loner_sunrise.ogf"
+}

@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    A BepInEx plugin for SPT that records what the real controller does, so
+    the Rust simulation can be compared against it.
+
+    Build:  dotnet build -c Release -p:EftDir=E:\spt
+    The game's own assemblies are referenced in place and never copied.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>stlkreft-oracle</AssemblyName>
+    <RootNamespace>Stlkreft.Oracle</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>..\..\local\oracle\stlkreft-oracle\</OutputPath>
+    <EftDir Condition="'$(EftDir)' == ''">$(EFT_DIR)</EftDir>
+    <Managed>$(EftDir)\EscapeFromTarkov_Data\Managed</Managed>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="$(EftDir)\BepInEx\core\BepInEx.dll" Private="false" />
+    <Reference Include="$(EftDir)\BepInEx\core\0Harmony.dll" Private="false" />
+    <!-- Everything the game ships, except the base class libraries, which
+         the SDK supplies for this target. -->
+    <Reference Include="$(Managed)\*.dll"
+               Exclude="$(Managed)\System*.dll;$(Managed)\mscorlib.dll;$(Managed)\netstandard.dll;$(Managed)\Mono.*.dll;$(Managed)\Microsoft.*.dll"
+               Private="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="scenarios\*.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

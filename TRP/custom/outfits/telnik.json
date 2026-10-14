@@ -1,0 +1,8 @@
+{
+  "id": "66f0a5740000000000000102",
+  "name": "outfit_bear_telnik",
+  "short_name": "Telnik",
+  "donor": "5648a7494bdc2d9d488b4583",
+  "their_top": "assets/content/characters/character/prefabs/tshirt_bear_telnik.bundle",
+  "their_hands": "assets/content/hands/hands_bear_telnik/hands_bear_telnik.skin.bundle"
+}

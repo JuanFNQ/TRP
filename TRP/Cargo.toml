@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lz4_flex = "0.11"
+lzma-rs = "0.3"
+miniz_oxide = "0.8"
+png = "0.18"
+
+# Parsing multi-megabyte bundles in an unoptimised build is too slow to iterate on.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.trp-data]
+opt-level = 3

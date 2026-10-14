@@ -1,0 +1,20 @@
+# Whitelist. Everything is ignored unless listed here, so extracted game
+# files, decompiler output and build products can never be committed by accident.
+/*
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/README.md
+!/crates/
+!/docs/
+!/hosts/
+# The weapons that are not the install's: one file of figures each, and
+# nothing else from that folder (a model belongs in local/).
+!/custom/
+/custom/*
+!/custom/*.json
+# And the outfits that are not the install's, the same way: a file of
+# figures each (a model stays in the other game's own folders).
+!/custom/outfits/
+/custom/outfits/*
+!/custom/outfits/*.json

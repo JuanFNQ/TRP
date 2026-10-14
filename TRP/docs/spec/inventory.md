@@ -1,0 +1,463 @@
+# Inventory
+
+What the character carries, where each thing sits, and the screen that shows it. Read from the game's code on 2026-10-11 (`EFT.InventoryLogic`, `EFT.UI`) and from the install's item database. Moving things, the weapon in hand, where the screen's views sit and what the open screen does to the keys and the hands were read and built on 2026-10-11 too. Nothing here has been compared with the running game yet: no recording carries the inventory (recorder 0.5.0 writes it; "Compared with the running game" below). What is built is at the end.
+
+The player controller needs it for three things: what the character weighs (movement and stamina go by carried weight), what it wears (drawn on the body), and what is in its hands.
+
+## The screen and its tabs
+
+**It opens on its gear tab every time** (`InventoryScreen.Show`, `TabGroup`, `EftGamePlayerOwner.ShowInventoryScreen`; read 2026-10-13, when the user found a container opening on the tab last looked at). In a raid the game makes the screen's controller anew at each opening, and the screen its group of tabs anew with the gear tab as the one it begins at; the inventory's key asks for no tab in particular (`Unchanged`), which is then that one, and a container asks for the gear tab outright. The tab last looked at is kept only across a screen opened from this one and come back from. Built so (`inventory_view::toggle`): by the key and by a container alike, the options tab included, which is the app's own.
+
+The inventory screen (`InventoryScreen`) is one screen with a row of tabs (`EInventoryTab`), in this order:
+
+| Tab | What it shows | Here |
+|---|---|---|
+| Overall | the character's statistics | shown, switched off |
+| Gear | equipment, containers, and the stash or the loot | built (plain) |
+| Health | the same panel with the body's health in place of the equipment | shown, placeholder |
+| Skills | skills and weapon mastering | shown, the two skills the controller has |
+| Map | the map item | shown, switched off |
+| Tasks (`Notes` in the code) | quests and notes | shown, switched off |
+| Achievements | | shown, switched off |
+| Prestige | not usable in a raid; hidden outside a regular session | shown, switched off |
+| Options | not the game's: its settings are a screen of its menu (`settings.md`) | built, apart at the row's far right, by the user's word (2026-10-12) |
+
+It opens on Gear unless told otherwise (the tab group's default). Gear and Health are the same panel (`ItemsPanel`) in two modes. The user's decision of 2026-10-11: tabs as the game has them; Overall, Map, Tasks and Prestige switched off for now (Achievements is treated the same).
+
+**The Gear tab** (`ItemsPanel`, `EquipmentTab`, `ContainersPanel`) has three parts side by side:
+
+- **Equipment**, a view for each of: earpiece, headwear, face cover, armband, body armour, eyewear, the weapon on the sling, the holster, the weapon on the back, the scabbard (and the dogtag's view).
+- **Containers**, in this order: tactical vest, pockets, backpack, secured container; the dogtag's slot hangs on the pockets' view. Each shows the grids of the item in that slot, and the pockets show their special slots.
+- **The stash, or what is being looted**; in a raid with nothing open it is empty.
+
+Under them run the health parameters (among them the carried weight, which is the same sum the controller uses) and the quick-use bar.
+
+### Where the views sit (read from the install, 2026-10-11)
+
+The game's screens are not in its bundles. They are objects of its scenes, and the build's scene files (`EscapeFromTarkov_Data\level<N>`) carry no type trees; but an object's name and parent and a screen transform's anchors, offset, size and pivot have the engine's own fixed layout, so they can be read (`trp_data::screen`; `probe scenes ui` lists the scenes, `probe screen level44 "Gear Panel" 1` shows one object with what hangs from it). The build's settings list the scenes by their paths; the one whose path ends in `UI/CommonUIScene.unity` holds the inventory screen:
+
+- `InventoryScreen` is 1920 units wide and as high as the screen, so the screen is laid out for a height of 1080. Its tab bar is 43 high across the top.
+- `Items Panel` (the Gear and Health tabs' panel) has three children that matter: `LeftSide` (a row: the left panel with the equipment, then the containers panel), `Stash Panel` (680 wide, against the right edge) and `Quick Use Panel` (854 wide, at the bottom's middle).
+- **The equipment panel** (`Gear Panel`, with the `EquipmentTab` script) is 494 by 650. Its slot views are its own children, each fixed by an offset from the panel's top left corner. The script names eleven of them in this order: earpiece, headwear, face cover, armband, body armour, eyewear, primary weapon, holster, secondary weapon, scabbard, dogtag; the reader finds that run of pointers in the script's fields and so knows which view is which slot's without going by the objects' names. As read: three views to a row, 125 square and 184 apart (the armband's is 44 high and the dogtag's sits under it); the two long weapons' views are 310 wide with the holster's and the scabbard's beside them; the rows begin 20, 186, 354 and 524 down. The primary weapon's view (the sling's) is the third row's.
+- A slot's caption is a header 20 high that sits over the view, not in it.
+- **The containers panel** is laid out by layout scripts while the game runs: a column, and in it for each container a row of its slot view (125 square) and then its grids side by side. Only that order is taken from it.
+- A grid's cell is 63 units (`GridView`, in the code).
+- **There is no figure in the panel.** In the game's menu the character stands in the scene behind the screen (the "environment" scenes), and in a raid the world shows through. The user asked for the slots over a paper figure (2026-10-11); the app draws one of plain shapes, which is its own.
+
+The app reads the equipment panel at its start and puts each slot's view where the install has it, scaled by the window's height over 1080; cells are 63 of those units and the right-hand part is the stash panel's 680 wide. The widths of the other two parts, the captions' words and the figure are the app's.
+
+## Equipment slots
+
+The character's equipment is one item (`InventoryEquipment`, template `55d7217a4bdc2d86028b456d`, "Default Inventory") with fifteen slots (`EquipmentSlot`, in the code's order): FirstPrimaryWeapon, SecondPrimaryWeapon, Holster, Scabbard, Backpack, SecuredContainer, TacticalVest, ArmorVest, Pockets, Eyewear, FaceCover, Headwear, Earpiece, Dogtag, ArmBand.
+
+Each slot's filter is in the template (read from the install): the two primary slots take 25 kinds or single weapons, the holster 6, the scabbard knives, and each of the rest one class of item (vest, armour, backpack, pockets, secured container, headwear, face cover, visors, armband), the earpiece 12 named headsets and the dogtag 14 named tags.
+
+Eight of them are drawn on the body (`AllVisualSlotNames`): Backpack, TacticalVest, ArmorVest, Eyewear, FaceCover, Headwear, Earpiece, ArmBand.
+
+## What a slot accepts (`Slot.CheckConditions`)
+
+A slot holds one item. It takes an item when all of these hold:
+
+1. the slot is empty and not locked;
+2. the filter passes: one of the filter's ids is the item's own template, or a class the item belongs to (its template's chain of parents);
+3. no item worn elsewhere blocks this slot: an item's template can name slots it blocks (`BlocksEarpiece`, `BlocksEyewear`, `BlocksHeadwear`, `BlocksFaceCover` and so on; `SlotBlockerComponent`), and while it is worn those slots take nothing;
+4. the other way round: the slots the new item would block are empty;
+5. neither the item nor anything already on the parent lists the other among its conflicting items;
+6. the item is a single one, not a stack;
+7. a weapon has all its vital parts (not in a slot named `BuildSlot`), and an item is not put inside itself.
+
+Not read further: the raid's own restrictions (`CanAcceptRaid`), examining, weapon malfunctions.
+
+## Grids
+
+A container's room is one or more grids (`Grid`), each so many cells wide and high (`cellsH`, `cellsV` in the template), with a filter of its own: a list it takes and a list it refuses (a backpack takes any item and refuses secured containers and a list of cases). A vest has several small grids; the starting pockets are four grids of one cell and three special slots.
+
+**An item's size in cells** (`CalculateCellSize`) is its template's width and height, and for an item with parts, more: every part (in a slot that counts toward the size) gives its own extra cells to the left, right, top and bottom, and of those the *largest* on each side is added, not the sum; "forced" extras add up. A folded stock takes its reduction off the right. So a rifle is as long as its longest barrel and stock make it. A slot counts toward the size if it says so itself (`_mergeSlotWithChildren` true in the database) or else if its item does (`MergesWithChildren`: true for a weapon, false for a backpack or armour); the slot of the round in the chamber never does. Read from the install so, the Standard edition's two starting rifles come out at 5 by 2 cells.
+
+**Turned.** An item lies as it is or turned a quarter (`LocationInGrid`: column, row, and which way), which swaps its width and height.
+
+**Placing by hand** (`AddInternal`): the item's rectangle has to lie inside the grid, cover no taken cell, and pass the grid's filter; a grid may also cap how many items it holds.
+
+**Finding room** (`FindFreeSpace`): rows from the top, and in each row cells from the left; the first cell from which the item's rectangle is free takes it. The item is tried as it lies first and, if it fits nowhere and is not square, turned. (A stash that stretches adds rows; a character's containers do not stretch.)
+
+## Moving things (`ItemManipulator.Move`, `MovePathCheck`, `Add`; read 2026-10-11)
+
+A move takes an item out of where it is and puts it at an address: a slot of some item, or a cell of one of its grids with a turn. It is tried in full before anything is changed, and the screen tries it the same way to show whether a place will take what the mouse holds. Refused, in this order:
+
+1. The item is at that address already.
+2. The address is the dogtag's slot: nothing is moved there by hand.
+3. **In a raid:** a weapon part whose template says it is not to be changed there (`RaidModdable` false) is neither put into a slot nor taken out of one; and a slot marked as required (`_required`: a vital part's, such as a barrel's or a receiver's) is neither filled nor emptied.
+4. **In a raid:** an item whose template names equipment slots it is not removed from (`CantRemoveFromSlotsDuringRaid`) stays in such a slot of the equipment. In the install the pockets (7 templates) and the secured containers (12) each name their own.
+5. The destination has to take things from this owner (a container that cannot be put into during a raid, a trader's, another player's: not read further; nothing in the install's database is marked as closed to putting into).
+6. **Backpacks in backpacks:** counting the backpacks the address lies in, the item itself if it is one, and the deepest run of backpacks inside it, the sum may not pass `MaxBackpackInserting` of the game's settings (7 in the install).
+7. The item would go into itself.
+8. The place's own rules: a slot's ("What a slot accepts") or a grid's ("Placing by hand").
+9. **A weapon goes onto the character whole:** an item with slots that is put into a slot of something the character wears is refused while a vital part of it is missing.
+
+Then it is taken out and put in. Not read further or not built: quest items and their own stash, pinned and locked items, limits on how many of a kind may be carried, what cannot be looted, a part that blocks folding, and the room a weapon in a grid needs when a part makes it larger (the game checks the weapon's new size against the grid before it lets the part on).
+
+### Dropping one thing on another (`ItemController.ExecutePossibleAction`, `CompoundItem.Apply`)
+
+Let go over another item, in this order until one works:
+
+1. **Merge:** both stack (`StackMaxSize` over 1), are of one kind, and the other has room for the whole stack: the two become one.
+2. **Put into** the other, if it holds things: into the first of its slots that takes the item (in a raid a part is not offered a required slot), else into the first place its grids have ("Finding room"). A slot that refuses a whole stack is given one of it.
+3. **Top up:** both stack and the other has some room: as much as fits goes over and the rest stays.
+
+Let go over an empty slot or a cell, it is the move above; with a stack on a place that takes only part of it, as much as fits (not built). With Ctrl held only part of a stack is moved (not built). Swapping two things by dropping one on the other is written and switched off in the game (`UnityUtils.DisabledForNow`).
+
+### With the mouse (`GridView`, `SlotView`, `DraggedItemView`)
+
+A held item hangs from the mouse by the point it was taken at. Over a grid it would go to the cell its own top left corner is nearest: the corner's place in the grid over the cell's 63 units, rounded, and kept inside the grid. `R` turns it a quarter while it is held. Over a slot that holds something, it is dropped on that thing. The moves without dragging have a section of their own, next.
+
+## Clicks, keys and windows (read 2026-10-12, afternoon)
+
+**Set beside the game on 2026-10-12** (sixteen recordings made by hand: "Compared with the running game", "The clicks, the keys and the moves"): all sixteen recorded moves are the model's own.
+
+Read from `ItemView.OnClick`, `ItemUiContext`, `ItemContextInteractionsSwitcher`, `ItemManipulator.QuickFindAppropriatePlace`, `InventoryExtension.FindSlotToPickUp`, `InventoryEquipmentExtension`, `ItemController.ExecutePossibleAction`, `GridView.AcceptOnce`, `SplitDialog`, `StepSlider`, `GridWindow`, `FastAccess`, `BindResult`, `InventoryController.IsAtBindablePlace`, `PlayerInputTranslator`, `Player.SetSlotItem` and `Process`, `InputManager`; and from the install: its key bindings (`SPT_Runtime\user\sptSettings\Control.ini`; `probe keys <part of a name>`), two of its game settings (`Game.ini`) and the screen's quick-use panel (`probe scenes zzz` prints it).
+
+### A click on an item
+
+A click is the button pressed and let go on the same thing; the engine counts a second one on the same thing within 0.3 s as a double click (its own input module, in its published source: the count goes up while each press follows the last by less than that, and an even count is a double click). By the left button:
+
+| Held | What the game does |
+|---|---|
+| nothing, a double click | food, drink or medicine is used, if the setting `ItemQuickUseMode` allows it (the install has `InRaidAndInLobby`); a container is opened in a window of its own; anything else is inspected in a window |
+| Ctrl | the thing is sent to the first place found for it on the other side ("Sent to the other side", below) |
+| Shift | the thing is sent to the sorting table (a raid has none) |
+| Alt | the thing is put on (the menu's "Equip"; "Put on", below) |
+
+With Ctrl or Shift held a double click is not taken as one. The right button opens the menu; the middle one examines, else folds or unfolds, switches on or off, else checks a magazine (none of the three built).
+
+**What counts as a container** (`Item.IsContainer`): what is searched (`SearchableItem`: backpacks, vests, pockets, secured containers), a plain container, one that locks, a stationary one.
+
+### Sent to the other side (`QuickFindAppropriatePlace`, the order `MoveToAnotherSide`)
+
+**What is looked in**, in order (`ItemUiContext`):
+
+1. If a container's window is the priority one and the thing does not lie in that container: that container, and nothing else.
+2. Else, if something is open beside the equipment and the thing does not lie in it: what is open, and after it the equipment if the thing is the character's.
+3. Else the equipment.
+4. And last, in every case, what the thing lies in now (a weapon and its parts counting as one thing: from a part, what holds the weapon).
+
+**The equipment stands for four of the things worn**, in an order that goes by the kind of thing (`GetPrioritizedContainersForLoot`):
+
+| The thing is | Looked in, in order |
+|---|---|
+| a round or a magazine | vest, pockets, backpack, secured container |
+| money | secured container, backpack, vest, pockets |
+| a grenade | pockets, vest, backpack, secured container |
+| anything else | backpack, vest, pockets, secured container |
+
+Anything else that is looked in offers its own slots and then its own grids.
+
+**Each thing looked in is tried by itself, in that order** (the four worn count as one):
+
+1. A stack of the thing's kind among what lies directly in it, with room for one more at least, takes the thing: all of it if there is room, else as much as there is room for, never the last one, and the rest stays where it was.
+2. Else the thing goes to the first place found: a slot that takes it, or the first free room in a grid, rows from the top. **The search goes by the grid as it stands**, so the cells the thing lies on now are taken: a thing sent with nowhere else to go moves to the next free place in its own container.
+3. A move that the first place found refuses ends the try.
+
+The first try that works is the move. So a thing in the crate goes to the character (a magazine to the vest), a thing on the character goes to the crate, with nothing open a thing on the character goes to the first *other* place the character's order has for it, and with nothing worn that could hold it, it hops within the crate. Not read: quest items (they have a grid of their own) and pinned or locked things.
+
+### Put on (`ItemUiContext.EquipItem`, `FindSlotToPickUp`)
+
+Offered for equipment, knives, secured containers, what is searched, vests and weapons, and not for a thing that is in one of the equipment's slots already ("it is on already"). The slots tried go by the kind of thing, the kinds asked in this order:
+
+| The thing is | Slots tried, in order |
+|---|---|
+| body armour | the armour's |
+| glasses | the eyewear's |
+| headwear, a face cover, a headset, a backpack, a vest, an armband | its own |
+| a knife | the sheath |
+| a revolver | the holster, the sling, the back |
+| a pistol | the holster |
+| any other weapon | the sling, the back, the holster |
+| a secured container | its own |
+
+The first that takes it by its own rules ("What a slot accepts") is the move; none, and the game says there is no free slot. (Not told apart here: a flare gun, which goes to the holster, and what goes only into the pockets' special slots.)
+
+**A thing taken up off the ground goes the same way first** (`PickUp`): onto the slot of its kind if one is free; else, with the four worn taken as one, onto a stack of its kind or into the first room, in the order of the table above. The game offers to take a thing only if that would find it a place. (This replaces the order written here on 2026-10-11, which was marked PROVISIONAL: a slot that takes it, then vest, pockets, backpack, secured container.)
+
+### A container's window, and the priority one (`GridWindow`, `PriorityWindowMode`)
+
+A double click on a container opens a window with its grids, whose things are moved like any others; a double click on anything else opens a window that says what it is. With the game's setting `PriorityWindowMode` at `Auto`, as the install has it, a container's window becomes the priority one when it opens and whenever it is picked, and stops being it when it shuts. All windows shut with the screen.
+
+### Part of a stack (`ExecutePossibleAction`, `SplitMax`, `TransferMax`, `SplitDialog`)
+
+**With Ctrl held as a thing is let go, only part of a stack goes**, and a thing that is no stack goes nowhere:
+
+- onto a free cell or an empty slot: so many are split off into it, all but one at the most, and into a slot one;
+- onto a stack of its kind: so many are handed over, as many as that has room for and never the last one.
+
+Where more than one may go, **a window asks how many**: headed "Split" or "Transfer", at the mouse, with a slider from one to the most, a field the figure can be typed into, a button that goes through with it and one that drops it; Enter goes through with it and Escape drops it. It comes up at half the most and one (integer half: 30 of 59). The slider stops at notches: one every twenty-fourth of the most, rounded up, the first at one, and the most at the end (for 59: 1, 3, 6 and on to 57, then 59); a typed figure may be any from one to the most. Where only one may go, it goes with no window.
+
+Without Ctrl a stack let go on a stack of its kind merges if the whole fits, and else fills the other up ("Dropping one thing on another").
+
+### The keys (`Control.ini`, `InputManager`, `PlayerInputTranslator`)
+
+The game's keys are bindings by name (`EGameKey`), each with one or two variants of keys held together and a way of being pressed; the input manager turns each into a command. As this install has them (read 2026-10-12; the app reads them at its start):
+
+| Binding | Key | Pressed | What it does |
+|---|---|---|---|
+| `Inventory` | Tab | going down | opens and shuts the screen |
+| `Interact` | F | held | works what is looked at |
+| `ThrowItem` | Delete | going down | with the screen open: discards the thing under the mouse (in a raid at once, with no question) |
+| `SecondaryWeapon` | 1 | going down | takes the holster's weapon in hand |
+| `PrimaryWeaponFirst` | **2** | going down | takes the **sling's** weapon in hand |
+| `PrimaryWeaponSecond` | **3** | going down | takes the **back's** weapon in hand |
+| `Knife` | U in this install | going down | the sheath's |
+| `Slot4` to `Slot9`, `Slot0` | 4 to 9, 0 | **coming up** | the quick-use keys |
+| `ReloadWeapon` | R | **coming up** | reloads (a double press, `QuickReloadWeapon`, is the fast reload) |
+| `CheckAmmo` | **T with Left Alt** | going down | looks at the magazine |
+
+(The app had the sling's weapon on `3` "as remembered" until 2026-10-12: wrong by the install. Its reload was on the key going down and its look at the magazine on `T` alone until that night, when every key the character takes became the install's binding, heard as the game's input manager hears it: `settings.md`.)
+
+**A weapon slot's key** (`SetSlotItem`): nothing if the slot is empty. Else the thing is taken in hand by a process of the player's: nothing if it is the thing in hand already; else what is in hand is put away by its own operation, and when it has gone the active slot is set and the new thing is drawn. A second key pressed while the first thing is still going takes the place of what was to come. Refused while the weapon in hand is in something that cannot be cut short, and while the inventory is moving a thing into or out of the hands (not built: the app refuses nothing here).
+
+**The weapon in hand moved out of its slot** (`OutProcess`, `SetControllerInsteadRemovedOne`): it is put away, and the hands take the first other thing in the slots' order (sling, back, holster, sheath) or are empty. Moved from the sling to the back it therefore leaves the hands and hangs there until the back's key; moved back into the slot the hands last drew from, it is taken in hand at once ("The weapon in hand").
+
+### Escape (`InventoryScreen.TranslateCommand`, `ItemUiContext.TranslateCommand`, `Window.TranslateCommand`, `InputNodeAbstract.TranslateInput`; read and built 2026-10-13)
+
+Escape shuts the inventory screen, as the inventory's own key does, but **one thing a press**, by the order the game's tree of screens hands a key down: the windows over the screen are asked first, the one opened or picked last before the rest, and a window that has the key shuts and keeps it; with no window open the screen's own items are asked, where a menu on an item shuts and then the window that asks how many of a stack; and only with none of those up does the screen itself shut. (The window that asks how many is no window of the tree: with it up over an open container's window, Escape shuts the container's window first.)
+
+**Built:** `inventory_view::toggle` (the screen), `windows` (the one on top), `ask` (the window that asks, when no other is open). The options tab is the app's own: while a key is being chosen there, or a way of being pressed asked for, Escape is that tab's (it keeps what stood) and the screen stays. **Not built:** the menu on an item (there is none here); Escape with the screen shut, which in the game opens its menu. **Compared with the game: nothing**; run by captures (a window open: the first press shuts the window, the second the screen; a key being chosen: the screen stays).
+
+### The quick-use keys and their bar (`FastAccess`, `BindResult`, `InventoryScreenQuickAccessPanel`)
+
+- **What a key is bound to.** Four keys go with slots and are never bound by hand: the sheath's, the holster's (1), the sling's (2), the back's (3). Seven, 4 to 9 and 0, are bound to things.
+- **What may be bound** (`IsAtBindablePlace`): a weapon, a grenade, a knife, medicine, food or drink, a range finder, a compass or a radio transmitter, whole, that lies directly in the vest or the pockets worn.
+- **Binding:** with the screen open, the key let go with the mouse over a thing of the character's binds it. A thing bound to another key leaves that key; what the key had is unbound. A thing dragged onto one of the bar's views is bound to it, and one dragged off its view is unbound (not built: the bar is only shown).
+- **Unbinding:** whenever a thing is moved or discarded, it is unbound if it no longer lies where it may be bound.
+- **In play** (`SetQuickSlotItem`) the key takes what it is bound to in hand: a weapon is drawn like a slot's; medicine is applied if it can do anything to the body as it is; food and drink are taken. Refused while a weapon is being changed.
+- **The bar** is the screen's `Quick Use Panel`: 854 units wide and 115 high, its lower edge 30 over the screen's and its middle 25.6 to the right of the screen's, with a row of views 64 square, 70 apart: the grenade key's, the sheath's, 1, 2, 3, and after a gap 4 to 9 and 0. The scene has the row laid out by a layout script, so the places read are those it was saved with.
+
+### Built (2026-10-12)
+
+- `trp-sim/src/inventory.rs`: `quick_find` with the two orders (`Order::OTHER_SIDE`, `PICK_UP`), `loot_order`, `slot_to_wear`, `equip`, `pick_up` by the game's order (it gives back what is left on the ground: the thing refused, or the rest of a stack), `can_pick_up`, `split_most`, `transfer_most`, `transfer_item`, the grid's search as the game makes it (`find_other_room`), and `Bound` (`bind`, `settle`, `bindable`). A thing's class is asked by the database's name for it (`is`), which is the game's own type name.
+- `trp-data`: `Install::key_bindings` and `game_setting`; the quick-use panel beside the equipment panel (`GearPanel::quick`, `quick_slots`); `probe keys`.
+- The app (`inventory_view.rs`, `keys.rs`):
+  - **A click is told from a carry.** The button going down on a thing takes nothing yet; moved 10 pixels with the button down, the thing is carried as before (`ESTIMATE`: the engine's default drag threshold; the scene's own is not read); let go where it went down, it is a click, and two within 0.3 s a double one.
+  - **Ctrl and a click, Alt and a click, a double click** as above. A double click on food or medicine says that using it is not built.
+  - **Windows:** a container's grids or what a thing is (its name in the database, its class, weight, cells and stack: the game's own description, figures and picture are not read), moved by the caption, shut by the cross, the one on top taking the mouse; the priority one has its caption lit.
+  - **The window that asks how many**, with the game's stops and its starting figure; the slider is slid with the mouse, a figure typed, Enter or ACCEPT, Escape or the cross. **This replaces "splitting stays at half"** (the user, 2026-10-11): asked for in the brief of 2026-10-12; the window comes up at half and one.
+  - **With Ctrl held a thing that is no stack is refused**, as the game refuses it (it used to be moved).
+  - **The quick-use bar** where the install's scene has it, shown only: the four slots' things and the seven keys' things, each with the install's own key for it. A quick-use key let go over a thing binds it; a bound thing has its key after its name.
+  - **The keys are the install's** (the character's too, since that night: `settings.md`): the inventory's, the key that works what is looked at, the discard key, the three weapon slots' and the seven quick-use keys (`keys.rs`; where the install has none, what this one had on 2026-10-12). **The sling's weapon is now on `2`, the back's on `3`.**
+  - **The weapon in hand is the one in any of the slots a weapon is held from**, of the kind the app has built: a slot's key puts away what is in hand and draws what hangs there; the weapon in hand moved to another slot is put away and hangs there. One rifle is built, with one logic: a second of its kind would be drawn with the first one's rounds (`PROVISIONAL`).
+  - In play a quick-use key bound to a weapon draws it; one bound to medicine, food or drink says that using it is not built.
+  - A thing on the ground is offered only if a pick-up would find it a place.
+
+**Checked** (2026-10-12): the model's tests (`a_thing_is_sent_to_the_other_side`, `a_thing_is_put_on_by_its_kind`, `part_of_a_stack_is_split_off_or_handed_over`, `things_are_bound_to_the_quick_use_keys`); against the install (`things_are_sent_put_on_and_bound_by_the_install_s_classes`: the stock rifle onto the sling, a second onto the back and a third nowhere, the vest and the backpack onto their slots, a magazine to the crate and back to the vest, a magazine put down and taken up into the vest, the medical kit bound in the pockets and not in the backpack, the rifle on the sling not bound); the screen's own logic without a window (`clicks_put_on_send_over_and_open`, `ctrl_lets_go_of_part_of_a_stack`, `the_slider_has_the_game_s_stops`). **In the app, by scripted clicks and key presses** (`docs/workbench.md` has the commands): Alt and a click on each of the crate's three things puts them on (3.49, 7.48, then 12.32 kg carried; `local\shots\s31_f.png`); the `4` key let go over the medical kit in the vest binds it (its name then ends in `[4]`, and the bar's view for `4` shows it); Ctrl and a click on a magazine in the vest sends it to the crate's first cell; a double click on the backpack opens its window; a stack of 60 let go on a cell of that window with Ctrl held brings up the window at 30 of 59 (`s31_c.png`), and Enter makes it 30 and 30 (`s31_d.png`, with the window moved by its caption). The slot keys, with the animator's states logged (`local\frames_s31.txt`): the rifle in hand dragged from the sling to the back goes `IN INVENTORY`, `IDLE TO OUT` (0.26 s after the hold is reached, when the blend into it is over), and the empty hands appear 0.8 s later; `3` then draws it (`OUT TO IDLE`, at rest 0.95 s on); `2`, with the sling empty, and `3` again, with that rifle in hand, do nothing. (Written before the recordings of the afternoon; what those showed is in "Compared with the running game".)
+
+**PROVISIONAL or not built:** the menu of the right button and the middle button's actions; examining and searching; using food, drink or medicine (there is no health system); grenades and the grenade key; the knife and its key; the bar's views taking the mouse; the selectors the bar opens; a weapon slot's key refused in an operation that cannot be cut short; the fast draw of the holster's weapon on a double press; what the game shows when a quick move is refused (a notice; here the line under the equipment says it).
+
+## The weapon in hand (`Player.SetFirstAvailableItem`, `TrySetInHands`, `DetectActiveSlot`; read 2026-10-11)
+
+- **At the start** a character takes in hand the first thing it can from these slots in order: the sling's weapon, the back's, the holster's, the scabbard's. With none, its hands are empty, which is a controller and a rig of its own ("Empty hands").
+- **The active slot** is the equipment slot the thing now in hand was drawn from. It is set whenever something is taken in hand, and stays set when that slot is emptied.
+- **When something is moved into the active slot it is taken in hand at once.** Into any other slot it is not: it hangs there until its key is pressed (the keys for the sling's weapon, the back's and the holster's: `2`, `3` and `1` in the install, read since 2026-10-12; "Clicks, keys and windows", "The keys"). So a character that began with empty hands and puts a rifle on the sling still has empty hands until the key.
+- The weapon in hand taken out of its slot leaves the hands for the next thing by the order above; here, empty.
+
+**Several weapons** (2026-10-12, evening). The app builds a rig for each of its weapons (the AKM, the M3 Super 90, the Five-seveN, the Model 700: `trp-app`'s `WEAPONS`), each with its own animator, logic and weapon motion, and one of them or the empty hands' is in the hands at a time (`weapon::Stowed`). Any of the four that hangs in a slot a weapon is held from is taken in hand by that slot's key; a pistol is put into the holster, whose key is `1`. Each rig keeps its weapon's rounds, fire mode and fold while it stands by. **One logic to a kind of weapon:** two weapons of one kind would share their rounds (`PROVISIONAL`, as before).
+
+## Reach (`Player.InteractionRaycast`, `InteractionRay`)
+
+What can be opened or picked up is found by a line from the point the player looks from, begun `BEHIND_CAST` (0.15 m) behind it and reaching `LOOT_RAYCAST_DISTANCE` (1.3 m) ahead of it; a door is nearer still (`DOOR_RAYCAST_DISTANCE`, 1 m). Both figures are the settings object's. A loot container is then opened by the interaction key, which plays the character's own animation for it and shows the container in the stash's place; searching it takes time, item by item (not built: here the crate is open at once).
+
+## Opening a container, and the hands while the inventory is open (read 2026-10-11, midday)
+
+**Corrected on 2026-10-12** by the recordings made by hand (`interactions.md`, "Working a door or a container"): the approach described next is the game's way to a thing that is **unlocked or kicked**. A container that is simply searched goes no such way: no approach, no crouch, no state; its gesture, and its screen 0.55 s after the key (the install's `DelayToOpenContainer`). What follows stands for the unlocking path only.
+
+**Approaching** (`ApproachState`, a movement state of its own; `LootableContainer.GetInteractionParameters`). A thing in the world that is opened says where it is opened from, what is looked at, and which animation opens it (a container's own, or `ContainerOpenDefault`). On entering the state:
+
+- the lean is let go and blind fire ended; a character lying down is no longer taken as lying;
+- if what is looked at (or its handle) is more than 0.65 m under the ribcage, the character **crouches to it**: the stance goes to its lowest, and the stance it had is kept (`LevelOnApproachStart`). If it is above the ribcage the character stands up to it. A thing may forbid either;
+- if the thing says so (`Snap`), the character is walked to the place it is opened from while its body and view turn to the thing: the time is the distance over 2.5 m/s for an unburdened character (down to 0.01 fully overweight), no less than the turn takes at 90 degrees a second, no more than 1.5 s; the way through is eased;
+- when that is done the body's animator is told (`Approached`) and plays the animation for the interaction; at its end the thing opens and, for a container, the inventory screen with it.
+
+When the container is shut (the screen closed), it is told so and **the stance kept is taken again** (`Player.TryInteractionCallback`).
+
+There is also a movement state named for looting (`LootPlayerState`: the view held within 15 degrees either way and from 15 down to 3 up, no lean). Nothing in the game's code enters it or sets the animator's `Loot` flag from outside: like automatic vaulting, it is dead in this version.
+
+**The inventory open** (`Player.SetInventoryOpened`, `WaitWeaponInventory`). Blind fire ends, a mounted weapon is taken off its mount, and the thing in hand is told: its own animator's flag for the inventory takes its hands layer through `OPEN INVENTORY` into `IN INVENTORY`, and `CLOSE INVENTORY` when the screen shuts. For the AKM those are the clips `akm_hands_out` (the left hand comes off and the weapon is turned aside in the right), `akm_hands_off` (held so) and `akm_hands_in`. Only once the hands are in one of the first two is the body's animator told (`Inventory`), which is the pose others see; while the hands do something else with the screen open (loading a magazine) it is told that too (`InventoryOperation`). A weapon taken out of its slot in the screen is put away from there (`IN INVENTORY` has a way of its own into the put-away state), and when the screen shuts it does not come back.
+
+The three states, as the AKM's animator has them (read from the install, 2026-10-11; `probe states <weapon> INVENTORY`):
+
+| State | Clip | Plays | Way out |
+|---|---|---|---|
+| `IDLE` | the resting clip, at half speed | | into `OPEN INVENTORY` on the flag, blended over 0.028 s |
+| `OPEN INVENTORY` | `akm_hands_out`, 0.667 s | from its start | into `IN INVENTORY` half way through (0.333 s), blended over 0.25 s; it has no other |
+| `IN INVENTORY` | `akm_hands_off`, 0.033 s | at a tenth of its speed, so over 0.333 s | into `CLOSE INVENTORY` when the flag goes, blended over 0.014 s |
+| `CLOSE INVENTORY` | `akm_hands_in`, 0.667 s | from its start | into `IDLE` at 0.64 s, blended over 0.03 s |
+
+`akm_hands_off` is not a still pose and **does not loop** (of the 85 clips of the weapon's whose names have an `a`, one is marked as looping, `hand_take`; the resting clip is not): its 33 ms carry the hands on to where they rest, and when it has run out the state stays on its last frame, as the engine leaves any state whose clip does not loop. Played over and over from its start, the left hand snaps 22 mm back every 33 ms, which is what the app did until the evening of 2026-10-11 (below). The way down has only the one way out, so an inventory shut at once still takes the hands down, and they start back 0.58 s after it opened at the earliest (half the way down, then the blend into the held state, which the animator does not leave while it is still on its way in).
+
+**Which of the weapon's operations take it** (`FirearmController`, each operation's `SetInventoryOpened`). The idling one puts the sights down and lets the trigger go, both when the inventory opens and when it shuts, and sets the animator's flag at once. A shot, automatic fire or a reload in hand only notes it and sets the flag when it hands back to idling. Empty hands, a knife and a grenade have the same call.
+
+**The animator's other ways into and out of the hold** (read 2026-10-11, night; `firing.md`, "The weapon goes by its animator", has them with their figures). A reload made or finished with the screen open does not bring the hands back to the weapon: `RELOAD IN` (with a round chambered) and `RELOAD CHARGE END` (after racking the bolt) leave for `RELOAD INVENTORY END`, which gives way to `IN INVENTORY`. A reload in hand tells the animator of the screen only once its magazine is out. A weapon put away while it is held down goes from `IN INVENTORY` to its put-away state. A weapon being drawn does not hear of the screen, but is told how it stands as soon as it has appeared, and then goes down for it (corrected 2026-10-12: `firing.md`, "Being drawn"). Automatic fire ends at the end of the cycle in which the screen is open.
+
+**The body is told as of a reload.** The hands' controller, whatever is in the hands, calls the movement state's `OnInventory`, which sets the body animator's `ProneReload` flag, the one `OnReload` sets at a reload's start and end. Both write the one flag, so it is whatever was said last. It is what holds a lying body still (`movement.md`, "Looking").
+
+## Empty hands (`Player.EmptyHandsController`, `EmptyHandsTemplate`; read 2026-10-11, evening)
+
+A character with nothing in its hands still has something in them as far as the game goes: an item made in code (`EmptyHands`, with a template that names one bundle, `assets/content/weapons/empty hands/weapon_empty_hands_container.bundle`, and is in no database) and a hands controller for it like a weapon's.
+
+**The rig** (read from the install; `probe tree`, `probe clips` and `probe states` take the bundle in place of a weapon's id). The bundle's root carries the same `WeaponPrefab` script a weapon's does, and the object it names (`weapon_empty_hands.generated`, 62 bones) is built like a weapon's rig: both arms from the collarbones to the finger tips under the same names, the animated camera bone, and `Weapon_root/Weapon_root_anim/weapon` with the two hand markers, the two reference markers, the elbows' goals, an aim bone and a fire port, and two bones for a thing held (`prop`). It draws nothing of its own. So everything that places the arms on a weapon places them here: the clips move the markers and the arms are solved onto them. (A second object in the bundle, `..._simple.generated`, is the same rig for the reduced animation sets.)
+
+**Its animator** has two layers that play, the hands' and the left hand's gestures (the same gestures a weapon's has). The hands' states:
+
+| State | Clip | Way out |
+|---|---|---|
+| `SPAWN` | `empty_hands_out`, 0.033 s | into `OUT TO IDLE` at once when the hands are made active |
+| `OUT TO IDLE` | `empty_hands_out_to_idle`, 0.167 s; its mark `WeapIn` 0.034 s in | into `IDLE` at 0.15 s, blended over 0.017 s |
+| `IDLE` | `empty_hands_idle` and `empty_hands_idle_down`, blended by `Aim_angle` between 0 and 90 | |
+| `IDLE TO OUT` | `empty_hands_idle_to_out`, 0.167 s; `WeapOut` at its end | back to `SPAWN` |
+| `LOOK` | `empty_hands_look`, 2.667 s | to `IDLE` at its end |
+
+`Aim_angle` is the view's pitch in degrees, set every frame (`ManualUpdate`): level and above, the hands rest by `empty_hands_idle`; looking straight down, by `empty_hands_idle_down`; between the two, by a blend in proportion. **There are no states for an open inventory:** the animator has the flag set like any other and nothing answers to it, so with empty hands the screen changes nothing about the arms.
+
+**The controller's life.** *Appearing* (`SpawnOperation`): the body's animator is given a weapon width of one and told the hands are busy (`ReloadFloat` 1), the hands' animator is made active, and when its `WeapIn` mark comes, 0.034 s in, the hands count as there and the body is told they are free. *Idling:* after five minutes with nothing done the animator is given its idle trigger; a look at the hands is `LOOK`. *Going* (`Remove`): the body is told the hands are busy and the controller is finished **at once**; `IDLE TO OUT` is not waited for, so empty hands vanish as the next thing is drawn. The inventory opening sets the animator's flag and tells the body's `ProneReload` as for a weapon.
+
+**The weapon motion goes on, with nothing made afresh** (`ProceduralWeaponAnimation.ClearPreviousWeapon`, `InitTransforms`). The motion is one object for whatever is in the hands. For empty hands it is told to forget the weapon (no weapon data, so no recoil, no sights to bring the eye to, no line that feels for obstacles) and its sway and displacement strengths are put to 0.5; then it is tied to the new rig's bones and its springs are reset. What it is *not* told stays as the last weapon set it: the point the rig swings about, the damping of the position spring, the ergonomic weight. And the two strengths of 0.5 last only until the stance or the carried weight next changes, when they are worked out again from that left-over ergonomic weight (`OnAimOrPoseChanged`, `UpdateSwayFactors`). A character that has held no weapon has the player prefab's own figures: its `PlayerSpring` swings about (0, -0.17, 0) and damps the position spring by 0.5, and its ergonomic weight is nothing.
+
+**The body's animator** is told the kind of thing in hand (`WeaponAnimationType`: empty hands are 4) and uses it only to choose between the rifle, pistol and launcher variants of additive layers; the unarmed upper body others see comes from this rig, which the body's arms follow as they follow a weapon's.
+
+**Built** (2026-10-11, evening).
+
+- *Reading:* the prefab as a weapon is read (`trp_data::weapon::assemble_prefab`, `EMPTY_HANDS`); the player prefab's own swing point (`HandsData::rotation_center`); the weapon motion's settings for hands that hold no weapon (`trp_sim::empty_hands_settings`): the prefab's swing point and damping, no weight, no recoil, no line for obstacles; the second clip of a resting state that goes by the view's pitch (`trp_sim::rest_blend`) and the clip of a named state (`state_clip`).
+- *In the app, a second rig.* The empty hands' rig is made beside the weapon's at the start. Its arms and its camera bone are the weapon rig's own (44 of its 62 bones: the two prefabs name them alike, and the body's meshes and the arms' mesh are skinned to them once); its weapon bone with the markers is its own. What is in the hands is always one of the two: its rig, its clips, its clip player and its weapon motion are the ones everything draws and steps by, and the other set stands by (`Stowed`). Putting the weapon away changes the sets over when its clip has played out (at once, with the inventory open), puts the shared bones as the empty hands' prefab has them, tells the body's animator a width of one, hides the weapon's own bone and plays `empty_hands_out_to_idle` into the resting clip. Drawing the weapon changes them back at once and plays its draw clip. The resting hands are the first clip with the second laid over it by the view's pitch over 90 degrees.
+- With the inventory open the empty hands do nothing, as their animator has nothing for it.
+- *Since the night of 2026-10-11 the empty hands run on their own animator* (`trp_sim::EmptyHands`): made active they leave `SPAWN` for `OUT TO IDLE`, are there at its `WeapIn` mark (0.05 s after they are asked for, at 120 frames a second) and rest in `IDLE`, whose blend of two clips by `Aim_angle` is the animator's own blend tree, told the view's pitch every frame; told to go, they are gone at once. The app draws that animator's pose as it draws a weapon's, and no clip is played by name any more. The body's animator is told the hands are busy while they appear and from the moment they are to go. Checked against the install (`the_weapon_goes_by_its_animator`): four of the rig's 62 bones are elsewhere with the view straight down.
+
+**Checked.** Against the install (`empty_hands_are_read_like_a_weapon`): the rig's arms and markers, the resting state's two clips and their values, no inventory states, 0.167 s to appear with the mark 0.034 s in. In the app, by scripted runs (2026-10-11): a bare start plays `empty_hands_out_to_idle` and rests on `empty_hands_idle`, the hands 0.43 m under the eye and out of the picture with the view level (`local\shots\eh_fp.png`), the left hand in the picture with the view 70 degrees down (`eh_down.png`); from outside the arms are bent at the elbows with the hands before the belt (`eh_body.png`), and in a sprint the body's own running arms take over (`eh_sprint_side.png`); and one run through the whole of it (`--loot --bare --drag 1100:180:170:450 --tap 150:tab --tap 200:3 --tap 500:tab --tap 620:delete --tap 720:tab`): empty hands, the rifle taken from the crate and drawn with `3` (`akm_out_to_idle`, then its resting clip), the inventory opened (`akm_hands_out`, `akm_hands_off`), the rifle put on the ground there, and the empty hands appearing again. **Compared with the game: nothing.** No recording has empty hands, and nobody but the scripts has tried it.
+
+**PROVISIONAL or not built:**
+
+- The settings are those of a character that has held no weapon. What the game's empty hands keep of the last weapon (its swing point, its damping, its ergonomic weight for the sway) is not carried over, the springs start at rest where the game's are reset in place, and the strengths of 0.5 that stand until the first change of stance are not built.
+- (The body's animator is told the kind of thing in hand since the session after: `body-animator.md`, "The kind of thing in hand", which also has what the user asked about a sprint's fists; and that the hands are busy while they appear since the night after that.)
+- (A weapon drawn with the inventory open is told of the screen when it has appeared, by the player's owner, and goes down then: read and built on 2026-10-12, the night before's "stays up" having missed that call. The draw's own way into `OPEN INVENTORY` at 0.78 of itself is taken only if the animator's flag is up before the draw ends, which happens in the game when a draw is cut short; that is not built.)
+- The look at the hands, the compass, the idle trigger after five minutes, dropping the backpack, and every gesture of the left hand.
+- If the install's empty hands cannot be read, the weapon and the arms are hidden as before.
+
+## What an open screen does to the keys (read 2026-10-11, evening)
+
+The user, the same day: with the inventory open "we should not be able to move like tarkov". Read from `EFT.InputSystem.InputNode`, `EFT.UI.Screens.UIScreen`, `InventoryScreen`, `PlayerOwner`, `GamePlayerOwner`, `MoveInputTranslator`.
+
+- **The chain.** Every frame the game hands that frame's commands (one for each key pressed or let go) and its axes (movement, the mouse, the slow lean) down a chain of input nodes. Each node may take commands out of the list and may take the axes away. The player's node is added to the chain with low priority, so everything else is asked first.
+- **A screen takes nearly all of it.** Every screen (`UIScreen`: the inventory, the menus, the settings) hands on no axes at all, and of the commands only five that are not the player's: the screenshot, the console, the inventory key and the two of the voice chat (`InputNode.GetDefaultBlockResult`). The inventory screen itself shuts on the inventory key or Escape.
+- **So while it is open** the player's `Move`, `Look`, `Rotate` and slow lean are not called (not called with nothing: not called), and no key reaches it, **neither a press nor a release**.
+- **The frame of the key.** The inventory key reaches the player's node, since the screen is not up yet. The player is told its inventory is open at once (`SetInventoryOpened`), whatever commands came after the key in that frame are dropped, and that frame's axes are still handed over. The screen has the keys from the frame after.
+- **What that does to movement** (`movement.md`, "A frame with no input"): a walk or a crawl is left with no input and runs down as if the keys had been let go; a sprint loses its forward on the first such frame and ends through its stop; a jump keeps the direction it had; standing, nothing is asked. With the keys still down when the screen shuts, the walk starts again, since the axes are a state and not an event.
+- **What was pressed or let go meanwhile is lost.** A lean key let go under the screen leaves the character leaning when it shuts, until that key is pressed again (which then straightens: a press toward the side already leaned to does), and the same goes for a held step aside. A sprint key let go under the screen is no stop command, and one pressed under it is no start. The aim key and the trigger are commands too: the sights came down at the opening, and a button still held when the screen shuts does nothing until it is pressed again.
+- **The vault key.** The opening and the shutting both switch its per-frame try off (`OnStartInventoryOpen`, which `InventoryOpenRaiseAction` raises either way; `vaulting.md`, "Two moves, one key"). The key itself is not a state but a switch that every press and every release turns over, so a key held through the opening and let go after the shutting switches the try *on* with the key up: the hold's timer then runs, a jump is refused once it has passed its 0.6 s, and the next press switches it off again. Read from the code; not recorded.
+
+Nothing of this section is recorded: the recorder's scripts cannot open the inventory.
+
+**Out of the hands and into them.** A weapon is put away by its animator's own state for it (the AKM's clip `akm_idle_to_out`) and drawn by `OUT TO IDLE` (`akm_out_to_idle`, 0.97 s) from `SPAWN`.
+
+**Empty hands** are an item of their own (`EmptyHands`) with a prefab like a weapon's and a controller with its own operations (appearing, idling, dropping the backpack, the compass). They have a section of their own below.
+
+**Putting down and picking up.** Followed to its end on 2026-10-12 (`interactions.md`): the weapon's own layer for the left hand's actions (`hand_drop_stuff`, `Take Loot`) is not what plays for a firearm, whose calls for it are empty; the gestures are states of the body's animator. A thing picked up is taken by the body's `8 Take`, standing still only, and goes 0.6 s in to the first place found for it, by the game's own order (`QuickFindAppropriatePlace`; read on 2026-10-12, afternoon: "Clicks, keys and windows", "Put on"). A thing discarded falls as a thing of the world with no gesture at all: the game's list has one for it and nothing asks for it. Only a backpack taken off has one.
+
+**Splitting** a stack: dragged with Ctrl held, the game asks how many in a window of its own and puts that many in the place (`SplitMax`; "Clicks, keys and windows", "Part of a stack", read and built on 2026-10-12).
+
+## Weight
+
+- An item weighs its template's weight times how many are in its stack.
+- An item with containers (slots, grids, a magazine's rounds) weighs its own weight plus everything in them (`ContainerCollection.TotalWeight`).
+- **The character's carried weight** (`Inventory.TotalWeight`) is the sum over all fifteen slots of what is in each. With the Strength skill at its elite level it is the sum over nine of them only (TacticalVest, Pockets, Backpack, SecuredContainer, Earpiece, Headwear, Eyewear, FaceCover, ArmorVest): the weapons, the scabbard, the dogtag and the armband then weigh nothing.
+- The controller reads that sum whenever it changes (`PhysicalBase`; `movement.md` and `stamina.md` say what goes by it), and the Gear tab shows the same figure. Built since 2026-10-11 (`Movement::set_weight`): the inertia, the limits on speed and the stamina's costs are worked out again for the new weight with the character's skills as they are, the pools keep what they hold, and a character that has become fully overweight begins to pay for standing about. The curve under the walk's floor is then this character's again, as the game keys it by whichever character's weight changed last (`movement.md`).
+
+## What the install holds
+
+- `templates/items.json`: for every item its class (parent), weight, width and height, extra size, slots with their filters, grids with their sizes and filters, and the slots it blocks. `probe item <id or part of a name>` prints one.
+- `templates/profiles.json`: for each edition of the game and each side, the character a new account starts with, and in it the whole tree of its inventory as a flat list: each entry an id, a template, the id of what it is in, the slot or grid it is in there (`slotId`), for a grid the cell and the turn (`location`), and for a stack how many (`upd.StackObjectsCount`). The entry whose id is the inventory's `equipment` is the equipment item itself. `probe json templates/profiles.json /Standard/usec/character/Inventory 1` shows one.
+
+The Standard edition's starting character wears (read 2026-10-11): a rifle on the sling, a knife, a face cover, a helmet, a headset, body armour, a tactical vest, a backpack, the pockets and a secured container, with magazines, rounds and medicine in the vest, pockets and container.
+
+## Built (2026-10-11)
+
+- `crates/trp-data/src/inventory.rs`: reads the equipment tree of a starting character from the install (`Loadout::load`), a weapon as its stock preset has it (`Loadout::of_preset`), an equipment list out of a recording (`Loadout::of_recording`), each item's class chain, weight, size and extra size, slots (with whether one is required), grids, blocked slots, stack size, whether a part may be changed in a raid, the slots it stays in, and the game's own short names for items (`short_names`, from the install's English texts).
+- `crates/trp-data/src/screen.rs`: the install's scenes by name, a scene's objects with their screen layout, and the inventory screen's equipment panel (`GearPanel`).
+- `crates/trp-sim/src/inventory.rs`: the model with no engine types: items with slots and grids, the slot's and the grid's rules above, finding room, an item's size and weight, and the character's carried weight both ways; and since 2026-10-11 **moving** (`move_item`, by the nine refusals above bar the fifth), **dropping one thing on another** (`apply_item`: merge, put into, top up), the rules of a raid with the install's limit on backpacks (`Rules::of`), and a recorded equipment list set beside the model (`Equipment::of_recording`). Everything that stands by itself (the equipment, an open container) is a root, and a move goes between roots or within one. A move that is refused changes nothing.
+- The app:
+  - **It starts bare** (the user, 2026-10-11): nothing worn, nothing in hand. `--loadout <edition>/<side>` still gives a starting character's outfit.
+  - **Since 2026-10-12, evening, the crate is larger inside and holds every weapon** (the user: "Whenever a new weapon is added, add it onto the airdrop case. Make it larger internally, with a scroll bar so we can store more things"): ten cells across as the install's, and thirty down where the install's has twelve, which is the app's and not the game's; each of the app's weapons as its stock preset has it, with no round chambered; two full stacks of its own round for each weapon the kit is not made for; and the key of the range's locked door. Its panel in the screen is as high as the screen leaves and is scrolled by the wheel, a cell a notch, or by the bar at its side (`scroll_loot`). A run begun with `--equip` or to make a capture puts on the weapon it was begun with, the vest and the backpack, as before.
+  - **A crate stands on the range**, two and a half metres ahead and a little to the left: the install's airdrop crate as a container (one grid of ten by twelve cells; the install's weapon boxes are five by five at most and do not hold all three), holding the app's weapon as its stock preset has it, and the vest and the backpack a BEAR of the Standard edition starts with, each with what the database has in it **but for the magazines and the rounds, which are the weapon's own** (the user, 2026-10-11: "Make the items in the chest related to the AKM"; `Loadout::fit_to`: a magazine the weapon's magazine slot does not take becomes the magazine of its stock preset, a round its chamber does not take becomes its default round, no more to a magazine or a stack than each holds). For the AKM that is three of its own 30-round magazines of 7.62x39 PS in the vest and two lots of that round, 60 and 30, in the backpack, beside the medical kit, the water and the ration that were there. Looked at from within the game's reach it shows `F SEARCH`, and `F` opens the inventory screen with the crate in the stash's place. The box on the range is the app's own; the game's model for the crate is not read, and it opens at once with nothing to search.
+  - **The screen** (`Tab`, or `F` at the crate): the tabs in the game's order; Gear with the equipment's slot views where the install's own panel has them, over a paper figure, each container in its slot with its grids beside it, and what is open on the right. **Things are moved with the mouse**: held with the left button and let go on a cell, a slot or another thing, `R` turning what is held; what is held is outlined green where it would be taken and red where not, and the line under the equipment says what the last move came to or why it was refused. While the screen is open the mouse and the keys are the screen's, as in the game (since the evening of 2026-10-11; before that the movement keys still worked).
+  - **What the equipment holds is what the character is:** its sum is the carried weight the controller goes by from the next frame (unless `--weight` was given); what sits in the eight drawn slots is on the body, each by the mesh for what it is then worn over (a backpack sits differently over a vest); and the weapon in hand is the one on the sling, by the rules above: taken with `3` the first time, at once after that. With empty hands the weapon's keys do nothing; the hands themselves are the game's own rig for them since the evening of 2026-10-11 ("Empty hands"), where before neither weapon nor arms were drawn.
+  - A run nobody is at the keys of (a capture, a scripted run) has the crate's three things on from the start, put on by the model's own moves, so that it has its weapon as before, and weighs what `--weight` says (nothing by default), as it did before there was an inventory, unless it is run for the inventory (`--inventory`, `--loot`, `--equip`: then the equipment's sum); `--bare` keeps it bare, `--equip` does the same for a played run, `--loot` starts with the crate open, and `--drag x:y:x:y` (as often as wanted) drags the mouse from one place in the window to another in such a run.
+
+  - **Since midday, 2026-10-11** (the user had asked for an un-equip animation, looting as an animation and a state, dropping and splitting, and placeholder pictures):
+    - *The weapon goes down while the screen is open and comes back when it shuts*, by the hands' own clips for it; taken off the sling in the screen it does not come back; put away outside the screen it goes by its put-away clip; taken in hand it is drawn by its draw clip. The clips were found by the ends of their names and played one after another until the night of the same day, since when the weapon's animator does all of it (below). With the screen open the weapon's keys do nothing (`R` used to reload as well as turn what was held).
+    - *At the crate the character does what the approach does*, as far as it is built (`Movement::approach`, `let_go`): the lean let go, the crouch to a thing reached for more than 0.65 m under the ribcage (the crate's top is 0.5 m up, so it crouches), and the stance taken again when the screen shuts. Not built: the walk and turn to the place, the state of its own, the animation for opening, the wait before the screen opens.
+    - *Putting down:* `Delete` puts the thing held or under the mouse down 0.4 m ahead of the character, where it lies as a plain box (`take_out`: what a raid keeps in its slot stays there). *Picking up:* `F` with the thing looked at (`pick_up`: a slot of the equipment that takes it, else the first room in the vest, the pockets, the backpack, the secured container, which order is PROVISIONAL). The weight follows both.
+    - *Splitting:* with Ctrl held a stack let go on a free cell leaves half of itself there (`split_item`). The game asks how many; half is the user's decision for now (2026-10-11: "Leave splitting at half").
+    - *Pictures:* each item is drawn with a plain shape for its sort (a rifle, a magazine, rounds, a helmet, a vest, a backpack, a cross, a can, a headset, a knife, a part, a box), chosen by the nearest of its classes that has one and painted by the app at its start. They stand in for the game's own pictures of its items and are none of the game's.
+    - A capture run can press keys as well as drag (`--tap <frame>:<key>`).
+
+  - **Since the evening, 2026-10-11** (the user had found that the character could still be walked about with the screen open, and that the weapon and arms shook while it was):
+    - *The open screen has the keys* ("What an open screen does to the keys"). The simulation takes it as two things a host says each frame (`movement::Input`): `screen`, a screen has the keys and the mouse, and `inventory`, the character's inventory is open. With `screen` nothing is handed over: no movement, no turn of the view, no key; each key is noted as it stands, so that what it did meanwhile is lost. With `inventory` the body's animator is told as of a reload, and a change either way switches the vault key's try off. The app sets both while its screen is open, and tells the weapon nothing of its keys meanwhile either (the aim key and the trigger are noted, `Firearm::note_trigger`). The screen's systems now run after the simulation's frames, so a screen opened in one frame has the keys from the next, as the game's has.
+    - *The hands go down by the animator's own states* ("The inventory open"): the weapon's logic is told (`Firearm::set_inventory`) and takes the hands through the three states with the install's own exits, blends and speeds, holding the last one on its last frame; opened in a reload or a shot it waits for that to end; at rest it puts the sights down and lets the trigger go. The states and the two blends taken on a flag are read into `FirearmSettings::inventory` (`trp_sim::firearm_settings`); a weapon whose animator lacks them keeps its hands up. The clip player no longer starts a resting clip again from its beginning when it has run out unless the clip is marked as looping. A weapon taken out of the hands has its logic put back to rest (`Firearm::put_away`), and one taken in hand with the screen open is drawn first and lowered after.
+    - (Until the night after, the weapon's logic counted as busy until the hands were back. It now idles throughout, as the game's does, and a press of the trigger while the hands are down or coming up is the idling operation's: with a round chambered it fires, the animator asked for its fire state outright. Read from the code; not recorded.) (The lean stood here too until the session after: it is now the game's presses and releases, `movement.md`, "Lean", so a lean whose key was let go under the screen stands when it shuts.)
+
+  - **Since the night, 2026-10-11** (the user had tried it: the shake is gone; "the weapon going to standby while looting doest seem to match, as it blends with a empty reload better in tarkov"; and "the images for items stretch based on the grid size, they should shrink and grow instead"):
+    - *The weapon goes by its animator* (`firing.md`, "The weapon goes by its animator"). What the user saw was the reload: the app finished it, brought the hands back onto the weapon and then took them off again, where the game's animator goes from the reload straight into the hold (`RELOAD INVENTORY END`), from a chambered round and from an empty chamber alike. The weapon's logic is now the game's operations on the weapon's own animator, and the app draws that animator's pose, between the simulation's frames, in place of clips played by name. The same goes for the draw (`OUT TO IDLE`, or `OUT TO IDLE ARM` with an empty chamber), the put-away (`IDLE TO OUT`, from rest or from the hold) and the empty hands, which have their own controller on their own animator (`trp_sim::EmptyHands`).
+    - *What changed with it, all from the game's code:* a weapon taken off the sling in the open screen is put away from the hold by its animator (0.82 s) and only then do the empty hands appear, where it used to vanish at once; **a weapon taken in hand under an open screen is drawn and stays up**, where it used to be lowered after the draw (a draw does not hear of the inventory, and nothing tells the new weapon; "Being drawn" in `firing.md`); the weapon's logic idles while the hands are down, as the game's does, so the PROVISIONAL note about it counting as busy is gone; the body's animator is told the hands are busy through a draw and a put-away, and for the 0.034 s the empty hands take to appear.
+    - *The pictures keep their shape.* Each sort's picture is painted as wide and as high as its shapes reach (a rifle long, a magazine tall) and drawn whole in the middle of the item's box at the largest size that fits, so a larger box has a larger picture and never a stretched one; a thing that lies turned in its grid has its picture turned a quarter with it (`inventory_view::Picture`). `local\shots\pics_fit.png`.
+    - *Checked in the app by scripted runs* (`--log-frames` now writes the state the rig's animator is in or entering): a reload begun at 2.1 s with the screen opened 0.8 s into it goes `RELOAD OUT`, `RELOAD IN`, `RELOAD INVENTORY END` (2.9 s after the key), `IN INVENTORY` (`local\shots\an_reload_inv.png`); the run through the whole of it (`--loot --bare --drag 1100:180:170:450 --tap 150:tab --tap 200:3 --tap 500:tab --tap 620:delete --tap 720:tab`): the empty hands appear (`SPAWN`, `OUT TO IDLE`, `IDLE`), `3` draws the rifle (`OUT TO IDLE` for 0.95 s), the screen takes the hands down (`OPEN INVENTORY`, `IN INVENTORY` 0.34 s on), the rifle put on the ground there is put away from the hold (`IDLE TO OUT`, gone 0.80 s later) and the empty hands appear again; with the hands held down and settled the left hand moves at most 0.17 mm from one drawn frame to the next (0.14 mm at rest), as before. **Compared with the game: nothing**; and nobody but the scripts has tried it.
+
+  - **Since 2026-10-12** (the user: "continue working on the different left hand gestures of opening certain boxes, doors etc"; `interactions.md` has all of it):
+    - *The crate is worked with the left hand before it is shown.* `F` begins the game's own course: the lean let go and the crouch as before, the body's gesture for a container's opening, the thing told to do its part 1.6 s in, and the screen opened when the game's state for it is over. The walk is refused meanwhile, the view turns, and the inventory key does nothing.
+    - *A thing on the ground is taken with the left hand,* standing still only (walking, `F` does nothing, as the game's call does), with the view held for the 0.6 s until the thing goes into the inventory.
+    - *With the screen open the left arm is the body's,* in its own pose for an open inventory, once the weapon's hands have gone down; with empty hands it is not.
+    - *Putting a thing down has no gesture,* as before, and now by the reading and not for want of one.
+  - **Since the recordings of 2026-10-12** (nine made by hand and six scripted, with recorder 0.6.0; `interactions.md` and `firing.md` have what each showed):
+    - *The crate is searched, not approached.* `F` asks the left hand for the crate's gesture and holds the character to nothing: no crouch, no lean let go, the walk and the view free. The screen opens 0.55 s after the key (the install's wait, `DelayToOpenContainer`; read on the afternoon of 2026-10-12, where the morning had the class's 0.5 s and 0.05 s more for the screen), which stops the gesture where it is; a character that has gone a quarter of a metre further from the crate by then, or is in a jump, is shown nothing. `Movement::approach` and `let_go` are no longer the crate's.
+    - *Five containers since the afternoon of 2026-10-12* (`interactions.md`, "Built"): beside the airdrop crate, a wooden crate, a technical supply crate, a dead Scav and a drawer, each the install's item of that sort and empty, beyond the doors in the high wall. The one searched last is the one the screen shows (`Carried::loot`; the others are kept in `Carried::away`), and each is told to shut when its screen shuts.
+    - *A weapon taken in hand under the open screen goes down when it is up,* told of the screen as it appears; empty hands are told the same way.
+    - *A weapon's chamber is a place in it* (`patron_in_weapon`, among its slots), so a recorded list's chambered round is put where the game has it.
+
+**Checked** (2026-10-11): `cargo test -p trp-sim --test install a_starting_character -- --nocapture` (both Standard starting characters are put together from the install with no entry left over, everything the database has lying in a grid passes that grid's own rules where it lies, and the totals are 14.563 kg for the USEC and 16.531 kg for the BEAR, 10.819 and 12.403 with the weapons left out); `a_crate_is_emptied` (the crate's three things go onto a bare character by the model's moves, 12.320 kg in all with the kit the AKM's own, where it was 10.775 with the BEAR's 5.45 (so the figures of the scripted runs below, made before, are 1.55 kg under what the same runs give now); every magazine in the kit is one the rifle's slot takes and every round a 7.62x39; a rifle is refused by the headwear's slot and a vest by the sling's, a magazine dropped on the backpack goes into it, the pockets are not taken off in a raid); `the_equipment_panel` (the panel as read from the install); `a_recorded_equipment_list` (below); and the model's own tests for stacks, backpacks in backpacks, vital parts and a move refused. **In the app itself**, by five scripted drags of the mouse in a bare run with the crate open (`local\shots\inv2_dragged.png`): the rifle from the crate onto the sling (3.49 kg carried), the vest and the backpack into their slots (6.47, then 10.77 kg), a magazine out of the vest's first grid into a cell of the backpack (the vest 0.52 kg lighter, the backpack as much heavier, the sum the same), and the rifle onto the headwear's slot, which is refused and leaves it on the sling; the hands stay empty with the rifle on the sling, as the rules above have it for a character that began with none. The key `3`, the search key at the crate and turning a held thing with `R` were then tried by the user ("the 3 key, f and r work so far"). **The midday's additions, in the app by scripted drags and key presses** (`local\shots\inv3_split_drop.png`, `inv3_in_hand.png`, `inv3_picked_up.png`): opened at the crate the stance goes to 0.04 and comes back when the screen shuts; a stack of 60 rounds dragged with Ctrl onto a free cell is 30 and 30; `Delete` over one half puts it down (10.77 kg carried becomes 10.48); with the screen shut `3` draws the rifle (`akm_out_to_idle` plays); the half on the ground, looked at, shows `F TAKE PS`, and `F` puts it in the vest's first free cell (10.77 kg again); opening the screen with the rifle in hand plays `akm_hands_out`. Not run: the weapon put away outside the screen (nothing in the app does that yet), and `R` no longer reloading with the screen open.
+
+**The evening's, measured** (2026-10-11). *The shake, before:* in a scripted run with the rifle in hand and the screen opened on the 300th drawn frame (`--equip --tap 300:tab --log-frames`), the left hand as the camera sees it went 22 mm down over each 33 ms and snapped back, for as long as the screen was open: `akm_hands_off` played from its start again and again. *After:* the same run plays `akm_hands_out` for 0.34 s, then `akm_hands_off` blended in and held at its end, and with the screen shut again `akm_hands_in` for 0.64 s and the resting clip; over the 240 frames the weapon is held down the left hand moves at most 0.17 mm from one frame to the next (the resting weapon's own figure is 0.14 mm), and the picture is `local\shots\inv_walk.png`. *Walking:* in the simulation (`a_screen_takes_the_keys_from_a_walk`, `a_screen_ends_a_sprint`) a walk with the key still down comes to rest 0.474 m on and a sprint 0.855 m on, each on every frame where a character that let the keys go is (0.000000 m apart), and the view does not turn; in the app (`--equip --hold w --tap 500:tab --log-pacing`) the character is walking at 2.84 m/s at the key, standing 0.13 s later, 0.470 m further on, and does not move again with `W` held. Keys pressed under the screen, the lean kept, the vault key's switch and the lying body held are tried in the simulation (`keys_pressed_under_a_screen_are_lost` and the three tests after it), and the hands' three states in the weapon's logic (`the_hands_go_down_for_an_open_inventory_and_come_back` and the two after it). The fourteen recordings replay byte for byte as before (`after23` is `after22`). **Not compared with the game:** all of it is from the game's code and the install; no recording opens the inventory. **Not tried by hand** by anyone but the scripts: the user's own keys.
+
+## Compared with the running game
+
+**The equipment as recorded** (2026-10-12: the fifteen headers of the fifteenth recording and of the recordings made by hand, recorder 0.6.0; the replay and `byhand` print the comparison). Each list is put together by the model with **every item finding its place and no item differing from the game in cells or in weight**: 22 to 25 items with the rifle on the sling (the rifle 5 x 2 cells with its parts on, 3.855 kg loaded), 13 with it off. The model's sum is the game's to the gram in thirteen of the fifteen (9.975 kg, 10.705, 10.785, 6.570), and the sum at elite Strength, where a weapon in hand or on the sling weighs nothing, in all fifteen (6.110, 6.840, 6.920, 6.560). In the other two the game's plain figure is that of an earlier moment: 0.360 kg over the list after thirty rounds had been taken out of the rifle's magazine, and 0.012 kg over it after one round had been fired. So the figure the game keeps does not follow rounds leaving a weapon at once; what refreshes it is not read. (Before the chamber was given its place the model was one round short wherever one was chambered.)
+
+**The weapon's hands for the screen** are compared in `firing.md` ("Compared with the fifteenth recording and the recordings made by hand"): down and back, a reload ending in the hold, a weapon taken off its slot and put back, all on the game's own frames.
+
+**The clicks, the keys and the moves** (2026-10-12, 15:29 to 15:47: sixteen recordings made by hand with recorder 0.6.2, `local\traces\byhand3`, the Benelli M3 in hand, pockets and a secured container worn, no vest and no backpack; `cargo run -p trp-sim --bin byhand -- local\traces\byhand3`, kept as `local\byhand3.txt`). The recorder writes what is carried, what the container looked at holds and what is bound whenever any of them changes, and the keys and the button as they go down and come up with what is held. `byhand` puts the model together from the lists as they stood before each change and asks it for its own move by the same click, drag or key. The thing the mouse was on is not on record, so it is the thing that moved. **Sixteen changes, and the model's move is the game's in all sixteen:**
+
+| Recorded | The game | The model |
+|---|---|---|
+| Ctrl and a click on shells in a pocket, a container open | into the container's first cell | the same |
+| Ctrl and a click on them there | into the first pocket | the same (rounds: vest, pockets, backpack, secured container) |
+| Ctrl and a click on shells in the first pocket, nothing open (twice) | to the second pocket, and back to the first | the same: the next free place in what holds it, its own cells counting as taken |
+| a double click on the secured container, then Ctrl and a click on shells in a pocket | into the secured container | the same with that container's window the priority one, and with no other; with no window, the third pocket |
+| Ctrl and a click on them in that window | back to the first pocket | the same |
+| Alt and a click on a weapon in a container, the hands empty | onto the sling | the same |
+| Alt and a click on a hat in a container | onto the headwear's slot | the same |
+| a stack of 4 let go on a free cell with Ctrl held, the window accepted | 2 split off, 2 left | 1 to 3 may go; the window comes up at 2 |
+| a stack of 8 let go on a stack of 4 with Ctrl held, the window accepted | 4 handed over | 1 to 7 may go; the window comes up at 4 |
+| `4`, `5`, `6` let go one after another with the mouse over a splint in a pocket | bound to each in turn as the key comes up, the key before let go of | the same three times |
+| the splint dragged onto the bar (let go at 1026, 82 of 1920 by 1080) | bound to `5`, `4` let go of | the same; and the bar as the install's scene has it, centred in its panel as the app draws it, has the view for `5` there (its middle at 1025.6) |
+| a stack of shells taken up off the ground with `F` | into the first pocket | the same |
+| the weapon in hand dragged from the sling to the back | there | the model takes it there |
+
+Besides, on the same recordings:
+
+- **The weapon in hand moved to another slot is put away first and moved after.** The put-away begins on the frame the button comes up; the empty hands show 0.84 s later; **the list has the weapon on the back only 0.05 s after that** (the game's move waits for the hands). It then hangs there with the hands empty, and the back's key draws it: as read. (In the app the thing changes slot at once and the hands follow; what is carried comes out the same.)
+- **A weapon put on with the hands empty is drawn on the frame of the click** where it goes into the slot the hands last drew from (the recorded one had been in hand before); it comes up (`OUT TO IDLE`, 1.0 s for the M3), and **goes down for the open screen the frame after it is at rest** (`IDLE` for one frame, `OPEN INVENTORY`, `IN INVENTORY` 0.667 s later). The same with a weapon drawn by its key 0.12 s before the screen is opened. This is the end of a draw under an open screen, which was from the code until now (`firing.md`, "Being drawn"): the simulation's animator is the game's on every frame of both.
+- **The inventory by its key:** the screen is open on the frame `Tab` goes down and shut on the frame it goes down again, and the hands' animator is told on that frame.
+- **A thing taken up is the character's when the taking is over:** the movement state for it lasts 0.610 s, and the list has the shells on the frame it ends.
+- **The hands' animator is the game's on every frame of all sixteen** (8,084 frames).
+
+**Not compared:** a quick move the game refuses; a thing sent with something else of its kind over there (the merge); Ctrl and a click out of a container with a vest or a backpack worn (the recorded character had only pockets and a secured container, so the order's first two places were never there); Alt and a click with the slot taken; a pick-up of anything but rounds; a weapon put on a slot the hands never drew from (by the code it waits for its key: "The weapon in hand"); the screen's own layout but for the one point on the bar.
+
+**What the recorder writes for it.** Recorder 0.5.0 (built 2026-10-11) writes in every trace's header the game's own carried weight (`inventory_weight`, and `inventory_weight_elite` for Strength at its elite level) and the whole equipment (`equipment`: every item with its template, what it is in, the slot or grid it is in there, its cell and turn, its stack, its size in cells as the game works it out and its weight with all that is in it), and the carried weight again on every frame, where a dropped magazine changes it. The replay puts the listed equipment together and prints the model's sum beside the game's and every item whose cells or weight differ. The reading and the setting side by side are tried on a list made up from a starting character (`a_recorded_equipment_list_is_read_back`), which says nothing about the game. The first recording made with it settles the weight's sum, the sizes in cells (a rifle with its parts on above all) and how the game lists a magazine's rounds. Moving things is not something the recorder's scripts can do.
+
+**Not wanted** (the user, 2026-10-11): the stash. It is the menu's, outside a raid.
+
+**Not built:** the elite level of Strength is never applied by the app (the level at which a skill counts as elite is not read); the throw of a thing put down; what "Clicks, keys and windows" lists as not built (the right button's menu, the middle button, using a thing, the bar's views taking the mouse); the approach's walk and turn; a container shutting when the character walks away from it (here it stays open); searching and examining; a weapon in hand that is none of the four the app builds; of empty hands, what "Empty hands" lists as not built; the conflicting-items list (rule 5 of a slot); a part put on a weapon that lies in a grid (the room for its new size); stretching grids; a folded stock's size; scrolling where the character's own containers run off the screen (the crate's panel scrolls); the Health tab's contents (there is no health system); the game's own art for any of it.

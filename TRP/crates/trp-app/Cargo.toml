@@ -1,0 +1,35 @@
+[package]
+name = "trp-app"
+description = "The runtime: a Bevy application that plays the controller with data read from the user's install"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "trp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+trp-data = { path = "../trp-data" }
+trp-sim = { path = "../trp-sim" }
+bevy = { version = "0.16", default-features = false, features = [
+    "std",
+    "async_executor",
+    "multi_threaded",
+    "bevy_asset",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_gizmos",
+    "bevy_log",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_window",
+    "bevy_winit",
+    "default_font",
+    "png",
+    "tonemapping_luts",
+] }
