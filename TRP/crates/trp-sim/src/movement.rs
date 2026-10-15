@@ -625,6 +625,9 @@ struct VaultData {
 
 pub struct Movement {
     pub settings: MovementSettings,
+    /// Which of its systems run (`crate::Systems`): all, unless a host
+    /// switches some off.
+    pub systems: crate::Systems,
 
     pub position: [f32; 3],
     pub velocity: [f32; 3],
@@ -1026,6 +1029,8 @@ impl Movement {
         config: &serde_json::Value,
         weight: f32,
     ) -> anyhow::Result<()> {
+        // With the weight switched off what is carried weighs nothing.
+        let weight = if self.systems.weight { weight } else { 0.0 };
         let mut settings = self.settings.reweighed(hard, config, weight)?;
         self.stamina.reweigh(settings.stamina.overweight, settings.stamina.walk_overweight);
         settings.stamina = self.stamina.settings.clone();
@@ -1037,6 +1042,7 @@ impl Movement {
         let stamina = Stamina::new(settings.stamina.clone());
         let speed_memo = settings.max_speed;
         Self {
+            systems: crate::Systems::default(),
             head_look: HeadLook::new(settings.head_look),
             trunk_limit: settings.trunk_rotation_limit,
             character_speed: settings.max_speed,
@@ -1563,7 +1569,7 @@ impl Movement {
     /// fully overweight on spent legs.
     fn transition_speed(&self) -> f32 {
         let s = &self.settings;
-        let weight = s.overweight.max(if self.stamina.legs.exhausted() { 1.0 } else { 0.0 });
+        let weight = s.overweight.max(if self.stamina.legs_spent() { 1.0 } else { 0.0 });
         lerp(s.transition_speed_range[0], s.transition_speed_range[1], weight)
     }
 
@@ -2040,6 +2046,11 @@ impl Movement {
     /// by up to half a millisecond a frame. A host with one clock calls
     /// `step`.
     pub fn step_on_clock(&mut self, dt: f32, player_dt: f32, input: &Input, world: &dyn World) {
+        // The keys of a system switched off are not heard, and the
+        // stamina is told which of its two parts run.
+        let heard = self.systems.heard(input);
+        let input = &heard;
+        (self.stamina.drains, self.stamina.holds_back) = (self.systems.stamina, self.systems.exhaustion);
         if dt <= 0.0 || player_dt <= 0.0 {
             // The engine's timers still see the frame.
             if dt > 0.0 {
@@ -3035,7 +3046,7 @@ impl Movement {
         if diff.abs() > 0.001 {
             // Spent legs change the stance as slowly as a character at
             // nine tenths overweight.
-            let weight = s.overweight.max(if self.stamina.legs.exhausted() { 0.9 } else { 0.0 });
+            let weight = s.overweight.max(if self.stamina.legs_spent() { 0.9 } else { 0.0 });
             let range = if diff > 0.0 { s.pose_increase_range } else { s.pose_decrease_range };
             let rate = lerp(range[0], range[1], weight);
             let before = self.smoothed_pose_level;

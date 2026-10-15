@@ -184,6 +184,8 @@ struct Pending {
     stance_delta: f32,
     speed_delta: f32,
     reload: bool,
+    /// The reload key's double click (`QuickReloadWeapon`).
+    quick_reload: bool,
     fire_mode: bool,
     check_magazine: bool,
     check_chamber: bool,
@@ -289,6 +291,20 @@ pub struct Controller {
     /// How many chambered rounds the weapon has thrown out, unfired, since
     /// the inventory last put them on the ground.
     pub rounds_ejected: u32,
+    /// How many live rounds a single barrel's reload has taken out since
+    /// the inventory last put them away or down.
+    pub rounds_unloaded: u32,
+    /// The magazine within reach that a reload would take for the weapon
+    /// in hand, with its rounds, as the inventory last found it; the one
+    /// the last reload's key chose; and what the weapon has said of its
+    /// magazines since the inventory last heard: each exchange begun (the
+    /// rounds left in the old one, and whether it was the quick way), and
+    /// how many times an old one has left the hand (firing spec, "The
+    /// quick reload").
+    pub next_magazine: Option<(trp_sim::inventory::Id, u32)>,
+    pub magazine_asked: Option<trp_sim::inventory::Id>,
+    pub swaps: Vec<(Option<u32>, bool)>,
+    pub magazines_hidden: u32,
     /// A menu is shown for what is looked at: the wheel is the menu's and
     /// does not set the walking speed (`ActionPanel.TranslateCommand`).
     /// And the notches it has turned since the menu last took them, up
@@ -326,6 +342,11 @@ impl Controller {
             rounds_in_reach: 0,
             rounds_taken: 0,
             rounds_ejected: 0,
+            rounds_unloaded: 0,
+            next_magazine: None,
+            magazine_asked: None,
+            swaps: Vec::new(),
+            magazines_hidden: 0,
             menu_shown: false,
             menu_notches: 0,
         };
@@ -549,6 +570,7 @@ pub fn gather_input(
     pending.fold_stock |= bindings.fired("FoldStock");
     pending.jump |= bindings.fired("Jump");
     pending.reload |= bindings.fired("ReloadWeapon");
+    pending.quick_reload |= bindings.fired("QuickReloadWeapon");
     pending.fire_mode |= bindings.fired("ShootingMode");
     pending.check_magazine |= bindings.fired("CheckAmmo");
     pending.check_chamber |= bindings.fired("CheckChamber");
@@ -694,6 +716,9 @@ pub fn step(
         // keys either. Where each stands is still noted, so that a key
         // pressed under the screen does nothing when it shuts.
         let heard = !inventory_open;
+        // With the weapon's handling switched off none of its keys but the
+        // aim's is heard (settings spec, "Features").
+        let handled = heard && features.weapon_handling;
         let aim_key = armed
             && match (scenario, scripted) {
             (Some(_), _) => script_held("aim"),
@@ -717,13 +742,30 @@ pub fn step(
             // starts. A scripted run with `reload` starts one two seconds
             // in, or three with `prone`, when the character is down.
             let at = if has("prone") { 3.0 } else { 2.0 };
-            if armed && heard && (pending.reload || (has("reload") && passing(at)) || script_pressed("reload")) {
-                // A tube is filled from the rounds within reach; a
-                // magazine is changed for a full one.
+            let plain = pending.reload || (has("reload") && passing(at)) || script_pressed("reload");
+            let quick = pending.quick_reload && !plain;
+            if armed && handled && (plain || quick) {
                 if firearm.settings.internal_magazine {
-                    firearm.reload_shells(controller.rounds_in_reach);
-                } else {
+                    // A tube is filled from the rounds within reach, and
+                    // barrels are loaded, by either key; a cylinder's
+                    // quick way is not built, and its key does nothing.
+                    if plain || firearm.settings.cylinder.is_none() {
+                        firearm.reload_shells(controller.rounds_in_reach);
+                    }
+                } else if scenario.is_some() {
+                    // A recorded scenario changes the magazine for a full
+                    // one, as its recording does.
                     firearm.reload();
+                } else if let Some((magazine, rounds)) = controller.next_magazine {
+                    // The fullest magazine within reach goes in; with
+                    // none, nothing is done (`ReloadMagNotFound`). The
+                    // inventory makes the exchange as the reload begins.
+                    controller.magazine_asked = Some(magazine);
+                    if quick {
+                        firearm.quick_reload_with(rounds);
+                    } else {
+                        firearm.reload_with(rounds);
+                    }
                 }
             }
         }
@@ -826,6 +868,9 @@ pub fn step(
             // A state the body's animator entered may carry a pose for the
             // first-person weapon (the roll lying down does).
             hands.hands.weapon_flip_speed = controller.movement.settings.weapon_flip_speed;
+            // The weapon's motion and its recoil as the options' switches
+            // have them (the rig in hand may be new).
+            hands.hands.set_systems(&controller.movement.systems);
             // The weapon's motion is told whose eyes see it; the rig in
             // the hands may have been changed for another since.
             if hands.hands.point_of_view() != point_of_view {
@@ -904,7 +949,7 @@ pub fn step(
                         for (_, mode) in wanted.into_iter().filter(|(name, _)| script_pressed(name)) {
                             firearm.set_fire_mode(mode);
                         }
-                        if script_pressed("check_chamber") && armed && heard {
+                        if script_pressed("check_chamber") && armed && handled {
                             firearm.check_chamber();
                         }
                         script_held("fire")
@@ -919,34 +964,34 @@ pub fn step(
                     }
                     (None, None) => view.played() && controller.trigger,
                 };
-                if heard {
+                if handled {
                     firearm.set_trigger(trigger && armed, can_fire);
                 } else {
                     firearm.note_trigger(trigger && armed);
                 }
-                if armed && heard && pending.fire_mode {
+                if armed && handled && pending.fire_mode {
                     firearm.next_fire_mode();
                 }
-                if armed && heard && (pending.check_magazine || script_pressed("check_magazine")) {
+                if armed && handled && (pending.check_magazine || script_pressed("check_magazine")) {
                     firearm.check_magazine();
                 }
-                if armed && heard && pending.check_chamber {
+                if armed && handled && pending.check_chamber {
                     firearm.check_chamber();
                 }
                 // The fullest way of firing, the look at the selector and
                 // the look all over, each the idling operation's to take.
-                if armed && heard && pending.force_auto {
+                if armed && handled && pending.force_auto {
                     firearm.force_auto_fire_mode();
                 }
-                if armed && heard && pending.check_fire_mode {
+                if armed && handled && pending.check_fire_mode {
                     firearm.check_fire_mode();
                 }
-                if armed && heard && pending.examine {
+                if armed && handled && pending.examine {
                     firearm.examine();
                 }
                 // A scripted run with `fold` folds the stock a second and a
                 // half in.
-                if armed && heard && (pending.fold_stock || (has("fold") && passing(1.5))) {
+                if armed && handled && (pending.fold_stock || (has("fold") && passing(1.5))) {
                     firearm.fold_stock();
                 }
                 firearm.set_aim_angle(controller.movement.pitch);
@@ -966,6 +1011,12 @@ pub fn step(
                         // A chambered round thrown out by an opened bolt:
                         // the inventory puts it on the ground.
                         FirearmEvent::RoundEjected => controller.rounds_ejected += 1,
+                        FirearmEvent::RoundUnloaded => controller.rounds_unloaded += 1,
+                        // A magazine's exchange begun, and the old one out
+                        // of the hand: the inventory makes the one and
+                        // lets the magazine fall at the other.
+                        FirearmEvent::MagazineSwap { left, quick } => controller.swaps.push((left, quick)),
+                        FirearmEvent::MagazineHidden => controller.magazines_hidden += 1,
                         // The stock folded or unfolded: the recoil and
                         // the hold go by the build as it now stands, and
                         // the body's animator by its new width.

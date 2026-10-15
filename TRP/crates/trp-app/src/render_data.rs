@@ -201,11 +201,13 @@ pub struct PreparedMaterial {
 /// Meshes, pictures and materials made ready on another thread, as the
 /// engine's own values and not yet in its stores: what `Converted` makes,
 /// for a rig that is built away from the frame (`weapon::Preparing`).
-/// `add` puts them all into the stores at once, which is quick.
+/// `add_with_pictures` puts them all into the stores at once, which is quick.
 #[derive(Default)]
 pub struct PreparedLooks {
     pub meshes: Vec<Mesh>,
     images: Vec<Image>,
+    /// Each picture's mark, where they have been marked (`mark_pictures`).
+    marks: Vec<u64>,
     materials: Vec<PreparedMaterial>,
     by_material: HashMap<Option<ObjRef>, usize>,
     by_image: HashMap<(ObjRef, Role), Option<usize>>,
@@ -217,6 +219,21 @@ impl PreparedLooks {
     pub fn mesh(&mut self, unity: &UnityAssets, obj: ObjRef) -> Result<Vec<usize>> {
         let data = read_mesh(unity, obj)?;
         Ok(self.custom_mesh(&data))
+    }
+
+    /// The same, with the mesh's bind poses, for a mesh to be drawn on
+    /// bones (one for each bone, in its order).
+    pub fn mesh_with_poses(&mut self, unity: &UnityAssets, obj: ObjRef) -> Result<(Vec<usize>, Vec<Mat4>)> {
+        let data = read_mesh(unity, obj)?;
+        let poses = data.bind_poses.iter().map(|m| convert::matrix(*m)).collect();
+        Ok((self.custom_mesh(&data), poses))
+    }
+
+    /// One mesh without the bones it would be skinned to (`unskinned`).
+    pub fn unskin(&mut self, mesh: usize) {
+        if let Some(mesh) = self.meshes.get_mut(mesh) {
+            unskin(mesh);
+        }
     }
 
     /// A mesh made as the install's are (a weapon of one's own's part).
@@ -302,10 +319,7 @@ impl PreparedLooks {
     /// with no skeleton). A mesh with bones and nothing to move them would
     /// ask the engine for a skinned drawing it cannot give.
     pub fn unskinned(&mut self) {
-        for mesh in &mut self.meshes {
-            mesh.remove_attribute(Mesh::ATTRIBUTE_JOINT_INDEX);
-            mesh.remove_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT);
-        }
+        self.meshes.iter_mut().for_each(unskin);
     }
 
     /// Whether a material is the stand-in for one that could not be read.
@@ -313,15 +327,86 @@ impl PreparedLooks {
         self.materials.get(material).is_some_and(|m| m.fallback)
     }
 
+    /// How many pictures it has.
+    pub fn picture_count(&self) -> usize {
+        self.images.len()
+    }
+
     /// How many bytes its pictures have.
     pub fn picture_bytes(&self) -> usize {
         self.images.iter().map(|image| image.data.as_ref().map_or(0, Vec::len)).sum()
     }
 
-    /// Into the engine's stores: the handles of the meshes and of the
-    /// materials, each in its place.
-    pub fn add(self, meshes: &mut Assets<Mesh>, images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>) -> (Vec<Handle<Mesh>>, Vec<Handle<StandardMaterial>>) {
-        let pictures: Vec<Handle<Image>> = self.images.into_iter().map(|image| images.add(image)).collect();
+    /// Marks every picture by all that it is: its size, its format, its
+    /// levels, how it is sampled and every byte of it. Two pictures with
+    /// the same mark are drawn alike, and a rig's picture with the mark of
+    /// one already on the graphics card is drawn with that one
+    /// (`SharedPictures`). Done away from the frame, with the rest of a
+    /// rig's making.
+    pub fn mark_pictures(&mut self) {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        self.marks = self
+            .images
+            .iter()
+            .map(|image| {
+                let mut hasher = bevy::platform::hash::FixedHasher.build_hasher();
+                let descriptor = &image.texture_descriptor;
+                (descriptor.size, descriptor.mip_level_count, descriptor.format, format!("{:?}", image.sampler)).hash(&mut hasher);
+                image.data.as_deref().unwrap_or_default().hash(&mut hasher);
+                hasher.finish()
+            })
+            .collect();
+    }
+
+    /// Into the engine's stores: the handles of the meshes, of the
+    /// materials and of the pictures, each in its place.
+    pub fn add_with_pictures(self, meshes: &mut Assets<Mesh>, images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>) -> (Vec<Handle<Mesh>>, Vec<Handle<StandardMaterial>>, Vec<Handle<Image>>) {
+        let (meshes, materials, pictures, _) = self.add_sharing(meshes, images, materials, None);
+        (meshes, materials, pictures)
+    }
+
+    /// The same, a picture marked as one already there (`mark_pictures`)
+    /// taken from `shared` in place of its own, and those put there for
+    /// any that come after; with the marks of all it draws with, to let go
+    /// of when it goes (`SharedPictures::release`), and how many of its
+    /// pictures and their bytes were already on the card.
+    pub fn add_sharing(
+        self,
+        meshes: &mut Assets<Mesh>,
+        images: &mut Assets<Image>,
+        materials: &mut Assets<StandardMaterial>,
+        mut shared: Option<&mut SharedPictures>,
+    ) -> (Vec<Handle<Mesh>>, Vec<Handle<StandardMaterial>>, Vec<Handle<Image>>, Shared) {
+        // For the renderer's world alone: handed over to it they are moved
+        // there, where what the main world keeps as well is copied, on the
+        // main thread and all in the frame they come (Bevy's
+        // `extract_render_asset`): 36 ms of the frame the StG 44's rig came
+        // in. Nothing reads them in the main world after this.
+        let marked = self.marks.len() == self.images.len();
+        let mut kept = Shared::default();
+        let pictures: Vec<Handle<Image>> = self
+            .images
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut image)| {
+                let mark = self.marks.get(index).copied().filter(|_| marked);
+                if let (Some(mark), Some(shared)) = (mark, shared.as_deref_mut()) {
+                    kept.marks.push(mark);
+                    if let Some((handle, holders)) = shared.0.get_mut(&mark) {
+                        *holders += 1;
+                        kept.already += 1;
+                        kept.bytes_spared += image.data.as_ref().map_or(0, Vec::len);
+                        return handle.clone();
+                    }
+                    image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+                    let handle = images.add(image);
+                    shared.0.insert(mark, (handle.clone(), 1));
+                    return handle;
+                }
+                image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+                images.add(image)
+            })
+            .collect();
         let picture = |at: Option<usize>| at.map(|at| pictures[at].clone());
         let made = self
             .materials
@@ -342,7 +427,73 @@ impl PreparedLooks {
                 })
             })
             .collect();
-        (self.meshes.into_iter().map(|mesh| meshes.add(mesh)).collect(), made)
+        let meshes = self
+            .meshes
+            .into_iter()
+            .map(|mut mesh| {
+                mesh.asset_usage = RenderAssetUsages::RENDER_WORLD;
+                meshes.add(mesh)
+            })
+            .collect();
+        (meshes, made, pictures, kept)
+    }
+}
+
+/// The pictures of the weapons' rigs on the graphics card, each once, by
+/// its mark (`PreparedLooks::mark_pictures`), with how many rigs draw with
+/// it: a rig whose picture is the same as one already there draws with
+/// that one (the user, 2026-10-14, night: "The pictures should apply to
+/// weapons that look the exact same"), and a picture goes when the last
+/// rig that draws with it goes (`release`).
+#[derive(Resource, Default)]
+pub struct SharedPictures(HashMap<u64, (Handle<Image>, u32)>);
+
+impl SharedPictures {
+    /// A rig that drew with these has gone.
+    pub fn release(&mut self, marks: &[u64]) {
+        for mark in marks {
+            if let Some((_, holders)) = self.0.get_mut(mark) {
+                *holders -= 1;
+                if *holders == 0 {
+                    self.0.remove(mark);
+                }
+            }
+        }
+    }
+
+    /// How many pictures are kept.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// What a rig took of `SharedPictures`: the marks of all it draws with, and
+/// how many of its pictures (and their bytes) were already there.
+#[derive(Default)]
+pub struct Shared {
+    pub marks: Vec<u64>,
+    pub already: usize,
+    pub bytes_spared: usize,
+}
+
+/// A mesh's bones taken out: it is drawn as it lies. A mesh that keeps its
+/// joints is drawn by the engine only on bones (a `SkinnedMesh`); with
+/// none, the engine's skinned pipeline meets a bind group without them and
+/// the frame fails (the AS VAL's and the VSS's hammer spring, 2026-10-14).
+pub fn unskin(mesh: &mut Mesh) {
+    mesh.remove_attribute(Mesh::ATTRIBUTE_JOINT_INDEX);
+    mesh.remove_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT);
+}
+
+/// Meshes in the store drawn as they lie (`unskin`); one with no bones is
+/// left untouched, so as not to be sent to the card again.
+pub fn unskin_all(meshes: &mut Assets<Mesh>, handles: &[Handle<Mesh>]) {
+    for handle in handles {
+        if meshes.get(handle).is_some_and(|mesh| mesh.attribute(Mesh::ATTRIBUTE_JOINT_INDEX).is_some()) {
+            if let Some(mesh) = meshes.get_mut(handle) {
+                unskin(mesh);
+            }
+        }
     }
 }
 
@@ -474,8 +625,17 @@ fn build_image(tex: &TextureData, role: Role) -> Result<Image> {
     }
 }
 
-/// A picture of a weapon that is not the install's, as an image.
+/// A picture of a weapon that is not the install's, as an image: in the
+/// compressed format its blocks are (`custom::Blocks`), the colour space
+/// the one asked for.
 fn picture_image(picture: trp_data::custom::Picture, format: TextureFormat) -> Image {
+    use trp_data::custom::Blocks;
+    let format = match (picture.blocks, format) {
+        (Some(Blocks::Bc1), TextureFormat::Rgba8UnormSrgb) => TextureFormat::Bc1RgbaUnormSrgb,
+        (Some(Blocks::Bc1), _) => TextureFormat::Bc1RgbaUnorm,
+        (Some(Blocks::Bc5), _) => TextureFormat::Bc5RgUnorm,
+        (None, format) => format,
+    };
     let size = TextureData { name: String::new(), width: picture.width, height: picture.height, format: 0, mip_count: picture.mips, srgb: false, data: Vec::new() };
     image(&size, format, picture.mips as usize, picture.data)
 }

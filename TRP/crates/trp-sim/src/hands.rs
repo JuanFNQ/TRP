@@ -493,6 +493,10 @@ pub struct Hands {
     /// the turn-away's and the aim pose's, are looked at; the rest of what
     /// the character's own eyes see runs as the prefab has it.
     pub mask: u32,
+    /// Two systems of the features' list (`crate::Systems`, set by
+    /// `set_systems`): the weapon's motion, and the recoil.
+    motion: bool,
+    recoil_on: bool,
     /// How far up the sights are for the aim pose of a character seen
     /// from outside, 0 to 1 (`CustomEffector.PoseBlender`).
     aim_pose: Blender,
@@ -559,6 +563,8 @@ impl Hands {
             weapon_root: settings.weapon_root,
             point_of_view: PointOfView::FirstPerson,
             mask: d.mask,
+            motion: true,
+            recoil_on: true,
             aim_pose: Blender::new(0.0, d.aim_pose_speed),
             head: [0.0; 3],
             head_control: false,
@@ -641,6 +647,15 @@ impl Hands {
         self.point_of_view = point_of_view;
     }
 
+    /// Which of its systems run (`crate::Systems`): with the weapon's
+    /// motion off nothing is fed to the springs (the turning, the steps,
+    /// the breath, the walk), the lean does not roll the weapon and it
+    /// does not turn away from what it would stick into; with the recoil
+    /// off a shot is felt by neither the weapon nor the camera.
+    pub fn set_systems(&mut self, systems: &crate::Systems) {
+        (self.motion, self.recoil_on) = (systems.weapon_motion, systems.recoil);
+    }
+
     pub fn point_of_view(&self) -> PointOfView {
         self.point_of_view
     }
@@ -654,7 +669,7 @@ impl Hands {
     fn fixed_step_outside(&mut self, dt: f32, input: &HandsInput) {
         // With the turn-away masked off, as with a first-person pose
         // held, its depth is put to nothing every step.
-        if input.crawling || !self.poses.is_empty() || self.mask & effector::DRAW_DOWN == 0 {
+        if input.crawling || !self.poses.is_empty() || self.mask & effector::DRAW_DOWN == 0 || !self.motion {
             self.turn_away.depth = 0.0;
         }
         self.turn_away(dt);
@@ -725,8 +740,9 @@ impl Hands {
         self.recoil.set_pose(self.pose);
 
         // What the view's turning, the movement, the breath and the steps
-        // push into the springs is for the character's own eyes only.
-        if !self.outside() {
+        // push into the springs is for the character's own eyes only, and
+        // only while the weapon's motion runs.
+        if !self.outside() && self.motion {
             self.track(dt, input);
             self.react(dt);
             let breath = self.breath.step(dt, self.time, self.breath_intensity(), self.aiming, self.settings.head_bobbing, input.wind);
@@ -749,7 +765,7 @@ impl Hands {
                 blend.max(tilt_by_speed_and_stance(input.speed, input.smoothed_pose_level))
             };
         }
-        self.lean_rest = input.tilt * self.possible_tilt;
+        self.lean_rest = if self.motion { input.tilt * self.possible_tilt } else { 0.0 };
         self.set_rests();
 
         if self.outside() {
@@ -758,8 +774,9 @@ impl Hands {
         }
 
         // Crawling, and with a first-person pose held, the turn-away is
-        // switched off: the depth is put to nothing every step.
-        if input.crawling || !self.poses.is_empty() {
+        // switched off: the depth is put to nothing every step. So it is
+        // with the weapon's motion off.
+        if input.crawling || !self.poses.is_empty() || !self.motion {
             self.turn_away.depth = 0.0;
         }
         self.turn_away(dt);
@@ -1059,8 +1076,9 @@ impl Hands {
     /// A shot leaves the barrel. `strength` is 1 plus the cartridge's
     /// recoil percentage.
     pub fn shoot(&mut self, strength: f32) {
-        // A character whose mask has no shot feels none (a bot's).
-        if self.mask & effector::SHOOTING == 0 {
+        // A character whose mask has no shot feels none (a bot's), and
+        // none is felt with the recoil switched off.
+        if self.mask & effector::SHOOTING == 0 || !self.recoil_on {
             return;
         }
         self.camera_smooth.jump(self.settings.camera_snap, CAMERA_SNAP_DELAY, self.time);

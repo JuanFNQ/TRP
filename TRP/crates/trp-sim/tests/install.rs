@@ -4269,3 +4269,128 @@ fn a_weapon_of_ones_own_is_worked_by_its_donors_animator() {
     println!("held for a second on automatic it fired {fired} rounds");
     assert!((8..=10).contains(&fired), "{fired}");
 }
+
+/// The quick reload on the install's AKM (firing spec, "The quick
+/// reload"): `RELOAD OUT ALL` in place of `RELOAD START` and `RELOAD OUT`,
+/// then the plain reload's states; set beside the plain one, with a round
+/// chambered and from an empty chamber. Only the install's controller run
+/// by the simulation: no recording has a quick reload.
+#[test]
+fn the_quick_reload_throws_the_akm_s_magazine_out() {
+    use trp_sim::weapon_animator::WeaponAnimatorData;
+    use trp_sim::{Firearm, FirearmEvent};
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let db = Database::load(&install).expect("database");
+    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("settings object");
+    let mut assets = Assets::new(install).expect("manifest");
+    let weapon = trp_data::weapon::assemble(&mut assets, &db, "59d6088586f774275f37482f").expect("the AKM");
+    let data = WeaponAnimatorData::load(&assets, &weapon).expect("its controller");
+    let settings = trp_sim::firearm_settings(&assets, &db, &hard, &weapon).expect("its settings");
+    assert!(settings.fast_reload, "the AKM's template allows it (isFastReload)");
+    const FRAME: f32 = 1.0 / 120.0;
+    // The states entered and the marks' events, each with when, until
+    // the weapon is back at rest.
+    let reload = |quick: bool, chambered: bool| {
+        let mut w = Firearm::new(settings.clone(), &data);
+        (w.chamber, w.magazine) = (chambered, Some(if chambered { 12 } else { 0 }));
+        w.start_drawn();
+        if quick { w.quick_reload_with(30) } else { w.reload_with(30) }
+        let name = |w: &Firearm| {
+            let (state, _, next) = w.animator().state();
+            next.unwrap_or(state).trim_start_matches("Hands.").to_owned()
+        };
+        let (mut entered, mut said, mut last, mut at) = (Vec::new(), Vec::new(), String::new(), 0.0);
+        while at < 10.0 {
+            said.extend(w.step(FRAME).into_iter().filter(|e| !matches!(e, FirearmEvent::Sound(_))).map(|e| (e, at)));
+            at += FRAME;
+            let now = name(&w);
+            if now != last {
+                entered.push((now.clone(), at));
+                last = now;
+            }
+            if w.is_idle() && at > 0.5 {
+                break;
+            }
+        }
+        let when = |what: &FirearmEvent| said.iter().find(|(event, _)| event == what).map(|(_, at)| *at).expect("said");
+        let names: Vec<String> = entered.iter().map(|entry| entry.0.clone()).collect();
+        let swap = said.iter().find_map(|(event, _)| matches!(event, FirearmEvent::MagazineSwap { .. }).then(|| event.clone()));
+        (names, [when(&FirearmEvent::MagazineOut), when(&FirearmEvent::MagazineHidden), when(&FirearmEvent::MagazineIn), at], swap, (w.magazine, w.chamber))
+    };
+    for chambered in [true, false] {
+        let (plain, plain_at, _, plain_after) = reload(false, chambered);
+        let (quick, quick_at, swap, quick_after) = reload(true, chambered);
+        println!("chambered {chambered}: plain {plain:?}, out {:.3} hidden {:.3} in {:.3} at rest {:.3}", plain_at[0], plain_at[1], plain_at[2], plain_at[3]);
+        println!("chambered {chambered}: quick {quick:?}, out {:.3} hidden {:.3} in {:.3} at rest {:.3}", quick_at[0], quick_at[1], quick_at[2], quick_at[3]);
+        assert_eq!(quick[0], "RELOAD OUT ALL");
+        assert_eq!(&quick[1..], &plain[2..], "from the magazine going in the two are one");
+        assert_eq!(swap, Some(FirearmEvent::MagazineSwap { left: Some(if chambered { 12 } else { 0 }), quick: true }));
+        assert_eq!(quick_after, plain_after);
+        // `RELOAD OUT ALL`'s marks are 0.486 and 0.602 of a 1.0 s clip.
+        assert!((quick_at[0] - 0.486).abs() < 0.03 && (quick_at[1] - 0.602).abs() < 0.03, "{quick_at:?}");
+        // From the magazine out on, the quick one is the plain one moved
+        // earlier: the plain one leaves `RELOAD OUT` at 0.78 of 1.43 s
+        // after 0.13 s of `RELOAD START`; the quick one `RELOAD OUT ALL`
+        // at 0.9 of 1.0 s.
+        let earlier = plain_at[2] - quick_at[2];
+        assert!((earlier - (0.133 + 1.117 - 0.9)).abs() < 0.03, "{earlier}");
+        assert!((plain_at[3] - quick_at[3] - earlier).abs() < 0.03);
+    }
+}
+
+/// Reweighing a character (`Movement::set_weight`, done whenever what is
+/// carried changes) takes so long: the whole and the root motion table's
+/// copy, which it makes. Printed, not held to a figure.
+#[test]
+fn reweighing_is_timed() {
+    let Some(mut m) = movement(10.0) else { return };
+    let Ok(install) = Install::locate() else { return };
+    let db = Database::load(&install).expect("database");
+    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("settings object");
+    let began = std::time::Instant::now();
+    for step in 0..20 {
+        m.set_weight(&hard, &db.config, 10.0 + step as f32).expect("reweighed");
+    }
+    let whole = began.elapsed().as_secs_f32() * 1000.0 / 20.0;
+    let began = std::time::Instant::now();
+    for _ in 0..20 {
+        std::hint::black_box(m.settings.table.clone());
+    }
+    let table = began.elapsed().as_secs_f32() * 1000.0 / 20.0;
+    println!("reweighing: {whole:.2} ms a time, of which the table's copy {table:.2} ms");
+}
+
+/// What the inventory screen lights together, by the install's filters
+/// (inventory spec, "The box under the mouse, and what goes with it"),
+/// either way round: the AKM with a spare of its own magazine and its own
+/// round, and that magazine with that round; the M4A1 likewise with its
+/// own; neither weapon with the other's magazine or round, nor with the
+/// other.
+#[test]
+fn a_weapon_goes_with_its_own_magazines_and_rounds_and_not_another_s() {
+    use std::sync::Arc;
+    use trp_sim::inventory::{go_together, Item, Kind, MAGAZINE_SLOT};
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let db = Database::load(&install).expect("database");
+    let weapon = |template: &str| Item::of_list(&db, &trp_data::inventory::Loadout::of_preset(&db, template).expect("its preset")).expect("put together").0;
+    // A spare of the magazine on it, and a stack of its own round.
+    let own = |weapon: &Item| {
+        let magazine = weapon.in_slot(MAGAZINE_SLOT).expect("a magazine").kind.clone();
+        let round = db.items[&weapon.kind.template].props.get("defAmmo").and_then(|round| round.as_str()).expect("a round of its own");
+        (Item::new(magazine), Item::new(Arc::new(Kind::of(&db, round).expect("the round"))))
+    };
+    let (akm, m4) = (weapon("59d6088586f774275f37482f"), weapon("5447a9cd4bdc2dbd208b4567"));
+    let ((akm_magazine, akm_round), (m4_magazine, m4_round)) = (own(&akm), own(&m4));
+    for (a, b) in [(&akm, &akm_magazine), (&akm, &akm_round), (&akm_magazine, &akm_round), (&m4, &m4_magazine), (&m4, &m4_round), (&m4_magazine, &m4_round)] {
+        assert!(go_together(a, b) && go_together(b, a), "{} and {}", a.kind.name, b.kind.name);
+    }
+    for (a, b) in [(&akm, &m4_magazine), (&akm, &m4_round), (&m4, &akm_magazine), (&m4, &akm_round), (&akm_magazine, &m4_round), (&akm, &m4)] {
+        assert!(!go_together(a, b) && !go_together(b, a), "{} and {}", a.kind.name, b.kind.name);
+    }
+}

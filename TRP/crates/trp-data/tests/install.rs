@@ -657,3 +657,55 @@ fn every_outfit_of_the_folder_is_built() {
         }
     }
 }
+
+/// A weapon of one's own's pictures, compressed to be drawn with
+/// (`custom::Picture::compressed`): how far each channel of the largest
+/// level comes back from what was read, as a root mean square in 255 and
+/// the share of pixels more than eight off. Passes with a note where no
+/// weapon of one's own has its files here.
+#[test]
+fn a_weapon_of_one_s_own_s_pictures_compress_closely() {
+    use trp_data::compress::{bc1_decoded, bc5_decoded};
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let db = Database::load(&install).expect("database");
+    let mut assets = Assets::new(install).expect("manifest");
+    let mut checked = 0;
+    for template in db.custom.keys() {
+        let Ok(weapon) = assemble(&mut assets, &db, template) else { continue };
+        let Some(build) = weapon.custom.as_ref() else { continue };
+        for material in &build.materials {
+            let Ok(read) = trp_data::custom::pictures(material) else {
+                eprintln!("skipped: the pictures of {} are not here", material.name);
+                continue;
+            };
+            for (what, picture) in [("colour", read.colour), ("normal", read.normal), ("surface", read.surface)] {
+                let Some(picture) = picture else { continue };
+                let (width, height, channels) = (picture.width, picture.height, picture.channels);
+                let first = width as usize * height as usize * channels;
+                let original = picture.data[..first].to_vec();
+                let packed = picture.compressed();
+                let blocks = &packed.data[..trp_data::compress::level_bytes(width, height, if channels == 4 { 8 } else { 16 })];
+                let back = if channels == 4 { bc1_decoded(width, height, blocks) } else { bc5_decoded(width, height, blocks) };
+                let kept = if channels == 4 { 3 } else { 2 };
+                let mut line = format!("{} {what} {width}x{height}:", material.name);
+                for channel in 0..kept {
+                    let (mut sum, mut off) = (0.0f64, 0usize);
+                    for pixel in 0..(width * height) as usize {
+                        let d = original[pixel * channels + channel] as f64 - back[pixel * channels + channel] as f64;
+                        sum += d * d;
+                        off += (d.abs() > 8.0) as usize;
+                    }
+                    let rms = (sum / (width * height) as f64).sqrt();
+                    line += &format!(" channel {channel} {rms:.2} ({:.1}% over 8)", off as f64 * 100.0 / (width * height) as f64);
+                    assert!(rms < 6.0, "{line}");
+                }
+                println!("{line}");
+                checked += 1;
+            }
+        }
+    }
+    println!("{checked} pictures checked");
+}

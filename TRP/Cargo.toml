@@ -3,7 +3,8 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+# One number for the three crates, raised with every change: docs\manual.md, "Versions".
+version = "0.9.1"
 edition = "2021"
 publish = false
 

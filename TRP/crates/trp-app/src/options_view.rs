@@ -111,11 +111,78 @@ pub struct Features {
     /// (`icons`). Off, none is drawn or read: each box has the plain shape
     /// of its sort.
     pub icon_generation: bool,
+    /// `COMPATIBLE ITEMS HIGHLIGHT` (the user, 2026-10-14, night: "Add the
+    /// hover machanic to the feature switches"): what goes with the thing
+    /// under the mouse, or carried, is lit orange (`inventory_view::
+    /// light_related`), as S.T.A.L.K.E.R. lights it. Off, only the box under
+    /// the mouse is lit, as the game lights it.
+    pub compatible_highlight: bool,
+    /// `CHARACTER MODEL` (the user, 2026-10-14, night: "Lets change the
+    /// Paper player model to be a still model of the 3d model of the
+    /// current playermodel ... standing straight like the image provided
+    /// this stance comes from the pre-raid screen. Make it a switchable
+    /// mechanic feature as well."): the gear page has the character's own
+    /// model behind its slots, as the game's screens stand it, drawn by the
+    /// body's own meshes and pictures (`figure_view`). Off, the app's paper
+    /// figure of plain shapes.
+    pub character_model: bool,
+    /// The systems of the list that are built (the user, 2026-10-14:
+    /// "make the switches work for mechanics that are fully done. For
+    /// now, when set to off, lets make it just stop"): those of the
+    /// simulation (`trp_sim::Systems`, `systems`), and the app's own
+    /// three: the weapon's handling (its keys are not heard), the
+    /// first-person body (nothing of it is drawn for the character's own
+    /// eyes), the inventory (its screen opens on the options alone, and
+    /// nothing is taken, bound or moved) and what is worked in the world
+    /// (nothing is looked at to be worked).
+    pub movement: bool,
+    pub vaulting: bool,
+    pub stamina: bool,
+    pub weight: bool,
+    pub exhaustion: bool,
+    pub weapon_motion: bool,
+    pub recoil: bool,
+    pub weapon_handling: bool,
+    pub first_person_body: bool,
+    pub inventory: bool,
+    pub world_interactions: bool,
 }
 
 impl Default for Features {
     fn default() -> Self {
-        Self { custom_hands: true, smooth_animations: true, icon_generation: true }
+        Self {
+            custom_hands: true,
+            smooth_animations: true,
+            icon_generation: true,
+            compatible_highlight: true,
+            character_model: true,
+            movement: true,
+            vaulting: true,
+            stamina: true,
+            weight: true,
+            exhaustion: true,
+            weapon_motion: true,
+            recoil: true,
+            weapon_handling: true,
+            first_person_body: true,
+            inventory: true,
+            world_interactions: true,
+        }
+    }
+}
+
+impl Features {
+    /// The simulation's own systems as switched.
+    pub fn systems(&self) -> trp_sim::Systems {
+        trp_sim::Systems {
+            movement: self.movement,
+            vaulting: self.vaulting,
+            stamina: self.stamina,
+            weight: self.weight,
+            exhaustion: self.exhaustion,
+            weapon_motion: self.weapon_motion,
+            recoil: self.recoil,
+        }
     }
 }
 
@@ -270,11 +337,7 @@ fn save(path: &std::path::Path, controls: &Controls, graphics: &Graphics, mouse:
         "controls": { "double_click": controls.double_click, "keys": keys, "axes": axes },
         "mouse": { "sensitivity": mouse.sensitivity, "aiming_sensitivity": mouse.aiming, "optic_sensitivity": mouse.optic, "inverted_x": mouse.invert[0], "inverted_y": mouse.invert[1] },
         "graphics": { "vsync": graphics.vsync, "field_of_view": graphics.field_of_view, "mode": mode, "resolution": graphics.resolution },
-        "features": {
-            "custom_first_person_hands": features.custom_hands,
-            "smooth_first_person_animations": features.smooth_animations,
-            "icon_generation": features.icon_generation,
-        },
+        "features": FeatureSwitch::ALL.iter().map(|switch| (switch.key().to_owned(), serde_json::Value::Bool(switch.get(features)))).collect::<serde_json::Map<_, _>>(),
     });
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder)?;
@@ -290,9 +353,11 @@ fn save(path: &std::path::Path, controls: &Controls, graphics: &Graphics, mouse:
 fn load(path: &std::path::Path, controls: &mut Controls, graphics: &mut Graphics, mouse: &mut Mouse, features: &mut Features) -> [bool; 2] {
     let Some(all) = std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()) else { return [false; 2] };
     let switch = |name: &str| all.get("features").and_then(|kept| kept.get(name)?.as_bool());
-    features.custom_hands = switch("custom_first_person_hands").unwrap_or(features.custom_hands);
-    features.smooth_animations = switch("smooth_first_person_animations").unwrap_or(features.smooth_animations);
-    features.icon_generation = switch("icon_generation").unwrap_or(features.icon_generation);
+    for kept in FeatureSwitch::ALL {
+        if let Some(on) = switch(kept.key()) {
+            *kept.slot(features) = on;
+        }
+    }
     if let Some(kept) = all.get("mouse") {
         let figure = |name: &str, kind: Slide, now: f32| kept.get(name).and_then(|v| v.as_f64()).map_or(now, |v| (v as f32).clamp(kind.range()[0], kind.range()[1]));
         mouse.sensitivity = figure("sensitivity", Slide::Sensitivity, mouse.sensitivity);
@@ -408,6 +473,12 @@ impl OptionsState {
         if let Some(on) = options.icon_generation {
             features.icon_generation = on;
         }
+        for (name, on) in &options.feature_switches {
+            match FeatureSwitch::ALL.into_iter().find(|switch| switch.key() == name) {
+                Some(switch) => *switch.slot(&mut features) = *on,
+                None => eprintln!("no switch of the features is called {name}: {}", FeatureSwitch::ALL.map(FeatureSwitch::key).join(", ")),
+            }
+        }
         let started = features.clone();
         Self { sub: 0, listening: None, asking: None, note: String::new(), scroll: 0.0, graphics, features, started, mouse, install_mouse, apply_at_start, install_graphics, dirty: true, file, names, sliding: None }
     }
@@ -501,25 +572,14 @@ const SAID: [(&str, &str); 10] = [
     ("Inverted Y axis", "INVERTED Y AXIS"),
 ];
 
-/// The systems a host might switch on or off, or feed from its own game:
-/// a name, where it stands here, and what it is. **A list only** (the
-/// user, 2026-10-12): nothing is switched by it yet. What is switched is
-/// `Features`, shown over this list.
-const FEATURES: [(&str, &str, &str); 22] = [
-    ("MOVEMENT SYSTEM", "built", "Tarkov's walk, inertia, sprint, stance, lean, step aside, jump and crawl. Off, the host moves its own character and the rest follows it."),
-    ("VAULTING AND CLIMBING", "built", "The jump key held takes the character over or onto what stands ahead."),
-    ("STAMINA", "built", "The legs' and the arms' stamina, what drains and refills them, what running out does."),
-    ("WEIGHT", "built", "Carried weight slows the character and adds inertia. Could be fed from the host's own inventory (a backpack's weight in STALKER)."),
-    ("EXHAUSTION", "built", "Out of breath: the sway, no sprint and no jump on spent legs."),
-    ("WEAPON MOTION", "built", "The springs, sway, breathing, the walk's bob, the lean's roll and the turn-away from walls."),
-    ("RECOIL", "built", "The climb, the kick back and the camera's kick, by the weapon, its parts and the round."),
-    ("WEAPON HANDLING", "built", "Firing, reloading, the checks, drawing and putting away, by the weapon's own animator."),
+/// The systems a host might switch on or off, or feed from its own game,
+/// that are not switched yet: a name, where it stands here, and what it
+/// is. **A list only** (the user, 2026-10-12). Those that are built are
+/// switches since 2026-10-14 (`FeatureSwitch`, shown over this list).
+const FEATURES: [(&str, &str, &str); 11] = [
     ("AIMING", "in part", "The eye on the iron sights' line and the aimed field of view are built; optics are not."),
-    ("FIRST-PERSON BODY", "built", "The legs and the arms drawn, the upper body as a shadow."),
     ("THIRD-PERSON BODY", "in part", "The character as others see it: its own pose, weapon and breath (F5, or the free camera). Built for the player's own; a second character is not."),
-    ("INVENTORY SYSTEM", "built", "The equipment's slots, containers and their grids, moving things, the quick-use bar."),
     ("LOOTING SYSTEM", "in part", "Containers searched and things taken up are built; a search item by item is not."),
-    ("WORLD INTERACTIONS", "built", "Doors, containers, a trunk, a kick, a lock and its key."),
     ("ADVANCED ATTACHMENT SYSTEM", "not built", "Parts put on a weapon and taken off it, and what each does to its handling. Weapons are their stock presets."),
     ("HEALTH", "not built", "The body's parts and what harms them."),
     ("ADVANCED HEALING SYSTEM", "not built", "Bleeding, fractures and their treatment, medicine used from the bar."),
@@ -563,17 +623,117 @@ struct InvertChoice(usize);
 /// A switch of `Features`.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 enum FeatureSwitch {
+    Movement,
+    Vaulting,
+    Stamina,
+    Weight,
+    Exhaustion,
+    WeaponMotion,
+    Recoil,
+    WeaponHandling,
+    FirstPersonBody,
+    Inventory,
+    WorldInteractions,
     CustomHands,
     SmoothAnimations,
     IconGeneration,
+    CompatibleHighlight,
+    CharacterModel,
 }
 
 impl FeatureSwitch {
-    const ALL: [Self; 3] = [Self::CustomHands, Self::SmoothAnimations, Self::IconGeneration];
+    /// The built systems of the list in its order, then the app's five.
+    const ALL: [Self; 16] = [
+        Self::Movement,
+        Self::Vaulting,
+        Self::Stamina,
+        Self::Weight,
+        Self::Exhaustion,
+        Self::WeaponMotion,
+        Self::Recoil,
+        Self::WeaponHandling,
+        Self::FirstPersonBody,
+        Self::Inventory,
+        Self::WorldInteractions,
+        Self::CustomHands,
+        Self::SmoothAnimations,
+        Self::IconGeneration,
+        Self::CompatibleHighlight,
+        Self::CharacterModel,
+    ];
+
+    /// Its name in the options file.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Movement => "movement",
+            Self::Vaulting => "vaulting_and_climbing",
+            Self::Stamina => "stamina",
+            Self::Weight => "weight",
+            Self::Exhaustion => "exhaustion",
+            Self::WeaponMotion => "weapon_motion",
+            Self::Recoil => "recoil",
+            Self::WeaponHandling => "weapon_handling",
+            Self::FirstPersonBody => "first_person_body",
+            Self::Inventory => "inventory",
+            Self::WorldInteractions => "world_interactions",
+            Self::CustomHands => "custom_first_person_hands",
+            Self::SmoothAnimations => "smooth_first_person_animations",
+            Self::IconGeneration => "icon_generation",
+            Self::CompatibleHighlight => "compatible_items_highlight",
+            Self::CharacterModel => "character_model",
+        }
+    }
+
+    fn slot(self, features: &mut Features) -> &mut bool {
+        match self {
+            Self::Movement => &mut features.movement,
+            Self::Vaulting => &mut features.vaulting,
+            Self::Stamina => &mut features.stamina,
+            Self::Weight => &mut features.weight,
+            Self::Exhaustion => &mut features.exhaustion,
+            Self::WeaponMotion => &mut features.weapon_motion,
+            Self::Recoil => &mut features.recoil,
+            Self::WeaponHandling => &mut features.weapon_handling,
+            Self::FirstPersonBody => &mut features.first_person_body,
+            Self::Inventory => &mut features.inventory,
+            Self::WorldInteractions => &mut features.world_interactions,
+            Self::CustomHands => &mut features.custom_hands,
+            Self::SmoothAnimations => &mut features.smooth_animations,
+            Self::IconGeneration => &mut features.icon_generation,
+            Self::CompatibleHighlight => &mut features.compatible_highlight,
+            Self::CharacterModel => &mut features.character_model,
+        }
+    }
 
     /// Its name on the tab, and what it does.
     fn words(self) -> (&'static str, &'static str) {
         match self {
+            Self::Movement => (
+                "MOVEMENT SYSTEM",
+                "Tarkov's walk, inertia, sprint, stance, lean, step aside, jump and crawl. Off, none of their keys is heard and the character stays where it stands; the view still turns.",
+            ),
+            Self::Vaulting => ("VAULTING AND CLIMBING", "The jump key held takes the character over or onto what stands ahead. Off, it only jumps."),
+            Self::Stamina => ("STAMINA", "The legs' and the arms' stamina and the breath, what drains and refills them. Off, nothing is paid for and they stay full."),
+            Self::Weight => ("WEIGHT", "Carried weight slows the character, adds inertia and costs stamina. Off, what is carried weighs nothing to them."),
+            Self::Exhaustion => (
+                "EXHAUSTION",
+                "What spent stamina does: the sway, no sprint and no jump on spent legs, the breath let go. Off, the pools still drain, and running out holds nothing back.",
+            ),
+            Self::WeaponMotion => (
+                "WEAPON MOTION",
+                "The springs, sway, breathing, the walk's bob, the lean's roll and the turn-away from walls. Off, the weapon moves only by its animation and its recoil.",
+            ),
+            Self::Recoil => ("RECOIL", "The climb, the kick back and the camera's kick of a shot. Off, a shot moves neither the weapon nor the camera."),
+            Self::WeaponHandling => (
+                "WEAPON HANDLING",
+                "Firing, reloading, the checks, the fire mode, the stock, drawing and putting away. Off, none of the weapon's keys is heard; the sights still come up.",
+            ),
+            Self::FirstPersonBody => ("FIRST-PERSON BODY", "The legs and the arms drawn, the upper body as a shadow. Off, none of it is drawn for the character's own eyes."),
+            Self::Inventory => (
+                "INVENTORY SYSTEM",
+                "The equipment's slots, containers and their grids, moving things, the quick-use bar. Off, the screen opens on these options alone, and nothing is taken up, bound or moved.",
+            ),
+            Self::WorldInteractions => ("WORLD INTERACTIONS", "Doors, containers, a trunk, a kick, a lock and its key, things on the ground. Off, nothing is looked at to be worked."),
             Self::CustomHands => (
                 "CUSTOM FIRST PERSON HANDS",
                 "An outfit that changes the body brings its own arms into first person. Off, the hands do not change with what is worn: they are Tarkov's default arms. Whatever an outfit has not got is Tarkov's default either way.",
@@ -586,23 +746,24 @@ impl FeatureSwitch {
                 "ICON GENERATION",
                 "The inventory's pictures drawn from each item's own model, as Tarkov draws them, once, and kept for later runs (the first run starts a few seconds later while it draws them). Off, none is drawn or read: each box shows the plain shape of its sort.",
             ),
+            Self::CompatibleHighlight => (
+                "COMPATIBLE ITEMS HIGHLIGHT",
+                "With the mouse on a thing in the inventory, or a thing carried, what goes with it is lit orange: a weapon's magazines, rounds and parts, a magazine's weapons and rounds, the weapons and magazines rounds go in. S.T.A.L.K.E.R.'s way; Tarkov has nothing like it. Off, only the thing under the mouse is lit, as in Tarkov.",
+            ),
+            Self::CharacterModel => (
+                "CHARACTER MODEL",
+                "The gear page has the character's own model behind its slots, in what it wears, standing as Tarkov's pre-raid screen stands it, hands at its sides, and still. It is drawn from the body already loaded, nothing read twice, and drawn again only when what is worn changes. Off, a paper figure of plain shapes.",
+            ),
         }
     }
 
     fn get(self, features: &Features) -> bool {
-        match self {
-            Self::CustomHands => features.custom_hands,
-            Self::SmoothAnimations => features.smooth_animations,
-            Self::IconGeneration => features.icon_generation,
-        }
+        *self.slot(&mut features.clone())
     }
 
     fn flip(self, features: &mut Features) {
-        match self {
-            Self::CustomHands => features.custom_hands = !features.custom_hands,
-            Self::SmoothAnimations => features.smooth_animations = !features.smooth_animations,
-            Self::IconGeneration => features.icon_generation = !features.icon_generation,
-        }
+        let on = self.slot(features);
+        *on = !*on;
     }
 }
 /// The button that ends the run (`QUIT`, the user's word for it).
@@ -892,6 +1053,17 @@ fn graphics_part(page: &mut ChildSpawnerCommands, state: &OptionsState, resoluti
 }
 
 fn features_part(page: &mut ChildSpawnerCommands, state: &OptionsState) {
+    // Rows close together, so that the switches and the list fit a
+    // window of 900 pixels.
+    page.spawn(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() }).with_children(|page| features_rows(page, state));
+}
+
+/// The column of the column width the two notes of a row take: the
+/// switch's being restart required, and how far a system of the list
+/// stands.
+const NOTE_WIDTH: f32 = 125.0;
+
+fn features_rows(page: &mut ChildSpawnerCommands, state: &OptionsState) {
     // What is switched: rows as the list's rows are, each with a switch
     // that is one.
     page.spawn(words("Switched here, each taking effect when the app is next started:", 12.0, WORDS));
@@ -909,7 +1081,7 @@ fn features_part(page: &mut ChildSpawnerCommands, state: &OptionsState) {
             // Restart required: faint as a standing note; bright, and the
             // state the run holds said, once thrown away from it.
             let pending = on != switch.get(&state.started);
-            row.spawn(Node { width: Val::Px(90.0), flex_shrink: 0.0, flex_direction: FlexDirection::Column, ..default() }).with_children(|cell| {
+            row.spawn(Node { width: Val::Px(NOTE_WIDTH), flex_shrink: 0.0, flex_direction: FlexDirection::Column, ..default() }).with_children(|cell| {
                 cell.spawn(words("RESTART REQUIRED", 10.0, if pending { WORDS } else { FAINT }));
                 if pending {
                     cell.spawn(words(if on { "off until then" } else { "on until then" }, 10.0, FAINT));
@@ -935,7 +1107,7 @@ fn features_part(page: &mut ChildSpawnerCommands, state: &OptionsState) {
             row.spawn(Node { width: Val::Px(290.0), flex_shrink: 0.0, ..default() }).with_children(|cell| {
                 cell.spawn(words(name, 13.0, WORDS));
             });
-            row.spawn(Node { width: Val::Px(90.0), flex_shrink: 0.0, ..default() }).with_children(|cell| {
+            row.spawn(Node { width: Val::Px(NOTE_WIDTH), flex_shrink: 0.0, ..default() }).with_children(|cell| {
                 cell.spawn(words(stands, 11.0, FAINT));
             });
             row.spawn(words(what, 11.0, FAINT));
@@ -971,6 +1143,7 @@ fn rebuild(
     page: Query<Entity, With<OptionsPage>>,
     mut was: Local<(bool, Vec2)>,
 ) {
+    let _clock = crate::render_timing::Clock::new("options rebuild");
     let size = window.single().map_or(Vec2::ZERO, |window| Vec2::new(window.width(), window.height()));
     let shows = controller.inventory_open && selected.0 == OPTIONS;
     let changed = state.dirty || *was != (shows, size);
@@ -1354,7 +1527,8 @@ mod tests {
         let graphics = Graphics { vsync: false, field_of_view: 68.0, mode: Mode::Borderless, resolution: [2560, 1440] };
         let mouse = Mouse { sensitivity: 0.42, aiming: 0.31, optic: 2.5, invert: [false, true] };
         let path = std::env::temp_dir().join(format!("trp-options-test-{}.json", std::process::id()));
-        save(&path, &changed, &graphics, &mouse, &Features { custom_hands: false, smooth_animations: false, icon_generation: false }).unwrap();
+        let kept = Features { custom_hands: false, smooth_animations: false, icon_generation: false, compatible_highlight: false, character_model: false, stamina: false, world_interactions: false, ..Features::default() };
+        save(&path, &changed, &graphics, &mouse, &kept).unwrap();
         // Read over an install that has since gained a binding: the new
         // one stays, the rest are as kept.
         let mut read = install.clone();
@@ -1365,13 +1539,14 @@ mod tests {
         let mut switched = Features::default();
         assert!(switched.custom_hands);
         assert_eq!(load(&path, &mut read, &mut display, &mut pointer, &mut switched), [true, true]);
-        assert!(!switched.custom_hands && !switched.smooth_animations && !switched.icon_generation);
+        assert!(!switched.custom_hands && !switched.smooth_animations && !switched.icon_generation && !switched.compatible_highlight && !switched.character_model);
+        assert_eq!(switched, kept, "every switch is kept, the systems' among them");
         // A file kept before there was such a switch leaves it as it is.
         let older = path.with_extension("older.json");
         std::fs::write(&older, r#"{ "graphics": { "vsync": true } }"#).unwrap();
         let mut untold = Features::default();
         assert_eq!(load(&older, &mut read.clone(), &mut display.clone(), &mut pointer.clone(), &mut untold), [false, true]);
-        assert!(untold.custom_hands && untold.smooth_animations && untold.icon_generation);
+        assert_eq!(untold, Features::default());
         let _ = std::fs::remove_file(&older);
         let _ = std::fs::remove_file(&path);
         assert_eq!(read.keys[..3], changed.keys[..]);

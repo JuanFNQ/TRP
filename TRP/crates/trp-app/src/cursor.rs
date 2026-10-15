@@ -2,8 +2,10 @@
 //! holds the pointer is the host's business.
 //!
 //! While the character plays the pointer is hidden and held where it is;
-//! while a screen is open it is shown and kept inside the window; with
-//! the free camera, or with the window not the one in front, it is free.
+//! while a screen is open it is shown and free to leave the window, for
+//! another window or another screen (the user, 2026-10-14: "make it
+//! completely free to move if we press tab"); with the free camera, or
+//! with the window not the one in front, it is free.
 //! The engine puts a hold on the pointer only when what is asked of it
 //! changes, and the system lets go of one whenever another window comes to
 //! the front, so the hold is asked for afresh from what stands every frame:
@@ -34,10 +36,8 @@ pub fn hold(options: Res<Options>, view: Res<View>, controller: Res<Controller>,
         return;
     }
     let Ok(mut window) = window.single_mut() else { return };
-    let (grab, visible) = if !window.focused {
+    let (grab, visible) = if !window.focused || controller.inventory_open {
         (CursorGrabMode::None, true)
-    } else if controller.inventory_open {
-        (CursorGrabMode::Confined, true)
     } else if view.played() {
         (CursorGrabMode::Locked, false)
     } else {

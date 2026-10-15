@@ -32,13 +32,20 @@ const LAYER: usize = 23;
 /// cells at 63, and one more).
 const CELL_PIXELS: u32 = 63;
 /// The cache's own folder under `local\icon_cache`: a new one when what is
-/// drawn changes, so that an older picture is not read.
-const CACHE: &str = "v1";
-/// How many frames a model stands in the studio at the least before it is
-/// read back, and how many more for each picture of it the graphics card
-/// takes a frame to have (`main::UPLOAD_BUDGET`).
+/// drawn changes, so that an older picture is not read. (`v2` since
+/// 2026-10-14, night: a picture of `v1` may have been read back before all
+/// of its model was on the graphics card, without some of its parts.)
+const CACHE: &str = "v2";
+/// How many frames a model stands in the studio at the least once all of
+/// it is on the graphics card (`weapon::UploadWatch`) before it is read
+/// back.
 const SETTLE_FRAMES: u32 = 4;
-const UPLOAD_BYTES_A_FRAME: usize = 24 << 20;
+/// What the studio waited before it waited for the card: so many frames,
+/// and one more for each so many bytes of the model's pictures, where the
+/// app sends 8 MB a frame (`main::UPLOAD_BUDGET`) and meshes besides, and
+/// shares that with every rig and picture going up. Kept to say, in the
+/// log, which pictures that had read back short.
+const OLD_RULE_BYTES_A_FRAME: usize = 24 << 20;
 
 /// An item's model as the icon thread makes it ready: its tree, what each
 /// node draws, how the whole is posed in the studio and how much of it the
@@ -263,8 +270,10 @@ impl Worker {
     }
 }
 
-/// A picture being drawn: the model in the studio, its target, and how
-/// long it has stood there.
+/// A picture being drawn: the model in the studio, its target, how long
+/// it has stood there (or, once its reading back is asked, how long that
+/// has been waited for), and the reading back asked, if one is: only its
+/// answer is taken.
 struct Drawing {
     template: String,
     size: [u32; 2],
@@ -272,9 +281,20 @@ struct Drawing {
     target: Handle<Image>,
     frames: u32,
     wait: u32,
-    asked: bool,
+    asked: Option<Entity>,
     tries: u32,
+    /// All of the model is on the graphics card, and how many frames the
+    /// old rule had waited for it.
+    on_card: bool,
+    old_rule: u32,
 }
+
+/// So many frames at the most a picture's reading back is waited for: the
+/// engine drops one it cannot make (its target not on the graphics card
+/// yet: "Unknown image for screenshot, skipping") and never answers, and
+/// the studio had waited on it for ever, every picture after it with it.
+/// It is asked again then, as a picture that came out empty is.
+const ANSWER_FRAMES_AT_MOST: u32 = 120;
 
 /// Every picture asked for, made, being made or to be made.
 #[derive(Resource)]
@@ -294,6 +314,10 @@ pub struct Icons {
     worker: Option<Worker>,
     task: Option<Task<(Option<Worker>, (String, [u32; 2]), anyhow::Result<PreparedIcon>)>>,
     ready: VecDeque<PreparedIcon>,
+    /// Pictures on their way to the screen away from the frame: read from
+    /// the cache (`LoadFromUserCacheAsync`), or drawn and being finished
+    /// and kept (`receive_icons`).
+    arriving: Vec<Task<Arrived>>,
     studio: Option<Studio>,
     camera: Option<Entity>,
     drawing: Option<Drawing>,
@@ -307,9 +331,14 @@ pub struct Icons {
 
 impl Icons {
     pub fn new(install: trp_data::Install, on: bool, signatures: HashMap<String, String>) -> Self {
-        // `local` beside the workspace, as the options' file is looked for.
+        // `local` beside the workspace, as the options' file is looked for;
+        // or the folder `TRP_ICON_CACHE` names (to try a run with a cache of
+        // its own, an empty one say, and leave the kept one be).
         let here = std::env::current_dir().unwrap_or_default();
-        let folder = here.ancestors().map(|dir| dir.join("local")).find(|local| local.is_dir()).map(|local| local.join("icon_cache").join(CACHE));
+        let folder = match std::env::var_os("TRP_ICON_CACHE") {
+            Some(folder) => Some(PathBuf::from(folder).join(CACHE)),
+            None => here.ancestors().map(|dir| dir.join("local")).find(|local| local.is_dir()).map(|local| local.join("icon_cache").join(CACHE)),
+        };
         if !on {
             println!("the inventory's pictures are not drawn (ICON GENERATION is off)");
         }
@@ -323,6 +352,7 @@ impl Icons {
             worker: None,
             task: None,
             ready: VecDeque::new(),
+            arriving: Vec::new(),
             studio: None,
             camera: None,
             drawing: None,
@@ -335,7 +365,7 @@ impl Icons {
 
     /// Whether any picture is still to be made.
     pub fn busy(&self) -> bool {
-        !self.queue.is_empty() || self.task.is_some() || !self.ready.is_empty() || self.drawing.is_some()
+        !self.queue.is_empty() || self.task.is_some() || !self.ready.is_empty() || self.drawing.is_some() || !self.arriving.is_empty()
     }
 
     fn path(&self, template: &str, size: [u32; 2]) -> Option<PathBuf> {
@@ -358,67 +388,152 @@ pub struct IconsPlugin;
 
 impl Plugin for IconsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (ask_icons, prepare_icons, draw_icons, report_icons).chain());
+        app.add_systems(Update, (ask_icons, receive_icons, prepare_icons, draw_icons, report_icons).chain());
     }
+}
+
+/// A picture come back from away from the frame: its item's template, the
+/// cells it was asked for, its size in pixels, whether it was drawn (else
+/// read from the cache), and as it lies and turned a quarter.
+struct Arrived {
+    template: String,
+    cells: [u32; 2],
+    size: [u32; 2],
+    drawn: bool,
+    made: anyhow::Result<(Vec<u8>, Vec<u8>)>,
 }
 
 /// A picture as the screen draws it, from RGBA with its colours not
-/// multiplied: as it lies, and turned a quarter.
-fn picture_of(images: &mut Assets<Image>, width: u32, height: u32, rgba: Vec<u8>) -> Picture {
+/// multiplied, as it lies and turned a quarter.
+fn picture_of(images: &mut Assets<Image>, [width, height]: [u32; 2], upright: Vec<u8>, turned: Vec<u8>) -> Picture {
     let make = |w: u32, h: u32, data: Vec<u8>| Image::new(Extent3d { width: w, height: h, depth_or_array_layers: 1 }, TextureDimension::D2, data, TextureFormat::Rgba8UnormSrgb, bevy::asset::RenderAssetUsages::default());
-    let turned = trp_data::icon::turned(&rgba, width as usize, height as usize);
-    Picture::rendered(images.add(make(width, height, rgba)), images.add(make(height, width, turned)), width as f32 / height as f32)
+    Picture::rendered(images.add(make(width, height, upright)), images.add(make(height, width, turned)), width as f32 / height as f32)
 }
 
-/// Every item the screen can show, by its template and its size: what is
-/// worn and carried, what the open container and the range's others hold
-/// (not the containers themselves: they have no model of an item), what
-/// lies on the ground. One whose picture is in the cache is read from
-/// there; any other is asked of the icon thread.
-fn ask_icons(mut carried: ResMut<Carried>, mut icons: ResMut<Icons>, mut images: ResMut<Assets<Image>>) {
-    if !icons.on || !carried.is_changed() {
-        return;
-    }
-    fn walk(item: &trp_sim::inventory::Item, out: &mut Vec<(String, [u32; 2])>) {
-        out.push((item.kind.template.clone(), item.cells()));
-        for child in item.contents() {
-            walk(child, out);
+/// A picture the screen waits for has come, or cannot: the screen puts it
+/// in its spinner's place (`inventory_view::PicturesArrived`), and a
+/// change to what is carried is not made of it, which would draw the whole
+/// screen afresh.
+fn arrived(carried: &mut Carried, ready: &mut crate::inventory_view::PicturesArrived, template: String, picture: Option<Picture>) {
+    match picture {
+        Some(picture) => {
+            carried.pictures.insert(template.clone(), picture);
+        }
+        None => {
+            carried.picture_failed.insert(template.clone());
         }
     }
-    // The equipment and the range's containers, the open one and the others,
-    // are no things of the screen's own: what is in them is.
-    let mut seen = Vec::new();
-    let away = carried.away.iter().flatten().flat_map(|container| container.contents());
-    for item in carried.equipment.item.contents().chain(carried.loot.contents()).chain(away) {
-        walk(item, &mut seen);
+    ready.0.push(template);
+}
+
+/// The pictures read or finished away from the frame, put on the screen
+/// as they come; one the cache had none of, or none of its size, is asked
+/// of the icon thread to be drawn.
+fn receive_icons(mut icons: ResMut<Icons>, mut carried: ResMut<Carried>, mut ready: ResMut<crate::inventory_view::PicturesArrived>, mut images: ResMut<Assets<Image>>) {
+    let _clock = crate::render_timing::Clock::new("receive_icons");
+    if icons.arriving.is_empty() {
+        return;
     }
-    for (item, _) in &carried.ground {
-        walk(item, &mut seen);
+    let mut done = Vec::new();
+    icons.arriving.retain_mut(|task| match block_on(poll_once(task)) {
+        Some(come) => {
+            done.push(come);
+            false
+        }
+        None => true,
+    });
+    for come in done {
+        match (come.made, come.drawn) {
+            (Ok((upright, turned)), drawn) => {
+                let picture = picture_of(&mut images, come.size, upright, turned);
+                arrived(carried.bypass_change_detection(), &mut ready, come.template, Some(picture));
+                if drawn {
+                    icons.drawn += 1;
+                } else {
+                    icons.cached += 1;
+                }
+            }
+            (Err(_), false) => icons.queue.push_back((come.template, come.cells)),
+            (Err(e), true) => {
+                warn!("the picture of {} is not made: {e:#}", come.template);
+                icons.failed += 1;
+                arrived(carried.bypass_change_detection(), &mut ready, come.template, None);
+            }
+        }
     }
-    let mut read = Vec::new();
+}
+
+/// Every item the screen shows, by its template and its size, asked for
+/// when the screen first shows it, as the game asks for an item view's
+/// picture when the view is made (`ItemView.RefreshIcon`,
+/// `ItemViewFactory.LoadItemIcon`, `ItemIconCreator.GetItemIcon`; icons
+/// spec, "When a picture is asked for"): what is worn and carried, and
+/// the container open beside it (not the container itself: it has no
+/// model of an item). What lies in a container not yet opened, and on the
+/// ground, is not asked for. Its picture is read from the cache away from
+/// the frame, as the game reads it (`LoadFromUserCacheAsync`); one the
+/// cache has not is asked of the icon thread to be drawn. Meanwhile its
+/// box shows a spinner, where the game's shows its loader.
+fn ask_icons(carried: Res<Carried>, in_sight: Res<crate::inventory_view::LootInSight>, mut icons: ResMut<Icons>) {
+    let _clock = crate::render_timing::Clock::new("ask_icons");
+    if !icons.on || !(carried.is_changed() || in_sight.is_changed()) {
+        return;
+    }
+    // What the screen shows in boxes of their own, as the game's views
+    // are made: what is in the equipment's slots, and what lies in their
+    // grids (the panel of the four containers); what lies in the grids of
+    // a container opened in a window; and of the open container what its
+    // panel has in sight (`LootInSight`), as the game's panel makes views
+    // only for what is in sight of its scroll area (`GridViewMagnifier`).
+    // Not a weapon's parts or a magazine's rounds, nor what is in a
+    // container lying in another: those have no box of their own until it
+    // is opened.
+    let mut seen: Vec<&trp_sim::inventory::Item> = Vec::new();
+    for item in carried.equipment.item.contents() {
+        seen.push(item);
+        seen.extend(item.grids.iter().flatten().map(|(_, child)| child));
+    }
+    for window in carried.windows.iter().filter(|window| window.grids) {
+        if let Some(item) = carried.find(window.item) {
+            seen.extend(item.grids.iter().flatten().map(|(_, child)| child));
+        }
+    }
+    if carried.loot_open {
+        for (grid, rows) in carried.loot.grids.iter().zip(&in_sight.0) {
+            for (place, item) in grid {
+                let height = if place.turned { item.cells()[0] } else { item.cells()[1] };
+                if place.y < rows[1] && place.y + height > rows[0] {
+                    seen.push(item);
+                }
+            }
+        }
+    }
+    let seen: Vec<(String, [u32; 2])> = seen.into_iter().map(|item| (item.kind.template.clone(), item.cells())).collect();
     for wanted in seen {
         if wanted.1[0] == 0 || wanted.1[1] == 0 || !icons.known.insert(wanted.clone()) {
             continue;
         }
         let (template, cells) = wanted;
         let size = [cells[0] * CELL_PIXELS + 1, cells[1] * CELL_PIXELS + 1];
-        match icons.path(&template, size).map(|path| trp_data::icon::load_png(&path)) {
-            Some(Ok((width, height, rgba))) if [width, height] == size => read.push((template, width, height, rgba)),
-            _ => icons.queue.push_back((template, cells)),
-        }
-    }
-    // Written only when there is something to write: a change to what is
-    // carried redraws the screen.
-    for (template, width, height, rgba) in read {
-        let picture = picture_of(&mut images, width, height, rgba);
-        carried.pictures.insert(template, picture);
-        icons.cached += 1;
+        let Some(path) = icons.path(&template, size) else {
+            icons.queue.push_back((template, cells));
+            continue;
+        };
+        icons.arriving.push(AsyncComputeTaskPool::get().spawn(async move {
+            let made = trp_data::icon::load_png(&path).and_then(|(width, height, rgba)| {
+                anyhow::ensure!([width, height] == size, "the cache's picture is {width} by {height}");
+                let turned = trp_data::icon::turned(&rgba, width as usize, height as usize);
+                Ok((rgba, turned))
+            });
+            Arrived { template, cells, size, drawn: false, made }
+        }));
     }
 }
 
 /// A line in the log each time what was asked is all made: how many
 /// pictures were read, drawn, and could not be made.
 fn report_icons(mut icons: ResMut<Icons>) {
+    let _clock = crate::render_timing::Clock::new("report_icons");
     let counts = (icons.cached, icons.drawn, icons.failed);
     if icons.busy() || counts == icons.reported {
         return;
@@ -428,7 +543,8 @@ fn report_icons(mut icons: ResMut<Icons>) {
 }
 
 /// The icon thread: one model at a time, in the order asked.
-fn prepare_icons(mut icons: ResMut<Icons>) {
+fn prepare_icons(mut icons: ResMut<Icons>, mut carried: ResMut<Carried>, mut ready: ResMut<crate::inventory_view::PicturesArrived>) {
+    let _clock = crate::render_timing::Clock::new("prepare_icons");
     let icons = &mut *icons;
     if let Some(task) = icons.task.as_mut() {
         let Some((worker, (template, _), made)) = block_on(poll_once(task)) else { return };
@@ -439,12 +555,17 @@ fn prepare_icons(mut icons: ResMut<Icons>) {
             Err(e) => {
                 info!("the picture of {template} is not made: {e:#}");
                 icons.failed += 1;
+                arrived(carried.bypass_change_detection(), &mut ready, template, None);
             }
         }
     }
     let Some(wanted) = icons.queue.pop_front() else {
-        // Nothing left to read: the thread's reader and its bundles go.
-        icons.worker = None;
+        // Nothing left to read: the thread's reader and its bundles go,
+        // let go of away from the frame, as the rigs' is (`weapon::
+        // prepare_rigs`: freeing one in the frame had cost it 40 ms).
+        if let Some(worker) = icons.worker.take() {
+            AsyncComputeTaskPool::get().spawn(async move { drop(worker) }).detach();
+        }
         return;
     };
     let (worker, install) = (icons.worker.take(), icons.install.clone());
@@ -470,8 +591,23 @@ fn draw_icons(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut cameras: Query<(&mut Camera, &mut Projection)>,
     waiting: Res<crate::PipelinesWaiting>,
+    mut carried: ResMut<Carried>,
+    mut ready: ResMut<crate::inventory_view::PicturesArrived>,
+    uploads: Res<crate::weapon::UploadWatch>,
 ) {
+    let _clock = crate::render_timing::Clock::new("draw_icons");
     let icons = &mut *icons;
+    // `TRP_ICON_TRACE` in the environment: where the pictures stand, every
+    // 60 frames (with `main::count_waiting`'s pipelines still being built,
+    // which a picture waits on).
+    if std::env::var_os("TRP_ICON_TRACE").is_some() {
+        static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let frame = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if frame % 60 == 0 {
+            let drawing = icons.drawing.as_ref().map(|d| format!("{} frames {} wait {} asked {} tries {}", d.template, d.frames, d.wait, d.asked.is_some(), d.tries));
+            info!("icon trace {frame}: queue {} task {} ready {} arriving {} drawing {:?} pipelines waiting {}", icons.queue.len(), icons.task.is_some(), icons.ready.len(), icons.arriving.len(), drawing, waiting.0.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
     // The camera and its lights, once the icon camera is known.
     if icons.camera.is_none() {
         let Some(studio) = icons.ready.front_mut().and_then(|first| first.studio.take()).or_else(|| icons.studio.take()) else { return };
@@ -526,17 +662,42 @@ fn draw_icons(
     // read back.
     if let Some(drawing) = icons.drawing.as_mut() {
         drawing.frames += 1;
-        if !drawing.asked && drawing.frames >= drawing.wait && waiting.0.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            drawing.asked = true;
-            commands.spawn(Screenshot::image(drawing.target.clone())).observe(icon_captured);
+        // Not until every mesh and picture of it is on the card: a part
+        // whose own are not is left out of the drawing, and the picture
+        // kept without it.
+        if !drawing.on_card {
+            let name = format!("icon {}", drawing.model);
+            if uploads.take(|waited| waited == name).is_empty() {
+                return;
+            }
+            if drawing.frames > drawing.old_rule {
+                info!("the picture of {}: its model all on the graphics card {} frames after it was put in the studio, where {} had been waited", drawing.template, drawing.frames, drawing.old_rule);
+            }
+            (drawing.on_card, drawing.frames) = (true, 0);
+        }
+        if drawing.asked.is_none() && drawing.frames >= drawing.wait && waiting.0.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            drawing.asked = Some(commands.spawn(Screenshot::image(drawing.target.clone())).observe(icon_captured).id());
+            drawing.frames = 0;
+        } else if drawing.asked.is_some() && drawing.frames > ANSWER_FRAMES_AT_MOST {
+            if drawing.tries < 3 {
+                warn!("the picture of {} was not read back in {ANSWER_FRAMES_AT_MOST} frames: asked again", drawing.template);
+                (drawing.asked, drawing.frames, drawing.tries) = (None, 0, drawing.tries + 1);
+            } else {
+                warn!("the picture of {} was not read back three times: not made", drawing.template);
+                give_up(&mut commands, icons, &mut images, carried.bypass_change_detection(), &mut ready);
+                if let Ok((mut camera, _)) = cameras.get_mut(camera) {
+                    camera.is_active = false;
+                }
+            }
         }
         return;
     }
     let Some(prepared) = icons.ready.pop_front() else { return };
     let PreparedIcon { template, size, hierarchy, keeps_own, looks, parts, extra, turn, place, half_height, picture_bytes, .. } = prepared;
-    let (mesh_handles, material_handles) = looks.add(&mut meshes, &mut images, &mut materials);
+    let (mesh_handles, material_handles, pictures) = looks.add_with_pictures(&mut meshes, &mut images, &mut materials);
     let layer = RenderLayers::layer(LAYER);
     let model = commands.spawn((Name::new(format!("Icon of {template}")), Transform { translation: place, rotation: turn, ..default() }, Visibility::Inherited)).id();
+    uploads.wait(format!("icon {model}"), pictures.iter().map(Handle::id).collect(), mesh_handles.iter().map(Handle::id).collect());
     let mut entities: Vec<Entity> = Vec::with_capacity(hierarchy.nodes.len());
     for (index, node) in hierarchy.nodes.iter().enumerate() {
         let own = if index == 0 && !keeps_own { Transform::from_scale(Vec3::from(node.scale)) } else { convert::transform(node.translation, node.rotation, node.scale) };
@@ -556,7 +717,11 @@ fn draw_icons(
     // Drawn at twice its size (`IconCreatorBase`: a texture of double
     // size), onto a picture of its own.
     let (width, height) = (size[0] * 2, size[1] * 2);
-    let mut target = Image::new_fill(Extent3d { width, height, depth_or_array_layers: 1 }, TextureDimension::D2, &[0, 0, 0, 0], TextureFormat::Rgba8UnormSrgb, bevy::asset::RenderAssetUsages::default());
+    // With nothing in it to send: a picture with something to send waits
+    // its turn behind every other's (`main::UPLOAD_BUDGET`), and one not on
+    // the card when it is read back is not read at all. The camera clears
+    // it before drawing.
+    let mut target = Image::new_uninit(Extent3d { width, height, depth_or_array_layers: 1 }, TextureDimension::D2, TextureFormat::Rgba8UnormSrgb, bevy::asset::RenderAssetUsages::default());
     target.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
     let target = images.add(target);
     if let Ok((mut aim, mut projection)) = cameras.get_mut(camera) {
@@ -566,8 +731,18 @@ fn draw_icons(
             ortho.scaling_mode = ScalingMode::Fixed { width: 2.0 * half_height * size[0] as f32 / size[1] as f32, height: 2.0 * half_height };
         }
     }
-    let wait = SETTLE_FRAMES + (picture_bytes / UPLOAD_BYTES_A_FRAME) as u32;
-    icons.drawing = Some(Drawing { template, size, model, target, frames: 0, wait, asked: false, tries: 0 });
+    let old_rule = SETTLE_FRAMES + (picture_bytes / OLD_RULE_BYTES_A_FRAME) as u32;
+    icons.drawing = Some(Drawing { template, size, model, target, frames: 0, wait: SETTLE_FRAMES, asked: None, tries: 0, on_card: false, old_rule });
+}
+
+/// A picture that cannot be made: its model and its target go, and its
+/// box keeps the plain shape of its sort.
+fn give_up(commands: &mut Commands, icons: &mut Icons, images: &mut Assets<Image>, carried: &mut Carried, ready: &mut crate::inventory_view::PicturesArrived) {
+    let Some(drawing) = icons.drawing.take() else { return };
+    commands.entity(drawing.model).despawn();
+    images.remove(&drawing.target);
+    icons.failed += 1;
+    arrived(carried, ready, drawing.template, None);
 }
 
 /// The picture read back: finished as the game finishes it, put on the
@@ -577,11 +752,14 @@ fn icon_captured(
     mut commands: Commands,
     mut icons: ResMut<Icons>,
     mut carried: ResMut<Carried>,
+    mut ready: ResMut<crate::inventory_view::PicturesArrived>,
     mut images: ResMut<Assets<Image>>,
     mut cameras: Query<&mut Camera>,
 ) {
     let icons = &mut *icons;
-    let Some(drawing) = icons.drawing.as_mut() else { return };
+    // (An answer to a reading back asked before, and asked again since, is
+    // not this picture's.)
+    let Some(drawing) = icons.drawing.as_mut().filter(|drawing| drawing.asked == Some(trigger.target())) else { return };
     let captured = &trigger.event().0;
     let Some(data) = captured.data.as_ref() else { return };
     let [width, height] = drawing.size;
@@ -591,32 +769,32 @@ fn icon_captured(
     // never kept.
     let empty = !data.chunks_exact(4).any(|pixel| pixel[3] > 0);
     if empty && drawing.tries < 3 {
-        (drawing.tries, drawing.frames, drawing.asked, drawing.wait) = (drawing.tries + 1, 0, false, SETTLE_FRAMES * 2);
+        (drawing.tries, drawing.frames, drawing.asked, drawing.wait) = (drawing.tries + 1, 0, None, SETTLE_FRAMES * 2);
         return;
     }
     if empty {
         warn!("the picture of {} came out empty three times: not made", drawing.template);
-        let (model, target) = (drawing.model, drawing.target.clone());
-        commands.entity(model).despawn();
-        images.remove(&target);
-        icons.drawing = None;
-        icons.failed += 1;
+        give_up(&mut commands, icons, &mut images, carried.bypass_change_detection(), &mut ready);
         if let Some(mut camera) = icons.camera.and_then(|camera| cameras.get_mut(camera).ok()) {
             camera.is_active = false;
         }
         return;
     }
+    // Finished, kept and turned away from the frame: the shadow's blur and
+    // the PNG had cost the frame they were made in.
     let shadow = icons.studio.as_ref().map_or_else(|| Studio::as_read(), Clone::clone);
-    let rgba = trp_data::icon::finish(data, (width * 2) as usize, (height * 2) as usize, shadow.shadow, shadow.shadow_offset);
     let (template, model, target) = (drawing.template.clone(), drawing.model, drawing.target.clone());
-    if let Some(path) = icons.path(&template, [width, height]) {
-        if let Err(e) = trp_data::icon::save_png(&path, width, height, &rgba) {
-            warn!("the picture of {template} is not kept: {e:#}");
+    let (path, data, cells) = (icons.path(&template, [width, height]), data.clone(), [(width - 1) / CELL_PIXELS, (height - 1) / CELL_PIXELS]);
+    icons.arriving.push(AsyncComputeTaskPool::get().spawn(async move {
+        let rgba = trp_data::icon::finish(&data, (width * 2) as usize, (height * 2) as usize, shadow.shadow, shadow.shadow_offset);
+        if let Some(path) = path {
+            if let Err(e) = trp_data::icon::save_png(&path, width, height, &rgba) {
+                warn!("the picture of {template} is not kept: {e:#}");
+            }
         }
-    }
-    let picture = picture_of(&mut images, width, height, rgba);
-    carried.pictures.insert(template, picture);
-    icons.drawn += 1;
+        let turned = trp_data::icon::turned(&rgba, width as usize, height as usize);
+        Arrived { template, cells, size: [width, height], drawn: true, made: Ok((rgba, turned)) }
+    }));
     commands.entity(model).despawn();
     images.remove(&target);
     icons.drawing = None;

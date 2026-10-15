@@ -77,7 +77,8 @@ const AXES_AS_READ: [(&str, &str, &str); 3] = [("MoveX", "D", "A"), ("MoveY", "W
 
 /// The bindings the app acts on; the rest are the game's, kept and
 /// changed by its rules, and do nothing here yet.
-pub const BUILT: [&str; 43] = [
+pub const BUILT: [&str; 44] = [
+    "QuickReloadWeapon",
     "Nidnod",
     "LeanLockRight",
     "LeanLockLeft",
@@ -460,6 +461,7 @@ impl Bindings {
                     (key("Aim"), how("Aim", "Aim")),
                     line(key("Breath"), "Hold breath, aiming"),
                     line(key("ReloadWeapon"), "Reload"),
+                    line(key("QuickReloadWeapon"), "Quick reload: the magazine let fall"),
                     line(key("CheckAmmo"), "Check the magazine"),
                     line(key("CheckChamber"), "Check the chamber"),
                     line(key("ShootingMode"), "Next fire mode"),

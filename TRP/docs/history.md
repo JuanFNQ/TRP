@@ -4,6 +4,117 @@ The project's log, moved out of `AGENTS.md` on 2026-10-10 to keep that file shor
 
 ## Log
 
+### 2026-10-14, night: each container at its top; the RPK-16's magazine found missing (0.9.1)
+
+The user: "The scroll position of crates is shared between containers, make sure containers always start at the top. Also, the rpk-16 is missing a magazine. After this i think we are ready to start the health system." Then: "I'll need a new prompt."
+
+- **Built**: the crate panel scrolled back to the top whenever the screen is opened on a container or another is shown (`scroll_loot`). Seen in captures; 16 of the app's tests pass.
+- **Found, not put right**: the RPK-16 has no magazine as assembled, in hand and in its picture alike (`status.md`); left for the next session, with what was found.
+
+### 2026-10-14, night: the tables in an L; the clothing crate; pictures whole (0.9.0)
+
+The user, with three of the app's pictures short of parts (the AK-74 without its stock, grip and magazine; the RPK-16; the SV-98): "Rotate the last 4 weapon sets 90* over to the right to form an L shape. Give the OG green box a "clothing" label and a lid, and move the AKM into the rifle case. Also, some weapons sometimes fail to fully render their icons even after erasing the cache. What could be causing this? In this case it was the ak-74 and the RPK-16 mAGAzine, sv97, one other time it was the TX-15. Maybe this occurs if i scroll by too fast?"
+
+- **Found**: the studio guessed how long a model's pictures take to reach the card (24 MB a frame) where the app sends 8 and shares them with rigs made ahead; a part not yet there is not drawn, and the picture was kept. Scrolling fast made it likelier, as the user thought.
+- **Built**: the studio waits on the card itself (`weapon::UploadWatch`), the cache's folder `v2`; the last four tables in an arm towards the start; the airdrop crate labelled CLOTHING, with a lid and the gestures of one; the run's own weapon in its class's gun case, which a kitted run takes it from; `--start clothing`. Measured: 26 of 38 models later on the card than the old wait, all 38 pictures whole. 305 tests; the simulation untouched.
+
+### 2026-10-14, night: the tables of weapons; a window to vault through; DXC (0.8.0)
+
+The user: "If the proposed speed fix improves overall performance throughout the app, then yes let us add it. Lets split the weapons and magazines. We can make a small table with the guns ontop, and their magazines below, for each weapon type. The gun crates should be long and short, like a gun case. Make them green. The magazines should be in a black square box. Give them lids that open! There's also a random blue square near the center by the car get rid of it. add a small vaultable window by the door."
+
+- **Measured first**: DXC against FXC, with the libraries of the machine's own Windows SDK (`findings.md`): the warm-up and every first drawing of a new kind of material three to four times sooner, the crate's pictures twice as soon, a frame once built the same. So added: the app finds the two libraries beside `trp.exe` or in the newest Windows SDK, and says which compiler a run uses.
+- **Built**: the tables of weapons with the game's own weapon box and ammunition box on and under them, lids that open (`inventory.md`); a window in the door wall to the doorway's right (`vaulting.md`); the climbing block by the car taken away (the ring's blocks are as high). A test of the window by the simulation's own vault (`the_window_is_vaulted_through`); the range's layout test made to take a case over its box. 305 tests; the simulation untouched, so no regression run.
+
+### 2026-10-14, night: the crash on DirectX 12's places for samplers; the stuck pictures; pictures asked for in sight (0.7.1)
+
+The user, with the log of a run that stopped on `Not enough memory left`: "I deleted the icon cache to see it load. I noticed the icon loading hangs, probably loading things like gun parts and what not. See how tarkov handles icon loading. If they don't do anyhting special, can we make it so icons are only generated when the actual item appears/is called for? for exmaple: Dont create the ak-47 rear-sight icon by itself until the weapon is inspected, or the actual rear-sight is placed on the inventory."
+
+- **Read**: the game asks for a picture when an item's view is made, and its container panel's grid is magnified: views, and so pictures, only for what is in sight of its scroll area (`GridViewMagnifier`, found on the inventory screen's panel with the new `probe pointers`). A weapon's parts were never pictured on their own here: a weapon's picture is drawn from its whole model, which is the loading of its parts the user saw, as the game draws it.
+- **Found**: the stop was DirectX 12's 2,048 places for samplers (wgpu's), filled by the range's 67 materials (402 places) and by rigs made ahead (0.7.0) with nothing but the 30 s to limit them; the hang, a picture's reading back dropped by the engine because its target was not yet on the card, after which the studio waited for ever (`findings.md`).
+- **Built**: the range's materials shared; rigs kept to four uncarried and within 1,536 places (`weapon::SamplerPlaces`); the studio's target with nothing to send, a reading not answered asked again; of an open container only what is in sight asked for, again as it scrolls. Tools: `TRP_ICON_CACHE`, `TRP_ICON_TRACE`, a `samplers:` line under `TRP_RENDER_TIMING`, `probe pointers`. Measured on empty caches (`findings.md`); 304 tests; the simulation untouched, so no regression run.
+
+### 2026-10-14, night: the character model; rigs made ahead, let go of and shared (0.7.0)
+
+The user (with a picture of the pre-raid screen's character, standing with its arms at its sides): "Can we add the three recommended features you listed? The pictures should apply to weapons that look the exact same. Lets change the Paper player model to be a still model of the 3d model of the current playermodel, just like the items/guns, standing straight like the image provided this stance comes from the pre-raid screen. Make it a switchable mechanic feature as well. It should be the actual model not a 3d image so that storage isn't consumed, and it should be loaded from your current model so it doesn't have to load the same model twice, if that makes sense."
+
+- **Read**: how the game's screens show the character (`PlayerModelView`, `PlayerModelLoader`; `probe animator` added, which names an animator's controller), and the body controller's `GUI` layer (`findings.md`).
+- **Built**: `BodyData::load_standing`, the pose of the game's screens; the gear page's character model (`figure_view.rs`) on the body's own handles, and its switch `CHARACTER MODEL`; a rig made ahead when the mouse rests on a weapon or it is taken up; rigs nobody carried for 30 s let go of; pictures alike shared between rigs. A test of the stance against the install; captures of the model in four sets of clothes and with the switch off; a run that shared, made ahead and let go of. The regression: `after53`, `after52`'s in every figure (two reports differ only in the time the clips took to read).
+
+### 2026-10-14, night: what a rig costs; pictures of one's own compressed; a move's slow frame (0.6.0)
+
+The user: "You are the best. How much more memory would be consumed? Would the game not stutter when the crate is opened instead if you build the rigs before they are taken? Definitely compress any custom models to make them cheaper. I really really care about performance. Then, lets tackle the ~14ms frame whenever an item is moved."
+
+- **Measured**: every rig made ready and weighed (`--measure-rigs`): 8.4 GB of pictures for the 149, 3.5 GB for the crate of rifles; so not made before they are taken (`findings.md`).
+- **Built**: BC1 and BC5 encoders of the project's own (`trp-data/src/compress.rs`), a weapon of one's own's pictures compressed with them and kept in `local\picture_cache` (the StG 44's 213 to 43 MB; its rig ready in 0.28 s); the movement's root motion table shared where reweighing had copied it (the move's 9 ms); the icon thread's reader let go away from the frame. Errors of the compression measured on the StG 44's own pictures, the move's frames re-measured; the regression: `after52`, `after51`'s in every figure (only the clips' load times differ).
+
+### 2026-10-14, night: the freeze when a weapon is first taken, taken away (0.5.1)
+
+The user: "Okay, this looks very nice. What can we do on the app to minimize the freeze time time from loading the model? Check sources online and see what is possible while keeping the games integrity!"
+
+- **Read**: what the engine documents (Bevy 0.16's notes, its mesh allocator, Godot's account of a pipeline compiled on first draw) and Bevy's own source. **Measured**: one frame of 48 to 73 ms for the four, the renderer's schedule fast, no pipeline built; a tool written for it (`render_timing.rs`, `TRP_RENDER_TIMING`) put it on the main thread, half the rig maker's reader freed and half Bevy copying the rig at extraction.
+- **Built**: the reader freed away from the frame, the rig's meshes and pictures for the renderer alone (moved, not copied), 8 MB a frame to the card, a rig taken only once on the card. **After**: at most 7.2 to 10.3 ms, the first draws as later ones. Nothing of what is drawn or simulated changed. Regression not run (the simulation untouched).
+
+### 2026-10-14, night: every weapon made when wanted; a box that blinks (0.5.0)
+
+The user: "Do the AK, STG, M3 Super 90, and 5-7 load like all the rest of the weapons? because they should." And, while it was being built: "Items in tarkov blink, does this give them time to load? Check the code to see what tarkov does, because the blinking does not occur."
+
+- **Measured**: begun with nothing in hand, the app made one weapon's rig at the start, the AKM's, the run's own; the StG 44, the M3 and the Five-seveN were already made when first hung. **Built**: such a run begins with the empty hands' rig, which has every bone a weapon's shares (a new test over all 149), and the AKM is made when wanted like the rest. Taking each of the four from the crate showed a slot's key pressed before a rig was ready was lost (the StG 44's, 1.15 s): it now waits for the rig.
+- **Read**: the game's box blinks while its move waits on the hands (taking a weapon put into the slot last drawn from until its draw's end, putting away the weapon taken out of its slot), not while a model loads, which the single-player game does before the raid (`findings.md`). **Built** as read, the fade the game's; here the hands' taking includes a rig still being made. Seen in captures both ways.
+
+### 2026-10-14, night: the orange a switch (0.4.0)
+
+The user: "Add the hover machanic to the feature switches that can be disabled/enabled."
+
+- **Built**: `COMPATIBLE ITEMS HIGHLIGHT`, the fifteenth switch of the options' `FEATURES` part, after `ICON GENERATION`; on unless switched, restart required as every switch is, kept in the options' file as `compatible_items_highlight` and set for a run by `--feature compatible_items_highlight=on|off` (`settings.md`, "Features"). Off, nothing is lit orange; the box under the mouse is still lit white, which is the game's own and not part of the departure (my reading of "the hover mechanic": the orange is what the game has not). Seen in two captures (the M4A1 pointed at with it off; the tab), and the options' file test keeps it.
+
+### 2026-10-14, night: what goes with a thing, lit orange (0.3.0)
+
+The user: "You are amazing. Make it so when a weapon is highlighted, its related ammo/magazines or potentially attachments are highlited orange and vice-versa. Something like what stalker does."
+
+- **Read first**: Tarkov lights other boxes only while a thing is carried (green, yellow); S.T.A.L.K.E.R.'s lighting on hover is two scripts, Anomaly's from a weapon and GAMMA's magazines' (`findings.md`). So a departure, the user's, and recorded as one.
+- **Built**: two things go together when one has a place for the other by the game's filters (its slots and its parts', chambers, a magazine's cartridges), either way round (`trp_sim::inventory::go_together`, a unit test and one on the install's AKM and M4A1); the boxes of what goes with the thing under the mouse, or carried, are orange, and the box under the mouse has the game's white, which had not been drawn. Seen in four captures.
+
+### 2026-10-14, later still: the AS VAL's crash; every weapon run whole (0.2.2)
+
+The user: "ASVAL causes a crash. can we double check all weapons and ensure it doesnt occur!"
+
+- **The cause**: the AS VAL's and the VSS's hammer spring is a skinned part on two bones of the weapon's own (`findings.md`); the app drew it without them and Bevy's renderer stopped. **Built**: it is drawn on its bones, as the game draws it, in both ways a rig is made; anything skinned on a plain node elsewhere (a part whose bones are missing, a weapon of one's own's parts, what is worn on the head) is drawn as it lies.
+- **Every weapon checked**: a new test (`tests\every_weapon.rs`) puts each of the 149 through its logic, both reloads included; the app ran each as its weapon (all 149 with no error), and the AS VAL taken from the crate of rifles. Only the two weapons have such a part.
+
+### 2026-10-14, later still: spinners, and the screen's slow frames found (0.2.1)
+
+The user: "Can we a add spinners when something is loading instead of the paper icon? Let's knock out the redraw optimizaitons now."
+
+- **Measured first**: the inventory screen drawn whole costs about a millisecond with the crate of rifles open, not the 57 to 62 ms said the hour before. Those frames were the crate's 91 cached pictures read in the frame (41.7 ms of an update) and, once, a weapon's first hanging (render side, not yet traced). Put right in `findings.md`, `status.md` and `AGENTS.md`.
+- **Built**: cached pictures read, and drawn ones finished, away from the frame (the game's `LoadFromUserCacheAsync`); **a spinner in a box until its picture comes** (where the game's view shows its loader), the picture then put in its place without the screen drawn afresh; nothing drawn while the screen is shut; only what the screen shows asked for (365 pictures for the crate of rifles had been 91). The crate's opening frame: 1.5 ms of update. Seen in captures, with the picture cache moved aside for one run and put back.
+
+### 2026-10-14, late: the quick reload, the switches, every weapon in crates, pictures when first wanted (0.2.0)
+
+The session began with publishing: the user asked how a release reaches `TRP`. `E:\TRP-public` was gone from the disk, and `TRP` had a README edit made on GitHub (its "Requirements") that the private repository lacked; the steps given were to clone `TRP` again, bring that edit over by a cherry-pick, and then the release as `manual.md` has it ("Publishing"). Then, in answer to questions 1 and 2:
+
+- "Let's start with the quick reload mechanic. The free-look works great. Keys pressed with alt work. The mouse is not caught after alt tab. Can we make it completely free to move if we press tab, as in I can just go to other tabs when my inventory is open?"
+- "For the features list, make the switches work for mechanics that are fully done. For now, when set to off, lets make it just stop. After we have almost all features working good, we will attempt to merge games in whatever way possible."
+- "Let's make every weapon selectable. We can create a few more crates lining the small wall with labels. Separated like (Rifles) (Pistols) (Shotguns) (Snipers) (Custom)"
+- Later: "I like where you are heading, can we also make icon loading lazy for first-time? Check how tarkov handles that when opening an invetnroy for the first time."
+
+What was done:
+
+- **The quick reload** (`firing.md`, "The quick reload"), read from the game's code and built: the key's double click, `ReloadFast`, the AKM's `RELOAD OUT ALL`, the old magazine thrown down at `MagHide`. **Both reloads take the fullest magazine from the pockets and the vest**, as the game's do; the plain one puts the old magazine into the vest or the pockets where it has room. The crate's weapons have their magazines full in the inventory as in the hands, and spare magazines of their own. Measured on the install's AKM: in at 2.15 s for 2.50, at rest 0.35 s sooner. A cylinder's quick reload is left (the double click does nothing on the Rhino and the M32A1).
+- **The mouse**: with a screen open it is now free to leave the window. After Alt+Tab it was taken again in every way tried; the report is open.
+- **The switches** (`settings.md`, "Features"): the eleven systems the list has as built, off just stopping, each restart required, `--feature <name>=on|off`; the simulation's seven in `trp_sim::Systems`, the app's four in the app.
+- **Every weapon selectable** (`more-weapons.md`, "One barrel loaded alone, and the rocket launcher"; `inventory.md`): the single barrel's reload (MP-18, FN40GL) and the rocket launcher's firing (RShG-2) read and built; eight crates of weapons along the knee-high wall, labelled, holding all 148 and the StG 44 by `weapClass`. The user's five crates and three of the app's (submachine guns, machine guns, launchers), for what the five leave out. The airdrop crate keeps the kit.
+- **Pictures and rigs when first wanted**: as the game does (`icons.md`, "When a picture is asked for"), a picture is asked for when the screen first shows an item; a rig when its weapon is first hung. The curtain lifts at 1.7 s.
+- Regression `after49` and `after50` are `after48`'s byte for byte. Tests: see the version's line in `AGENTS.md`.
+
+### 2026-10-14: versions; the two repositories kept
+
+The user asked for a version scheme for the release, then: "Yes that would be nice! Keep that version updating whenever we do any changes." Asked whether `stlkreft` could be deleted for a private branch on `TRP` (GitHub makes a whole repository public or private, never a branch), the user: "We'll keep the other private then. I need better understanding of the workflow between the two."
+
+- **Versions** (`manual.md`, "Versions"): Semantic Versioning below 1.0, one number for the three crates in `Cargo.toml`, raised with every change; the recorder keeps its own. 0.1.0 is what `TRP` holds (`TRP: Initial Public Version`); **0.1.1** is this change. The app prints `TRP <version>` as its first line and `--version` prints it alone; the window's title is left as it was, since `local\window_keys_test.ps1` finds the window by that exact title.
+- **Publishing** (`manual.md`) says the workflow whole: day to day only `stlkreft`; a release copied by `read-tree`, committed, tagged in the copy alone, pushed; a change merged on `TRP` brought back by a cherry-pick.
+- **Found** in checking steps 1 to 11 of the user's list: the two repositories hold the same files (the same tree); `TRP` is public; neither had a `LICENSE` (step 6 not done; the user then added Apache-2.0 to `stlkreft`, which reaches `TRP` with the next release); the copy `E:\TRP-public` keeps a local branch `experimental` with the private history in it, from its clone (never pushed).
+- 282 tests pass. The simulation is untouched, so no regression was run.
+
 ### 2026-10-14, the small hours: the folder becomes TRP; the steps to publish
 
 The user: "Give me each step one by one perfectly so that I do them in a row when I close this VS code session."

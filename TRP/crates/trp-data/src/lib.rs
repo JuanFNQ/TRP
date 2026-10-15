@@ -8,6 +8,7 @@
 
 pub mod arms;
 pub mod body;
+pub mod compress;
 pub mod curve;
 pub mod custom;
 pub mod database;

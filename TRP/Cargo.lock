@@ -3781,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "trp-app"
-version = "0.1.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "bevy",
@@ -3792,7 +3792,7 @@ dependencies = [
 
 [[package]]
 name = "trp-data"
-version = "0.1.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "lz4_flex",
@@ -3805,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "trp-sim"
-version = "0.1.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "serde_json",

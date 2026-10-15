@@ -390,7 +390,7 @@ fn rgb565(c: u16) -> [u32; 3] {
     [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]
 }
 
-fn decode_color_block(block: &[u8], punch_through: bool) -> [[u8; 4]; 16] {
+pub(crate) fn decode_color_block(block: &[u8], punch_through: bool) -> [[u8; 4]; 16] {
     let c0 = u16::from_le_bytes([block[0], block[1]]);
     let c1 = u16::from_le_bytes([block[2], block[3]]);
     let (a, b) = (rgb565(c0), rgb565(c1));
@@ -406,7 +406,7 @@ fn decode_color_block(block: &[u8], punch_through: bool) -> [[u8; 4]; 16] {
     std::array::from_fn(|i| palette[(bits >> (i * 2)) as usize & 3])
 }
 
-fn decode_alpha_block(block: &[u8]) -> [u8; 16] {
+pub(crate) fn decode_alpha_block(block: &[u8]) -> [u8; 16] {
     let (a0, a1) = (block[0] as u32, block[1] as u32);
     let mut palette = [a0 as u8, a1 as u8, 0, 0, 0, 0, 0, 255];
     if a0 > a1 {

@@ -59,6 +59,9 @@ pub struct Kind {
     pub merges: bool,
     pub slots: Vec<Holder>,
     pub grids: Vec<Holder>,
+    /// What a magazine's rounds go into, with what it takes (they lie in
+    /// `Item::loose`); none for anything else.
+    pub cartridges: Vec<Holder>,
     /// The equipment slots it blocks while worn.
     pub blocks: Vec<String>,
     /// How many of it one stack holds; 0 or 1 for what does not stack.
@@ -83,6 +86,7 @@ impl Kind {
             merges: item.merges_with_parts(),
             slots: item.slots(),
             grids: item.grids(),
+            cartridges: item.cartridges(),
             blocks: item.blocked_slots(),
             stack_max: item.stack_max(),
             not_raid_moddable: !item.raid_moddable(),
@@ -506,6 +510,26 @@ fn takes_rounds(weapon: &Item) -> Option<Vec<String>> {
     }
     let cylinder = weapon.in_slot("mod_magazine")?;
     cylinder.kind.slots.iter().find(|slot| slot.name.starts_with(CAMORA)).map(|camora| camora.takes.clone())
+}
+
+/// Whether two things go together, as the screen lights them (inventory
+/// spec, "The box under the mouse, and what goes with it"): the one has a
+/// place for the other, either way round. A weapon goes with its
+/// magazines, its rounds and the parts that fit it or what is on it; a
+/// magazine with the weapons it fits and its rounds. A thing does not go
+/// with itself, and a grid's room is no place for this: a backpack would
+/// go with everything.
+pub fn go_together(one: &Item, other: &Item) -> bool {
+    one.id != other.id && (has_place_for(one, &other.kind) || has_place_for(other, &one.kind))
+}
+
+/// Whether a thing, or a part on it, has a place for that kind of thing by
+/// the game's filters: a slot (a chamber, a cylinder's chambers, a part's
+/// slot) or a magazine's cartridges, which take what they list and do not
+/// refuse.
+fn has_place_for(holder: &Item, kind: &Kind) -> bool {
+    let fits = |place: &Holder| kind.among(&place.takes) && !kind.among(&place.refuses);
+    holder.kind.slots.iter().chain(&holder.kind.cartridges).any(fits) || holder.slots.iter().flatten().any(|part| has_place_for(part, kind))
 }
 
 /// The class of backpacks, which go into one another only so deep.
@@ -1166,6 +1190,119 @@ pub fn take_rounds(equipment: &mut Item, weapon: Id, count: u32) -> u32 {
     count - left
 }
 
+/// A weapon's slot for its magazine.
+pub const MAGAZINE_SLOT: &str = "mod_magazine";
+
+/// The rounds a magazine holds.
+pub fn magazine_rounds(magazine: &Item) -> u32 {
+    magazine.loose.iter().map(|stack| stack.count).sum()
+}
+
+/// Leaves a magazine holding `count` rounds, the last stack losing its
+/// first (what was fired was what lay on top); more than it holds are
+/// more of the last stack's kind. An empty magazine is given none.
+pub fn set_magazine_rounds(magazine: &mut Item, count: u32) {
+    let held = magazine_rounds(magazine);
+    if count > held {
+        if let Some(last) = magazine.loose.last_mut() {
+            last.count += count - held;
+        }
+        return;
+    }
+    let mut over = held - count;
+    while over > 0 {
+        let Some(last) = magazine.loose.last_mut() else { break };
+        let taken = last.count.min(over);
+        (last.count, over) = (last.count - taken, over - taken);
+        if last.count == 0 {
+            magazine.loose.pop();
+        }
+    }
+}
+
+/// Fills a magazine with `count` rounds of one kind, what it held gone.
+pub fn fill_magazine(magazine: &mut Item, round: Arc<Kind>, count: u32) {
+    magazine.loose.clear();
+    if count > 0 {
+        let mut stack = Item::new(round);
+        stack.count = count;
+        magazine.loose.push(stack);
+    }
+}
+
+/// The magazine a reload takes for a weapon carried
+/// (`FirearmHandsInputTranslator.ReloadExternalMagazine`; firing spec,
+/// "The quick reload"): of the magazines lying directly in the pockets'
+/// and the vest's grids, in that order, those holding a round, the
+/// fullest first, and of them the first the weapon's magazine slot
+/// takes. Of two that hold the same, the one met first (`PROVISIONAL`:
+/// the game's sort keeps no order between them).
+pub fn next_magazine(equipment: &Item, weapon: Id) -> Option<Id> {
+    let weapon = equipment.find(weapon)?;
+    let takes = &weapon.kind.slots.get(weapon.slot_index(MAGAZINE_SLOT)?)?.takes;
+    let worn = WITHIN_REACH.iter().filter_map(|slot| equipment.in_slot(slot));
+    let mut found: Vec<&Item> = worn
+        .flat_map(|holder| holder.grids.iter().flatten())
+        .map(|(_, item)| item)
+        .filter(|item| is(item, "Magazine") && magazine_rounds(item) > 0)
+        .collect();
+    found.sort_by_key(|magazine| std::cmp::Reverse(magazine_rounds(magazine)));
+    found.into_iter().find(|magazine| magazine.kind.among(takes) && magazine.count == 1).map(|magazine| magazine.id)
+}
+
+/// Where the old magazine of a plain reload goes
+/// (`GetPrioritizedGridsForUnloadedObject`, `FindLocationForItem`): the
+/// first free place in the vest's grids and then the pockets', the
+/// smallest grid first; the backpack is not among them. The holder, the
+/// grid and the place.
+fn unloaded_place(equipment: &Item, magazine: &Item) -> Option<(Id, usize, Place)> {
+    let holders = ["TacticalVest", "Pockets"].into_iter().filter_map(|slot| equipment.in_slot(slot));
+    let mut grids: Vec<(&Item, usize)> = holders.flat_map(|holder| (0..holder.grids.len()).map(move |grid| (holder, grid))).collect();
+    grids.sort_by_key(|(holder, grid)| holder.kind.grids[*grid].cells[0] * holder.kind.grids[*grid].cells[1]);
+    grids.into_iter().find_map(|(holder, grid)| holder.find_room(grid, magazine).map(|place| (holder.id, grid, place)))
+}
+
+/// Puts what a weapon gives up where the game puts it
+/// (`placeToPutContainedAmmoMagazine`): an old magazine, or the live round
+/// out of a single barrel, to the first free place in the vest's and the
+/// pockets' grids, the smallest grid first. Hands it back where there is
+/// none, to be thrown down.
+pub fn put_unloaded(equipment: &mut Item, item: Item) -> Option<Item> {
+    let Some((holder, grid, place)) = unloaded_place(equipment, &item) else { return Some(item) };
+    match equipment.find_mut(holder) {
+        Some(holder) => {
+            holder.grids[grid].push((place, item));
+            None
+        }
+        None => Some(item),
+    }
+}
+
+/// The exchange a magazine's reload makes as it begins
+/// (`ReloadExternalMagResult.Run`): the magazine fitted leaves the weapon
+/// holding `left` rounds and is put where a plain reload puts it, unless
+/// the reload is the quick one or there is no such place; then `next`
+/// goes into the weapon's magazine slot. Returns the old magazine where
+/// it has nowhere to go: it is to be let fall at the mark `MagHide`.
+pub fn swap_magazine(equipment: &mut Item, weapon: Id, next: Option<Id>, left: Option<u32>, quick: bool) -> Option<Item> {
+    let slot = equipment.find(weapon)?.slot_index(MAGAZINE_SLOT)?;
+    let mut old = equipment.find_mut(weapon)?.slots[slot].take();
+    if let (Some(old), Some(left)) = (old.as_mut(), left) {
+        set_magazine_rounds(old, left);
+    }
+    let falls = match old {
+        Some(old) if quick => Some(old),
+        Some(old) => put_unloaded(equipment, old),
+        None => None,
+    };
+    if let Some(next) = next.and_then(|id| equipment.take(id)) {
+        if let Some(weapon) = equipment.find_mut(weapon) {
+            weapon.slots[slot] = Some(next);
+        }
+    }
+    falls
+}
+
 /// The slots a weapon is taken in hand from, in the order the game looks
 /// through them for something to hold (`Player._slotPriority`).
 pub const HAND_SLOTS: [&str; 4] = ["FirstPrimaryWeapon", "SecondPrimaryWeapon", "Holster", "Scabbard"];
@@ -1626,6 +1763,89 @@ mod tests {
         assert_eq!(rounds_in_reach(&worn, gun_id), 0);
     }
 
+    /// A rifle on the character, its magazine fitted with `fitted` rounds;
+    /// and a magazine of the kind it takes holding so many.
+    fn rifle_worn(worn: &mut Item, fitted: u32) -> (Id, Id) {
+        let rifle = Item::new(Arc::new(Kind { slots: vec![holder(MAGAZINE_SLOT, [0, 0], &["mag"], &[])], ..kind("rifle", "weapon", 3.0, [4, 1]) }));
+        let (rifle_id, fitted) = (rifle.id, loaded("mag", fitted));
+        let fitted_id = fitted.id;
+        worn.slots[0] = Some(rifle);
+        worn.find_mut(rifle_id).unwrap().slots[0] = Some(fitted);
+        (rifle_id, fitted_id)
+    }
+
+    fn loaded(name: &str, rounds: u32) -> Item {
+        let mut magazine = thing(name, "magazine", 0.2, [1, 2]);
+        fill_magazine(&mut magazine, Arc::new(kind("round", "ammo", 0.01, [1, 1])), rounds);
+        magazine
+    }
+
+    /// The reload's magazine is the fullest one directly in the pockets
+    /// or the vest that the weapon takes, with a round in it; the
+    /// backpack's, an empty one and one of another kind are passed over.
+    #[test]
+    fn a_reload_takes_the_fullest_magazine_within_reach() {
+        let (mut worn, [vest_id, _, bag_id], _) = dressed();
+        let (rifle_id, _) = rifle_worn(&mut worn, 3);
+        let (ten, twenty, empty, in_bag, other) = (loaded("mag", 10), loaded("mag", 20), loaded("mag", 0), loaded("mag", 30), loaded("drum", 30));
+        let (ten_id, twenty_id) = (ten.id, twenty.id);
+        for (holder, item) in [(vest_id, ten), (vest_id, empty), (bag_id, in_bag), (vest_id, other)] {
+            worn.find_mut(holder).unwrap().stow(item).unwrap();
+        }
+        assert_eq!(next_magazine(&worn, rifle_id), Some(ten_id));
+        worn.find_mut(vest_id).unwrap().grids[2].push((Place { x: 1, y: 0, turned: false }, twenty));
+        assert_eq!(next_magazine(&worn, rifle_id), Some(twenty_id));
+        // With nothing within reach that it takes, none.
+        let (mut bare, _, _) = dressed();
+        let (rifle_id, _) = rifle_worn(&mut bare, 3);
+        assert_eq!(next_magazine(&bare, rifle_id), None);
+    }
+
+    /// The plain reload's old magazine goes to the smallest grid of the
+    /// vest and the pockets with room, keeping what is left in it; the
+    /// quick one's, or one that finds no room, is handed back to be let
+    /// fall. The new one is in the weapon either way.
+    #[test]
+    fn the_old_magazine_is_put_away_or_let_fall() {
+        let (mut worn, [vest_id, pockets_id, _], _) = dressed();
+        let (rifle_id, fitted_id) = rifle_worn(&mut worn, 30);
+        let next = loaded("mag", 30);
+        let next_id = next.id;
+        worn.find_mut(vest_id).unwrap().put(0, next, Place { x: 0, y: 0, turned: false }).unwrap();
+        // The pockets' grids are one cell each: the magazine (one by two)
+        // goes to the vest's second grid, the smallest with room.
+        assert_eq!(swap_magazine(&mut worn, rifle_id, Some(next_id), Some(12), false), None);
+        assert_eq!(worn.holder_of(fitted_id), Some((vest_id, Spot::Cell(1, Place { x: 0, y: 0, turned: false }))));
+        assert_eq!(magazine_rounds(worn.find(fitted_id).unwrap()), 12);
+        assert_eq!(worn.holder_of(next_id), Some((rifle_id, Spot::Slot(0))));
+        assert!(worn.find(pockets_id).unwrap().grids.iter().all(Vec::is_empty));
+        // The quick way it is handed back with its rounds, though there is room.
+        let back = swap_magazine(&mut worn, rifle_id, Some(fitted_id), Some(4), true).expect("let fall");
+        assert_eq!((back.id, magazine_rounds(&back)), (next_id, 4));
+        assert_eq!(worn.holder_of(fitted_id), Some((rifle_id, Spot::Slot(0))));
+        // With no room it falls from a plain reload too.
+        let (mut full, [vest_id, _, _], _) = dressed();
+        let (rifle_id, fitted_id) = rifle_worn(&mut full, 5);
+        for grid in 0..3 {
+            full.find_mut(vest_id).unwrap().grids[grid].push((Place { x: 0, y: 0, turned: false }, thing("brick", "item", 1.0, [2, 2])));
+        }
+        assert_eq!(swap_magazine(&mut full, rifle_id, None, Some(5), false).map(|old| old.id), Some(fitted_id));
+    }
+
+    #[test]
+    fn a_magazine_s_rounds_go_from_the_top() {
+        let mut magazine = loaded("mag", 10);
+        magazine.loose.push(Item { count: 5, ..again(&magazine.loose[0]) });
+        set_magazine_rounds(&mut magazine, 12);
+        assert_eq!(magazine.loose.iter().map(|stack| stack.count).collect::<Vec<_>>(), [10, 2]);
+        set_magazine_rounds(&mut magazine, 7);
+        assert_eq!(magazine.loose.iter().map(|stack| stack.count).collect::<Vec<_>>(), [7]);
+        set_magazine_rounds(&mut magazine, 9);
+        assert_eq!(magazine_rounds(&magazine), 9);
+        set_magazine_rounds(&mut magazine, 0);
+        assert!(magazine.loose.is_empty());
+    }
+
     /// What Ctrl and a click looks in: the priority window's container and
     /// nothing else, unless the thing lies in it; else what is open, with
     /// the equipment after it for a thing the character has; else the
@@ -1646,5 +1866,33 @@ mod tests {
         assert_eq!(other_side(&worn, Some(&crate_), Some(bag_id), theirs_id), [bag_id]);
         // Unless the thing lies in it.
         assert_eq!(other_side(&worn, Some(&crate_), Some(vest_id), mine_id), [crate_id, worn_id]);
+    }
+
+    /// What goes together goes either way round: a rifle with the
+    /// magazines its slot takes, the rounds its chamber or its magazine
+    /// takes, and the parts that fit it or a part on it; a magazine with its
+    /// rounds. A refused kind, another calibre, a hat, a backpack's room and
+    /// the thing itself do not.
+    #[test]
+    fn what_goes_together_goes_either_way() {
+        let rail = |name: &str| holder(name, [0, 0], &["sight"], &["big_sight"]);
+        let mount = Item::new(Arc::new(Kind { slots: vec![rail("mod_scope")], ..kind("mount", "mod", 0.1, [1, 1]) }));
+        let slots = vec![holder(MAGAZINE_SLOT, [0, 0], &["mag"], &[]), holder("mod_mount", [0, 0], &["mount"], &[]), holder("patron_in_weapon", [0, 0], &["round"], &[])];
+        let mut rifle = Item::new(Arc::new(Kind { slots, ..kind("rifle", "weapon", 3.0, [4, 1]) }));
+        rifle.slots[1] = Some(mount);
+        let magazine = Item::new(Arc::new(Kind { cartridges: vec![holder("cartridges", [0, 0], &["round"], &[])], ..kind("mag", "magazine", 0.2, [1, 2]) }));
+        let (round, other_round) = (thing("round", "ammo", 0.01, [1, 1]), thing("shell", "ammo", 0.04, [1, 1]));
+        let (sight, big_sight, hat) = (thing("red_dot", "sight", 0.1, [1, 1]), Item::new(Arc::new(Kind { classes: vec!["big".into(), "big_sight".into(), "sight".into()], ..kind("big", "sight", 0.4, [2, 1]) })), thing("hat", "headwear", 0.1, [1, 1]));
+        let bag = Item::new(Arc::new(Kind { grids: vec![holder("main", [4, 4], &["item"], &[])], ..kind("bag", "backpack", 1.0, [3, 3]) }));
+        for (a, b) in [(&rifle, &magazine), (&rifle, &round), (&rifle, &sight), (&magazine, &round)] {
+            assert!(go_together(a, b) && go_together(b, a), "{} and {}", a.kind.name, b.kind.name);
+        }
+        for (a, b) in [(&rifle, &other_round), (&rifle, &big_sight), (&rifle, &hat), (&magazine, &sight), (&bag, &round), (&rifle, &rifle)] {
+            assert!(!go_together(a, b) && !go_together(b, a), "{} and {}", a.kind.name, b.kind.name);
+        }
+        // Rounds a rifle has no chamber for, which its magazine takes.
+        let mut tube = Item::new(Arc::new(Kind { slots: vec![holder(MAGAZINE_SLOT, [0, 0], &["mag"], &[])], ..kind("tube", "weapon", 3.0, [5, 1]) }));
+        tube.slots[0] = Some(again(&magazine));
+        assert!(go_together(&tube, &round));
     }
 }

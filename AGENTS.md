@@ -44,41 +44,51 @@ table under "Where the rest is".
 
 ## Decisions of the user in force
 
-- **Do not code until told:** character values in a menu, values taken from STALKER, a weapon of a
-  kind not yet built, **anything switched by the options' list of features** (a list to be talked
-  over first), co-op. Researched: the end of `docs\findings.md`.
-- **Weapons told:** the M3 Super 90 (its stock folds), the FN Five-seveN, the Remington Model 700
-  (2026-10-12); **one of each kind those are not**, "to run around and test" (2026-10-13: the SV-98,
-  the SKS, the Rhino, the MP-43, the M32A1), with a catalogue of donors and rigs built when needed.
-  **A weapon added goes into the airdrop crate**, larger inside than the install's, with a scroll bar
-  (`WEAPONS` in `trp-app\src\main.rs`). **Found in a container it has no round in its chamber** and
-  works its action when taken in hand; a run that begins armed has one chambered.
-- **A weapon of one's own** (2026-10-13): the Sturmgewehr 44, from the user's model in
-  `local\ExperimentalWeapon` (never in the repository), on the best of Tarkov's animations.
-- **Three switches of the options, each "restart required"** (2026-10-14, night: a run holds those
-  it began with): `CUSTOM FIRST PERSON HANDS` (2026-10-13; off, the hands do not change with what
-  is worn), `SMOOTH FIRST PERSON ANIMATIONS` (a departure in the drawing alone), `ICON GENERATION`.
+- **Do not code until told:** character values in a menu, values taken from STALKER, a host's game
+  feeding a system (2026-10-14: "After we have almost all features working good, we will attempt to
+  merge games"), co-op. Researched: the end of `docs\findings.md`.
+- **Every weapon selectable** (2026-10-14, late): all of the install's along the knee-high wall,
+  labelled by class ("Separated like (Rifles) (Pistols) (Shotguns) (Snipers) (Custom)";
+  `range::WEAPON_CRATES`, `weapon_crates` in `main.rs`): since that night **a table for each, the
+  guns in a green gun case on it, their magazines in a black box under it, lids that open** (the
+  game's `WeaponCrate` and `AmmoBox`), the last four in an arm: an L; **the run's own weapon in its
+  class's case**; the airdrop crate is **CLOTHING**, with a lid. A window to vault, by the door.
+  **Found in a container a weapon has no round in its chamber** and works its action when taken in
+  hand; a run that begins armed has one chambered. **Every weapon's rig is made when first wanted,
+  the run's own too** (2026-10-14, night: "because they should"); a box blinks as the game's does. A weapon of one's own: the StG 44 (2026-10-13),
+  from the user's model in `local\ExperimentalWeapon` (never in the repository).
+- **The switches of the options, each "restart required"** (a run holds those it began with):
+  `CUSTOM FIRST PERSON HANDS`, `SMOOTH FIRST PERSON ANIMATIONS` (a departure in the drawing alone),
+  `ICON GENERATION`, `COMPATIBLE ITEMS HIGHLIGHT` (2026-10-14, night: the orange; off, Tarkov's
+  white alone), `CHARACTER MODEL` (the same night), and since 2026-10-14, late, **every system
+  the list has as built** ("For now,
+  when set to off, lets make it just stop"; `settings.md`, "Features"; `trp_sim::Systems`).
+- **The quick reload is the game's**, on `R`'s double click (2026-10-14, late); **with a screen
+  open the mouse is free to leave the window** ("so I can just go to other tabs").
 - **Outfits from STALKER** (2026-10-13): suits in the crate, on the armour's slot, in place of the
-  player's model, read from the user's own GAMMA folders, never written or copied. **What one has
-  not got is Tarkov's default body and gloves**; for its own eyes it is cut at Tarkov's waist; its
-  hands are judged beside Tarkov's bare ones. **Pictured from that game's model of the item**
-  (2026-10-14, night), with Tarkov's icon setup.
-- **The options are a tab of the inventory, at its far right** (2026-10-12): rebinds; graphics;
-  features to switch, a list only but for the three; as the game's own tab, `QUIT` ends the run, the
-  app holds the mouse (`docs\spec\settings.md`). **Doors have the game's menu**, the wheel choosing.
-  **The weapons' animations go by the skills.**
-- **The inventory** (2026-10-11): Tarkov's tabs exactly (Overall, Map, Tasks, Prestige may stay off),
-  its slots where the game has them over a paper figure; the app starts bare with a crate to loot.
-  **No stash.** Still wanted: looting as an animation.
+  player's model, read from the user's own GAMMA folders, never written or copied; what one has not
+  got is Tarkov's default; pictured from that game's model of the item.
+- **The options are a tab of the inventory, at its far right** (2026-10-12): rebinds; graphics; the
+  features; `QUIT` ends the run (`docs\spec\settings.md`). **Doors have the game's menu**, the wheel
+  choosing. **The weapons' animations go by the skills.**
+- **The inventory** (2026-10-11): Tarkov's tabs exactly, its slots where the game has them over
+  **the character's own model, still, as the pre-raid screen stands it** (2026-10-14, night:
+  "loaded from your current model"; off, a paper figure); the app starts bare with crates to loot.
+  **No stash.** Still wanted: looting as an animation. **The inventory's pictures are made when the screen first shows an item** (2026-10-14:
+  "Check how tarkov handles that"), as the game does. **What goes with the thing under the mouse is
+  lit orange**, either way round (2026-10-14, night: "Something like what stalker does"): a
+  departure of the screen's, the user's (`inventory.md`, "The box under the mouse").
 - **STALKER** (2026-10-11): for now, Tarkov's motion and features on STALKER's own arms and weapons;
-  the engine may be patched. **Complete the character controller first.** Keep in mind, do not code:
-  every system a host can switch on or off and feed from its own game (`docs\history.md`, "The systems").
+  the engine may be patched. **Complete the character controller first.**
 - The recorder may be changed however the work needs; running it is the user's. The stance, speed
   and stamina display stays plain by default. A tool the user points to is judged by whether it
   speeds the work.
 - **Published for others to build and change** (2026-10-14), **as TRP, the Tushonka Runtime
-  Project**: they bring their own SPT, which is Single Player Tushonka, and, if any, STALKER; a
-  first start asks in the console where those are (`setup.rs`). Making it public is the user's.
+  Project**: they bring their own SPT (Single Player Tushonka) and, if any, STALKER; a first start
+  asks where those are (`setup.rs`). **Two repositories kept**: work in `stlkreft` only; a release is
+  copied to `TRP` (`docs\manual.md`, "Publishing"; `E:\TRP-public` is cloned again if it is gone).
+- **The version is raised with every change** (2026-10-14): `TRP\Cargo.toml`, Semantic Versioning
+  below 1.0 (`docs\manual.md`, "Versions"); say the new number when a piece of work lands.
 - **Keep this file and the README near 200 lines** (2026-10-13), detail in the documents below.
 
 ## Where things stand (2026-10-14)
@@ -91,90 +101,80 @@ table under "Where the rest is".
   doors, containers, trunks and a kick; the M3 Super 90; the inventory's clicks and keys; the eye on
   the iron sights' line; the keys as the game's input manager hears them (a tapped `R`, 0.312 s).
 - **From the code and the install, compared with nothing** (each spec says so at its end): the
-  options tab, the mouse's rate (0.125 degrees a count), the slow lean, the walk key, the backpack's
-  key, the looks at the weapon; the door's menu and the lock; the Five-seveN, the Model 700 (aimed,
-  its eye is 7.8 mm left of the bore: question 3), the M3's fold; the skill's speeds; the inventory
-  screen's layout; empty hands; a first weapon put on with hands never armed; the character as others
-  see it (`F5`, `third-person.md`); the head's free look (the middle button, `free-look.md`).
-- **The StG 44, which is not the game's** (`custom-weapons.md`, `custom\stg44.json`): on the FN
-  SCAR-L's rig and animator with two edits to its pose; set beside its donor frame for frame; its
-  round, recoil and cells `PROVISIONAL` or `ESTIMATE`.
-- **Every weapon counted** (`probe weapons`): 128 of the install's 148 run on the four logics built
-  first; **one of each of the other five kinds** (`more-weapons.md`: the SV-98, the SKS, the Rhino
-  50DS, the MP-43e-1C, the M32A1), drawn, fired and reloaded in captures, neither recorded nor played
-  by hand; **the donors' catalogue** (`donor --catalogue`, `--rank`); rigs made ready off the frame.
-- **Outfits of STALKER as the character's body** (`outfits.md`, `xray.rs`, `outfit.rs`): the Sunrise
-  and the SEVA from GAMMA's loose files (`local\gamma_dir.txt`) and **Anomaly's packed archives**
-  (`xray_archive.rs`, all 68 read; the Sunrise's rucksack), on Tarkov's skeleton from outside and
-  in the shadow; in first person cut at Tarkov's waist, that game's arms on Tarkov's finger joints and
-  wrist at the joints' size (1.27): palms 1.09 and 1.18 times Tarkov's glove's. The Telnik, Tarkov's
-  own, to set them beside; `CUSTOM FIRST PERSON HANDS` off keeps Tarkov's arms; what an outfit lacks
-  is Tarkov's default. Seen in captures only.
-- **2026-10-14**: the hands' animations drawn smooth or not (`firing.md`; the simulation the same, a
-  lockstep test); a rig taken from the frame after it is built, its pictures re-packed as BC5 (the
-  invisible first draw, the freeze: `findings.md`); **the inventory's pictures as the game makes
-  them** (`icons.md`): each item's model in its prefab's pose under a copy of the game's icon camera,
-  drawn once, kept in `local\icon_cache\v1`; a STALKER suit from that game's model lying on the
-  ground, looked down on (the turn is this work's). Seen in captures, not compared with the game's.
+  options tab, the mouse's rate, the slow lean, the walk key, the backpack's key, the looks at the
+  weapon; the door's menu and the lock; the Five-seveN, the Model 700, the M3's fold; the skill's
+  speeds; the inventory's layout; empty hands; the character as others see it (`F5`); the free look;
+  the StG 44 on the SCAR-L's rig (`custom-weapons.md`); the five kinds of 2026-10-13
+  (`more-weapons.md`) and the donors' catalogue; STALKER's suits as the body (`outfits.md`); the
+  smooth hands; the inventory's pictures the game's way (`icons.md`).
+- **2026-10-14, late to night** (`status.md` has each, newest first): the quick reload; eleven
+  more switches; all 149 weapons, on tables by class; rigs and pictures made when first wanted, a
+  weapon's ahead by the mouse, rigs let go of, pictures alike shared; no freeze on a first take or
+  a move; the gear page's character model; DirectX 12's 2,048 sampler places kept to
+  (`weapon::SamplerPlaces`); pictures in sight only, as the game's grid; DXC where found (the
+  warm-up 3 to 4 times sooner); a window to vault; pictures read back only once on the card (the
+  old guess cut 26 of 38 short). Seen in captures, not tried by hand.
 - **The pointer and the window** (`cursor.rs`): after anything that touches the window or the keys'
-  way in, run `local\window_keys_test.ps1`. **Not run:** fullscreen, the pointer after Alt+Tab.
-- 282 tests pass; regression `after48`. Recorder 0.6.2 has run; 0.7.0 is built (`\` switches the
-  player to third person; the mouse's axes are on record). **Not started:** health, healing, hunger,
-  skills as a system, sound, the STALKER host.
+  way in, run `local\window_keys_test.ps1`; `local\alttab2_test_s3f.ps1` tries Alt+Tab four ways.
+- Version 0.9.1 (0.1.0 published); 305 tests pass; regression `after53` (`after48`'s in every
+  figure). Recorder 0.6.2 has run; 0.7.0 is built (`\` switches the player to third person; the
+  mouse's axes are on record). **Not started:** health, healing, hunger, skills as a system, sound,
+  the STALKER host.
 
 ## Next steps
 
-1. **Ask the user** the questions below: 1 and 2 first; 8 to 13 once what they ask of has been
-   tried by hand (all of it in the crate or on the options tab).
-2. **If the user has recorded** (traces newer than 2026-10-12 21:34 in `E:\spt\BepInEx\plugins\
+1. **The RPK-16's magazine** (`5beed0f50db834001c062b12`): assembled with nothing in `mod_magazine`
+   (in hand, its logic's "magazine of 0", its picture); the kit's vest got three of its magazines,
+   so the database names one. Read its stock preset (`Database::default_preset`, `armed` and
+   `fed_from_magazines` in `main.rs`, `trp_data::weapon::assemble`) and check the other weapons.
+2. **The health system** (the user, 2026-10-14, night: "we are ready to start the health system"):
+   research the game first (`Player`'s health controller, body parts, effects, healing, hunger and
+   thirst, fall damage, the inventory's Health tab), spec it in `docs\spec\health.md`, then build it
+   in `trp-sim` with a feature switch. Ask the user the questions below as they come up.
+3. **If the user has recorded** (traces newer than 2026-10-12 21:34 in `E:\spt\BepInEx\plugins\
    traces`; `docs\manual.md`, "By hand"): to `local\traces\recording17` or `byhand5`, checked whole.
-   Third person (item 11) needs the replay to take a trace's point of view from its header; the free
-   look (item 12) needs `byhand` to read the mouse's axes.
-3. **Scripts for the weapons that have none** (`scenarios-57`, `-m700`, a fold for the M3: the
-   recorder needs a fold press; then the five kinds), each with an aimed scenario, and one run with
-   a weapon skill level. For the keys, by hand: item 10, a tapped sprint key, `C` with the wheel.
-4. **The rest of the weapon kinds** (`more-weapons.md`, "Not built"): one barrel reloaded alone and
-   the rocket launcher's firing, which would make every weapon of the install selectable; the rounds
-   and cases drawn; a revolver's fistful and quick reload; a kind for a revolver in `donor --rank`.
-   Then the catalogue put to use: a second weapon of one's own, or a model from STALKER.
-   **For the suit** (`outfits.md`, "Not built"): its visor's glass seen through, that game's normal
-   and gloss pictures; Anomaly's archives are read now, so any of that game's content can be had.
-5. **The bindings that wait for a system** (`settings.md`, "Not built"): the pistol's fast draw, a
-   magazine as a thing, blind fire, the left shoulder. Then what the user settles of the features.
-6. **The rest of each weapon** (the specs' "Not built"): the body's animator's two speeds, the M3
-   in the inventory screen, the key in the hand. Then empty hands' rest, looting, the systems to come.
-7. **Loose ends** (`findings.md`): a door's aiming point and when it snaps; the weapon line's
-   length at a reload's end in the app; elite Strength; the rounds in a weapon as things of the
-   inventory; a pack dragged off its slot; a figure typed into a bar; the mouse's rate measured;
-   **the selector's layer, which follows no switch of fire mode in the simulation, the AKM's either**.
+   Third person needs the replay to take a trace's point of view from its header; the free look needs
+   `byhand` to read the mouse's axes. A quick reload and the RShG-2 are worth recording.
+4. **Memory** (`findings.md`, "what a rig costs"): rigs are let go of after 30 s uncarried and share
+   pictures alike, not meshes; `--measure-rigs` weighs them, `TRP_RENDER_TIMING` finds a slow frame.
+5. **Scripts for the weapons that have none** (`scenarios-57`, `-m700`, a fold for the M3; the five
+   kinds; the quick reload), each with an aimed scenario, and one run with a weapon skill level.
+6. **The rest of the weapon kinds** (`more-weapons.md`, "Not built"): a cylinder's quick reload, a
+   revolver's fistful, `LOAD ONE` with no magazine in reach, rounds, cases, grenades and rockets
+   drawn. **For the suit** (`outfits.md`, "Not built"): its visor's glass, that game's normal and
+   gloss pictures.
+7. **The bindings that wait for a system** (`settings.md`, "Not built"): the pistol's fast draw, a
+   magazine chosen, blind fire, the left shoulder. **The rest of each weapon** (the specs' "Not
+   built"). Then empty hands' rest, looting item by item, the systems to come.
+8. **Loose ends** (`findings.md`): a door's aiming point and when it snaps; elite Strength; the
+   rounds in a weapon as things of the inventory as they are fired; a figure typed into a bar; the
+   mouse's rate measured; **the selector's layer, which follows no switch of fire mode**.
 
 ## Open questions for the user
 
-1. **The reload's wait is your game's** (0.312 s: the fast reload's double click on `R`): keep it,
-   or move that double click off `R`? By hand: do the mouse and the free look turn as far as in your
-   game for the same hand travel, do keys with Alt held work, does the pointer lock after Alt+Tab?
-2. **The features' list** (the tab's third part): which are to be switches, and does a switch
-   turn a system off, or hand it to the host's own game (weight, hunger, radiation)?
-3. **The Model 700 aimed** looks over the receiver from 7.8 mm left, the install's own bone: is
-   that what your game shows (a screenshot would settle it)? A scope is optics: wanted next?
-4. **Skill levels** are an option (`--weapon-skill`): read them from your SPT profile, or the tab?
-5. A first weapon taken by hands empty all raid waits for its key (the code's way): so in your game?
-6. The crate's weapons full, none chambered, ten by thirty cells, the other containers empty: right?
-7. **Recordings from here on** are a check only (`docs\manual.md`, the short list): still agreed?
-8. **The StG 44**: it kicks and handles as the stock AKM and fires the install's 7.62x39: right, or
-   other figures? The left hand on the handguard (as built) or on the magazine well? Its sling? And
-   may a trigger reach every layer of an animator (the selector's, step 7)? That touches the simulation.
-9. **The character as others see it** (`F5`): does it look as other players do in your game? Is a
-   second character on the range wanted next, or is that co-op's and to wait?
-10. **The five new weapons:** the revolver and the launcher are found full, the double barrel empty:
-   right? Next: rounds and cases drawn, the one-barrel weapons, or the grenade in flight? Record them?
-11. **The outfits' hands** (1.27, the wrist on Tarkov's): right, or set aside by the switch? The SEVA's
-   glove too broad (`arms_size`)? Their figures the PACA's, or the other game's? The rucksack right?
-12. **The smooth animations**: right in play, on and off? The legs below the eyes by it too? A
-   recording of `L` ("By hand", item 14) says whether the game's own look stutters.
-13. **The inventory's pictures** (the game's way): do they look as your game's (a screenshot beside
-   the app's would say)? The suits looked down on, head up: as you meant? Kept behind the curtain
-   (a first run waits ~8 s once; drawn in play, 20 to 90 ms stalls), or drawn in play after all?
+1. **The RShG-2** fires from the sights only. By the game's code a press from the hip starts its
+   firing and then waits for good (built so; the hands stay locked): so in your game?
+2. **The pointer after Alt+Tab** was taken again every way tried here: how did you come back?
+3. **The tables of weapons**: your five and SMGS, MACHINE GUNS, LAUNCHERS for the rest; three spare
+   magazines or two stacks each; the box under the table reached crouched; lids to 80 and 55: right?
+4. **The Model 700 aimed** looks over the receiver from 7.8 mm left, the install's own bone: is
+   that what your game shows? A scope is optics: wanted next?
+5. **Skill levels** are an option (`--weapon-skill`): read them from your SPT profile, or the tab?
+6. **Recordings from here on** are a check only (`docs\manual.md`, the short list): still agreed?
+7. **The quick reload** by hand: does the old magazine fall where your game drops it (0.35 m ahead)?
+8. **The switches** by hand: does off do what you meant for each (movement off: frozen in place;
+   the first-person body off: no arms either)?
+9. **The StG 44**: the AKM's recoil and 7.62x39, the left hand on the handguard, its sling: right?
+10. **The character as others see it** (`F5`): as other players look in your game? A second one next?
+11. **The outfits' hands** (1.27, the wrist on Tarkov's), the SEVA's glove, the rucksack: right?
+12. **The smooth animations**: right in play, on and off? The legs below the eyes by it too?
+13. **The inventory's pictures**: as your game's? **The orange** of what goes together: strong
+   enough? Its switch leaves Tarkov's white on the box pointed at: so meant? **The StG 44's
+   surface picture** in BC1 keeps its metal a little less exactly (up to 9% of pixels 8 off): BC7?
+14. **The character model**: its framing and light (the app's), still and empty-handed by your word;
+   should it hold the weapon in hand and turn by a drag, as the game's does? 30 s before a rig goes?
+15. **DXC is taken from your Windows SDK** (or beside `trp.exe`): for others who build TRP, ship the
+   two DLLs with a release, or the build feature that links it in (it downloads while building)?
 
 ## Working here
 
@@ -189,7 +189,7 @@ cargo run -p trp-sim --bin replay -- --traces local\traces\recording13 06
 cargo run -p trp-sim --bin byhand -- local\traces\byhand3          (a recording made by hand)
 cargo run -p trp-data --bin probe -- states 61a4c8884f95bc3b2c5dc96f reload   (also: weapons, item)
 cargo run -p trp-sim --bin donor -- --rank custom\stg44.json       (--catalogue makes its file)
-bash local/regress.sh <name>  then  bash local/metricdiff.sh <name> after48  (9 min; or statecheck.sh)
+bash local/regress.sh <name>  then  bash local/metricdiff.sh <name> after51  (9 min; or statecheck.sh)
 ```
 
 - **After any change to the simulation, run the regression** and compare with the last kept run.

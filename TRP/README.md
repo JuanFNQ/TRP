@@ -35,11 +35,11 @@ The first-person controller is built and, wherever a recording can show it, comp
 | The head's free look (middle mouse) | `free-look.md` | nothing |
 | Empty hands | `inventory.md` | appearing: by hand; the rest: nothing |
 
-282 tests pass. The regression over the sixteen kept recordings is run after every change to the simulation; the last (`after48`, 2026-10-14, after the crates were renamed) is the same in every figure as the one before it.
+305 tests pass, one of which runs every weapon of the crates through its logic. The regression over the sixteen kept recordings is run after every change to the simulation; the last (`after51`, 2026-10-14, after the quick reload, the switches and the last kinds of weapon) is the same in every figure as the one before them (`after48`).
 
 **Not built** (the full list: `docs/status.md`, "Missing"): health, healing, hunger and thirst as systems, skills as a system; sound, muzzle effects, shell ejection, the rounds and magazines as things drawn; malfunctions, ballistics and dispersion, optics, mounting, blind fire, the left shoulder; grenades and the knife; a weapon with one barrel reloaded alone, the rocket launcher; slopes, sliding and falls' harm; searching item by item, using food or medicine; a second character; Tarkov's own shading (materials are an approximation); the STALKER host.
 
-**Placeholders.** Every guess in the code is marked `ESTIMATE` and every unconfirmed rule `PROVISIONAL`; all of them are listed in `docs/status.md`, "Placeholders". The ones that show most: the mouse's 0.125 degrees a count (two figures of the install and the engine's halving, never measured); the StG 44's round, recoil and size; the test range, which is the app's own; the crate, which is larger than the install's and holds every weapon; a weapon found in it has a full magazine and nothing chambered.
+**Placeholders.** Every guess in the code is marked `ESTIMATE` and every unconfirmed rule `PROVISIONAL`; all of them are listed in `docs/status.md`, "Placeholders". The ones that show most: the mouse's 0.125 degrees a count (two figures of the install and the engine's halving, never measured); the StG 44's round, recoil and size; the test range, which is the app's own; the crates, which are larger than the install's, and the crates of weapons, which are the app's; a weapon found in one has a full magazine and nothing chambered; where a magazine let fall lies.
 
 ## Requirements
 
@@ -56,9 +56,9 @@ cd TRP\TRP
 cargo run -p trp-app
 ```
 
-**On the first start the console asks where your games are**: your Single Player Tushonka (SPT) folder (the one with `SPT_Runtime` and the game's `EscapeFromTarkov.exe`), and, if you have them, GAMMA's Mod Organizer folder and Anomaly's own folder (offered from Mod Organizer's settings; Enter skips either). Each answer is checked, and kept as a one-line file in `local/` (`eft_dir.txt`, `gamma_dir.txt`, `anomaly_dir.txt`). `cargo run -p trp-app -- --setup` asks again; the files can also be written by hand, or `EFT_DIR`, `GAMMA_DIR` and `ANOMALY_DIR` set instead.
+**On the first start the console asks where your games are**: your Single Player Tushonka (SPT) folder (the one with `SPT_Runtime` and the game's `EscapeFromTarkov.exe`), and, if you have them, GAMMA's Mod Organizer folder and Anomaly's own folder (offered from Mod Organizer's settings; Enter skips either). Each answer is checked, and kept as a one-line file in `local/` (`eft_dir.txt`, `gamma_dir.txt`, `anomaly_dir.txt`). `cargo run -p trp-app -- --setup` asks again; the files can also be written by hand, or `EFT_DIR`, `GAMMA_DIR` and `ANOMALY_DIR` set instead. The first line printed is the version (`--version` prints it alone): Semantic Versioning below 1.0, raised with every change (`docs/manual.md`, "Versions").
 
-The first build compiles Bevy and takes a few minutes. A run begins with a curtain of three or four seconds while the renderer builds what it draws with and the crate's weapons are made ready on another thread, so that nothing stops the game later. The very first run takes some eight: it draws every item's picture for the inventory, as the game does, and keeps them in `local/icon_cache` (delete that folder to have them drawn again). The character starts bare on a test range; **the crate straight ahead holds every weapon** (look at it and press `F`; Alt and a click puts a thing on; `Tab` shuts the screen; `2`, `3` or `1` takes the weapon in hand).
+The first build compiles Bevy and takes a few minutes. A run begins with a curtain of a second or two while the renderer builds what it draws with. An item's picture for the inventory is drawn the first time the screen shows the item, as the game does, and kept in `local/icon_cache` (delete that folder to have them drawn again); a weapon is made ready the first time it is hung on a slot. The character starts bare on a test range; **the crate straight ahead holds a rifle, a vest and a backpack, and the eight crates to its right along the low wall hold every weapon of the install**, labelled by class (look at one and press `F`; Alt and a click puts a thing on; `Tab` shuts the screen; `2`, `3` or `1` takes the weapon in hand).
 
 **The keys are the install's own bindings** (`Control.ini`), each pressed the way the install has it; the guide at the top left of the display reads them off as they stand (`F1` hides it), and the inventory screen's last tab, `OPTIONS`, changes them. In the install this was written with:
 
@@ -76,7 +76,8 @@ The first build compiles Bevy and takes a few minutes. A run begins with a curta
 | `Z` twice | Drop the backpack |
 | Left mouse, right mouse | Fire; aim (a press on, a press off) |
 | `Left Alt` | Hold breath, aiming |
-| `R` | Reload (0.3 s after the key: the install has a double click on it) |
+| `R` | Reload from the fullest magazine in the pockets or the vest (0.3 s after the key: the install has a double click on it) |
+| `R` twice | Quick reload: the old magazine is let fall |
 | `Left Alt` + `T`, `Left Shift` + `T` | Check the magazine; look into the chamber |
 | `B`, `B` twice, `Left Alt` + `B` | Next fire mode; the fullest; look at the selector |
 | `L`, `Left Alt` + `L` | Look the weapon over; fold the stock |
@@ -91,7 +92,7 @@ The first build compiles Bevy and takes a few minutes. A run begins with a curta
 
 ```
 cargo run -p trp-app -- --weapon rhino_50ds          begin with a weapon in hand, by its id or a part of its name
-cargo run -p trp-app -- --add-weapon m4a1            lay another weapon of the database in the crate
+cargo run -p trp-app -- --add-weapon m4a1            lay another copy of a weapon in the airdrop crate
 cargo run -p trp-app -- --equip                      begin with the crate's rifle, vest and backpack on
 cargo run -p trp-app -- --view watch                 watched from outside (also fp, side, body, map)
 cargo run -p trp-app -- --weapon-skill 50 --mastering 2 --weight 30 --fov 75
@@ -102,7 +103,7 @@ The last is a capture: keys pressed on given frames through the bindings (`--tap
 
 ## The weapons
 
-Nine of the install's and one of one's own lie in the crate. Which logic a weapon runs on goes by its template (`docs/spec/more-weapons.md`): 128 of the install's 148 weapons with a stock preset are of the first four kinds, and `--add-weapon` or `--weapon` takes any of them.
+Every weapon of the install with a stock preset (148) and the one of one's own lie in the gun cases on the tables of weapons, eight of them by class, with what loads them in a box under each (`docs/spec/inventory.md`). Which logic a weapon runs on goes by its template (`docs/spec/more-weapons.md`); every kind the install has runs, and `--weapon` begins with any of them in hand.
 
 | Weapon | Item | Kind | Compared with |
 |---|---|---|---|
@@ -117,7 +118,7 @@ Nine of the install's and one of one's own lie in the crate. Which logic a weapo
 | Milkor M32A1 | `6275303a9f372d6ea97f9ec7` | a launcher with a drum a spring turns (its grenade does not fly) | nothing |
 | Sturmgewehr 44 | `66f0a5740000000000000044` | not the game's: a model of one's own on the FN SCAR-L's animations (`custom/stg44.json`) | its donor |
 
-A weapon found in the crate has a full magazine, tube or cylinder and no round chambered, and works its action when first drawn; the double barrel is found empty. Each has two stacks of its rounds beside it: a weapon filled with loose rounds takes them from the pockets and the vest worn (`R`).
+A weapon found in a crate has a full magazine, tube or cylinder and no round chambered, and works its action when first drawn; a weapon with barrels is found empty, the rocket launcher with its rocket. Beside each lie three spare magazines, or two stacks of its rounds: the reloads take them from the pockets and the vest worn (`R`).
 
 **Three outfits** lie in the crate too (`docs/spec/outfits.md`); Alt and a click puts one on the body armour's slot. **The Sunrise suit and the SEVA suit** are S.T.A.L.K.E.R.'s, read from your GAMMA folder: each is then the character's body **with its own build** (broader than Tarkov's, as tall), on a rig of its own that follows Tarkov's animation, the hands on the weapon and the feet on the ground as Tarkov's are. It is drawn from outside (`F5`) and as the shadow; in first person it is cut at the waist as Tarkov's own body is, and **the arms are that game's own first-person arms for the suit**, every finger's joints and the wrist on Tarkov's own and the hand's skeleton the size of Tarkov's (1.27 times the model's file; a line `"arms_size"` in the outfit's file says another), through every animation of Tarkov's weapons. **`CUSTOM FIRST PERSON HANDS`, at the top of the options tab's `FEATURES` part, switches that off**: the hands are then Tarkov's default arms whatever is worn. **The Telnik** is Tarkov's own: a top with bare hands, to set the other two beside. **What an outfit has not got is Tarkov's default** body or arms. Not drawn: the Sunrise's rucksack (its picture is only in Anomaly's packed archives, which are not read yet). `--wear 66f0a5740000000000000101` starts in the Sunrise (`...102` the Telnik, `...103` the SEVA).
 
@@ -145,7 +146,7 @@ cargo test --workspace
 cargo test -p trp-sim -- --nocapture
 ```
 
-The unit tests need nothing. The tests in each crate's `tests/` folder run against the configured install and pass with a note when there is none; with `--nocapture` they print what they measured. 282 pass.
+The unit tests need nothing. The tests in each crate's `tests/` folder run against the configured install and pass with a note when there is none; with `--nocapture` they print what they measured. 305 pass.
 
 ## Layout
 
@@ -188,3 +189,5 @@ This is a re-implementation, as OpenMW is of Morrowind's engine or OpenRCT2 of R
 - **File formats.** Unity's from the files themselves (bundles describe their own layouts) and the public documentation of open tools (AssetRipper, AssetStudio, UnityPy). S.T.A.L.K.E.R.'s models and packed archives from that engine's published source (OpenXRay), the archives' compression written afresh from the published LZHUF and LZO algorithms. Binary FBX as Blender's developers have written it up.
 
 **Not affiliated** with or endorsed by Battlestate Games, GSC Game World, or the teams of Single Player Tushonka (SPT), Anomaly or GAMMA. Escape from Tarkov and S.T.A.L.K.E.R. are trademarks of their owners, named here only to say which games this works with.
+
+**License**: Apache-2.0 (`LICENSE`, at the repository's top), for this project's own code only; it grants nothing in the games it reads.

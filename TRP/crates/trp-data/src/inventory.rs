@@ -309,6 +309,12 @@ impl ItemTemplate {
         self.holders("Grids")
     }
 
+    /// What a magazine's rounds go into (`Cartridges`), with what it takes
+    /// and refuses: none for anything else.
+    pub fn cartridges(&self) -> Vec<Holder> {
+        self.holders("Cartridges")
+    }
+
     /// Width and height in cells.
     pub fn cells(&self) -> [u32; 2] {
         let cell = |name: &str| self.props.get(name).and_then(Json::as_u64).unwrap_or(1) as u32;

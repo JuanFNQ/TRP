@@ -320,6 +320,20 @@ const HEAD_BONES: [&str; 2] = ["/Base HumanNeck", "/Base HumanNeck/Base HumanHea
 /// a tenth of a degree, as the length of the turn's three angles.
 const HEAD_TURN_LEAST: f32 = 0.01;
 
+/// The layer of the body's animator the game's own screens stand the
+/// character by, and the parameters it is set by: the kind of thing in the
+/// hands, as a whole number and twice as a figure, -1 for none
+/// (`PlayerModelLoader.CreateWeapon`: the layer at index 11 given a weight
+/// of 1). Its one state, `GUI.GUI_IDLE`, blends by the last of them, and
+/// at -1 plays `inv_idle_hands_down`.
+const STANDING_LAYER: &str = "GUI";
+const STANDING_KIND: [&str; 3] = ["WeaponType", "WeaponTypeFloat", "UI_WeaponType"];
+const NOTHING_IN_HANDS: f32 = -1.0;
+
+/// A pose of the bones a host named, each one's place and turning in its
+/// parent, in the order named.
+pub type Pose = Vec<([f32; 3], [f32; 4])>;
+
 /// The state of the interactions' layer for a backpack's drop, and the
 /// mark in it the game's logic waits for.
 const BACKPACK_DROP: &str = "InteractionsLayer.10 Backpack Drop";
@@ -335,7 +349,21 @@ impl BodyData {
     /// names the bones its meshes hang on, and `Body::drawn_bone` gives
     /// each as the animation has it.
     pub fn load_with(assets: &mut Assets, drawn: &[String]) -> Result<Self> {
+        Ok(Self::load_standing(assets, drawn, &[])?.0)
+    }
+
+    /// As `load_with`, and with it the character as the game's own screens
+    /// stand it with nothing in its hands (`standing`): the pose of every
+    /// bone of `figure`, each named by its path below the animated object,
+    /// or why it could not be had. Nothing more is read when `figure` is
+    /// empty, and the body's own animator is the same either way.
+    pub fn load_standing(assets: &mut Assets, drawn: &[String], figure: &[String]) -> Result<(Self, Option<Result<Pose>>)> {
         let table = trp_data::body::controller(assets)?;
+        let standing = (!figure.is_empty()).then(|| standing(assets, &table, figure));
+        Ok((Self::load_from(assets, &table, drawn)?, standing))
+    }
+
+    fn load_from(assets: &mut Assets, table: &trp_data::states::StateTable, drawn: &[String]) -> Result<Self> {
         let mut paths: Vec<String> = BONES.iter().map(|path| (*path).to_owned()).collect();
         paths.extend(finger_paths(BONES[ARMS[1][5]], 'L'));
         paths.extend(BEND_GOAL_NAMES.iter().map(|name| format!("{}/{name}", BONES[4])));
@@ -449,6 +477,35 @@ impl BodyData {
         let clip = &self.controller.clips.get(clip)?.clip;
         Some((clip.duration() / state.speed.abs().max(1e-6), clip.name.clone()))
     }
+}
+
+/// The character as the game's own screens stand it with nothing in its
+/// hands (`PlayerModelLoader.CreateWeapon`, which its screens call with no
+/// time to play): the body's controller on the bones named, its standing
+/// layer at a weight of 1 and nothing in the hands, updated once by
+/// nothing. A controller of its own, for these bones and of the states
+/// such an update plays: each layer's first and the standing layer's.
+fn standing(assets: &mut Assets, table: &trp_data::states::StateTable, paths: &[String]) -> Result<Pose> {
+    let named: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let bones = trp_data::body::bones(assets, &named)?
+        .into_iter()
+        .map(|b| BoneRest { path: b.path, position: b.position, rotation: b.rotation })
+        .collect();
+    let firsts: Vec<&str> = table.layers.iter().filter_map(|layer| layer.default_state.as_deref()).collect();
+    let prefix = format!("{STANDING_LAYER}.");
+    let played = |state: &AnimState| state.full_name.starts_with(&prefix) || firsts.contains(&state.full_name.as_str());
+    let mut controller = Controller::load(assets, table, bones, &played)?;
+    // The root as the body's own: the clips' travel over the ground taken
+    // off it.
+    controller.root_bone = paths.iter().position(|path| path == BONES[0]);
+    let layer = controller.layer(STANDING_LAYER).ok_or_else(|| anyhow::anyhow!("the body's controller has no layer {STANDING_LAYER}"))?;
+    let mut animator = Animator::new(Arc::new(controller));
+    animator.set_layer_weight(layer, 1.0);
+    for name in STANDING_KIND {
+        animator.set_float(name, NOTHING_IN_HANDS);
+    }
+    animator.update(0.0);
+    Ok(animator.pose().to_vec())
 }
 
 /// What the movement tells the body's animator each step.

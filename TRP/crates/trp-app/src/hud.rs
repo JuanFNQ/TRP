@@ -235,6 +235,7 @@ fn guide(
     mut panel: Query<(Entity, &mut Node), With<GuidePanel>>,
     mut drawn: Local<Option<(u32, View)>>,
 ) {
+    let _clock = crate::render_timing::Clock::new("hud guide");
     let Ok((panel, mut node)) = panel.single_mut() else { return };
     if keys.just_pressed(KeyCode::F1) {
         shown.0 = !shown.0;
@@ -385,6 +386,7 @@ fn show(
     mut notches: Query<(&Notch, &mut BackgroundColor), Without<Fill>>,
     mut word: Query<&mut Text, With<StanceWord>>,
 ) {
+    let _clock = crate::render_timing::Clock::new("hud show");
     let m = &controller.movement;
     let stamina = &m.stamina;
     for (fill, mut node, mut colour) in &mut fills {
@@ -443,6 +445,7 @@ fn frame_rate(
     mut times: ResMut<FrameTimes>,
     mut readout: Query<(&mut Text, &mut Visibility), With<FrameRateText>>,
 ) {
+    let _clock = crate::render_timing::Clock::new("hud frame_rate");
     let Ok((mut text, mut shown)) = readout.single_mut() else { return };
     if keys.just_pressed(KeyCode::F3) {
         *shown = if *shown == Visibility::Hidden { Visibility::Inherited } else { Visibility::Hidden };

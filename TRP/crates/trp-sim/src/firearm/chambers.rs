@@ -340,6 +340,9 @@ impl Firearm {
     /// every barrel that holds no round is to have one, as far as the
     /// rounds in reach go.
     pub(super) fn begin_barrels_reload(&mut self, within_reach: u32) {
+        if self.in_chambers.len() == 1 {
+            return self.begin_single_barrel_reload(within_reach);
+        }
         self.reload_free = (0..self.in_chambers.len()).filter(|index| self.in_chambers[*index] != Chamber::Round).take(within_reach as usize).collect();
         if self.reload_free.is_empty() {
             return;
@@ -357,9 +360,89 @@ impl Firearm {
         self.operation = Operation::ChambersReload { can_abort: false, aborted: false, added: false, hide: None };
     }
 
+    /// A single barrel's reload (`ReloadSingleBarrelOperation.Start`;
+    /// more-weapons spec, "One barrel loaded alone, and the rocket
+    /// launcher"): taken whatever the barrel holds, as far as a round is in
+    /// reach. The game's inventory makes the exchange now: a live round in
+    /// the barrel is taken out and one of those in reach goes in.
+    fn begin_single_barrel_reload(&mut self, within_reach: u32) {
+        if within_reach == 0 {
+            return;
+        }
+        self.reload_unloads = self.in_chambers[0] == Chamber::Round;
+        self.reload_free = vec![0];
+        self.animator.set_flag("Inventory", false);
+        self.animator.set("ShellsInWeapon", self.count(Chamber::Shell) as f32);
+        self.animator.set("AmmoInChamber", if self.reload_unloads { 1.0 } else { 0.0 });
+        self.animator.set_flag("CanReload", true);
+        self.animator.trigger("Reload");
+        self.events.push(Event::RoundsTaken(1));
+        self.hands_busy = true;
+        self.operation = Operation::ChambersReload { can_abort: false, aborted: false, added: false, hide: None };
+    }
+
+    /// A rocket launcher's trigger at rest (`Idling.SetTriggerPressed`,
+    /// `RocketLauncherFire.Start`): refused just after the sights have come
+    /// down, until the resting state begins again; otherwise, with its
+    /// rocket in, the firing begins: the animator's `Fire` follows the
+    /// trigger and the sights are put down. The animator fires from the
+    /// sights only (its resting state's way to firing waits for
+    /// `IsAimingFloat`), and until it does the firing waits.
+    pub(super) fn rocket_trigger(&mut self, pressed: bool) {
+        if pressed && !self.aiming && self.aim_flags {
+            return;
+        }
+        self.trigger = pressed;
+        self.animator.set_flag("Fire", pressed);
+        if pressed && self.in_chambers.first() == Some(&Chamber::Round) {
+            self.aiming = false;
+            self.operation = Operation::BarrelsFire { fired: false, shots: 1 };
+        }
+    }
+
     /// A mark of the animator's while barrels fire or are reloaded.
     pub(super) fn barrels_mark(&mut self, name: &str) -> bool {
+        let (single, rocket) = (self.in_chambers.len() == 1, self.settings.rocket_launcher);
         match (name, self.operation.clone()) {
+            // A rocket launcher's shot (`RocketLauncherFire`): the rocket
+            // leaves at the fire mark; at the shot's end the trigger is
+            // let go and the weapon idles.
+            ("FiringBullet", Operation::BarrelsFire { fired: false, shots }) if rocket => {
+                self.operation = Operation::BarrelsFire { fired: true, shots };
+                self.in_chambers[0] = Chamber::Empty;
+                self.count_chambers();
+                self.events.push(Event::Shot { strength: self.settings.shot_strength });
+            }
+            ("FireEnd", Operation::BarrelsFire { fired: true, .. }) if rocket => {
+                self.trigger = false;
+                self.animator.set_flag("Fire", false);
+                self.animator.set("AmmoInChamber", 0.0);
+                self.to_idle();
+            }
+            // A single barrel's reload: the live round counts as the barrel
+            // stands, comes out at the case's mark (to the vest or the
+            // ground, as the host finds room), and the new round in ends it.
+            ("DelAmmoChamber", Operation::ChambersReload { .. }) if single => self.animator.set("AmmoInChamber", 1.0),
+            ("ShellEject", Operation::ChambersReload { .. }) if single => {
+                self.animator.set_flag("CanReload", true);
+                if std::mem::take(&mut self.reload_unloads) {
+                    self.in_chambers[0] = Chamber::Empty;
+                    self.count_chambers();
+                    self.events.push(Event::RoundUnloaded);
+                }
+                self.animator.set("AmmoInChamber", 0.0);
+            }
+            ("AddAmmoInChamber", Operation::ChambersReload { added: false, hide, .. }) if single => {
+                self.reload_free.clear();
+                self.in_chambers[0] = Chamber::Round;
+                self.count_chambers();
+                self.animator.set("AmmoInChamber", 1.0);
+                self.animator.set_flag("CanReload", false);
+                self.to_idle();
+                if let Some(fast) = hide {
+                    self.hide(fast);
+                }
+            }
             ("FiringBullet", Operation::BarrelsFire { fired: false, shots }) => {
                 self.operation = Operation::BarrelsFire { fired: true, shots };
                 for _ in 0..shots {

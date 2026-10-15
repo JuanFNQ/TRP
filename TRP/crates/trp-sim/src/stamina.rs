@@ -400,6 +400,11 @@ pub struct Stamina {
     /// keeps").
     aim_cost: Option<f32>,
     aim_taken: (bool, f32),
+    /// The two systems of the features' list this is (`crate::Systems`):
+    /// with `drains` off nothing is paid and the pools stay full; with
+    /// `holds_back` off (exhaustion) a spent pool holds nothing back.
+    pub drains: bool,
+    pub holds_back: bool,
 }
 
 impl Stamina {
@@ -417,6 +422,8 @@ impl Stamina {
             spam_until: f32::NEG_INFINITY,
             aim_cost: None,
             aim_taken: (false, 0.0),
+            drains: true,
+            holds_back: true,
         };
         // A fully overweight character pays for standing about.
         if stamina.settings.overweight >= 1.0 {
@@ -454,7 +461,12 @@ impl Stamina {
 
     /// The legs or the oxygen under the threshold (`Physical.Exhausted`).
     pub fn exhausted(&self) -> bool {
-        self.legs.exhausted() || self.oxygen.exhausted()
+        self.holds_back && (self.legs.exhausted() || self.oxygen.exhausted())
+    }
+
+    /// The legs under the threshold, where that holds the character back.
+    pub fn legs_spent(&self) -> bool {
+        self.holds_back && self.legs.exhausted()
     }
 
     /// Whether a sprint is being paid for: the sprint's own flag.
@@ -464,14 +476,14 @@ impl Stamina {
 
     /// Whether a jump may start: more than the threshold in the legs.
     pub fn can_jump(&self) -> bool {
-        self.legs.current > EXHAUSTED
+        !self.holds_back || self.legs.current > EXHAUSTED
     }
 
     /// Whether a vault or a climb may start (`Physical.CanVault`,
     /// `CanClimb`): more than the threshold in the legs, and in the arms
     /// too where the obstacle is high enough to take a hand.
     pub fn can_vault(&self, hand: bool) -> bool {
-        self.legs.current > EXHAUSTED && (!hand || self.arms.current > EXHAUSTED)
+        !self.holds_back || (self.legs.current > EXHAUSTED && (!hand || self.arms.current > EXHAUSTED))
     }
 
     /// A cost that goes by how overweight the character is: standing by
@@ -569,7 +581,7 @@ impl Stamina {
         if on == self.sprinting() {
             return on;
         }
-        let start = on && self.legs.current > EXHAUSTED && !prone && self.settings.overweight < 1.0;
+        let start = on && (!self.holds_back || self.legs.current > EXHAUSTED) && !prone && self.settings.overweight < 1.0;
         if start {
             self.legs.run(Drain::Sprint);
             self.oxygen.run(Drain::Sprint);
@@ -587,8 +599,12 @@ impl Stamina {
         self.sprinting()
     }
 
-    /// The legs at nothing: whatever needs them stops.
+    /// The legs at nothing: whatever needs them stops (unless spent legs
+    /// hold nothing back).
     fn legs_ran_dry(&mut self) {
+        if !self.holds_back {
+            return;
+        }
         self.legs.stop(Drain::Sprint);
         self.oxygen.stop(Drain::Sprint);
     }
@@ -674,8 +690,8 @@ impl Stamina {
     /// asked to on such legs nothing happens at all, a breath already held
     /// stays held. Gives back whether it is held now.
     pub fn hold_breath(&mut self, on: bool) -> bool {
-        if !(self.legs.exhausted() && on) {
-            if on && self.oxygen.current > EXHAUSTED {
+        if !(self.legs_spent() && on) {
+            if on && (!self.holds_back || self.oxygen.current > EXHAUSTED) {
                 self.oxygen.run(Drain::HoldBreath);
             } else {
                 self.oxygen.stop(Drain::HoldBreath);
@@ -695,6 +711,9 @@ impl Stamina {
     pub fn breath_stamina(&self) -> f32 {
         /// The least the level counts as (`EnergyLowerLimit`).
         const LEAST: f32 = 0.05;
+        if !self.holds_back {
+            return 1.0;
+        }
         let level = if self.settings.legs_shake_hands { self.arms.level().min(self.legs.level()) } else { self.arms.level() };
         level.clamp(LEAST, 1.0)
     }
@@ -703,6 +722,9 @@ impl Stamina {
     /// oxygen's level, or the lower of that and the legs' where the
     /// settings have exhaustion deepen the breath (`OxygenLevel`).
     pub fn breath_oxygen(&self) -> f32 {
+        if !self.holds_back {
+            return 1.0;
+        }
         if self.settings.legs_deepen_breath { self.oxygen.level().min(self.legs.level()) } else { self.oxygen.level() }
     }
 
@@ -730,6 +752,14 @@ impl Stamina {
     /// One frame of `dt` seconds by the player's clock, with the engine's
     /// clock at `now`: the legs, the arms and the oxygen in that order.
     pub fn update(&mut self, dt: f32, now: f32) {
+        // Switched off, nothing is paid for: the pools are full again,
+        // whatever the frame's charges took.
+        if !self.drains {
+            for pool in [&mut self.legs, &mut self.arms, &mut self.oxygen] {
+                pool.current = pool.capacity;
+            }
+            return;
+        }
         self.aim_cost = Some(self.cost(Drain::Aim));
         let costs = [Drain::Sprint, Drain::Walk, Drain::Aim, Drain::OverweightIdle, Drain::Crawl, Drain::HoldBreath]
             .map(|d| (d, self.cost(d)));
@@ -745,7 +775,7 @@ impl Stamina {
         if self.arms.work(&costs, refills[1], dt, now) {
             self.arms_ran_dry();
         }
-        if self.oxygen.work(&costs, refills[2], dt, now) {
+        if self.oxygen.work(&costs, refills[2], dt, now) && self.holds_back {
             // Out of oxygen, the breath is let go.
             self.oxygen.stop(Drain::HoldBreath);
         }
@@ -831,6 +861,32 @@ mod tests {
         run(&mut stamina, &mut now, 3.6);
         assert!(stamina.legs.current > EXHAUSTED && stamina.legs.current < 17.0, "{}", stamina.legs.current);
         assert!(stamina.sprint(true, false, now), "more than the threshold starts one again");
+    }
+
+    /// The features' two switches (`crate::Systems`): with the stamina off
+    /// nothing is paid for; with exhaustion off the pools are paid from as
+    /// ever, and spent ones hold nothing back.
+    #[test]
+    fn the_stamina_and_exhaustion_switched_off() {
+        let mut stamina = Stamina::new(settings());
+        stamina.drains = false;
+        let mut now = 10.0;
+        assert!(stamina.sprint(true, false, now));
+        stamina.jump(now);
+        run(&mut stamina, &mut now, 30.0);
+        assert_eq!([stamina.legs.current, stamina.oxygen.current], [stamina.legs.capacity, stamina.oxygen.capacity]);
+        assert!(stamina.sprinting());
+
+        let mut stamina = Stamina::new(settings());
+        stamina.holds_back = false;
+        let mut now = 10.0;
+        assert!(stamina.sprint(true, false, now));
+        run(&mut stamina, &mut now, 30.0);
+        assert_eq!(stamina.legs.current, 0.0, "the legs pay as ever");
+        assert!(stamina.sprinting(), "and the sprint goes on");
+        assert!(stamina.can_jump() && stamina.can_vault(true) && !stamina.exhausted() && !stamina.legs_spent());
+        assert!(stamina.hold_breath(true), "a breath is held on spent legs");
+        assert_eq!((stamina.breath_stamina(), stamina.breath_oxygen()), (1.0, 1.0));
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub mod rig;
 pub mod script;
 pub mod settings;
 pub mod stamina;
+pub mod systems;
 pub mod things;
 pub mod vaulting;
 pub mod weapon_animator;
@@ -39,6 +40,7 @@ pub use movement::{Acted, Flat, Input, Movement, State, Stopwatch, World, WorldI
 pub use pacing::{Pacer, REFERENCE_FRAME_RATE};
 pub use settings::MovementSettings;
 pub use stamina::{Stamina, StaminaSettings};
+pub use systems::Systems;
 
 use anyhow::{anyhow, Context, Result};
 use trp_data::curve::{Curve, Key};
@@ -613,6 +615,8 @@ pub fn firearm_settings(_assets: &Assets, db: &Database, hard: &HardSettings, we
         stop_aiming_at: hard.float("STOP_AIMING_AT")?,
         cylinder,
         barrels,
+        fast_reload: flag("isFastReload"),
+        rocket_launcher: db.item(&weapon.template).ok().is_some_and(|item| db.is_a(item, "RocketLauncher")),
     })
 }
 

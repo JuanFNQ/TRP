@@ -575,3 +575,150 @@ for n in 3 ... 16 v vl; do cmp local/r${n}_replay_after48.txt local/r${n}_replay
 ```
 
 - The program is `target\debug\trp.exe` now; the old `eftpc.exe` may still lie in `target\debug` from before, and is stale.
+
+## Added 2026-10-14, late (the quick reload, the switches, every weapon, pictures when first wanted)
+
+```
+bash local/regress.sh after49     (the quick reload; after48's to the byte)
+bash local/regress.sh after50     (the switches; after48's to the byte)
+bash local/regress.sh after51     (kept: the sights told to every animator, the single barrel, the rocket launcher;
+                                   after48's in every figure, the M3's report but for the clips' load time)
+powershell -File local\alttab2_test_s3f.ps1   (the app in its own process: Alt+Tab away and back, a click on the window,
+                                   the pointer on the other screen, the inventory open; the hold and the pointer each time)
+trp.exe --equip --tap 150:lmb:3 --tap 400:r:3 --tap 420:r:3 --log-frames ...   (a quick reload: R twice in 20 frames)
+trp.exe --start rifles --tap 60:f:3 --tap 330:alt:60 --drag-at 340 --drag 1400:500:1400:500 --tap 520:tab:3 --tap 800:3:3
+                                  (the crate of rifles opened, the M4A1 put on the back with Alt and a click, drawn)
+trp.exe --feature movement=off --hold w --log-pacing ...    (any switch for a capture, which reads no options file)
+trp.exe --weapon rshg --equip --tap 200:rmb:3 --tap 400:lmb:3  (the RShG-2: the sights up, then the shot)
+```
+
+- **`sed -i` in Git Bash writes a file back with LF line ends**, whatever it had: twice this session on a CRLF source (put right with PowerShell's `ReadAllText`/`WriteAllText`). Edit with the Edit tool or PowerShell.
+- Scratch of this session in `local\`: `*_s3f.*` (the specs' sections as written, the edit scripts, logs, captures in `local\shots\*_s3f.png`).
+
+## Added 2026-10-14, later still (every weapon run whole)
+
+```
+cargo test -p trp-sim --test every_weapon -- --nocapture   (every weapon of the crates: assembled, its skinned parts'
+                                   bones, drawn, fired, reloaded both ways, put away; a line each, with its id; 16 s)
+powershell -File local\every_weapon_app_s3g.ps1   (each of those as the app's weapon: fired at 150, R at 300, aimed at 900,
+                                   captured at 1100; a line each in local\every_weapon_app_s3g.txt, the logs in
+                                   local\every_app_s3g\, the captures in local\shots\every_s3g\; 11 s a weapon, 28 min;
+                                   -Only <name>,<name> for some, added to the file)
+trp.exe --start rifles --tap 60:f:3 --drag-at 340 --drag 1305:160:1305:160 (ten times) --drag 1150:505:1150:505
+        --wheel 356:-120 --tap 498:alt:30 --tap 560:tab:3 --tap 700:3:3   (the crate of rifles scrolled to its end by the
+                                   wheel, the pointer kept on it by drags onto themselves; the AS VAL put on with Alt and
+                                   a click, its rig made ready away from the frame, drawn from the back)
+```
+
+- **The loop's `R` at frame 300 falls inside a slow weapon's shot** (the Rhinos' 30 rounds a minute, the bolt actions), where it is not heard: those are not reloaded in the app's run, and the test reloads them. It is a check that nothing stops, not of the reloads.
+- **A log written with `*>` from Windows PowerShell is UTF-16 and wrapped at the console's width**: a line with a long name goes on below (read it with `iconv -f UTF-16LE` in Git Bash; match the start of a line, not its end). **A script's `param()` must be its first statement**: after any other it is taken for a command, and the parameter is never bound.
+- Scratch of this session in `local\`: `*_s3g.*`.
+
+## Added 2026-10-14, night (what goes with a thing, lit)
+
+```
+trp.exe --start rifles --tap 60:f:3 --drag-at 340 --drag 1410:500:1410:500 --screenshot local\shots\x.png --screenshot-frame 420
+                                  (the pointer left on the M4A1 by a drag onto itself: what goes with it lit;
+                                   1040:550 is a STANAG, 1358:415 a stack of PS; captures local\shots\lit_*_s3h.png)
+trp.exe ... --drag 1040:550:760:650 --screenshot-frame 350   (a STANAG carried, half way: its weapons lit)
+trp.exe ... --feature compatible_items_highlight=off ...      (the same with the switch off: the M4A1 lit white alone)
+trp.exe --inventory --drag 1490:78:1490:78 --drag 405:116:405:116 --screenshot ... --screenshot-frame 400
+                                  (the options' FEATURES part: the fifteen switches over the list)
+```
+
+- Scratch of this session in `local\`: `*_s3h.*`.
+
+## Added 2026-10-14, night (every weapon made when wanted; a box that blinks)
+
+```
+cargo test -p trp-sim --test every_weapon the_empty_hands -- --nocapture   (the empty hands have every bone a weapon shares)
+powershell -File local\four_lazy_s3j.ps1   (the AKM, the StG 44, the M3, the Five-seveN, each the crate's weapon at a bare
+                                   start: Alt and a click, Tab, its slot's key, a shot; whether its rig was made when wanted)
+trp.exe --tap 40:tab:3 --drag-at 100 --drag 170:455:170:600 --screenshot-frame 150   (the AKM in hand dragged from the sling
+                                   to the back: it blinks while it is put away; a later frame, whole)
+trp.exe ... the same, fifteen drags onto the empty pockets, then --drag 170:600:170:455 --screenshot-frame 406
+                                  (dragged back to the sling, the slot last drawn from: it blinks until it is drawn)
+trp.exe --bare --loot ...          (a run begun with nothing in hand, the airdrop crate open: only the empty hands' rig)
+```
+
+- Scratch of this session in `local\`: `*_s3j.*`.
+
+## Added 2026-10-14, night (the freeze when a weapon is first taken)
+
+```
+powershell -File local\freeze_s3k.ps1 [-Tag x]   (the four from the crate at a bare start, each with --log-pacing: the
+                                   longest frames after the curtain; logs local\freeze_<name>_<tag>.txt)
+$env:TRP_RENDER_TIMING = '8'; trp.exe ...       (prints the renderer's frames and the main thread's longer than 8 ms,
+                                   stage by stage; 20 ms when the variable is not a number; Remove-Item Env:\TRP_RENDER_TIMING after)
+```
+
+- `--screenshot` costs its own frame (20 ms, frames 901 to 905 in these runs), and an inventory move draws the screen afresh (some 14 ms, frame 134): neither is a weapon's loading.
+- Scratch of this session in `local\`: `*_s3k*`.
+
+## Added 2026-10-14, night (what a rig costs; a move's slow frame)
+
+```
+trp.exe --bare --measure-rigs <crate|all>   (every weapon of that crate made ready and weighed, none put into the world:
+                                   a line each and the sum; then the run ends; RIFLES, PISTOLS, ... or all)
+cargo test -p trp-data --test install a_weapon_of_one -- --nocapture   (each picture of a weapon of one's own, compressed:
+                                   what comes back, channel by channel)
+cargo test -p trp-sim --test install reweighing_is_timed -- --nocapture   (what reweighing costs)
+$env:TRP_RENDER_TIMING = '5'; trp.exe --bare --loot --drag-at 120 --drag 1385:205:1385:205 --tap 116:alt:20 --log-pacing ...
+                                  (the vest put on from the airdrop crate: the move's frames, with the systems that say so)
+```
+
+- In a `--log-pacing` file a frame's `dt` is the time up to it: the work of a slow `dt` is in the row before it, which its `update` shows.
+- Scratch of this session in `local\`: `*_s3l*`.
+
+## Added 2026-10-14, night (the character model; rigs ahead, let go of, shared)
+
+```
+cargo test -p trp-sim --test standing -- --nocapture   (the stance of the game's screens: where the hands, feet and head are)
+cargo run -p trp-data --bin probe -- animator <bundle>    (the animator of a bundle's prefab and its controller)
+trp.exe --inventory --equip --screenshot local\shots\x.png --screenshot-frame 300   (the character model in the kit)
+trp.exe --loot --bare --weapon 5c488a752e221602b412af63 --add-weapon 5dcbd56fdbd3d91b3e5468d5 --drag-at 120
+        --drag 1330:175:170:450 --drag 1120:175:1120:175 --screenshot-frame 6600 ...
+                                  (the MDR 7.62 hung, the 5.56 made ahead by the mouse resting on it, its pictures
+                                   shared, and let go of 30 s on: the log's lines from `trp::weapon`)
+```
+
+- Scratch of this session in `local\`: `*_s3m*`.
+
+## Added 2026-10-14, night (DirectX 12's places for samplers; the stuck pictures)
+
+```
+$env:TRP_ICON_CACHE = '<a folder>'   (a run's own icon cache, an empty one to see pictures made; the kept one is left be)
+$env:TRP_ICON_TRACE = '1'            (every 60 frames: the studio's queue and drawing, and each pipeline still being built)
+$env:TRP_RENDER_TIMING = '5000'      (with it, a `samplers:` line whenever the places held move: materials, lined, interface pictures)
+cargo run -p trp-data --bin probe -- pointers level44 "InventoryScreen/Items Panel/Stash Panel/Simple Panel"
+trp.exe --bare --start rifles --tap 60:f:3 --drag-at 340 --drag 1145:175:1160:175 --drag 1250:520:1250:520 ... --wheel 820:-12
+                                  (rifles taken up one after another with empty clicks between, then the crate scrolled:
+                                   seven at 1145:175 1385:225 1225:345 1120:445 1410:500 1300:600 1170:710)
+```
+
+- Scratch of this session in `local\`: `*_s3n*`.
+
+## Added 2026-10-14, night (the tables of weapons; the window; DXC)
+
+```
+bash local/dxc_compare_s3o.sh <scratch folder holding dxc\dxcompiler.dll and dxc\dxil.dll>
+                                  (FXC against DXC, two runs each: the warm-up, the crate's pictures on an empty cache, a walk)
+trp.exe --bare --start window --hold w+vault --log-pacing local\x.txt   (through the window in the vault's state)
+trp.exe --bare --start rifles --tap 60:f:3 --tap 230:tab:3 --screenshot-frame 236   (the gun case opened, its lid up as the screen shuts)
+trp.exe --bare --start rifles --tap 20:c:3 --tap 140:f:3   (crouched, the magazine box under the table opened)
+cargo test -p trp-app the_window -- --nocapture   (the window's sill as the simulation's grid measures it)
+```
+
+- Scratch of this session in `local\`: `*_s3o*`.
+
+## Added 2026-10-14, night (the L; pictures whole)
+
+```
+$env:TRP_ICON_CACHE = '<an empty folder>'; trp.exe --bare --start rifles --tap 60:f:3 --drag-at 250 --drag 1250:400:1250:400 --wheel 700:-6 --wheel 1100:-6 ...
+                                  (the rifles' case's pictures made with a rig made ahead meanwhile: the log's
+                                   "its model all on the graphics card N frames after ..." lines are those the old wait cut short)
+trp.exe --bare --start machine-guns --view map:9   (the L from above)
+trp.exe --bare --start clothing --tap 60:f:3 --tap 230:tab:3 --screenshot-frame 236   (the clothing crate's lid open)
+```
+
+- Scratch of this session in `local\`: `*_s3p*`.

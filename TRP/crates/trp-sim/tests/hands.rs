@@ -227,6 +227,54 @@ fn time_to_aim_follows_weight_and_ergonomics() {
     assert!((0.3..2.5).contains(&time));
 }
 
+/// The features' two switches (`trp_sim::Systems`): with the weapon's
+/// motion off a weapon turned with the view, walked with and leant over
+/// stands where a still one does, and with the recoil off a shot moves
+/// neither the weapon nor the camera.
+#[test]
+fn the_weapon_s_motion_and_the_recoil_switched_off() {
+    let Some((mut moved, _, firearm)) = full_rig() else { return };
+    let Some((mut still_one, _)) = rig() else { return };
+    let off = trp_sim::Systems { weapon_motion: false, recoil: false, ..trp_sim::Systems::default() };
+    moved.set_systems(&off);
+    still_one.set_systems(&off);
+    let mut yaw = 0.0;
+    for frame in 0..240 {
+        yaw += 120.0 * DT;
+        let footstep = (frame % 30 == 0).then_some(1.0);
+        let walking = HandsInput { yaw, speed: 1.0, walking: true, idle: false, footstep, velocity: [0.0, 0.0, 1.0], tilt: 1.0, tilt_target: 1.0, ..still() };
+        moved.advance(DT, &walking);
+        still_one.advance(DT, &still());
+        if frame == 120 {
+            moved.shoot(firearm.settings.shot_strength);
+        }
+        let (a, b) = (moved.weapon_transform(), still_one.weapon_transform());
+        let apart = length(std::array::from_fn(|i| a.0[i] - b.0[i]));
+        assert!(apart < 1e-6 && angle(quat_mul_inverse(a.1, b.1)) < 1e-3, "frame {frame}: {a:?} against {b:?}");
+        let (camera, rest) = (moved.frame(DT, camera_bone(), None), still_one.frame(DT, camera_bone(), None));
+        assert!(angle(quat_mul_inverse(camera.rotation, rest.rotation)) < 1e-3, "frame {frame}");
+    }
+    assert_eq!(moved.recoil.weapon_rotation(), [0.0; 3]);
+    // And with both on, the same moves it.
+    let (Some((mut moved, _)), Some((mut still_one, _))) = (rig(), rig()) else { return };
+    let (mut yaw, mut most) = (0.0, 0.0f32);
+    for frame in 0..240 {
+        yaw += 120.0 * DT;
+        let footstep = (frame % 30 == 0).then_some(1.0);
+        moved.advance(DT, &HandsInput { yaw, speed: 1.0, walking: true, idle: false, footstep, velocity: [0.0, 0.0, 1.0], tilt: 1.0, tilt_target: 1.0, ..still() });
+        still_one.advance(DT, &still());
+        let (a, b) = (moved.weapon_transform(), still_one.weapon_transform());
+        most = most.max(angle(quat_mul_inverse(a.1, b.1)));
+    }
+    println!("with the motion on the same input turns the weapon up to {most:.2} degrees from the still one");
+    assert!(most > 0.5, "{most}");
+}
+
+/// The turn from `b` to `a`.
+fn quat_mul_inverse(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    trp_sim::math::quat_mul(a, [-b[0], -b[1], -b[2], b[3]])
+}
+
 #[test]
 fn one_shot_from_the_hip_kicks_the_weapon_and_the_camera() {
     let Some((mut hands, _, firearm)) = full_rig() else { return };

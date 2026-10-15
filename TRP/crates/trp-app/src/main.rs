@@ -9,6 +9,7 @@ mod body_view;
 mod controller;
 mod convert;
 mod cursor;
+mod figure_view;
 mod grid;
 mod hands_view;
 mod hud;
@@ -19,6 +20,7 @@ mod keys;
 mod options_view;
 mod range;
 mod render_data;
+mod render_timing;
 mod weapon;
 
 use std::path::PathBuf;
@@ -39,27 +41,6 @@ use weapon::WeaponRig;
 
 /// Kalashnikov AKM 7.62x39.
 const DEFAULT_WEAPON: &str = "59d6088586f774275f37482f";
-/// Every weapon the app has from the start: the AKM, the Benelli M3 Super
-/// 90, the FN Five-seveN and the Remington Model 700, and one of each
-/// kind of weapon those four are not (the user, 2026-10-13;
-/// `docs/spec/more-weapons.md`): the SV-98 (a bolt action whose magazine
-/// comes out), the SKS (a self-loader filled through its action), the
-/// Chiappa Rhino 50DS (a revolver), the MP-43e-1C (barrels loaded one by
-/// one) and the Milkor M32A1 (a launcher with a drum). **Each lies in the
-/// crate** (the user, 2026-10-12: whenever a weapon is added, it is added
-/// to the crate); its rig is built when it is first hung on a slot
-/// (`weapon::RigBuilder`).
-pub const WEAPONS: [&str; 9] = [
-    DEFAULT_WEAPON,
-    "6259b864ebedf17603599e88",
-    "5d3eb3b0a4b93615055e84d2",
-    "5bfea6e90db834001b7347f3",
-    "55801eed4bdc2d89578b4588",
-    "574d967124597745970e7c94",
-    "61a4c8884f95bc3b2c5dc96f",
-    "5580223e4bdc2d1c128b457f",
-    "6275303a9f372d6ea97f9ec7",
-];
 /// The crate on the range: the install's airdrop crate, a loot container
 /// with one grid of ten by twelve cells, which is the smallest of the
 /// install's that holds a rifle, a vest and a backpack together (its
@@ -70,8 +51,165 @@ const CRATE: &str = "6223349b3136504a544d1608";
 /// word** (2026-10-12: larger inside, with a scroll bar, to hold more).
 const CRATE_CELLS: [u32; 2] = [10, 30];
 /// How many full stacks of its own rounds lie in the crate for each
-/// weapon the kit is not made for.
+/// weapon the kit is not made for, and how many full magazines for each
+/// such weapon fed from magazines. The app's choice.
 const SPARE_STACKS: usize = 2;
+const SPARE_MAGAZINES: usize = 3;
+
+/// For a weapon whose magazine comes out to be changed
+/// (`ReloadMode` `ExternalMagazine`): the kind of magazine its stock
+/// preset has, how many rounds that holds, and the round the weapon
+/// names as its own (`defAmmo`).
+fn fed_from_magazines(db: &trp_data::Database, weapon: &str) -> Option<(std::sync::Arc<trp_sim::inventory::Kind>, u32, std::sync::Arc<trp_sim::inventory::Kind>)> {
+    let item = db.items.get(weapon)?;
+    if item.props.get("ReloadMode")?.as_str()? != "ExternalMagazine" {
+        return None;
+    }
+    let preset = db.default_preset(weapon).ok()?;
+    let magazine = &preset.items.iter().find(|part| part.slot.as_deref() == Some(trp_sim::inventory::MAGAZINE_SLOT))?.template;
+    let capacity = db.items.get(magazine)?.props.get("Cartridges")?.get(0)?.get("_max_count")?.as_u64()? as u32;
+    let round = item.props.get("defAmmo")?.as_str()?;
+    let kind = |template: &str| trp_sim::inventory::Kind::of(db, template).ok().map(std::sync::Arc::new);
+    Some((kind(magazine)?, capacity, kind(round)?))
+}
+
+/// A weapon as its stock preset has it, with what loads it: fed from
+/// magazines, its own full (as the hands have it when it is drawn) and,
+/// with `spares`, `SPARE_MAGAZINES` more of the kind, full of its own
+/// round, which its reloads take (firing spec, "The quick reload");
+/// otherwise, with `spares`, `SPARE_STACKS` full stacks of that round,
+/// which a tube, a cylinder or barrels are filled from. The weapon first.
+fn armed(db: &trp_data::Database, weapon: &str, spares: bool) -> anyhow::Result<Vec<trp_sim::inventory::Item>> {
+    use trp_sim::inventory::{fill_magazine, Item, Kind, MAGAZINE_SLOT};
+    let (mut item, _) = trp_data::inventory::Loadout::of_preset(db, weapon).and_then(|list| Item::of_list(db, &list))?;
+    let mut made = Vec::new();
+    match fed_from_magazines(db, weapon) {
+        Some((magazine, capacity, round)) => {
+            if let Some(fitted) = item.slot_index(MAGAZINE_SLOT).and_then(|slot| item.slots[slot].as_mut()) {
+                fill_magazine(fitted, round.clone(), capacity);
+            }
+            for _ in (0..SPARE_MAGAZINES).filter(|_| spares) {
+                let mut spare = Item::new(magazine.clone());
+                fill_magazine(&mut spare, round.clone(), capacity);
+                made.push(spare);
+            }
+        }
+        // A rocket launcher's controller has no state to reload in: it
+        // has its rocket and no more (more-weapons spec).
+        None if spares && !db.items.get(weapon).is_some_and(|item| db.is_a(item, "RocketLauncher")) => {
+            let round = db.items.get(weapon).and_then(|item| item.props.get("defAmmo")?.as_str()).and_then(|round| db.items.get(round));
+            if let Some(round) = round {
+                let kind = std::sync::Arc::new(Kind::of(db, &round.id)?);
+                for _ in 0..SPARE_STACKS {
+                    let mut stack = Item::new(kind.clone());
+                    stack.count = round.stack_max();
+                    made.push(stack);
+                }
+            }
+        }
+        None => {}
+    }
+    made.insert(0, item);
+    Ok(made)
+}
+
+/// Whether the simulation has the logic a weapon runs on
+/// (`docs/spec/more-weapons.md`): every kind of the install's but a weapon
+/// fired once and thrown away (`IsOneoff`, whose firing is not read; no
+/// weapon with a stock preset in the install read is one).
+fn logic_built(db: &trp_data::Database, weapon: &str) -> bool {
+    let Some(item) = db.items.get(weapon) else { return false };
+    !item.props.get("IsOneoff").and_then(serde_json::Value::as_bool).unwrap_or(false)
+}
+
+/// Which crate of weapons a weapon goes into (`range::WEAPON_CRATES`): a
+/// weapon of one's own is custom; any other goes by the class its template
+/// gives it (`weapClass`, which the weapon skills go by too; the item's
+/// place among the database's classes would have the M32A1 a revolver).
+fn crate_of(db: &trp_data::Database, weapon: &str) -> Option<usize> {
+    if db.custom.contains_key(weapon) {
+        return Some(7);
+    }
+    match db.items.get(weapon)?.props.get("weapClass")?.as_str()? {
+        "assaultRifle" | "assaultCarbine" => Some(0),
+        "smg" => Some(1),
+        "machinegun" => Some(2),
+        "sniperRifle" | "marksmanRifle" => Some(3),
+        "shotgun" => Some(4),
+        "pistol" => Some(5),
+        "grenadeLauncher" | "specialWeapon" => Some(6),
+        _ => None,
+    }
+}
+
+/// The game's own weapon box and lootable ammunition box (`WeaponCrate`, a
+/// grid of 5 by 2; `AmmoBox`, 3 by 3), which the tables of weapons' gun
+/// cases and magazine boxes are.
+const GUN_CASE: &str = "578f87ad245977356274f2cc";
+const MAGAZINE_BOX: &str = "5909d45286f77465a8136dc6";
+
+/// What each table of weapons holds, in `range::WEAPON_CRATES`' order: in
+/// its gun case every weapon of the install of its class that has a stock
+/// preset and runs on a logic built, and every weapon of one's own, by
+/// name; in its magazine box what loads them (`armed`'s spares). Each is
+/// its game's container, ten cells across as the range's crates are, and
+/// as deep as what it holds (the app's: the game's own hold one weapon,
+/// and nine things).
+fn weapon_crates(db: &trp_data::Database) -> anyhow::Result<(Vec<trp_sim::inventory::Item>, Vec<trp_sim::inventory::Item>)> {
+    use trp_sim::inventory::{Item, Kind};
+    /// Deeper than any needs, before each is cut to what it holds.
+    const DEEPEST: u32 = 2000;
+    let deep = |template: &str| -> anyhow::Result<Kind> {
+        let mut kind = Kind::of(db, template)?;
+        kind.grids.first_mut().ok_or_else(|| anyhow::anyhow!("{template} has no grid"))?.cells = [CRATE_CELLS[0], DEEPEST];
+        Ok(kind)
+    };
+    let (case_kind, box_kind) = (deep(GUN_CASE)?, deep(MAGAZINE_BOX)?);
+    let (case_deep, box_deep) = (std::sync::Arc::new(case_kind.clone()), std::sync::Arc::new(box_kind.clone()));
+    let mut cases: Vec<Item> = range::WEAPON_CRATES.iter().map(|_| Item::new(case_deep.clone())).collect();
+    let mut boxes: Vec<Item> = range::WEAPON_CRATES.iter().map(|_| Item::new(box_deep.clone())).collect();
+    let mut weapons: Vec<(&String, &String)> = db
+        .items
+        .values()
+        .filter(|item| (item.name.starts_with("weapon_") && db.is_a(item, "Weapon")) || db.custom.contains_key(&item.id))
+        .filter(|item| logic_built(db, &item.id) && db.default_preset(&item.id).is_ok())
+        .map(|item| (&item.name, &item.id))
+        .collect();
+    weapons.sort();
+    let mut counts = [0; range::WEAPON_CRATES.len()];
+    for (name, weapon) in weapons {
+        let Some(at) = crate_of(db, weapon) else {
+            eprintln!("{name} is of no class a crate of weapons has");
+            continue;
+        };
+        match armed(db, weapon, true) {
+            Ok(made) => {
+                // The weapon first, then what loads it.
+                for (index, thing) in made.into_iter().enumerate() {
+                    let (into, what) = if index == 0 { (&mut cases[at], "weapon case") } else { (&mut boxes[at], "magazine box") };
+                    if into.stow(thing).is_err() {
+                        eprintln!("the {} {what} has no room for {name}'s", range::WEAPON_CRATES[at]);
+                    }
+                }
+                counts[at] += 1;
+            }
+            Err(e) => eprintln!("the tables of weapons have no {name}: {e:#}"),
+        }
+    }
+    // Each cut to the rows it fills.
+    let cut = |item: &mut Item, kind: &Kind| {
+        let rows = item.grids[0].iter().map(|(place, thing)| place.y + if place.turned { thing.cells()[0] } else { thing.cells()[1] }).max().unwrap_or(0);
+        let mut cut = kind.clone();
+        cut.grids[0].cells = [CRATE_CELLS[0], rows.max(1)];
+        item.kind = std::sync::Arc::new(cut);
+        item.kind.grids[0].cells[1]
+    };
+    for (((case, held), label), count) in cases.iter_mut().zip(boxes.iter_mut()).zip(range::WEAPON_CRATES).zip(counts) {
+        let (case_rows, box_rows) = (cut(case, &case_kind), cut(held, &box_kind));
+        println!("the table of {label}: {count} weapons in its case ({case_rows} rows), what loads them in its box ({box_rows} rows)");
+    }
+    Ok((cases, boxes))
+}
 /// The key of the range's locked door: a key of the install's (the first
 /// dormitory's marked room, by its name there). Any key would do; a door
 /// is opened by the key whose item it names (`KeyTemplate.KeyId` is the
@@ -140,10 +278,16 @@ struct Watching(Option<Vec3>);
 pub struct Options {
     /// Item template id of the weapon.
     pub weapon: String,
-    /// Every weapon the run builds: `WEAPONS`, and after them the
-    /// weapons that are not the install's but one's own
-    /// (`trp_data::custom`), whose models are where their files say.
+    /// What the airdrop crate holds besides the run's own weapon: those
+    /// asked for (`--add-weapon`). Every weapon whose logic is built lies
+    /// in the crates of weapons along the knee-high wall (`weapon_crates`).
     pub weapons: Vec<String>,
+    /// `--measure-rigs <crate|all>`: the crate of weapons (by its label, or
+    /// all of them) whose every weapon's rig is made ready and measured,
+    /// not put into the world, before the run ends (`weapon::Measured`);
+    /// then their templates.
+    measure_crate: Option<String>,
+    pub measure_rigs: Vec<String>,
     /// Manifest key of the arms bundle.
     pub arms: String,
     /// The bundles of the clothing the body is drawn in: its upper body and
@@ -263,11 +407,20 @@ pub struct Options {
     /// `--bare`, so that it has its weapon in hand as before.
     equip: bool,
     bare: bool,
+    /// Whether a weapon hangs where the hands take one from as the run
+    /// begins (`--equip`, a run nobody is at the keys of, a loadout): the
+    /// run begins with it in hand. Otherwise it begins with empty hands and
+    /// every weapon's rig is made when it is first wanted (`weapon::
+    /// spawn_weapon`).
+    pub starts_armed: bool,
     /// Drags of the mouse to make in a run nobody is at the keys of, each
     /// from one place in the window to another, in pixels (`--drag
     /// x:y:x:y`, as often as wanted): how the inventory screen's moving
     /// of things is tried without a hand on the mouse.
     drags: Vec<[f32; 4]>,
+    /// The drawn frame the first of them begins on (`--drag-at`; 90 unless
+    /// told), for a screen that opens later than that.
+    drag_at: u32,
     /// Keys to press in such a run: the drawn frame, the key, and for
     /// how many frames it is held (`--tap <frame>:<key>[:<frames>]` with
     /// a letter, a digit, `tab`, `delete`, `space`, `ctrl`, `alt`,
@@ -305,6 +458,9 @@ pub struct Options {
     /// The switch `ICON GENERATION` as the run begins, the same way
     /// (`--icons on|off`).
     pub icon_generation: Option<bool>,
+    /// Any switch of the options' features as the run begins, by its name
+    /// in the options' file (`--feature stamina=off`, as often as wanted).
+    pub feature_switches: Vec<(String, bool)>,
     /// How the window presents its frames: `vsync` (the default), `off`,
     /// or `mailbox`.
     present: String,
@@ -371,6 +527,33 @@ fn backends(options: &Options) -> Option<bevy::render::settings::Backends> {
     }
 }
 
+/// DirectX's newer shader compiler, DXC, as its two libraries: beside
+/// `trp.exe`, or in the newest Windows 10 or 11 SDK that has both for this
+/// machine's kind (`Windows Kits\10\bin\<version>\x64`). The engine looks
+/// for them in the folder it is run from alone, and without them compiles
+/// with the older FXC: measured on 2026-10-14, DXC built what a run draws
+/// with in 0.43 to 0.61 s where FXC took 1.59 to 2.04, and the rifles
+/// crate's pictures in 4.0 s where FXC took 7.2; a frame once all is built
+/// takes the same (`docs/findings.md`).
+fn dxc_libraries() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let both = |folder: &std::path::Path| {
+        let (dxc, dxil) = (folder.join("dxcompiler.dll"), folder.join("dxil.dll"));
+        (dxc.is_file() && dxil.is_file()).then_some((dxc, dxil))
+    };
+    let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().and_then(both));
+    beside.or_else(|| {
+        let kits = std::path::PathBuf::from(std::env::var_os("ProgramFiles(x86)")?).join("Windows Kits").join("10").join("bin");
+        let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
+        let mut versions: Vec<std::path::PathBuf> = std::fs::read_dir(&kits).ok()?.flatten().map(|entry| entry.path()).filter(|path| path.is_dir()).collect();
+        // The newest first: the folders are named by version, `10.0.n.0`.
+        versions.sort_by_key(|path| path.file_name().and_then(|name| name.to_str()).map(|name| name.split('.').map(|part| part.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>()));
+        versions.iter().rev().find_map(|version| both(&version.join(arch)))
+    })
+}
+
 /// The game's own defaults for the four settings of its menu the app
 /// takes: the field of view, head bobbing, and the mouse's sensitivity
 /// from the hip and with the sights up (the defaults written in the
@@ -383,7 +566,9 @@ const DEFAULT_VIEW: [f32; 4] = [50.0, 0.2, 0.7, 0.5];
 fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
     let mut options = Options {
         weapon: DEFAULT_WEAPON.to_owned(),
-        weapons: WEAPONS.map(str::to_owned).to_vec(),
+        weapons: Vec::new(),
+        measure_crate: None,
+        measure_rigs: Vec::new(),
         arms: DEFAULT_ARMS.to_owned(),
         body: DEFAULT_BODY.to_owned(),
         legs: DEFAULT_LEGS.to_owned(),
@@ -422,7 +607,9 @@ fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
         loot: false,
         equip: false,
         bare: false,
+        starts_armed: false,
         drags: Vec::new(),
+        drag_at: 90,
         taps: Vec::new(),
         mouse: Vec::new(),
         wheel: Vec::new(),
@@ -432,6 +619,7 @@ fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
         custom_hands: None,
         smooth_animations: None,
         icon_generation: None,
+        feature_switches: Vec::new(),
         whole: false,
         map: None,
         screenshot: None,
@@ -454,6 +642,7 @@ fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
             // stock preset for. Its rig is built when it is first hung on
             // a slot, and it can be worked if its kind of logic is built.
             "--add-weapon" => options.added.extend(args.next()),
+            "--measure-rigs" => options.measure_crate = args.next(),
             "--arms" => options.arms = args.next().unwrap_or_default(),
             "--body" => options.body = args.next().unwrap_or_default(),
             "--legs" => options.legs = args.next().unwrap_or_default(),
@@ -493,6 +682,7 @@ fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
                     _ => eprintln!("ignoring --mouse {given}: wanted <frame>:<frames>:<counts across a frame>:<counts down a frame>"),
                 }
             }
+            "--drag-at" => options.drag_at = args.next().and_then(|frame| frame.parse().ok()).unwrap_or(options.drag_at),
             "--drag" => {
                 let numbers: Vec<f32> = args.next().unwrap_or_default().split(':').filter_map(|v| v.parse().ok()).collect();
                 match numbers[..] {
@@ -573,6 +763,13 @@ fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
             "--custom-hands" => options.custom_hands = Some(args.next().as_deref() != Some("off")),
             "--smooth-animations" => options.smooth_animations = Some(args.next().as_deref() != Some("off")),
             "--icons" => options.icon_generation = Some(args.next().as_deref() != Some("off")),
+            "--feature" => {
+                let given = args.next().unwrap_or_default();
+                match given.split_once('=') {
+                    Some((name, on)) => options.feature_switches.push((name.to_owned(), on != "off")),
+                    None => eprintln!("--feature takes a switch's name and on or off: {given}"),
+                }
+            }
             // Taken before the rest (`setup::wanted`).
             "--setup" => {}
             "--seed" => options.seed = args.next().and_then(|v| v.parse().ok()).unwrap_or(1),
@@ -609,9 +806,16 @@ fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
 }
 
 fn main() -> anyhow::Result<()> {
+    // The version before anything else, so that whatever a run prints says
+    // which build it came from (`docs\manual.md`, "Versions"); `--version`
+    // prints it alone.
+    println!("TRP {}", env!("CARGO_PKG_VERSION"));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--version") {
+        return Ok(());
+    }
     // Where the games are: asked in the console on a first start, or with
     // `--setup` (`setup`).
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if setup::wanted(&args) {
         setup::run(&mut std::io::stdin().lock())?;
     }
@@ -653,15 +857,8 @@ fn main() -> anyhow::Result<()> {
             None => eprintln!("--add-weapon {wanted}: the database has no such weapon"),
         }
     }
-    // The run's own weapon lies in the crate with the rest.
-    if !options.weapons.contains(&options.weapon) && db.items.contains_key(&options.weapon) {
-        options.weapons.push(options.weapon.clone());
-    }
-    // The weapons of one's own, each built and in the crate like the
-    // rest (the user, 2026-10-12: a weapon added goes into the crate).
-    let mut custom: Vec<&String> = db.custom.keys().collect();
-    custom.sort();
-    options.weapons.extend(custom.into_iter().cloned());
+    // The weapons of one's own lie in their crate of weapons
+    // (`weapon_crates`); one that could not be read is said here.
     for note in &db.custom_notes {
         eprintln!("a weapon of one's own is left out: {note}");
     }
@@ -720,24 +917,37 @@ fn main() -> anyhow::Result<()> {
         grid.cells = CRATE_CELLS;
     }
     let mut loot = trp_sim::inventory::Item::new(std::sync::Arc::new(crate_kind));
+    // The tables of weapons along the knee-high wall: their gun cases, and
+    // their magazine boxes.
+    let (cases, boxes) = weapon_crates(&db)?;
+    // The run's own weapon is the one in its class's gun case (the user,
+    // 2026-10-14, night: "move the AKM into the rifle case"), and a run that
+    // begins with it on takes it from there: its class, and its number.
+    let own = crate_of(&db, &options.weapon).and_then(|class| {
+        let found = cases.get(class)?.grids.iter().flatten().find(|(_, item)| item.kind.template == options.weapon);
+        found.map(|(_, item)| (class, item.id))
+    });
     // What a run nobody is at the keys of, or one begun with `--equip`,
     // has on from the start: the weapon it is run with, the vest and the
     // backpack.
     let mut put_on = Vec::new();
+    put_on.extend(own.map(|(_, id)| id));
     {
         use trp_data::inventory::Loadout;
         use trp_sim::inventory::{Equipment, Item};
         let mut things = Vec::new();
-        // Every weapon the app builds, the one the run is for first, each
-        // as its stock preset has it.
-        let weapons = std::iter::once(options.weapon.as_str()).chain(options.weapons.iter().map(String::as_str).filter(|weapon| *weapon != options.weapon));
+        // Any other weapon asked for (`--add-weapon`), and the run's own
+        // where no gun case has it, each as its stock preset has it and
+        // with what loads it, in the crate; the run's own has the kit's
+        // magazines in the vest.
+        let weapons = std::iter::once(options.weapon.as_str()).filter(|_| own.is_none()).chain(options.weapons.iter().map(String::as_str).filter(|weapon| *weapon != options.weapon));
         for weapon in weapons {
-            match Loadout::of_preset(&db, weapon).and_then(|list| Item::of_list(&db, &list)) {
-                Ok((item, _)) => {
+            match armed(&db, weapon, weapon != options.weapon) {
+                Ok(mut made) => {
                     if weapon == options.weapon {
-                        put_on.push(item.id);
+                        put_on.push(made[0].id);
                     }
-                    things.push(item);
+                    things.append(&mut made);
                 }
                 Err(e) => eprintln!("the crate has no {weapon}: {e:#}"),
             }
@@ -767,19 +977,6 @@ fn main() -> anyhow::Result<()> {
                 Err(e) => eprintln!("the crate has no {id}: {e:#}"),
             }
         }
-        // For each other weapon, full stacks of the round it names as its
-        // own: what a tube or a magazine that stays in the weapon is
-        // filled from.
-        for weapon in options.weapons.iter().filter(|weapon| **weapon != options.weapon) {
-            let round = db.items.get(weapon).and_then(|item| item.props.get("defAmmo")?.as_str()).and_then(|round| db.items.get(round));
-            let Some(round) = round else { continue };
-            let Ok(kind) = trp_sim::inventory::Kind::of(&db, &round.id).map(std::sync::Arc::new) else { continue };
-            for _ in 0..SPARE_STACKS {
-                let mut stack = Item::new(kind.clone());
-                stack.count = round.stack_max();
-                things.push(stack);
-            }
-        }
         // The key of the range's locked door.
         match trp_sim::inventory::Kind::of(&db, DOOR_KEY) {
             Ok(kind) => things.push(Item::new(std::sync::Arc::new(kind))),
@@ -794,11 +991,22 @@ fn main() -> anyhow::Result<()> {
         }
     }
     // The range's other containers, and the things lying about.
-    let away: Vec<Option<trp_sim::inventory::Item>> = std::iter::once(Ok(None))
+    let mut away: Vec<Option<trp_sim::inventory::Item>> = std::iter::once(Ok(None))
         .chain(CONTAINERS.iter().map(|template| {
             trp_sim::inventory::Kind::of(&db, template).map(|kind| Some(trp_sim::inventory::Item::new(std::sync::Arc::new(kind))))
         }))
         .collect::<anyhow::Result<_>>()?;
+    // The weapons whose rigs are to be measured (`--measure-rigs`).
+    if let Some(wanted) = options.measure_crate.as_deref() {
+        for (holds, label) in cases.iter().zip(range::WEAPON_CRATES) {
+            if wanted.eq_ignore_ascii_case("all") || wanted.eq_ignore_ascii_case(label) {
+                let weapons = holds.grids.iter().flatten().map(|(_, thing)| thing).filter(|thing| trp_sim::inventory::is(thing, "Weapon"));
+                options.measure_rigs.extend(weapons.map(|weapon| weapon.kind.template.clone()));
+            }
+        }
+    }
+    // The tables' gun cases, then their magazine boxes, after those.
+    away.extend(cases.into_iter().chain(boxes).map(Some));
     let mut ground = Vec::new();
     for ((template, count), at) in LYING.into_iter().zip(range::LYING) {
         match trp_sim::inventory::Kind::of(&db, template) {
@@ -815,14 +1023,18 @@ fn main() -> anyhow::Result<()> {
     if (options.equip || options.unattended()) && !options.bare {
         use trp_sim::inventory::{move_item, Spot};
         let worn = equipment.item.id;
+        // (The run's own weapon is in its gun case; the rest in the crate.)
+        let mut case = own.and_then(|(class, _)| away.get_mut(range::gun_case_of(class))).and_then(Option::as_mut);
         for id in put_on {
-            let mut roots = [&mut equipment.item, &mut loot];
+            let mut roots: Vec<&mut trp_sim::inventory::Item> = vec![&mut equipment.item, &mut loot];
+            roots.extend(case.as_deref_mut());
             let slots = 0..roots[0].kind.slots.len();
             if !slots.into_iter().any(|slot| move_item(&mut roots, id, worn, Spot::Slot(slot), &rules).is_ok()) {
                 eprintln!("something in the crate goes into no slot");
             }
         }
     }
+    options.starts_armed = trp_sim::inventory::HAND_SLOTS.into_iter().any(|slot| equipment.worn(slot).is_some());
     // Such a run is what the app's own figures are measured with, so it
     // weighs what it did before there was an inventory (what `--weight`
     // says; nothing, if nothing was said) unless the inventory is what it
@@ -851,8 +1063,18 @@ fn main() -> anyhow::Result<()> {
     // The clothing the body is drawn in names the bones the animator has
     // to pose for it.
     let mut clothing = body_view::BodyParts::load(&mut unity, &db, &[&options.body, &options.legs, &options.head], &options.wear, options_state.features.custom_hands);
-    let body_data = match trp_sim::body::BodyData::load_with(&mut unity, &clothing.bones) {
-        Ok(data) => data,
+    // And, with the options' `CHARACTER MODEL` on, the pose the game's
+    // screens stand the character in, for the gear page's model of it.
+    let standing: &[String] = if options_state.features.character_model { &clothing.standing } else { &[] };
+    let body_data = match trp_sim::body::BodyData::load_standing(&mut unity, &clothing.bones, standing) {
+        Ok((data, standing)) => {
+            match standing {
+                Some(Ok(pose)) => clothing.standing_pose = Some(pose),
+                Some(Err(e)) => eprintln!("the character model is not drawn: {e:#}"),
+                None => {}
+            }
+            data
+        }
         Err(e) => {
             eprintln!("the body is not drawn: {e:#}");
             clothing = body_view::BodyParts::default();
@@ -939,6 +1161,20 @@ fn main() -> anyhow::Result<()> {
     if let Some(backends) = backends(&options) {
         renderer.backends = Some(backends);
     }
+    // DirectX 12's shaders by its newer compiler where it is found
+    // (`dxc_libraries`); the engine's own choice, the variable
+    // `WGPU_DX12_COMPILER`, still has the last word.
+    if bevy::render::settings::Dx12Compiler::from_env().is_none() {
+        match dxc_libraries() {
+            Some((dxc, dxil)) => {
+                println!("DirectX 12's shaders by DXC: {}", dxc.display());
+                renderer.dx12_shader_compiler =
+                    bevy::render::settings::Dx12Compiler::DynamicDxc { dxc_path: dxc.display().to_string(), dxil_path: dxil.display().to_string() };
+            }
+            None if cfg!(windows) => println!("DirectX 12's shaders by FXC: DXC's dxcompiler.dll and dxil.dll are neither beside trp.exe nor in a Windows SDK"),
+            None => {}
+        }
+    }
     let mut plugins = DefaultPlugins
         .set(WindowPlugin {
             primary_window: Some(Window {
@@ -961,6 +1197,12 @@ fn main() -> anyhow::Result<()> {
     let mut controller =
         Controller::new(movement, trp_sim::Pacer::new(options.frame_rate, engine.fixed_timestep, engine.maximum_timestep));
     controller.camera_box = camera_box;
+    // The simulation's systems as the options' switches have them for
+    // this run (settings spec, "Features").
+    controller.movement.systems = options_state.features.systems();
+    if !controller.movement.systems.weight {
+        controller.movement.set_weight(&hard, &db.config, 0.0)?;
+    }
 
     // Until the renderer has reported, it counts as having work to do.
     let waiting = PipelinesWaiting(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)));
@@ -982,6 +1224,9 @@ fn main() -> anyhow::Result<()> {
             ground,
             icons: Default::default(),
             pictures: Default::default(),
+            pictures_on: options_state.features.icon_generation,
+            picture_failed: Default::default(),
+            spinner: Handle::default(),
             bound: Default::default(),
             windows: Vec::new(),
             priority: None,
@@ -991,6 +1236,7 @@ fn main() -> anyhow::Result<()> {
             priority_auto: unity.install.game_setting("PriorityWindowMode").is_none_or(|mode| mode == "Auto"),
             asking: None,
             pack_asked: false,
+            falling: Vec::new(),
         })
         .insert_resource(bindings)
         .insert_resource(icons::Icons::new(unity.install.clone(), options_state.features.icon_generation, icons::signatures(&db)))
@@ -1012,23 +1258,25 @@ fn main() -> anyhow::Result<()> {
         .init_resource::<Watching>()
         .init_resource::<keys::ScriptedMouse>()
         .insert_resource(Warmup(true))
+        .init_resource::<render_data::SharedPictures>()
         .insert_resource(waiting.clone())
         .insert_resource(updates)
         .add_plugins(hud::HudPlugin)
         .add_plugins(inventory_view::InventoryPlugin)
         .add_plugins(options_view::OptionsPlugin)
         .add_plugins(icons::IconsPlugin)
-        .add_systems(Startup, (setup_world, (weapon::spawn_weapon, body_view::spawn_body).chain()))
+        .add_plugins(figure_view::FigurePlugin)
+        .add_systems(Startup, (setup_world, range::spawn_labels, (weapon::spawn_weapon, body_view::spawn_body).chain()))
         .add_systems(
             Update,
             (
-                (mark_frame, keys::hear, weapon::prepare_rigs).chain(),
+                (mark_frame, keys::hear, weapon::prepare_rigs, weapon::free_rigs).chain(),
                 (switch_view, cursor::hold, cursor::keep_alt).chain(),
                 controller::gather_input.run_if(running),
                 controller::step.run_if(running),
                 fly_camera,
                 controller::apply,
-                show_things,
+                (show_things, range::place_labels),
                 animation::play_clips,
                 animation::pose_rig,
                 hands_view::apply_hands,
@@ -1044,10 +1292,23 @@ fn main() -> anyhow::Result<()> {
             )
                 .chain(),
         );
+    // What a rig brought to the graphics card, asked about here and
+    // answered by the renderer (`weapon::Uploads`).
+    let uploads = weapon::UploadWatch::default();
+    app.insert_resource(uploads.clone());
+    // The graphics card's places for samplers held, counted by the renderer
+    // (`weapon::SamplerPlaces`).
+    let places = weapon::SamplerPlaces::default();
+    app.insert_resource(places.clone());
     if let Some(renderer) = app.get_sub_app_mut(bevy::render::RenderApp) {
         use bevy::render::{Render, RenderSet};
         renderer.insert_resource(waiting).add_systems(Render, count_waiting.in_set(RenderSet::Cleanup));
+        renderer.insert_resource(uploads).add_systems(Render, weapon::watch_uploads.in_set(RenderSet::Cleanup));
+        renderer.insert_resource(places).add_systems(Render, weapon::count_places.in_set(RenderSet::Cleanup));
+        // Where a slow frame of the renderer's goes, if asked for.
+        render_timing::add(renderer);
     }
+    render_timing::add_main(&mut app);
     app.run();
     Ok(())
 }
@@ -1104,8 +1365,30 @@ const WARMUP_LIMIT: f32 = 30.0;
 struct WarmupProp;
 
 /// In the renderer's world: how many pipelines are still to be built.
-fn count_waiting(cache: Res<bevy::render::render_resource::PipelineCache>, waiting: Res<PipelinesWaiting>) {
+fn count_waiting(cache: Res<bevy::render::render_resource::PipelineCache>, waiting: Res<PipelinesWaiting>, mut frame: Local<u32>) {
     waiting.0.store(cache.waiting_pipelines().count(), std::sync::atomic::Ordering::Relaxed);
+    *frame += 1;
+    // `TRP_ICON_TRACE`: each pipeline still waiting, every 60 of the
+    // renderer's frames, by its label and how far it has got (a new kind of
+    // material's took 1 to 2.5 s on DirectX 12, 2026-10-14).
+    if std::env::var_os("TRP_ICON_TRACE").is_some() && *frame % 60 == 0 {
+        use bevy::render::render_resource::{CachedPipelineState, PipelineDescriptor};
+        let pipelines: Vec<&bevy::render::render_resource::CachedPipeline> = cache.pipelines().collect();
+        for id in cache.waiting_pipelines() {
+            let Some(pipeline) = pipelines.get(id) else { continue };
+            let state = match &pipeline.state {
+                CachedPipelineState::Queued => "queued".to_owned(),
+                CachedPipelineState::Creating(_) => "creating".to_owned(),
+                CachedPipelineState::Ok(_) => "ok".to_owned(),
+                CachedPipelineState::Err(e) => format!("error {e}"),
+            };
+            let (label, defs) = match &pipeline.descriptor {
+                PipelineDescriptor::RenderPipelineDescriptor(d) => (d.label.clone(), d.fragment.as_ref().map_or(0, |f| f.shader_defs.len())),
+                PipelineDescriptor::ComputePipelineDescriptor(d) => (d.label.clone(), d.shader_defs.len()),
+            };
+            info!("pipeline trace {}: {id} {label:?} {state}, {defs} defs", *frame);
+        }
+    }
 }
 
 /// Ends the warm-up when the renderer has caught up, and clears its
@@ -1118,7 +1401,6 @@ fn warm_up(
     props: Query<Entity, With<WarmupProp>>,
     mut budget: ResMut<bevy::render::render_asset::RenderAssetBytesPerFrame>,
     preparing: Option<Res<weapon::Preparing>>,
-    icons: Res<icons::Icons>,
     mut frames: Local<[u32; 2]>,
 ) {
     if !warmup.0 {
@@ -1126,14 +1408,14 @@ fn warm_up(
     }
     let [seen, calm] = &mut *frames;
     *seen += 1;
-    // The rigs of the weapons the run lays in the crate are made ready on
-    // another thread from the start; the curtain waits for them, so that
-    // what they bring to the graphics card goes up under it (the StG 44's
-    // uncompressed pictures had stood a frame of play still for 100 ms).
-    // And for the pictures of what the character and the crate hold, where
-    // they are not in the cache yet (a first run): drawn in play, each new
-    // model's first frame in the studio took 20 to 90 ms.
-    let preparing = preparing.is_some_and(|preparing| preparing.busy()) || icons.busy();
+    // A rig asked for at the start is made ready on another thread; the
+    // curtain waits for it, so that what it brings to the graphics card
+    // goes up under it (the StG 44's uncompressed pictures had stood a
+    // frame of play still for 100 ms). The inventory's pictures are not
+    // waited for: as in the game they are asked for when the screen first
+    // shows an item (`icons::ask_icons`; icons spec, "When a picture is
+    // asked for").
+    let preparing = preparing.is_some_and(|preparing| preparing.busy());
     let building = waiting.0.load(std::sync::atomic::Ordering::Relaxed) > 0 || *seen < WARMUP_FRAMES || preparing;
     *calm = if building { 0 } else { *calm + 1 };
     if *calm >= WARMUP_CALM || time.elapsed_secs() > WARMUP_LIMIT {
@@ -1153,7 +1435,7 @@ fn warm_up(
 
 /// What goes up to the graphics card a frame after the curtain, at most
 /// (a whole picture or mesh at least).
-const UPLOAD_BUDGET: usize = 24 << 20;
+const UPLOAD_BUDGET: usize = 8 << 20;
 
 /// When this frame's systems began, for `--log-pacing`.
 #[derive(Resource)]
@@ -1416,29 +1698,30 @@ fn setup_world(
             extension: lined(grid::Lines::ground()),
         })),
     ));
+    // One material for each colour, with lines or without, shared by every
+    // block of it: each material holds six of the graphics card's places
+    // for samplers, of which DirectX 12 has 2,048 for all that is drawn
+    // (`docs/findings.md`), and one for each of the range's 67 blocks and
+    // parts had taken 402 of them. The lines go by where a point is, so a
+    // shared material draws each block as its own did.
+    let mut made: std::collections::HashMap<([u8; 4], bool), Handle<grid::GridMaterial>> = std::collections::HashMap::new();
+    let mut material = |color: Color, lines: bool| {
+        let key = (color.to_srgba().to_u8_array(), lines);
+        made.entry(key)
+            .or_insert_with(|| {
+                let extension = if lines { lined(grid::Lines::solid()) } else { lined(grid::Lines::solid().none()) };
+                materials.add(grid::GridMaterial { base: StandardMaterial::from_color(color), extension })
+            })
+            .clone()
+    };
     for solid in &range.solids {
-        commands.spawn((
-            Mesh3d(meshes.add(Cuboid::from_size(solid.size))),
-            MeshMaterial3d(materials.add(grid::GridMaterial {
-                base: StandardMaterial::from_color(solid.color),
-                extension: lined(grid::Lines::solid()),
-            })),
-            Transform::from_translation(solid.centre),
-        ));
+        commands.spawn((Mesh3d(meshes.add(Cuboid::from_size(solid.size))), MeshMaterial3d(material(solid.color, true)), Transform::from_translation(solid.centre)));
     }
     // What moves of the things the hands work: a door's leaf, a lid, a
     // drawer. Plain, without the grid.
     for (index, placed) in range.things.iter().enumerate() {
         let Some((place, size, color)) = placed.part_shown() else { continue };
-        commands.spawn((
-            ThingPart(index),
-            Mesh3d(meshes.add(Cuboid::from_size(size))),
-            MeshMaterial3d(materials.add(grid::GridMaterial {
-                base: StandardMaterial::from_color(color),
-                extension: lined(grid::Lines::solid().none()),
-            })),
-            place,
-        ));
+        commands.spawn((ThingPart(index), Mesh3d(meshes.add(Cuboid::from_size(size))), MeshMaterial3d(material(color, false)), place));
     }
 
 }

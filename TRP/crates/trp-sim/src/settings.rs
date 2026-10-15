@@ -13,7 +13,10 @@ use crate::stamina::StaminaSettings;
 use crate::vaulting::VaultingSettings;
 
 pub struct MovementSettings {
-    pub table: RootMotionTable,
+    /// Shared, not copied, by the settings for another weight
+    /// (`reweighed`): its copy had cost some 9 ms every time what was
+    /// carried changed.
+    pub table: std::sync::Arc<RootMotionTable>,
     pub move_state: u32,
     pub sprint_state: u32,
 
@@ -169,7 +172,8 @@ pub struct MovementSettings {
 impl MovementSettings {
     /// `config` is the `config` section of `globals.json`; `gravity` is the
     /// engine's vertical gravity, negative.
-    pub fn new(table: RootMotionTable, hard: &HardSettings, config: &Json, weight: f32, gravity: f32) -> Result<Self> {
+    pub fn new(table: impl Into<std::sync::Arc<RootMotionTable>>, hard: &HardSettings, config: &Json, weight: f32, gravity: f32) -> Result<Self> {
+        let table = table.into();
         let section = |name: &str| config.get(name).ok_or_else(|| anyhow!("globals have no {name}"));
         let inertia_cfg = section("Inertia")?;
         let stamina_cfg = section("Stamina")?;

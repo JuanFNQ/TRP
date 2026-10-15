@@ -263,3 +263,64 @@ fn a_launcher_fires_from_a_spring_driven_drum() {
     assert_eq!((w.magazine, w.camora), (Some(6), 0));
     assert!(w.is_idle());
 }
+
+const MP18: &str = "61f7c9e189e6fb1a5e3ea78d";
+const FN40GL: &str = "5e81ebcd8e146c7080625e15";
+const RSHG2: &str = "676bf44c5539167c3603e869";
+
+/// One barrel loaded alone (the MP-18 and the FN40GL): found empty,
+/// loaded; fired, its case thrown out as the next goes in; loaded again
+/// over a live round, which comes out (more-weapons spec, "One barrel
+/// loaded alone, and the rocket launcher").
+#[test]
+fn one_barrel_is_loaded_alone_whatever_it_holds() {
+    for template in [MP18, FN40GL] {
+        let Some(mut w) = weapon_of(template) else { return };
+        assert_eq!((w.settings.barrels, w.settings.rocket_launcher), (1, false));
+        w.found();
+        w.draw();
+        run(&mut w, 3.0);
+        assert_eq!(w.magazine, Some(0));
+        let reload = |w: &mut Firearm, what: &str| {
+            w.reload_shells(20);
+            let (entered, said) = run(w, 10.0);
+            let said: Vec<&FirearmEvent> = said.iter().map(|s| &s.0).collect();
+            println!("  {what}: {}; said {said:?}", told(&entered));
+            assert!(w.is_idle() && w.magazine == Some(1), "{what}");
+            (entered, said.into_iter().cloned().collect::<Vec<_>>())
+        };
+        let (_, said) = reload(&mut w, "from empty");
+        assert!(said.contains(&FirearmEvent::RoundsTaken(1)) && !said.contains(&FirearmEvent::RoundUnloaded));
+        let (_, fired) = press(&mut w, 2.0);
+        assert_eq!((shots(&fired), w.magazine), (1, Some(0)));
+        let (_, said) = reload(&mut w, "over a case");
+        assert!(!said.contains(&FirearmEvent::RoundUnloaded));
+        let (_, said) = reload(&mut w, "over a live round");
+        assert!(said.contains(&FirearmEvent::RoundUnloaded), "the live round comes out");
+        // With nothing in reach the key does nothing.
+        w.reload_shells(0);
+        assert!(w.is_idle());
+    }
+}
+
+/// The rocket launcher (the RShG-2): found with its rocket; fired from
+/// the sights only, by its own firing; empty after, and idle.
+#[test]
+fn the_rocket_launcher_fires_from_the_sights() {
+    let Some(mut w) = weapon_of(RSHG2) else { return };
+    assert!(w.settings.rocket_launcher);
+    w.found();
+    w.draw();
+    let (entered, _) = run(&mut w, 5.0);
+    println!("  drawn as found: {}; {:?}", told(&entered), w.magazine);
+    assert!(w.is_idle() && w.magazine == Some(1));
+    // The sights up: its own clip's mark has the animator ready to fire.
+    w.set_aim(true, true);
+    let (entered, _) = run(&mut w, 1.0);
+    println!("  the sights up: {}; IsAimingFloat {}", told(&entered), w.animator().get("IsAimingFloat"));
+    assert!(w.animator().get("IsAimingFloat") > 0.9);
+    let (entered, said) = press(&mut w, 3.0);
+    println!("  fired: {}", told(&entered));
+    assert_eq!((shots(&said), w.magazine), (1, Some(0)));
+    assert!(names(&entered).contains(&"FIRE") && !w.aiming() && w.is_idle());
+}

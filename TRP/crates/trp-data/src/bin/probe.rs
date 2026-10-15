@@ -115,6 +115,27 @@ fn main() -> Result<()> {
                 show(&scene, index, 1, depth);
             }
         }
+        // What the scripts on the objects of a scene whose path ends so
+        // point to among the scene's own scripts: each such pointer in their
+        // fields, by where it lies, with the object it points to and that
+        // object's scripts (`pointers level44 "InventoryScreen/Items Panel/Stash Panel/Simple Panel"`).
+        (Some("pointers"), Some(file)) => {
+            let scene = trp_data::screen::Scene::load(&assets.install, file, true)?;
+            let end = arg(2).unwrap_or("");
+            for index in (0..scene.nodes.len()).filter(|&index| scene.path(index).ends_with(end)) {
+                println!("{}  [{}]", scene.path(index), scene.nodes[index].scripts.join(", "));
+                for behaviour in scene.behaviours.iter().filter(|behaviour| behaviour.node == index) {
+                    let fields = scene.fields(behaviour);
+                    println!("  the script {}: {} bytes of fields", behaviour.id, fields.len());
+                    for start in (0..fields.len().saturating_sub(11)).step_by(4) {
+                        let mut r = trp_data::unity::reader::Reader::new(&fields[start..]);
+                        let (Ok(file), Ok(path)) = (r.i32(), r.i64()) else { continue };
+                        let Some(to) = scene.owner(path).filter(|_| file == 0 && path != 0) else { continue };
+                        println!("    at {start}: {}  [{}]", scene.path(to), scene.nodes[to].scripts.join(", "));
+                    }
+                }
+            }
+        }
         // Game objects of the game's own `resources.assets` (no type trees)
         // whose name has a word: each component's class and path id; a
         // transform's place and turn; the first figures of anything else,
@@ -1402,6 +1423,23 @@ fn main() -> Result<()> {
                 print_tree(&assets, file)?;
             }
         }
+        // Each Animator of a bundle: the object it is on and the controller
+        // it names, through any override to the controller under it.
+        (Some("animator"), Some(key)) => {
+            for file in assets.load(key)? {
+                for obj in assets.objects_of(file, class::ANIMATOR).collect::<Vec<_>>() {
+                    let v = assets.read(obj)?;
+                    let owner = v.get("m_GameObject").and_then(|g| g.as_pptr()).and_then(|p| assets.resolve_loaded(file, p)).and_then(|go| assets.name_of(go)).unwrap_or_default();
+                    let mut controller = v.get("m_Controller").and_then(|p| p.as_pptr()).and_then(|p| assets.resolve_loaded(file, p));
+                    let mut chain = Vec::new();
+                    while let Some(at) = controller {
+                        chain.push(format!("{} (file {}, {})", assets.name_of(at).unwrap_or_default(), at.file, at.path_id));
+                        controller = assets.read(at).ok().and_then(|c| c.get("m_Controller").and_then(|p| p.as_pptr()).and_then(|p| assets.resolve_loaded(at.file, p)));
+                    }
+                    println!("animator on {owner}: {}", if chain.is_empty() { "no controller".to_owned() } else { chain.join(" over ") });
+                }
+            }
+        }
         (Some("scripts"), Some(key)) => {
             for file in assets.load(key)? {
                 for obj in assets.objects_of(file, class::MONO_BEHAVIOUR).collect::<Vec<_>>() {
@@ -1521,7 +1559,8 @@ fn main() -> Result<()> {
                 println!("  {} on {}: {} vertices, {triangles} triangles", part.mesh.name, weapon.hierarchy.path(weapon.hierarchy.nodes[part.node].parent.unwrap_or(0)), part.mesh.positions.len());
             }
             let started = std::time::Instant::now();
-            let read = trp_data::custom::pictures_of(&custom.materials);
+            // As read, before they are compressed to be drawn with: pixels.
+            let read: Vec<_> = custom.materials.iter().map(trp_data::custom::pictures).collect();
             println!("its pictures were read in {:.2} s", started.elapsed().as_secs_f32());
             for (index, (material, pictures)) in custom.materials.iter().zip(read).enumerate() {
                 let pictures = pictures?;

@@ -31,8 +31,8 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use trp_sim::things::{Action, Menu};
 use trp_sim::{Acted, FirearmEvent, Interaction as Gesture, State, WorldInteraction};
 use trp_sim::inventory::{
-    apply_item, can_pick_up, equip, is, move_item, pick_up, quick_find, split_item, split_most, take_out, transfer_item, transfer_most, Applied, Bound, Equipment, Id,
-    Item, Order, Place, Refusal, Rules, Spot, HAND_SLOTS,
+    apply_item, can_pick_up, equip, go_together, is, move_item, pick_up, quick_find, split_item, split_most, take_out, transfer_item, transfer_most, Applied, Bound,
+    Equipment, Id, Item, Order, Place, Refusal, Rules, Spot, HAND_SLOTS,
 };
 
 use crate::controller::Controller;
@@ -72,8 +72,17 @@ pub struct Carried {
     /// what a thing shows until its own picture is made.
     pub icons: HashMap<&'static str, Picture>,
     /// Each item's own picture, by its template, as the game makes it
-    /// (`icons`: its model drawn once and kept).
+    /// (`icons`: its model drawn once and kept). Written without telling
+    /// of a change to what is carried: a picture come is put in its
+    /// spinner's place (`PicturesArrived`), not drawn with the screen
+    /// afresh.
     pub pictures: HashMap<String, Picture>,
+    /// Whether the pictures are made at all (`ICON GENERATION`), those that
+    /// could not be, and the spinner shown in a box while its picture is
+    /// still to come (where the game's view shows its loader).
+    pub pictures_on: bool,
+    pub picture_failed: std::collections::HashSet<String>,
+    pub spinner: Handle<Image>,
     /// What is bound to the quick-use keys.
     pub bound: Bound,
     /// The windows open over the screen, the last on top.
@@ -90,6 +99,37 @@ pub struct Carried {
     /// screen's key for putting a thing down: `toggle` begins it, and the
     /// pack leaves the shoulders at the gesture's own mark.
     pub pack_asked: bool,
+    /// A magazine out of the weapon with nowhere to go, until it leaves
+    /// the hand and falls (firing spec, "The quick reload").
+    pub falling: Vec<Item>,
+}
+
+/// The pictures that have come since the screen last took them, or that
+/// cannot be made, by template (`icons`): the boxes still showing a
+/// spinner for one have it put in its place (`fill_pictures`).
+#[derive(Resource, Default)]
+pub struct PicturesArrived(pub Vec<String>);
+
+/// The things whose box blinks (inventory spec, "A box that blinks"): a
+/// move that waits on the hands, as the game's does (`ItemView.Blinking`,
+/// a view being added or removed until its operation succeeds, which for
+/// the character's own hands is when the weapon put in the slot they
+/// last drew from has appeared in them, or the one taken out of its slot
+/// has been put away and the next is in hand). Kept by `settle`, drawn by
+/// `blink`; a blinking box takes no clicks (`ItemView.IsInteractive`).
+#[derive(Resource, Default)]
+pub struct Blinking(pub Vec<Id>);
+
+/// A box's spinner, shown while its thing's picture is still to come, and
+/// what is wanted in its place: the thing's template, the plain shape of
+/// its sort should no picture come, the box's inside and whether the thing
+/// lies turned.
+#[derive(Component)]
+struct Loading {
+    template: String,
+    sort: &'static str,
+    size: Vec2,
+    turned: bool,
 }
 
 /// A window over the screen: a container's grids, or what a thing is.
@@ -180,6 +220,14 @@ impl MenuTexts {
 #[derive(Resource, Default)]
 pub struct LootScroll(f32);
 
+/// The rows of each of the open container's grids that its panel shows
+/// now, from the first to the one after the last: the game's container
+/// panel makes the views of what is in sight alone (its `GridViewMagnifier`
+/// on the panel's scroll area), and asks for their pictures then
+/// (`icons::ask_icons`).
+#[derive(Resource, Default, PartialEq)]
+pub struct LootInSight(pub Vec<[u32; 2]>);
+
 /// The scrolled part of the panel beside the equipment, and the bar's
 /// thumb: each with how high the part shown is and how high all of it,
 /// in pixels.
@@ -226,6 +274,12 @@ const GEAR: usize = 1;
 /// The options' tab.
 pub const OPTIONS: usize = 8;
 
+/// Whether a tab can be opened: one built, and with the options'
+/// `INVENTORY SYSTEM` off, the options' alone.
+fn tab_open(index: usize, features: &crate::options_view::Features) -> bool {
+    TABS[index].1 && (features.inventory || index == OPTIONS)
+}
+
 /// The equipment panel's views in the order the game's panel names them,
 /// each with a caption (an English word of the app's) and where it sits
 /// if the install's own panel could not be read: left, top, width and
@@ -245,6 +299,16 @@ const EQUIPMENT: [(&str, &str, [f32; 4]); 10] = [
 ];
 /// The panel's own size where the install's is not read.
 const PANEL_SIZE: [f32; 2] = [494.0, 650.0];
+/// The equipment panel's size in its own units: the install's, or the
+/// app's where that could not be read.
+pub fn gear_panel(carried: &Carried) -> [f32; 2] {
+    if carried.panel.slots.is_empty() {
+        PANEL_SIZE
+    } else {
+        carried.panel.size
+    }
+}
+
 /// The figure behind the slots, as plain shapes in the panel's units:
 /// left, top, width, height and how round the corners are. The app's own
 /// drawing of a paper figure; the game has none in this panel (in its
@@ -266,7 +330,7 @@ const CONTAINERS: [(&str, &str); 4] = [("TacticalVest", "TACTICAL RIG"), ("Pocke
 /// The game lays its screens out 1080 units high (the inventory screen is
 /// 1920 wide and as high as the screen); a unit here is that share of the
 /// window's height.
-const SCREEN_HEIGHT: f32 = 1080.0;
+pub const SCREEN_HEIGHT: f32 = 1080.0;
 /// The side of a grid's cell (`GridView`), a slot view's side and the
 /// height of the caption over one, and the stash panel's width, in those
 /// units: the first from the game's code, the others from its scene.
@@ -281,6 +345,19 @@ const STASH_WIDTH: f32 = 680.0;
 /// and goes by the thing's own collider.
 const DROP_AHEAD: f32 = 0.4;
 const LOOSE_REACH: f32 = 0.25;
+/// Where a magazine let fall lies: so far ahead of the character and so
+/// far to its right, in metres. ESTIMATE: the game drops it from the
+/// weapon's own magazine and lets it fall (`DropMod`); this is under
+/// where a rifle is held.
+const MAGAZINE_DROP: [f32; 2] = [0.35, 0.05];
+
+/// A place on the ground so far ahead of a character standing at
+/// `position` (the simulation's axes) and turned to `yaw`, and so far to
+/// its right: in the engine's axes.
+fn beside(position: [f32; 3], yaw: f32, [ahead, right]: [f32; 2]) -> Vec3 {
+    let (sin, cos) = yaw.to_radians().sin_cos();
+    Vec3::new(position[0] + sin * ahead + cos * right, position[1], -(position[2] + cos * ahead - sin * right))
+}
 
 /// How many pixels one of the game's screen units is in this window.
 #[derive(Resource, Clone, Copy, PartialEq)]
@@ -297,6 +374,13 @@ pub const LINE: Color = Color::srgb(0.30, 0.31, 0.30);
 pub const WORDS: Color = Color::srgb(0.80, 0.80, 0.74);
 pub const FAINT: Color = Color::srgb(0.45, 0.46, 0.43);
 const THING: Color = Color::srgb(0.20, 0.24, 0.27);
+/// The game's colour for the box under the mouse (`ItemView.
+/// DefaultSelectedColor`: white at 77 of 255), laid over the box's own.
+const POINTED: (Srgba, f32) = (Srgba::WHITE, 77.0 / 255.0);
+/// What goes with it, in orange (the user, 2026-10-14): the game's own
+/// orange for a box (a thing with a repair's bonus, `GridItemView`), laid
+/// over the box at a share the app's, and its border.
+const GOES_WITH: (Srgba, f32) = (Srgba::new(209.0 / 255.0, 153.0 / 255.0, 45.0 / 255.0, 1.0), 0.40);
 const SLOT: Color = Color::srgba(0.07, 0.08, 0.08, 0.62);
 const SHAPE: Color = Color::srgb(0.27, 0.26, 0.22);
 
@@ -436,7 +520,10 @@ impl Plugin for InventoryPlugin {
             .init_resource::<AskedFor>()
             .init_resource::<Reach>()
             .init_resource::<LootScroll>()
+            .init_resource::<LootInSight>()
             .init_resource::<MenuTexts>()
+            .init_resource::<PicturesArrived>()
+            .init_resource::<Blinking>()
             .add_systems(Startup, (spawn, make_icons, menu_texts))
             // After the simulation's frames and before the weapon's clips:
             // a screen opened in one frame has the keys from the next, as
@@ -451,7 +538,7 @@ impl Plugin for InventoryPlugin {
                     // (The panel's scrolling goes by where the mouse is
                     // over the page as it stood, so before the page is
                     // drawn afresh.)
-                    (scripted_drags, reach, toggle.in_set(ScreenKeys), choose_tab, ask, windows, drag, quick_keys, scroll_loot, rebuild, settle, show_ground).chain().run_if(crate::running),
+                    (scripted_drags, reach, toggle.in_set(ScreenKeys), choose_tab, ask, windows, drag, quick_keys, scroll_loot, rebuild, fill_pictures, light_related, foresee, settle, blink, show_ground).chain().run_if(crate::running),
                     crate::body_view::show_worn,
                 )
                     .chain()
@@ -495,7 +582,7 @@ impl Carried {
     }
 
     /// An item by its number, on the character or in the crate.
-    fn find(&self, id: Id) -> Option<&Item> {
+    pub fn find(&self, id: Id) -> Option<&Item> {
         self.equipment.item.find(id).or_else(|| self.loot.find(id))
     }
 
@@ -645,7 +732,7 @@ fn why(refusal: &Refusal) -> String {
     }
 }
 
-fn spawn(mut commands: Commands, options: Res<Options>) {
+fn spawn(mut commands: Commands, options: Res<Options>, features: Res<crate::options_view::Features>) {
     let open = options.inventory;
     let root = Node {
         position_type: PositionType::Absolute,
@@ -662,8 +749,8 @@ fn spawn(mut commands: Commands, options: Res<Options>) {
     commands.spawn((Screen, root, BackgroundColor(BACK), GlobalZIndex(10), shown)).with_children(|screen| {
         // The row of tabs.
         screen.spawn(Node { column_gap: Val::Px(6.0), align_items: AlignItems::Center, ..default() }).with_children(|row| {
-            for (index, (caption, enabled)) in TABS.into_iter().enumerate() {
-                let color = if !enabled { FAINT } else { WORDS };
+            for (index, (caption, _)) in TABS.into_iter().enumerate() {
+                let color = if !tab_open(index, &features) { FAINT } else { WORDS };
                 let back = if index == GEAR { LINE } else { PANEL };
                 // The options' tab stands apart, against the right edge.
                 let margin = if index == OPTIONS { UiRect::left(Val::Auto) } else { UiRect::default() };
@@ -820,6 +907,31 @@ fn make_icons(mut images: ResMut<Assets<Image>>, mut carried: ResMut<Carried>) {
     }
     let plain = paint(&[(false, [0.22, 0.22, 0.78, 0.78])]);
     carried.icons.insert("thing", plain);
+    carried.spinner = images.add(spinner_image());
+}
+
+/// The spinner: a ring with a quarter of it open, fading from its head to
+/// its tail, in the screen's light colour on nothing. The app's (the
+/// game's loader's own picture is not read).
+fn spinner_image() -> Image {
+    const SIDE: usize = 64;
+    let middle = SIDE as f32 / 2.0;
+    let (outer, inner) = (middle - 1.5, middle - 8.5);
+    let mut data = vec![0u8; SIDE * SIDE * 4];
+    for (index, pixel) in data.chunks_exact_mut(4).enumerate() {
+        let (dx, dy) = ((index % SIDE) as f32 + 0.5 - middle, (index / SIDE) as f32 + 0.5 - middle);
+        let reach = (dx * dx + dy * dy).sqrt();
+        // A pixel's worth of soft edge on either side of the ring.
+        let edge = ((outer - reach).min(reach - inner) + 0.5).clamp(0.0, 1.0);
+        // Round from the top the way it turns, 0 to 1: the head at the
+        // end, the tail a quarter after the start, open before that.
+        let round = (dx.atan2(-dy) / std::f32::consts::TAU).rem_euclid(1.0);
+        let along = ((round - 0.25) / 0.75).clamp(0.0, 1.0);
+        let alpha = edge * along * along;
+        pixel.copy_from_slice(&[226, 228, 214, (alpha * 235.0) as u8]);
+    }
+    let size = Extent3d { width: SIDE as u32, height: SIDE as u32, depth_or_array_layers: 1 };
+    Image::new(size, TextureDimension::D2, data, TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::default())
 }
 
 /// How much of an item's box its picture may take, each way.
@@ -843,11 +955,28 @@ fn item_view(parent: &mut ChildSpawnerCommands, carried: &Carried, item: &Item, 
     });
 }
 
-/// An item's picture, whole in the middle of a box of that size.
+/// An item's picture, whole in the middle of a box of that size: the
+/// thing's own where it has been made; while it is still to come a
+/// spinner, as the game's view shows its loader until its picture is read
+/// or drawn (`ItemView._iconLoader`; icons spec, "When a picture is asked
+/// for"); the plain shape of its sort where none is made at all.
 fn picture_in(thing: &mut ChildSpawnerCommands, carried: &Carried, item: &Item, size: Vec2, turned: bool) {
-    // The thing's own picture where it has been made; until then, the
-    // plain shape of its sort.
-    let Some(picture) = carried.pictures.get(&item.kind.template).or_else(|| carried.icons.get(icon_of(item))) else { return };
+    let template = &item.kind.template;
+    if let Some(picture) = carried.pictures.get(template) {
+        thing.spawn(picture_node(picture, size, turned));
+        return;
+    }
+    let [across, down] = item.cells();
+    let coming = carried.pictures_on && across > 0 && down > 0 && !carried.picture_failed.contains(template);
+    if coming {
+        thing.spawn(spinner_node(carried, Loading { template: template.clone(), sort: icon_of(item), size, turned }));
+    } else if let Some(picture) = carried.icons.get(icon_of(item)) {
+        thing.spawn(picture_node(picture, size, turned));
+    }
+}
+
+/// A picture placed whole in the middle of a box of that size.
+fn picture_node(picture: &Picture, size: Vec2, turned: bool) -> impl Bundle {
     // The box's inside, within its border.
     let room = (size - Vec2::splat(2.0)).max(Vec2::ONE);
     let shape = if turned { 1.0 / picture.shape } else { picture.shape };
@@ -856,7 +985,78 @@ fn picture_in(thing: &mut ChildSpawnerCommands, carried: &Carried, item: &Item, 
     let width = height * shape;
     let over = placed((room.x - width) / 2.0, (room.y - height) / 2.0, width, height);
     let image = if turned { &picture.turned } else { &picture.upright };
-    thing.spawn((ImageNode::new(image.clone()), over));
+    (ImageNode::new(image.clone()), over)
+}
+
+/// How large a spinner is, as a share of the box's shorter side, and at
+/// most and least in pixels; and how many turns it makes a second. The
+/// app's.
+const SPINNER_SHARE: f32 = 0.42;
+const SPINNER_SIDE: [f32; 2] = [10.0, 28.0];
+const SPINNER_TURNS: f32 = 1.1;
+
+/// A spinner in the middle of a box, turned each frame (`fill_pictures`).
+fn spinner_node(carried: &Carried, loading: Loading) -> impl Bundle {
+    let room = (loading.size - Vec2::splat(2.0)).max(Vec2::ONE);
+    let side = (room.min_element() * SPINNER_SHARE).clamp(SPINNER_SIDE[0], SPINNER_SIDE[1]).min(room.min_element());
+    let over = placed((room.x - side) / 2.0, (room.y - side) / 2.0, side, side);
+    (ImageNode::new(carried.spinner.clone()), over, Transform::default(), loading)
+}
+
+/// Turns the spinners, and puts in each one's place the picture that has
+/// come for it, or the plain shape of its sort where none can be made:
+/// the box and everything else on the screen stay as they are.
+fn fill_pictures(
+    mut commands: Commands,
+    time: Res<Time<Real>>,
+    carried: Res<Carried>,
+    mut arrived: ResMut<PicturesArrived>,
+    mut spinners: Query<(Entity, &Loading, &ChildOf, &mut Transform)>,
+) {
+    let come = std::mem::take(&mut arrived.0);
+    let turn = Quat::from_rotation_z(-(time.elapsed_secs() * SPINNER_TURNS).fract() * std::f32::consts::TAU);
+    for (entity, loading, parent, mut transform) in &mut spinners {
+        if !come.contains(&loading.template) {
+            transform.rotation = turn;
+            continue;
+        }
+        let picture = carried.pictures.get(&loading.template).or_else(|| carried.icons.get(loading.sort));
+        if let Some(picture) = picture {
+            // First among the box's children, so that its words are drawn
+            // over it as before.
+            let shown = commands.spawn(picture_node(picture, loading.size, loading.turned)).id();
+            commands.entity(parent.parent()).insert_children(0, &[shown]);
+        }
+        commands.entity(entity).despawn();
+    }
+}
+
+/// How a blinking box's picture shows, `since` seconds after it began, as
+/// the game's (`ItemViewAnimation.CG_StartBlinking`): faded out to nothing
+/// over half a second and back over the next, round and round, each half a
+/// tween with the tweening library's default easing (out, quadratic).
+fn blink_alpha(since: f32) -> f32 {
+    let out_quad = |x: f32| 1.0 - (1.0 - x) * (1.0 - x);
+    let into = since.rem_euclid(1.0);
+    if into < 0.5 { 1.0 - out_quad(into / 0.5) } else { out_quad((into - 0.5) / 0.5) }
+}
+
+/// Fades the pictures of the boxes that blink (`Blinking`), each from when
+/// it began; a box that has stopped is whole again. Only a picture whose
+/// fading changes is written.
+fn blink(time: Res<Time<Real>>, blinking: Res<Blinking>, views: Query<&ItemView>, mut pictures: Query<(&mut ImageNode, &ChildOf), Without<Loading>>, mut began: Local<HashMap<Id, f64>>) {
+    let now = time.elapsed_secs_f64();
+    began.retain(|id, _| blinking.0.contains(id));
+    for id in &blinking.0 {
+        began.entry(*id).or_insert(now);
+    }
+    for (mut image, parent) in &mut pictures {
+        let Ok(view) = views.get(parent.parent()) else { continue };
+        let alpha = began.get(&view.0).map_or(1.0, |at| blink_alpha((now - at) as f32));
+        if image.color.alpha() != alpha {
+            image.color.set_alpha(alpha);
+        }
+    }
 }
 
 /// A slot as drawn: whatever is in it, filling it. `size` is the slot's,
@@ -1058,10 +1258,14 @@ fn asking_box(commands: &mut Commands, asking: &Asking, window: Vec2) {
 /// them, over a figure; in the middle each container in its slot with its
 /// grids beside it; on the right what is open, in the width of the game's
 /// stash panel.
-fn gear_page(gear: &mut ChildSpawnerCommands, carried: &Carried, units: Units, scroll: f32) {
+///
+/// Behind the slots, the character's own model where the options have it
+/// (`CHARACTER MODEL`, `figure_view`), over the whole panel; else the
+/// app's paper figure.
+fn gear_page(gear: &mut ChildSpawnerCommands, carried: &Carried, units: Units, scroll: f32, figure: Option<&Handle<Image>>) {
     let (s, cell) = (units.0, units.cell());
     let worn = &carried.equipment.item;
-    let size = if carried.panel.slots.is_empty() { PANEL_SIZE } else { carried.panel.size };
+    let size = gear_panel(carried);
     let left = Node {
         width: Val::Px((size[0] + 60.0) * s),
         flex_direction: FlexDirection::Column,
@@ -1074,8 +1278,15 @@ fn gear_page(gear: &mut ChildSpawnerCommands, carried: &Carried, units: Units, s
     gear.spawn((left, BackgroundColor(PANEL))).with_children(|left| {
         let panel = Node { width: Val::Px(size[0] * s), height: Val::Px(size[1] * s), flex_shrink: 0.0, ..default() };
         left.spawn(panel).with_children(|doll| {
-            for [left, top, width, height, round] in FIGURE {
-                doll.spawn((placed(left * s, top * s, width * s, height * s), BackgroundColor(SHAPE), BorderRadius::all(Val::Px(round * s))));
+            match figure {
+                Some(figure) => {
+                    doll.spawn((placed(0.0, 0.0, size[0] * s, size[1] * s), ImageNode::new(figure.clone())));
+                }
+                None => {
+                    for [left, top, width, height, round] in FIGURE {
+                        doll.spawn((placed(left * s, top * s, width * s, height * s), BackgroundColor(SHAPE), BorderRadius::all(Val::Px(round * s))));
+                    }
+                }
             }
             for (slot, caption, own) in EQUIPMENT {
                 let Some(index) = worn.slot_index(slot) else { continue };
@@ -1123,7 +1334,10 @@ fn gear_page(gear: &mut ChildSpawnerCommands, carried: &Carried, units: Units, s
             view.spawn(words("Nothing is open. Look at a container on the range from close by and press the key that works it.", 11.0, FAINT));
             return;
         }
-        view.spawn(words(carried.name(&carried.loot).to_uppercase(), 11.0, FAINT));
+        // A table of weapons' gun case or magazine box by its class: each
+        // is one of the game's containers, which all its kind are named by.
+        let caption = crate::range::weapon_crate_label(carried.loot_of).unwrap_or_else(|| carried.name(&carried.loot));
+        view.spawn(words(caption.to_uppercase(), 11.0, FAINT));
         let grids = &carried.loot.kind.grids;
         let whole: f32 = grids.iter().map(|grid| grid.cells[1] as f32 * cell).sum::<f32>() + GRID_GAP * grids.len().saturating_sub(1) as f32;
         // From under its caption down to the quick-use bar.
@@ -1177,6 +1391,8 @@ const SCROLL_BAR: f32 = 12.0;
 /// how far they are scrolled and puts the thumb where that is.
 fn scroll_loot(
     controller: Res<Controller>,
+    carried: Res<Carried>,
+    mut in_sight: ResMut<LootInSight>,
     wheel: Res<bevy::input::mouse::AccumulatedMouseScroll>,
     buttons: Res<ButtonInput<MouseButton>>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -1185,7 +1401,19 @@ fn scroll_loot(
     mut area: Query<(&LootArea, &mut ScrollPosition, &RelativeCursorPosition)>,
     mut thumb: Query<(&LootThumb, &mut Node, &RelativeCursorPosition)>,
     mut held: Local<Option<f32>>,
+    mut last_shown: Local<Option<usize>>,
 ) {
+    // Each container opens at its top (the user, 2026-10-14, night: "The
+    // scroll position of crates is shared between containers, make sure
+    // containers always start at the top"): the screen opened on one, or
+    // another one shown, scrolls the panel back up.
+    let showing = (controller.inventory_open && carried.loot_open).then_some(carried.loot_of);
+    if *last_shown != showing {
+        *last_shown = showing;
+        if scroll.0 != 0.0 {
+            scroll.0 = 0.0;
+        }
+    }
     if !controller.inventory_open {
         *held = None;
         return;
@@ -1222,6 +1450,27 @@ fn scroll_loot(
             node.top = top;
         }
     }
+    // The rows in sight, grid by grid: the grids lie one under another,
+    // `GRID_GAP` apart.
+    let cell = units.cell().max(1.0);
+    let (from, until) = (to, to + sizes.shown);
+    let mut top = 0.0;
+    let rows: Vec<[u32; 2]> = carried
+        .loot
+        .kind
+        .grids
+        .iter()
+        .map(|grid| {
+            let height = grid.cells[1] as f32;
+            let first = ((from - top) / cell).floor().clamp(0.0, height);
+            let end = ((until - top) / cell).ceil().clamp(first, height);
+            top += height * cell + GRID_GAP;
+            [first as u32, end as u32]
+        })
+        .collect();
+    if in_sight.0 != rows {
+        in_sight.0 = rows;
+    }
 }
 
 /// Draws the Gear page afresh when something has moved or been opened,
@@ -1239,12 +1488,27 @@ fn rebuild(
     mut units: ResMut<Units>,
     page: Query<Entity, With<GearPage>>,
     over: Query<Entity, With<Overlay>>,
+    figure: Res<crate::figure_view::FigureImage>,
     mut was: Local<(bool, usize)>,
     mut afresh: Local<u32>,
 ) {
+    let _clock = crate::render_timing::Clock::new("inventory rebuild");
     let (now, size) = window.single().map_or((*units, Vec2::ZERO), |window| (Units(window.height() / SCREEN_HEIGHT), Vec2::new(window.width(), window.height())));
     let shows = (controller.inventory_open, selected.0);
-    if !carried.is_changed() && now == *units && shows == *was {
+    // Nothing is drawn while the screen is shut: what lies over it goes as
+    // it shuts, and the page is drawn afresh as it opens, whatever changed
+    // meanwhile (a reload's magazines, a thing taken up).
+    if !controller.inventory_open {
+        if *was != shows {
+            for entity in &over {
+                commands.entity(entity).despawn();
+            }
+            *was = shows;
+        }
+        *afresh = 0;
+        return;
+    }
+    if !carried.is_changed() && now == *units && shows == *was && !figure.is_changed() {
         *afresh = 0;
         return;
     }
@@ -1258,7 +1522,7 @@ fn rebuild(
     }
     (*units, *was) = (now, shows);
     for page in &page {
-        commands.entity(page).despawn_related::<Children>().with_children(|gear| gear_page(gear, &carried, now, scroll.0));
+        commands.entity(page).despawn_related::<Children>().with_children(|gear| gear_page(gear, &carried, now, scroll.0, figure.0.as_ref()));
     }
     for entity in &over {
         commands.entity(entity).despawn();
@@ -1296,7 +1560,6 @@ fn scripted_drags(
     mut frame: Local<u32>,
     mut notches_left: Local<i32>,
 ) {
-    const START: u32 = 90;
     const EACH: u32 = 16;
     if !options.unattended() {
         return;
@@ -1340,7 +1603,7 @@ fn scripted_drags(
             _ => {}
         }
     }
-    let Some(since) = frame.checked_sub(START) else { return };
+    let Some(since) = frame.checked_sub(options.drag_at) else { return };
     let Some([x, y, to_x, to_y]) = options.drags.get((since / EACH) as usize).copied() else { return };
     match since % EACH {
         0 => window.set_cursor_position(Some(Vec2::new(x, y))),
@@ -1360,9 +1623,124 @@ fn cover_under<'a>(covers: impl Iterator<Item = (&'a Cover, &'a RelativeCursorPo
 
 /// The thing under the mouse on what is drawn on top there: the smallest
 /// is the one meant. With it, where in it the mouse is, as a share of it.
-fn item_under<'a>(items: impl Iterator<Item = (&'a ItemView, &'a RelativeCursorPosition, &'a ComputedNode)>, cover: u8, but: Option<Id>) -> Option<(Id, Vec2)> {
-    let over = items.filter(|(view, at, _)| view.1 == cover && Some(view.0) != but && at.mouse_over());
+/// A box that blinks is not there to the mouse (`ItemView.IsInteractive`).
+fn item_under<'a>(items: impl Iterator<Item = (&'a ItemView, &'a RelativeCursorPosition, &'a ComputedNode)>, cover: u8, but: Option<Id>, blinking: &Blinking) -> Option<(Id, Vec2)> {
+    let over = items.filter(|(view, at, _)| view.1 == cover && Some(view.0) != but && at.mouse_over() && !blinking.0.contains(&view.0));
     over.min_by(|a, b| a.2.size().length_squared().total_cmp(&b.2.size().length_squared())).map(|(view, at, _)| (view.0, at.normalized.unwrap_or_default()))
+}
+
+/// How long the mouse rests on a weapon before its rig is made ready
+/// ahead of its being hung, in seconds. `ESTIMATE`: the app's choice.
+const RESTS_ON: f32 = 0.25;
+
+/// A weapon the mouse rests on, or one taken up, has its rig made ready
+/// before it is hung, so that the hands do not wait for it then: once no
+/// weapon hung waits for one, and one at a time (`weapon::Preparing::
+/// ask_ahead`). One that is not hung within a while is let go of again
+/// (`weapon::free_rigs`); it is asked for once a rest, so that a mouse
+/// left on it does not have it made again and again.
+#[allow(clippy::too_many_arguments)]
+fn foresee(
+    time: Res<Time>,
+    controller: Res<Controller>,
+    carried: Res<Carried>,
+    drag: Res<Drag>,
+    blinking: Res<Blinking>,
+    covers: Query<(&Cover, &RelativeCursorPosition)>,
+    views: Query<(&ItemView, &RelativeCursorPosition, &ComputedNode)>,
+    preparing: Option<ResMut<crate::weapon::Preparing>>,
+    stowed: Option<Res<Stowed>>,
+    mut resting: Local<Option<(Id, f32, bool)>>,
+) {
+    let (Some(mut preparing), Some(stowed)) = (preparing, stowed) else { return };
+    if !controller.inventory_open {
+        *resting = None;
+        return;
+    }
+    let (pointed, taken) = match &drag.0 {
+        Some(held) => (Some(held.id), true),
+        None => (item_under(views.iter(), cover_under(covers.iter()), None, &blinking).map(|(id, _)| id), false),
+    };
+    let now = time.elapsed_secs();
+    let Some(pointed) = pointed else {
+        *resting = None;
+        return;
+    };
+    let (since, asked) = match *resting {
+        Some((id, since, asked)) if id == pointed => (since, asked),
+        _ => {
+            *resting = Some((pointed, now, false));
+            (now, false)
+        }
+    };
+    if asked || (!taken && now - since < RESTS_ON) {
+        return;
+    }
+    *resting = Some((pointed, since, true));
+    let Some(item) = carried.find(pointed).filter(|item| trp_sim::inventory::is(item, "Weapon")) else { return };
+    let template = &item.kind.template;
+    if !stowed.has_rig(template) && stowed.awaited(template) {
+        preparing.ask_ahead(template);
+    }
+}
+
+/// The box under the mouse in the game's own colour for it, and the boxes
+/// of the things that go with it in orange (inventory spec, "The box under
+/// the mouse, and what goes with it"); while a thing is carried, what goes
+/// with that. The orange only with `COMPATIBLE ITEMS HIGHLIGHT` on (settings
+/// spec, "Features"). Worked out again only when what is pointed at
+/// changes or the screen has been drawn afresh, and only a box whose
+/// colour changes is written, so that nothing else is drawn anew.
+fn light_related(
+    controller: Res<Controller>,
+    features: Res<crate::options_view::Features>,
+    carried: Res<Carried>,
+    drag: Res<Drag>,
+    blinking: Res<Blinking>,
+    covers: Query<(&Cover, &RelativeCursorPosition)>,
+    mut views: Query<(&ItemView, &RelativeCursorPosition, &ComputedNode, &mut BackgroundColor, &mut BorderColor)>,
+    fresh: Query<(), Added<ItemView>>,
+    mut lit_for: Local<Option<(Option<Id>, bool)>>,
+) {
+    let _clock = crate::render_timing::Clock::new("inventory light_related");
+    if !controller.inventory_open {
+        *lit_for = None;
+        return;
+    }
+    let pointed = match &drag.0 {
+        Some(held) => Some(held.id),
+        None => item_under(views.iter().map(|(view, at, node, ..)| (view, at, node)), cover_under(covers.iter()), None, &blinking).map(|(id, _)| id),
+    };
+    // (A thing pointed at and then taken is the same thing: its own box
+    // goes back to its colour.)
+    let now = (pointed, drag.0.is_some());
+    if *lit_for == Some(now) && fresh.is_empty() {
+        return;
+    }
+    *lit_for = Some(now);
+    // Every thing on the screen by its number, once.
+    let mut things = HashMap::new();
+    fn index<'a>(item: &'a Item, into: &mut HashMap<Id, &'a Item>) {
+        into.insert(item.id, item);
+        item.contents().for_each(|inside| index(inside, into));
+    }
+    index(&carried.equipment.item, &mut things);
+    index(&carried.loot, &mut things);
+    let source = pointed.and_then(|id| things.get(&id).copied());
+    let over = |(tint, share): (Srgba, f32)| Color::Srgba(THING.to_srgba().mix(&tint, share));
+    for (view, _, _, mut back, mut border) in &mut views {
+        let (want_back, want_border) = match source {
+            Some(source) if source.id == view.0 => (if drag.0.is_some() { THING } else { over(POINTED) }, LINE),
+            Some(source) if features.compatible_highlight && things.get(&view.0).is_some_and(|thing| go_together(source, thing)) => (over(GOES_WITH), Color::Srgba(GOES_WITH.0)),
+            _ => (THING, LINE),
+        };
+        if back.0 != want_back {
+            back.0 = want_back;
+        }
+        if border.0 != want_border {
+            border.0 = want_border;
+        }
+    }
 }
 
 /// A click on a thing (`ItemView.OnClick`, the left button): a double
@@ -1426,6 +1804,7 @@ fn drag(
     mut drag: ResMut<Drag>,
     mut clicks: ResMut<Clicks>,
     units: Res<Units>,
+    blinking: Res<Blinking>,
     camera: Query<&GlobalTransform, With<crate::weapon::Eye>>,
     (items, slots, grids, covers): (
         Query<(&ItemView, &RelativeCursorPosition, &ComputedNode)>,
@@ -1436,6 +1815,7 @@ fn drag(
     mut ghost: Query<(&mut Node, &mut Visibility, &mut BorderColor), With<Ghost>>,
     mut ghost_words: Query<&mut Text, With<GhostWords>>,
 ) {
+    let _clock = crate::render_timing::Clock::new("inventory drag");
     let Ok((mut node, mut shown, mut border)) = ghost.single_mut() else { return };
     let cell = units.cell();
     let cursor = window.single().ok().and_then(Window::cursor_position);
@@ -1448,7 +1828,7 @@ fn drag(
         return;
     };
     let cover = cover_under(covers.iter());
-    let under = |but: Option<Id>| item_under(items.iter(), cover, but);
+    let under = |but: Option<Id>| item_under(items.iter(), cover, but, &blinking);
     let held_key = |left: KeyCode, right: KeyCode| keys.pressed(left) || keys.pressed(right);
     let (ctrl, shift, alt) = (held_key(KeyCode::ControlLeft, KeyCode::ControlRight), held_key(KeyCode::ShiftLeft, KeyCode::ShiftRight), held_key(KeyCode::AltLeft, KeyCode::AltRight));
     let left = MouseButton::Left;
@@ -1745,11 +2125,17 @@ fn quick_keys(
     bindings: Res<Bindings>,
     options: Res<Options>,
     controller: Res<Controller>,
+    features: Res<crate::options_view::Features>,
     mut carried: ResMut<Carried>,
     mut asked: ResMut<AskedFor>,
+    blinking: Res<Blinking>,
     items: Query<(&ItemView, &RelativeCursorPosition, &ComputedNode)>,
     covers: Query<(&Cover, &RelativeCursorPosition)>,
 ) {
+    // With the options' `INVENTORY SYSTEM` off nothing is bound or used.
+    if !features.inventory {
+        return;
+    }
     let Some(key) = (0..QUICK_KEYS.len()).find(|key| bindings.fired(QUICK_KEYS[*key].0)) else { return };
     let word = match bindings.caption(QUICK_KEYS[key].0) {
         "" => QUICK_KEYS[key].1,
@@ -1760,7 +2146,7 @@ fn quick_keys(
         if carried.asking.is_some() {
             return;
         }
-        let Some((id, _)) = item_under(items.iter(), cover_under(covers.iter()), None) else { return };
+        let Some((id, _)) = item_under(items.iter(), cover_under(covers.iter()), None, &blinking) else { return };
         // Only what the character has is bound.
         let Some(item) = carried.equipment.item.find(id) else { return };
         let name = carried.name(item);
@@ -1801,6 +2187,17 @@ struct Hands {
     /// What is to be taken in hand when it has gone: a weapon and the
     /// slot it hangs in, or nothing (the game's scheduled process).
     next: Option<(Id, &'static str)>,
+    /// A weapon asked for by its slot's key while its rig was still being
+    /// made (`weapon::Preparing`), and its slot: the key is heard when the
+    /// rig comes, unless another is pressed first or the weapon leaves the
+    /// slot. (Not the game's: its weapons have no rig to wait for.)
+    waiting: Option<(Id, &'static str)>,
+    /// A weapon put into the slot the hands last drew from and taken in
+    /// hand for it, until it has appeared there; and the weapon in hand
+    /// taken out of its slot, until it has been put away and the next is
+    /// in hand. Their boxes blink (`Blinking`).
+    moved_in: Option<Id>,
+    moved_out: Option<Id>,
 }
 
 /// The rig that has just been taken in hand is drawn from its animator's
@@ -1873,9 +2270,12 @@ fn settle(
     weapon: Option<ResMut<HandsRig>>,
     mut stowed: Option<ResMut<Stowed>>,
     mut controller: ResMut<Controller>,
+    features: Res<crate::options_view::Features>,
+    mut blinking: ResMut<Blinking>,
     mut shown: Query<&mut Visibility>,
     mut hands: Local<Hands>,
 ) {
+    let _clock = crate::render_timing::Clock::new("inventory settle");
     // A weapon hung where the hands can take it with no rig yet has its
     // rig made ready before any other (`weapon::Preparing`); the hands
     // take it once it is in the world.
@@ -1888,7 +2288,8 @@ fn settle(
     }
     let game = &*game;
     if carried.is_changed() || !hands.settled {
-        let weight = carried.equipment.carried_weight(false);
+        // With the weight switched off what is carried weighs nothing.
+        let weight = if controller.movement.systems.weight { carried.equipment.carried_weight(false) } else { 0.0 };
         if !options.weight_given && (weight - controller.movement.settings.weight).abs() > 1e-4 {
             match controller.movement.set_weight(&game.hard, &game.db.config, weight) {
                 Ok(()) => info!("carried: {weight:.2} kg"),
@@ -1910,6 +2311,33 @@ fn settle(
         trp_sim::inventory::take_rounds(&mut carried.equipment.item, weapon, taken);
     }
     controller.rounds_in_reach = hands.item.map_or(0, |weapon| trp_sim::inventory::rounds_in_reach(&carried.equipment.item, weapon));
+    // A magazine's reload makes its exchange as it begins: the magazine
+    // its key chose goes into the weapon, and the old one, with what the
+    // weapon left in it, to the vest or the pockets, or (the quick way,
+    // or with no room there) out to fall as it leaves the hand (firing
+    // spec, "The quick reload").
+    for (left, quick) in std::mem::take(&mut controller.swaps) {
+        let (Some(weapon), Some(next)) = (hands.item, controller.magazine_asked.take()) else { continue };
+        let m = &controller.movement;
+        let at = beside(m.position, m.yaw, MAGAZINE_DROP);
+        // One still on its way down from a reload before is on the ground.
+        let fallen = std::mem::take(&mut carried.falling);
+        carried.ground.extend(fallen.into_iter().map(|old| (old, at)));
+        if let Some(old) = trp_sim::inventory::swap_magazine(&mut carried.equipment.item, weapon, Some(next), left, quick) {
+            carried.falling.push(old);
+        }
+    }
+    if std::mem::take(&mut controller.magazines_hidden) > 0 && !carried.falling.is_empty() {
+        let m = &controller.movement;
+        let at = beside(m.position, m.yaw, MAGAZINE_DROP);
+        let fallen = std::mem::take(&mut carried.falling);
+        carried.ground.extend(fallen.into_iter().map(|old| (old, at)));
+        carried.note = "the old magazine was let fall: it lies on the ground".to_owned();
+    }
+    controller.next_magazine = hands.item.and_then(|weapon| {
+        let next = trp_sim::inventory::next_magazine(&carried.equipment.item, weapon)?;
+        Some((next, trp_sim::inventory::magazine_rounds(carried.equipment.item.find(next)?)))
+    });
     // A chambered round the weapon threw out (a magazine filled with the
     // bolt open) lies on the ground before the character, as the game
     // throws it there: a round of the kind the weapon names as its own.
@@ -1921,13 +2349,32 @@ fn settle(
     if let (true, Some(round)) = (ejected > 0, round) {
         if let Ok(kind) = trp_sim::inventory::Kind::of(&game.db, &round).map(std::sync::Arc::new) {
             let m = &controller.movement;
-            let (sin, cos) = m.yaw.to_radians().sin_cos();
-            // Half a pace ahead and a little to the right, in the engine's axes.
-            let at = Vec3::new(m.position[0] + sin * DROP_AHEAD + cos * 0.2, m.position[1], -(m.position[2] + cos * DROP_AHEAD - sin * 0.2));
+            // Half a pace ahead and a little to the right.
+            let at = beside(m.position, m.yaw, [DROP_AHEAD, 0.2]);
             for _ in 0..ejected {
                 carried.ground.push((Item::new(kind.clone()), at));
             }
             carried.note = "the chambered round was thrown out as the bolt was opened: it lies on the ground".to_owned();
+        }
+    }
+    // A live round a single barrel's reload took out goes to the vest or
+    // the pockets where it has room, and else down on the ground (more-
+    // weapons spec, "One barrel loaded alone, and the rocket launcher").
+    let unloaded = std::mem::take(&mut controller.rounds_unloaded);
+    let round = hands
+        .item
+        .and_then(|weapon| carried.equipment.item.find(weapon))
+        .and_then(|weapon| game.db.items.get(&weapon.kind.template)?.props.get("defAmmo")?.as_str().map(str::to_owned));
+    if let (true, Some(round)) = (unloaded > 0, round) {
+        if let Ok(kind) = trp_sim::inventory::Kind::of(&game.db, &round).map(std::sync::Arc::new) {
+            let m = &controller.movement;
+            let at = beside(m.position, m.yaw, [DROP_AHEAD, 0.2]);
+            for _ in 0..unloaded {
+                if let Some(left) = trp_sim::inventory::put_unloaded(&mut carried.equipment.item, Item::new(kind.clone())) {
+                    carried.ground.push((left, at));
+                    carried.note = "the round taken out of the barrel had no room: it lies on the ground".to_owned();
+                }
+            }
         }
     }
     let carried = &*carried;
@@ -1941,8 +2388,21 @@ fn settle(
     let slot_of = |id: Id| HAND_SLOTS.into_iter().find(|slot| hangs(slot) == Some(id));
     let first_but = |but: Option<Id>| HAND_SLOTS.into_iter().find_map(|slot| hangs(slot).filter(|id| Some(*id) != but).map(|id| (id, slot)));
     // A slot's key, or a quick-use key bound to a weapon.
-    let live = !open && options.keys_live();
-    let key = SLOT_KEYS.iter().find(|(key, _)| live && bindings.fired(key)).and_then(|(_, slot)| hangs(slot).map(|id| (id, *slot)));
+    // With the weapon's handling switched off nothing is drawn or put
+    // away by a key (settings spec, "Features").
+    let live = !open && options.keys_live() && features.weapon_handling;
+    let pressed = SLOT_KEYS.iter().find(|(key, _)| live && bindings.fired(key)).map(|(_, slot)| *slot);
+    // A key for a weapon whose rig is still to come waits for it.
+    let worn_in = |slot: &str| carried.equipment.worn(slot);
+    let coming = |slot: &str| worn_in(slot).filter(|weapon| hangs(slot).is_none() && stowed.as_deref().is_some_and(|stowed| stowed.awaited(&weapon.kind.template)));
+    if let Some(slot) = pressed {
+        hands.waiting = coming(slot).map(|weapon| (weapon.id, slot));
+    }
+    let waited = hands.waiting.filter(|(id, slot)| live && hangs(slot) == Some(*id));
+    if waited.is_some() || hands.waiting.is_some_and(|(id, slot)| worn_in(slot).is_none_or(|weapon| weapon.id != id) || coming(slot).is_none() && hangs(slot).is_none()) {
+        hands.waiting = None;
+    }
+    let key = pressed.and_then(|slot| hangs(slot).map(|id| (id, slot))).or(waited);
     let asked_for = key.or_else(|| quick.filter(|_| live).and_then(|id| slot_of(id).map(|slot| (id, slot))));
     let said = controller.take_hands_events();
     let (gone, appeared) = (said.contains(&FirearmEvent::Hidden), said.contains(&FirearmEvent::Appeared));
@@ -2040,7 +2500,20 @@ fn settle(
                 if let Some(firearm) = weapon.firearm.as_mut() {
                     firearm.found();
                 }
-                empty_handed(&mut show, rig, weapon, controller, stowed.as_deref_mut())
+                match stowed.as_deref_mut() {
+                    // Begun with the empty hands' rig in hand, every weapon's
+                    // made when first wanted (`weapon::spawn_weapon`): they
+                    // come up as they do when a weapon is put away.
+                    Some(stowed) if stowed.held().is_none() => {
+                        controller.movement.body.set_weapon_width(rig.width);
+                        controller.movement.body.set_hands_kind(rig.kind);
+                        if let Some(empty) = weapon.empty.as_mut() {
+                            empty.draw();
+                        }
+                        first_pose(weapon, controller);
+                    }
+                    stowed => empty_handed(&mut show, rig, weapon, controller, stowed),
+                }
             }
         }
     } else if controller.armed {
@@ -2054,6 +2527,11 @@ fn settle(
             if left || other.is_some() {
                 hands.going = true;
                 hands.next = if left { first_but(held) } else { other };
+                // Taken out of its slot, it waits on the hands to put it
+                // away (`Player.TryRemoveFromHands`).
+                if left {
+                    hands.moved_out = held;
+                }
                 if let Some(firearm) = weapon.firearm.as_mut() {
                     firearm.hide(false);
                 }
@@ -2072,7 +2550,10 @@ fn settle(
                     (hands.item, hands.active) = (Some(id), Some(slot));
                     take(&mut show, rig, weapon, controller, stowed.as_deref_mut(), kind_of(id));
                 }
-                None => empty_handed(&mut show, rig, weapon, controller, stowed.as_deref_mut()),
+                None => {
+                    empty_handed(&mut show, rig, weapon, controller, stowed.as_deref_mut());
+                    hands.moved_out = None;
+                }
             }
         }
     } else {
@@ -2082,7 +2563,29 @@ fn settle(
         if let Some((id, slot)) = asked_for.or(back) {
             (hands.item, hands.active) = (Some(id), Some(slot));
             take(&mut show, rig, weapon, controller, stowed.as_deref_mut(), kind_of(id));
+            // Put there by a move, it waits on the hands to take it
+            // (`Player.TrySetInHands`).
+            if asked_for.is_none() {
+                hands.moved_in = Some(id);
+            }
         }
+    }
+    // The hands are done with a move when what they took has appeared in
+    // them (`SpawnOperation.WeaponAppeared`, at the draw's last mark).
+    if appeared {
+        (hands.moved_in, hands.moved_out) = (None, None);
+    }
+    // What blinks: those, and a weapon put into the slot the hands last
+    // drew from while its rig is still being made (the hands' taking it
+    // waits for that here).
+    let rig_coming = (!controller.armed && !hands.going)
+        .then(|| hands.active.and_then(|slot| carried.equipment.worn(slot)))
+        .flatten()
+        .filter(|weapon| Some(weapon.id) != hands.item && stowed.as_deref().is_some_and(|stowed| stowed.awaited(&weapon.kind.template)))
+        .map(|weapon| weapon.id);
+    let now: Vec<Id> = hands.moved_in.into_iter().chain(hands.moved_out).chain(rig_coming).collect();
+    if blinking.0 != now {
+        blinking.0 = now;
     }
     // The screen opening and shutting, told to what is in the hands now;
     // and the screen as it stands, told to what has just appeared there.
@@ -2116,6 +2619,7 @@ fn reach(
     bindings: Res<Bindings>,
     texts: Res<MenuTexts>,
     hands: Option<Res<HandsRig>>,
+    features: Res<crate::options_view::Features>,
     camera: Query<&GlobalTransform, With<crate::weapon::Eye>>,
     mut reach: ResMut<Reach>,
     mut prompt: Query<(Entity, &mut Visibility), With<Prompt>>,
@@ -2130,11 +2634,14 @@ fn reach(
     let busy = controller.movement.acting() || controller.movement.searching() || controller.movement.kicking();
     let hands_let = hands.as_deref().and_then(|hands| hands.firearm.as_ref()).is_none_or(|firearm| firearm.can_interact());
     let allowed = controller.movement.can_interact() && hands_let;
-    let playing = view.played() && !controller.inventory_open && !busy && allowed;
+    // With the options' `WORLD INTERACTIONS` off nothing is looked at to
+    // be worked; with `INVENTORY SYSTEM` off nothing that would go into the
+    // inventory is (a thing on the ground, a container to search).
+    let playing = view.played() && !controller.inventory_open && !busy && allowed && features.world_interactions;
     let mut seen = Reach::default();
     if let (true, Ok(eye)) = (playing, camera.single()) {
         let (from, to) = (eye.translation() - eye.forward() * behind, eye.translation() + eye.forward() * within);
-        seen.thing = range.looked_at(from, to, door + behind);
+        seen.thing = range.looked_at(from, to, door + behind).filter(|index| features.inventory || range.things[*index].holds.is_none());
         // A thing on the ground is looked at when the line passes within
         // a hand's breadth of it; the nearest along the line is meant.
         let along = to - from;
@@ -2147,7 +2654,7 @@ fn reach(
         // a place (`GetAvailableInteractionState`).
         let nearest = looked_at.min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, item)| item);
         let already = |id: Id| reach.loose == Some(id) && reach.thing == seen.thing;
-        seen.loose = nearest.filter(|item| already(item.id) || can_pick_up(&carried.equipment.item, item, &carried.rules)).map(|item| item.id);
+        seen.loose = nearest.filter(|item| features.inventory && (already(item.id) || can_pick_up(&carried.equipment.item, item, &carried.rules))).map(|item| item.id);
     }
     // The game's menu for it (`InteractionContextHelper.GetAvailableActions`):
     // a thing on the ground is taken; a door, a container or a trunk
@@ -2303,6 +2810,7 @@ fn toggle(
     camera: Query<&GlobalTransform, With<crate::weapon::Eye>>,
     keys: Res<ButtonInput<KeyCode>>,
     options_tab: Option<Res<crate::options_view::OptionsState>>,
+    features: Res<crate::options_view::Features>,
     mut selected: ResMut<Selected>,
     mut started: Local<bool>,
     mut reaching: Local<Reaching>,
@@ -2323,7 +2831,7 @@ fn toggle(
     let taken = !carried.windows.is_empty() || carried.asking.is_some() || options_tab.as_deref().is_some_and(|tab| tab.takes_escape());
     let escape = options.keys_live() && controller.inventory_open && keys.just_pressed(KeyCode::Escape) && !taken;
     let tab = tab || escape;
-    let key = options.keys_live() && !controller.inventory_open && bindings.fired("Interact");
+    let key = options.keys_live() && !controller.inventory_open && bindings.fired("Interact") && features.world_interactions;
     // What the hands' work on the world has come to.
     let mut search = None;
     for acted in controller.movement.take_acted() {
@@ -2496,9 +3004,11 @@ fn toggle(
     // screen afresh at each opening, with its tabs beginning at the
     // gear's (`InventoryScreen.Show`, `TabGroup`), and a container asks
     // for that tab outright (`ShowInventoryScreenLoot`). The tab last
-    // looked at is not kept from one opening to the next.
-    if open && selected.0 != GEAR {
-        selected.0 = GEAR;
+    // looked at is not kept from one opening to the next. With the
+    // options' `INVENTORY SYSTEM` off it opens on the options alone.
+    let opens_on = if features.inventory { GEAR } else { OPTIONS };
+    if open && selected.0 != opens_on {
+        selected.0 = opens_on;
     }
     // The container searched is the one the screen shows beside the
     // equipment; at the start, with `--loot`, the airdrop crate.
@@ -2532,12 +3042,13 @@ fn toggle(
 /// A click on a tab that can be opened shows its page.
 fn choose_tab(
     clicked: Query<(&Interaction, &TabButton), Changed<Interaction>>,
+    features: Res<crate::options_view::Features>,
     mut selected: ResMut<Selected>,
     mut tabs: Query<(&TabButton, &mut BackgroundColor)>,
     mut pages: Query<(&Page, &mut Node)>,
     mut shown: Local<Option<usize>>,
 ) {
-    if let Some(index) = clicked.iter().find(|(interaction, tab)| **interaction == Interaction::Pressed && TABS[tab.0].1).map(|(_, tab)| tab.0) {
+    if let Some(index) = clicked.iter().find(|(interaction, tab)| **interaction == Interaction::Pressed && tab_open(tab.0, &features)).map(|(_, tab)| tab.0) {
         if selected.0 != index {
             selected.0 = index;
         }
@@ -2605,12 +3116,16 @@ mod tests {
             ground: Vec::new(),
             icons: HashMap::new(),
             pictures: HashMap::new(),
+            pictures_on: false,
+            picture_failed: Default::default(),
+            spinner: Handle::default(),
             bound: Default::default(),
             windows: Vec::new(),
             priority: None,
             priority_auto: true,
             asking: None,
             pack_asked: false,
+            falling: Vec::new(),
         };
         (carried, ids)
     }

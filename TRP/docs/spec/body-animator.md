@@ -166,6 +166,10 @@ The movement code only raises and lowers flags:
 
 Each animator update the movement state that is current, if one of the animator's playing states names it, handles the frame: it takes the animator's motion and passes it on. While a landing clip with no movement state plays, nothing moves the character.
 
+## The stance of the game's screens (read and built 2026-10-14, night)
+
+The menus' copy of the player has the body's own controller, and its screens stand it by the layer `GUI` (index 11, an override of every bone, a weight of 0 in play): given 1, with the kind of thing in hand in `WeaponType`, `WeaponTypeFloat` and `UI_WeaponType` (-1 for nothing) and updated once (`PlayerModelLoader.CreateWeapon`). Its state `GUI.GUI_IDLE` loops a blend by `UI_WeaponType` (`inv_idle_hands_down` for nothing, `inv_idle` for a rifle or a pistol); others look out or check the weapon, by `UI_RandomTransition` and `UI_WeaponOperation`, which nothing here sets. `BodyData::load_standing` gives that pose for the bones a host names (`inventory.md`, "The character model"); the body's own animator is the same with it or without it. Against the install (`the_character_stands_as_the_game_s_screens_stand_it`): the shoulders 1.49 m up, the elbows 1.21, the palms 0.99 and 0.29 and 0.34 m either side, the feet on the ground, the head at 1.65; the body's animator and the pose read in 0.30 s.
+
 ## The kind of thing in hand (read and built 2026-10-11, the session after the evening's)
 
 The animator is told what the hands hold as a number (`PlayerAnimator.EWeaponAnimationType`: rifle 0, pistol 1, thrown 2, knife 3, empty hands 4, launcher 5), twice over: the whole number `WeaponType` and the float `WeaponTypeFloat`.

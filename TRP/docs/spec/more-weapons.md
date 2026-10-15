@@ -27,6 +27,8 @@ The barrels' five are the two MP-43s, and three with one barrel: the MP-18, the 
 | the weapon's chambers | one | one | none | two (`patron_in_weapon_000`, `_001`) | none |
 | rounds | ten in the magazine | ten in a magazine that stays | six in the cylinder | two | six in the drum |
 
+**Every one of the 149 run whole** (2026-10-14, after the user's "ASVAL causes a crash. can we double check all weapons and ensure it doesnt occur!"). `cargo test -p trp-sim --test every_weapon` assembles each weapon the crates hold, finds its skinned parts' bones in its own tree, and runs its logic on its own animator: found, drawn, aimed and fired, reloaded both ways (a magazine, and the quick reload; loose rounds where the magazine stays in), and put away, each time to rest; all 149 pass. In the app, each was the run's weapon, fired, reloaded, aimed and captured (`local\every_weapon_app_s3g.ps1`): all 149 ran to the end with no error. Only the AS VAL and the VSS have a part drawn on bones of their own, their hammer spring (`findings.md`), which had stopped the renderer.
+
 ## Two that needed nothing new
 
 **The SV-98** is the Model 700's firing on the AKM's reload: the bolt is worked when the trigger is let go (`bolt-action.md`), and the magazine is changed (`firing.md`). Its template says the bolt has to be opened for a reload (`MustBoltBeOpennedForExternalReload`), which the logic already answered. Seen: found and drawn, `OUT TO IDLE ARM` (2.02 s, nine and one); a shot, `FIRE`, then `FIRE RELOAD` on the release; reloaded with a round chambered, `RELOAD START`, `OUT`, `IN`, `END` (3.06 s, ten and one); from empty, `OPEN CHAMBER` first and `RELOAD CLOSE CHAMBER` last (5.00 s, nine and one).
@@ -76,10 +78,38 @@ Seen: empty and loaded with two, `RELOAD START`, `RELOAD IN`, `RELOAD END` (4.51
 - `crates/trp-sim/tests/kinds.rs`: the five, each on the install's own animator (the figures above).
 - The app: the five lie in the crate with two stacks of their rounds each (`WEAPONS`), `--weapon <id or part of a name>` begins with one in hand. Each drawn, fired and reloaded in a capture; with `B` pressed first, the Rhino's second shot plays `DOUBLE_ACTION_FIRE` and one press empties both of the MP-43's barrels.
 
+## One barrel loaded alone, and the rocket launcher (read 2026-10-14, when the user asked that every weapon be selectable)
+
+Read from `ReloadSingleBarrelOperation`, `ReloadSingleBarrelResult.Run`, the idling operation's `ReloadBarrels`, `FirearmHandsInputTranslator.ReloadBarrels`, `RocketLauncherFire`, `FirearmController.IsAiming` and `SetAimingInAnimator`, `FirearmsAnimator.SetAiming`, `SetAimingIn` and `SetAimingOut`, `Idling.ProcessRemoveOneOffWeapon`, and from the install's controllers of the MP-18 (`61f7c9e189e6fb1a5e3ea78d`), the FN40GL (`5e81ebcd8e146c7080625e15`) and the RShG-2 (`676bf44c5539167c3603e869`). With these three, **every weapon of the install that has a stock preset runs** (148, and the StG 44).
+
+**One barrel** (`ReloadMode` `OnlyBarrel` with a single chamber: the MP-18 and the FN40GL) fires as the MP-43 does (`FireOnlyBarrelFireOperation`, "Barrels loaded one by one"). Its reload is another operation, chosen by the barrels' count (`ReloadBarrels`):
+
+- **The key** takes the rounds within reach that the chamber takes, and with none does nothing. Unlike the MP-43's, it is taken **whatever the barrel holds**: empty, a case, or a live round.
+- **The exchange is made as it begins** (`ReloadSingleBarrelResult.Run`): a live round in the barrel goes to the first free place in the vest's and the pockets' grids, the smallest grid first, or with none is taken out to be thrown down; the new round goes into the barrel.
+- **The animator is told** (`Start`) how many cases there are (`ShellsInWeapon`), whether there was a live round (`AmmoInChamber` 1, else 0), `CanReload`, and `Reload`. The MP-18's `IDLE` leaves for `RELOAD START EMPTY` with neither, else for `RELOAD START`, which goes on to `RELOAD THROW` for a case or `RELOAD OUT` for a round, then `RELOAD IN` and `RELOAD END`; the FN40GL's has a start for each of the three.
+- **The marks**: `DelAmmoChamber` (`AmmoInChamber` as the barrel stands); `RemoveShell` (the cases are out); `ShellEject` (`CanReload` again; the live round thrown down where it found no place; `AmmoInChamber` 0); `MagShow` (the round in the hand); `AddAmmoInChamber` (`AmmoInChamber` as the barrel stands, `CanReload` down, **and the reload is over**: the weapon idles from there, where the MP-43's goes on to `AddAmmoInMag`).
+
+**The rocket launcher** (the RShG-2, of the class `RocketLauncher`; `IsOneoff` is false in this install, and it is `OnlyBarrel` with one chamber, its rocket):
+
+- **Its own firing** (`RocketLauncherFire`, chosen for a `RocketLauncher` before every other test): the trigger starts it; the animator's `Fire` follows the trigger; the sights are put down as it starts; at `FiringBullet` the rocket leaves and the chamber is empty; at `FireEnd` the trigger is let go and the weapon idles. Nothing cuts it short.
+- **It fires from the sights only.** Its `IDLE` leaves for `FIRE` (and, further down its list, `QUICK FIRE`) only with `IsAimingFloat` over 0.9, the trigger and a rocket in it; `AIM OFF`, taken on `AimingOut`, comes after `FIRE` in that list, so the sights coming down as the firing starts do not stop it.
+- **The sights and the animator**: whenever the sights change (`IsAiming`), the game raises `AimingIn` and lowers `AimingOut` with them up, the other way with them down, and sets `PrevIsAimingFloatState` to 0 or 1 the other way about (`SetAimingInAnimator`); for any weapon but a rocket launcher it also sets `IsAimingFloat` to the sights (`FirearmsAnimator.SetAiming`). The launcher's `IsAimingFloat` is the curve its clips `AIM ON` and `AIM OFF` carry. None of the other weapons built has any of these four in its controller's ways or blends.
+- **Its controller has no state to reload in**, and nothing in the game's code plays its `FIRE TO OUT`, whose mark `DropWeapon` would throw it away (a used weapon is thrown away by the idling operation only if it is `IsOneOff`, which this one is not). Fired, it stays in the hands empty. The reload key would start the single barrel's operation, which its animator would never answer: the app gives it no rockets to reload with.
+
+### Built (2026-10-14)
+
+- `trp_sim::firearm::chambers`: the single barrel's reload (the barrel replaced whatever it holds; `Event::RoundUnloaded` for a live round taken out, at `ShellEject`); the rocket launcher's firing (`FirearmSettings::rocket_launcher`); the four parameters of the sights told to the animator on every change, for every weapon (`Firearm::step`).
+- The app: the round taken out goes to the vest or the pockets where it has room, else to the ground; **the rocket launcher is found with its rocket** (`Firearm::found`, the app's choice as a full magazine is: it cannot be loaded), and its crate holds no rockets; every weapon with a stock preset lies in the crates of weapons.
+
+### Not built, and open
+
+- The rocket and the launcher's grenade as things fired (the M32A1's likewise), and their sights' ranges (the `Levering` layer's `SightingRange`).
+- **Compared with nothing**: no recording has any of the three. The figures are the install's controllers run by the simulation.
+
 ## Compared with the running game
 
 **With nothing.** No recording has any of the five. The regression is unchanged (`after45` is `after44` in every figure): no other weapon's logic moved.
 
 `PROVISIONAL`: what the animator is told of a cylinder's or the barrels' rounds while idle (`AmmoInChamber` is set to the rounds in all the chambers).
 
-**Not built:** the rounds and the cases as things drawn (the chambers show empty); a round or a case put on the ground; the fistful a character who knows the weapon loads into an empty cylinder (`MasteringLevel`), the quick reload that throws everything out, turning the cylinder by hand (`RollCylinder`), taking a round out of a chamber (`DischargeAmmoFromCamoraOperation`); the reload of one barrel (`ReloadSingleBarrelOperation`: the MP-18, the signal pistols); the round left in a barrel put back into the vest when another is loaded; the launcher's grenade as a thing fired, its sight's ranges; these weapons' rounds in the inventory screen (`inventory.md`: the weapon in hand keeps its own count); recoil and handling compared with anything.
+**Not built:** the rounds and the cases as things drawn (the chambers show empty); a round or a case put on the ground; the fistful a character who knows the weapon loads into an empty cylinder (`MasteringLevel`), the quick reload that throws everything out, turning the cylinder by hand (`RollCylinder`), taking a round out of a chamber (`DischargeAmmoFromCamoraOperation`); the round left in a barrel put back into the vest when another is loaded; the launcher's grenade as a thing fired, its sight's ranges (and the rocket's: "One barrel loaded alone, and the rocket launcher"); these weapons' rounds in the inventory screen (`inventory.md`: the weapon in hand keeps its own count); recoil and handling compared with anything.

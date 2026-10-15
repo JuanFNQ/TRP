@@ -113,6 +113,14 @@ pub struct FirearmSettings {
     /// How many barrels are loaded one by one (`ReloadMode.OnlyBarrel`);
     /// none for any other weapon.
     pub barrels: u32,
+    /// A fitted magazine may be changed the quick way, the old one let
+    /// fall (`isFastReload`, `Weapon.CanReloadFast`; firing spec, "The
+    /// quick reload").
+    pub fast_reload: bool,
+    /// A rocket launcher (the game's `RocketLauncher`): fired by its own
+    /// operation, from the sights only (more-weapons spec, "One barrel
+    /// loaded alone, and the rocket launcher").
+    pub rocket_launcher: bool,
 }
 
 /// What the weapon did this step, for the host to show and sound.
@@ -126,6 +134,15 @@ pub enum Event {
     AutoFire(bool),
     MagazineOut,
     MagazineIn,
+    /// A magazine's reload has begun, which is when the game makes the
+    /// exchange (`ReloadExternalMagResult.Run`): the magazine the host
+    /// chose goes into the weapon, and the one fitted leaves it with
+    /// `left` rounds (none if none was fitted), to be let fall in a quick
+    /// reload and otherwise put where there is room.
+    MagazineSwap { left: Option<u32>, quick: bool },
+    /// The old magazine has left the hand (the mark `MagHide`,
+    /// `OnMagPuttedToRig`): one that had nowhere to go falls now.
+    MagazineHidden,
     FireMode(FireMode),
     /// The weapon has appeared in the hands: its draw's last mark.
     Appeared,
@@ -140,6 +157,11 @@ pub enum Event {
     /// magazine filled with the bolt open (the game puts it on the ground
     /// as loot).
     RoundEjected,
+    /// The live round in a single barrel being reloaded has come out
+    /// (`ReloadSingleBarrelOperation.OnShellEjectEvent`): the game puts it
+    /// in the vest or the pockets where it has room, and else on the
+    /// ground.
+    RoundUnloaded,
     /// The stock has been folded, or unfolded: the weapon is a cell
     /// shorter or longer, its recoil is without or with the stock's share,
     /// and it may be held closer (`docs/spec/shotgun.md`, "The stock").
@@ -189,7 +211,8 @@ impl Blend {
 /// Asked for during the shot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Planned {
-    Reload(u32),
+    /// A magazine's reload, the quick way or not.
+    Reload(u32, bool),
     Shells(u32),
     Hide(bool),
 }
@@ -214,8 +237,9 @@ enum Operation {
     /// A reload, until the new magazine is in and no round is left to
     /// chamber: the rest of the animation plays out with the logic idling.
     /// `catch_off` is that the bolt's catch has been let go in it once: a
-    /// second mark for that is not answered.
-    Reload { mag_out: bool, mag_shown: bool, mag_in: bool, catch_off: bool, hide: Option<bool> },
+    /// second mark for that is not answered; `mag_hidden` that the old
+    /// magazine's mark for leaving the hand has been.
+    Reload { mag_out: bool, mag_shown: bool, mag_in: bool, catch_off: bool, mag_hidden: bool, hide: Option<bool> },
     /// A magazine that stays in the weapon filled a round at a time
     /// (`ReloadInternalMagOperation`; shotgun spec, "Filling the tube"),
     /// until it is full, the rounds within reach are used up, or it is cut
@@ -274,6 +298,14 @@ pub struct Firearm {
     reload_reach: u32,
     reload_cached: u32,
     reload_remove: i32,
+    /// A single barrel's reload takes a live round out of it.
+    reload_unloads: bool,
+    /// The sights as the animator was last told of them, and whether it
+    /// has been told since the resting state last began (the game's
+    /// `bool_0`, by which a rocket launcher's trigger is refused just
+    /// after the sights have come down).
+    aim_told: bool,
+    aim_flags: bool,
     /// A round is chambered.
     pub chamber: bool,
     /// Rounds in the fitted magazine, if one is fitted.
@@ -363,7 +395,11 @@ impl Firearm {
     /// round in its chamber, its magazine, tube or cylinder full. Barrels
     /// are chambers and nothing else: they are empty.
     pub fn found(&mut self) {
-        if self.settings.barrels > 0 {
+        // A rocket launcher cannot be loaded: it is found with its rocket
+        // (the app's choice, as a full magazine is).
+        if self.settings.rocket_launcher {
+            self.fill_chambers(true);
+        } else if self.settings.barrels > 0 {
             self.fill_chambers(false);
         } else if !self.has_chambers() {
             self.chamber = false;
@@ -391,6 +427,9 @@ impl Firearm {
             reload_reach: 0,
             reload_cached: 0,
             reload_remove: -1,
+            reload_unloads: false,
+            aim_told: false,
+            aim_flags: false,
             chamber: true,
             magazine: Some(settings.magazine_capacity),
             incoming: settings.magazine_capacity,
@@ -699,7 +738,14 @@ impl Firearm {
             Operation::ChambersReload { can_abort, aborted, .. } => *aborted |= pressed && *can_abort,
             // A shot from a cylinder or from barrels only lets go of the
             // trigger.
-            Operation::CylinderFire { .. } | Operation::BarrelsFire { .. } => self.trigger &= pressed,
+            Operation::CylinderFire { .. } | Operation::BarrelsFire { .. } => {
+                self.trigger &= pressed;
+                // A rocket launcher's animator has the trigger
+                // (`RocketLauncherFire.PrepareShot`).
+                if self.settings.rocket_launcher {
+                    self.animator.set_flag("Fire", self.trigger);
+                }
+            }
             // The look all over is ended by the trigger, pressed or let
             // go, and the idling operation takes it from there
             // (`UtilityOperation.SetTriggerPressed`).
@@ -728,7 +774,11 @@ impl Firearm {
             return;
         }
         self.animator_rounds();
-        // Chambers of their own have operations of their own.
+        // Chambers of their own have operations of their own, and so has
+        // a rocket launcher.
+        if self.settings.rocket_launcher {
+            return self.rocket_trigger(pressed);
+        }
         if self.settings.cylinder.is_some() {
             return self.cylinder_trigger(pressed);
         }
@@ -945,6 +995,24 @@ impl Firearm {
         self.trigger_changed(false);
     }
 
+    /// The animator told of the sights as they now stand
+    /// (`FirearmController.SetAimingInAnimator`; more-weapons spec, "One
+    /// barrel loaded alone, and the rocket launcher"): `AimingIn` up and
+    /// `AimingOut` down with them up, the other way with them down, and
+    /// `PrevIsAimingFloatState` the other way about; and, but for a rocket
+    /// launcher, whose own clips' marks set it, `IsAimingFloat`.
+    fn tell_aim(&mut self) {
+        let on = self.aiming;
+        self.aim_told = on;
+        if !self.settings.rocket_launcher {
+            self.animator.set("IsAimingFloat", if on { 1.0 } else { 0.0 });
+        }
+        self.animator.set_flag("AimingIn", on);
+        self.animator.set_flag("AimingOut", !on);
+        self.animator.set("PrevIsAimingFloatState", if on { 0.0 } else { 1.0 });
+        self.aim_flags = true;
+    }
+
     /// How far a reload with the sights up has stiffened the weapon, 0 to 1.
     pub fn tactical_reload(&self) -> f32 {
         self.tactical.value(self.clock)
@@ -959,6 +1027,24 @@ impl Firearm {
     /// is for the host game to decide. Asked for during a shot, the reload
     /// follows it, if nothing else is to.
     pub fn reload_with(&mut self, rounds: u32) {
+        self.reload_magazine(rounds, false);
+    }
+
+    /// The quick reload's key (`FirearmHandsInputTranslator.QuickReload`;
+    /// firing spec, "The quick reload"): heard only with the animator at
+    /// rest. With a magazine fitted, on a weapon that allows it, the old
+    /// magazine is let fall and the new one is fitted the quicker way;
+    /// otherwise this is the plain reload. `rounds` is what the new
+    /// magazine holds. `Event::MagazineSwap` says which it was.
+    pub fn quick_reload_with(&mut self, rounds: u32) {
+        if !self.animator_idling() {
+            return;
+        }
+        let quick = self.settings.fast_reload && self.magazine.is_some();
+        self.reload_magazine(rounds, quick);
+    }
+
+    fn reload_magazine(&mut self, rounds: u32, quick: bool) {
         match &mut self.operation {
             // A reload asked for while the last one's animation is still
             // playing out is taken like any other: the operation begins
@@ -971,10 +1057,10 @@ impl Firearm {
                     self.aiming = false;
                 }
                 self.idle_trigger(false);
-                self.begin_reload(rounds);
+                self.begin_reload(rounds, quick);
             }
             Operation::Single { planned, .. } | Operation::Automatic { planned, .. } if planned.is_none() => {
-                *planned = Some(Planned::Reload(rounds));
+                *planned = Some(Planned::Reload(rounds, quick));
                 self.trigger = false;
                 self.work_bolt_for_reload();
             }
@@ -993,8 +1079,11 @@ impl Firearm {
     }
 
     /// The reload operation's start: the animator is told what it is to
-    /// do, and does it from its resting state.
-    fn begin_reload(&mut self, rounds: u32) {
+    /// do, and does it from its resting state. The host is told of the
+    /// exchange, which the game makes now. A quick one raises `ReloadFast`
+    /// where the plain one raises `Reload` (`FirearmsAnimator.Reload`).
+    fn begin_reload(&mut self, rounds: u32, quick: bool) {
+        self.events.push(Event::MagazineSwap { left: self.magazine, quick });
         self.incoming = rounds;
         self.chambers = !self.chamber && rounds > 0;
         let (fitted, variant) = (self.magazine.is_some(), self.settings.magazine_variant as f32);
@@ -1003,7 +1092,7 @@ impl Firearm {
         self.animator.set_flag("CanReload", true);
         self.animator.set("RelTypeOld", if fitted { variant } else { -1.0 });
         self.animator.set("RelTypeNew", variant);
-        self.animator.trigger("Reload");
+        self.animator.trigger(if quick { "ReloadFast" } else { "Reload" });
         // With a round chambered and none to chamber from the new
         // magazine, a bolt held open is let go as the reload begins
         // (`ReloadExternalMagOperation.Start`).
@@ -1012,7 +1101,7 @@ impl Firearm {
             self.set_bolt_catch(false);
         }
         (self.hands_busy, self.reload_flag) = (true, true);
-        self.operation = Operation::Reload { mag_out: false, mag_shown: false, mag_in: false, catch_off: false, hide: None };
+        self.operation = Operation::Reload { mag_out: false, mag_shown: false, mag_in: false, catch_off: false, mag_hidden: false, hide: None };
     }
 
     /// Fills a magazine that stays in the weapon, a round at a time
@@ -1034,7 +1123,10 @@ impl Firearm {
                     self.aiming = false;
                 }
                 self.idle_trigger(false);
-                if self.magazine.is_some_and(|rounds| rounds < self.settings.magazine_capacity) {
+                // A single barrel is reloaded whatever it holds
+                // (`ReloadSingleBarrelResult.Run`).
+                let room = self.magazine.is_some_and(|rounds| rounds < self.settings.magazine_capacity) || self.settings.barrels == 1;
+                if room {
                     if self.settings.cylinder.is_some() {
                         self.begin_cylinder_reload(within_reach);
                     } else if self.settings.barrels > 0 {
@@ -1441,6 +1533,10 @@ impl Firearm {
     /// the marks that update passed, each to the operation then in hand.
     /// Returns what happened.
     pub fn step(&mut self, dt: f32) -> Vec<Event> {
+        // The animator hears of the sights whenever they have changed.
+        if self.aiming != self.aim_told {
+            self.tell_aim();
+        }
         // A reload made with the sights up stiffens the weapon, and lets
         // it go a moment after either ends.
         self.clock += dt;
@@ -1522,6 +1618,11 @@ impl Firearm {
                 self.animator.set_flag("Armed", false);
                 self.animator.set_layer_weight("Hammer", 1.0);
             }
+            // A rocket launcher's sights up and down as its own clips have
+            // them (`FirearmController.OnAimReady`, `OnIdleReady`): what
+            // its resting state's way to firing waits for.
+            ("AimReady", _) if self.settings.rocket_launcher => self.animator.set("IsAimingFloat", 1.0),
+            ("IdleReady", _) if self.settings.rocket_launcher => self.animator.set("IsAimingFloat", 0.0),
             ("Sound", _) => self.events.push(Event::Sound(mark.text.clone())),
             ("ThirdAction", _) => self.events.push(Event::BodyAction(mark.int)),
             ("IdleStart", _) => self.idle_started(),
@@ -1557,6 +1658,10 @@ impl Firearm {
             ("MagShow", Operation::Reload { mag_shown, .. }) if !*mag_shown => {
                 *mag_shown = true;
                 self.animator.set_flag("Inventory", self.inventory);
+            }
+            ("MagHide", Operation::Reload { mag_hidden, .. }) if !*mag_hidden => {
+                *mag_hidden = true;
+                self.events.push(Event::MagazineHidden);
             }
             // The bolt's catch in a magazine's reload: caught whenever the
             // mark says so, let go only the first time
@@ -1616,6 +1721,9 @@ impl Firearm {
 
     /// The mark at the very start of the animator's resting state.
     fn idle_started(&mut self) {
+        // The resting state begun: the sights' news is old
+        // (`Idling.OnIdleStartEvent`).
+        self.aim_flags = false;
         match self.operation {
             // The weapon is back at rest: the body is told the hands are
             // free, and the trigger is heard again after a reload.
@@ -1680,7 +1788,7 @@ impl Firearm {
     /// What a shot was asked to hand over to.
     fn run(&mut self, planned: Planned) {
         match planned {
-            Planned::Reload(rounds) => self.begin_reload(rounds),
+            Planned::Reload(rounds, quick) => self.begin_reload(rounds, quick),
             Planned::Shells(within_reach) => self.begin_shells(within_reach),
             Planned::Hide(fast) => self.start_remove(fast),
         }
@@ -1768,7 +1876,8 @@ pub(crate) mod tests {
     use crate::marks::MarkTable;
     use trp_data::states::{Parameter, ParameterKind};
 
-    const PARAMETERS: [(&str, ParameterKind, f32); 15] = [
+    const PARAMETERS: [(&str, ParameterKind, f32); 16] = [
+        ("ReloadFast", ParameterKind::Trigger, 0.0),
         ("Active", ParameterKind::Bool, 0.0),
         ("Inventory", ParameterKind::Bool, 0.0),
         ("Fire", ParameterKind::Bool, 0.0),
@@ -1793,7 +1902,7 @@ pub(crate) mod tests {
     /// below zero for none), the blend (a fraction of the state) and its
     /// conditions, each a parameter with `!` for "not set", `>0` or `<1`.
     type Way = (&'static str, f32, f32, &'static [&'static str]);
-    const STATES: [(&str, f32, &[(&str, f32)], &[Way]); 18] = [
+    const STATES: [(&str, f32, &[(&str, f32)], &[Way]); 19] = [
         ("SPAWN", 0.33, &[], &[("OUT TO IDLE", -1.0, 0.0, &["Active"])]),
         ("OUT TO IDLE", 0.967, &[("WeapIn", 0.99)], &[("IDLE", 0.98, 0.02, &["!Inventory"]), ("OPEN INVENTORY", 0.78, 0.22, &["Inventory"])]),
         (
@@ -1802,6 +1911,7 @@ pub(crate) mod tests {
             &[("IdleStart", 0.0)],
             &[
                 ("OPEN INVENTORY", -1.0, 0.05, &["Inventory"]),
+                ("RELOAD OUT ALL", -1.0, 0.1, &["ReloadFast", "MagInWeapon", "CanReload"]),
                 ("IDLE TO OUT", -1.0, 0.05, &["!Active"]),
                 ("RELOAD START", -1.0, 0.0, &["CanReload", "Reload", "MagInWeapon"]),
                 ("DRY FIRE", -1.0, 0.0, &["Armed", "AmmoInChamber<1", "Fire"]),
@@ -1821,6 +1931,7 @@ pub(crate) mod tests {
         ("DRY FIRE DISARMED", 0.267, &[], &[("IDLE", 1.0, 0.0, &["!Fire"])]),
         ("RELOAD START", 0.444, &[], &[("RELOAD OUT", 0.3, 0.75, &[])]),
         ("RELOAD OUT", 1.0, &[("MagOut", 0.462), ("MagHide", 0.85)], &[("RELOAD IN", 0.78, 0.22, &["CanReload"])]),
+        ("RELOAD OUT ALL", 1.0, &[("MagOut", 0.486), ("MagHide", 0.602)], &[("RELOAD IN", 0.9, 0.1, &[])]),
         (
             "RELOAD IN",
             1.2,
@@ -1922,6 +2033,8 @@ pub(crate) mod tests {
             draw_speed: 1.0,
             cylinder: None,
             barrels: 0,
+            fast_reload: true,
+            rocket_launcher: false,
             magazine_variant: 0,
             mastering: 0,
             stop_aiming_at: 0.1,
@@ -2327,6 +2440,77 @@ pub(crate) mod tests {
         let all = states(&mut w, 10.0, 0.0);
         assert_eq!(names(&all), ["RELOAD START", "RELOAD OUT", "RELOAD IN", "RELOAD END", "IDLE"]);
         assert!(w.is_idle() && !w.chamber);
+    }
+
+    /// The quick reload throws the magazine out by a state of its own
+    /// (`RELOAD OUT ALL`) and is the plain reload from there; the host is
+    /// told of the exchange as it begins and of the old magazine leaving
+    /// the hand.
+    #[test]
+    fn the_quick_reload_throws_the_magazine_out_and_goes_on_as_the_plain_one() {
+        let mut w = rifle();
+        w.set_trigger(true, true);
+        run(&mut w, 0.5);
+        w.set_trigger(false, true);
+        let mut again = rifle();
+        again.magazine = Some(29);
+        w.quick_reload_with(30);
+        assert!(w.reloading());
+        let all = states(&mut w, 6.0, 0.0);
+        assert_eq!(names(&all), ["RELOAD OUT ALL", "RELOAD IN", "RELOAD END", "IDLE"]);
+        assert!(w.chamber && w.magazine == Some(30));
+        // Out all 0.9 of 1 s, in 0.9 of 1.2 s, end 0.98 of 0.457 s.
+        let rest = all.last().unwrap().1 - all[0].1;
+        assert!((rest - 2.43).abs() < 5.0 * DT, "{rest}");
+        again.quick_reload_with(30);
+        let swap = again.step(DT);
+        assert!(swap.contains(&Event::MagazineSwap { left: Some(29), quick: true }), "{swap:?}");
+    }
+
+    #[test]
+    fn the_old_magazine_leaves_the_hand_once_in_either_reload() {
+        for quick in [false, true] {
+            let mut w = rifle();
+            if quick { w.quick_reload_with(30) } else { w.reload_with(30) }
+            let mut said = w.step(DT);
+            while !w.is_idle() {
+                said.extend(w.step(DT));
+                assert!(said.len() < 10_000);
+            }
+            let hidden = said.iter().filter(|e| **e == Event::MagazineHidden).count();
+            let swaps: Vec<&Event> = said.iter().filter(|e| matches!(e, Event::MagazineSwap { .. })).collect();
+            assert_eq!(hidden, 1, "{quick}");
+            assert_eq!(swaps, [&Event::MagazineSwap { left: Some(30), quick }]);
+            // It leaves after the magazine is out and before the new one is in.
+            let at = |wanted: &Event| said.iter().position(|e| e == wanted).unwrap();
+            assert!(at(&Event::MagazineOut) < at(&Event::MagazineHidden) && at(&Event::MagazineHidden) < at(&Event::MagazineIn));
+        }
+    }
+
+    /// The key is heard only with the animator at rest, and is the plain
+    /// reload where the weapon does not allow the quick one or has no
+    /// magazine fitted.
+    #[test]
+    fn the_quick_reload_is_refused_away_from_rest_and_plain_where_not_allowed() {
+        let swapped = |events: &[Event]| events.iter().any(|e| matches!(e, Event::MagazineSwap { .. }));
+        let mut w = rifle();
+        w.reload();
+        w.step(DT);
+        w.quick_reload_with(30);
+        assert!(!swapped(&w.step(DT)));
+        // Not allowed by the weapon.
+        let mut settings = settings();
+        settings.fast_reload = false;
+        let mut w = Firearm::new(settings, &animator());
+        w.start_drawn();
+        w.quick_reload_with(30);
+        assert!(w.step(DT).contains(&Event::MagazineSwap { left: Some(30), quick: false }));
+        assert_eq!(names(&states(&mut w, 1.0, 0.0))[0], "RELOAD OUT");
+        // No magazine fitted.
+        let mut w = rifle();
+        w.magazine = None;
+        w.quick_reload_with(30);
+        assert!(w.step(DT).contains(&Event::MagazineSwap { left: None, quick: false }));
     }
 
     #[test]

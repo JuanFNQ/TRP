@@ -86,6 +86,77 @@ const WALL_HIGH: f32 = 2.5;
 const KNEE_HIGH: f32 = 0.6;
 const WALL_HALF: f32 = 4.0;
 const DOORWAY: [f32; 2] = [-0.9, 0.9];
+/// How far the knee-high wall reaches to the right of the lane: further
+/// than the door wall, for the tables of weapons along it.
+const KNEE_RIGHT: f32 = 10.5;
+/// A window in the door wall to the right of the doorway, open, to vault
+/// through (the user, 2026-10-14, night: "add a small vaultable window by
+/// the door"): from one side to the other across the lane, and its sill's
+/// and its lintel's heights. Made to the vault's rules (`docs/spec/
+/// vaulting.md`): a sill of 0.9 m is within the 0.25 to 1.1 m a vault
+/// takes, the wall's 0.4 m within its 0.41 m of length, the 1 m opening
+/// more than the 0.9 m of roof it asks over the sill, and the capsule a
+/// vault shrinks to (1.0 to 1.73 m over the feet for this sill, 0.73 m
+/// across) passes under the lintel and between the jambs.
+const WINDOW: [f32; 2] = [2.0, 3.0];
+const SILL: f32 = 0.9;
+const LINTEL: f32 = 1.9;
+
+/// The tables of weapons along the knee-high wall, to the right of the
+/// airdrop crate, one for each class of weapon (the user, 2026-10-14:
+/// "Let's make every weapon selectable. We can create a few more crates
+/// lining the small wall with labels. Separated like (Rifles) (Pistols)
+/// (Shotguns) (Snipers) (Custom)"; and the same night: "Lets split the
+/// weapons and magazines. We can make a small table with the guns ontop,
+/// and their magazines below, for each weapon type. The gun crates should
+/// be long and short, like a gun case. Make them green. The magazines
+/// should be in a black square box. Give them lids that open!"), each with
+/// its label drawn over it. The three classes the user's five leave
+/// without a place (submachine guns, machine guns, launchers) are the
+/// app's. `main` fills them in this order: the gun cases are the range's
+/// containers from `CONTAINERS`' last on, the magazine boxes after them.
+pub const WEAPON_CRATES: [&str; 8] = ["RIFLES", "SMGS", "MACHINE GUNS", "SNIPERS", "SHOTGUNS", "PISTOLS", "LAUNCHERS", "CUSTOM"];
+/// Where the first table stands across the lane (its gun case half a metre
+/// from the airdrop crate), and how far each next one is from the last.
+const WEAPON_TABLE_FIRST: f32 = 1.5;
+const WEAPON_TABLE_STEP: f32 = 1.2;
+/// How many tables stand along the wall; the rest stand in an arm turned
+/// towards the start, the whole an L (the user, 2026-10-14, night: "Rotate
+/// the last 4 weapon sets 90* over to the right to form an L shape"),
+/// their fronts to the lane and their backs to the right. The arm's tables'
+/// middle across the lane, and how far its first one's near end is from
+/// the wall's face: a character before it stands clear of the row's last
+/// table. The app's.
+const ALONG_THE_WALL: usize = 4;
+const ARM_X: f32 = 6.8;
+const ARM_FROM_WALL: f32 = 0.4;
+/// The airdrop crate's lid: hinged along its back edge, by the wall, and
+/// lifted towards it so far (`ESTIMATE`: its prefab is not read), as the
+/// tables' boxes are.
+const AIRDROP_OPENS: f32 = 80.0;
+/// What the airdrop crate holds since the tables took the weapons (the
+/// user, 2026-10-14, night: 'Give the OG green box a "clothing" label and
+/// a lid'): its label, over it and on the screen.
+pub const AIRDROP_LABEL: &str = "CLOTHING";
+/// A table: how long along the wall, how high and how deep; its top's
+/// thickness, and its legs' side. The app's.
+const WEAPON_TABLE: Vec3 = Vec3::new(1.0, 0.85, 0.5);
+const TABLE_SLAB: f32 = 0.04;
+const TABLE_LEG: f32 = 0.05;
+/// The gun case on a table, long and low (the game's own weapon box, the
+/// `WeaponCrate` container whose grid is 5 by 2, is a long flat case), and
+/// the magazine box under it, square (the game's `AmmoBox`, 3 by 3): their
+/// sizes, and how far each lid opens. The app's shapes and angles
+/// (`ESTIMATE`): the game's models of them are not read. The box's lid
+/// opens no further than the table over it lets it.
+const GUN_CASE: Vec3 = Vec3::new(0.95, 0.13, 0.34);
+const MAGAZINE_BOX: Vec3 = Vec3::new(0.42, 0.42, 0.42);
+const GUN_CASE_OPENS: f32 = 80.0;
+const MAGAZINE_BOX_OPENS: f32 = 55.0;
+/// The first gun case and the first magazine box by their places in
+/// `Carried::away`.
+const GUN_CASE_HOLDS: usize = 5;
+const MAGAZINE_BOX_HOLDS: usize = GUN_CASE_HOLDS + WEAPON_CRATES.len();
 
 #[derive(Resource)]
 pub struct Range {
@@ -139,7 +210,6 @@ const TABLE: [f32; 2] = [1.9, ROW];
 const HIGH_SHELF: [f32; 2] = [3.7, ROW];
 const ROUNDS: [f32; 2] = [-1.0, DOOR_WALL_Z + 2.4];
 const CAR: [f32; 2] = [6.9, ROW - 1.5];
-const CLIMB: [f32; 2] = [12.5, 6.5];
 const TABLE_TOP: f32 = 0.8;
 const SHELF_TOP: f32 = 1.4;
 /// Where `main` lays the things to be taken up, in Bevy's axes: on the
@@ -171,18 +241,21 @@ impl Default for Range {
             ));
         }
         // The two walls across the lane: behind the start the door wall,
-        // with its doorway and a lintel over it; ahead the knee-high one, to
-        // vault and to lie at. And a block a metre high off to the right,
-        // to climb.
+        // with its doorway and a lintel over it and a window to its right;
+        // ahead the knee-high one, to vault and to lie at. (A block a metre
+        // high stood off to the right, to climb, until the user had it
+        // taken away on 2026-10-14: the ring's blocks are as high.)
         let grey = Color::srgb(0.55, 0.55, 0.58);
         let span = |z: f32, left: f32, right: f32, low: f32, high: f32| {
             block(Vec3::new((left + right) / 2.0, (low + high) / 2.0, z), Vec3::new(right - left, high - low, WALL_THICK), grey)
         };
         solids.push(span(DOOR_WALL_Z, -WALL_HALF, DOORWAY[0], 0.0, WALL_HIGH));
-        solids.push(span(DOOR_WALL_Z, DOORWAY[1], WALL_HALF, 0.0, WALL_HIGH));
+        solids.push(span(DOOR_WALL_Z, DOORWAY[1], WINDOW[0], 0.0, WALL_HIGH));
+        solids.push(span(DOOR_WALL_Z, WINDOW[0], WINDOW[1], 0.0, SILL));
+        solids.push(span(DOOR_WALL_Z, WINDOW[0], WINDOW[1], LINTEL, WALL_HIGH));
+        solids.push(span(DOOR_WALL_Z, WINDOW[1], WALL_HALF, 0.0, WALL_HIGH));
         solids.push(span(DOOR_WALL_Z, DOORWAY[0], DOORWAY[1], LEAF[1] + 0.05, WALL_HIGH));
-        solids.push(span(KNEE_WALL_Z, -WALL_HALF, WALL_HALF, 0.0, KNEE_HIGH));
-        solids.push(block(Vec3::new(CLIMB[0], 0.5, CLIMB[1]), Vec3::ONE, Color::srgb(0.38, 0.52, 0.60)));
+        solids.push(span(KNEE_WALL_Z, -WALL_HALF, KNEE_RIGHT, 0.0, KNEE_HIGH));
         // Somewhere to fall from, to the left of the start: stairs going the
         // lane's way up to a platform, and a lower platform beside it that
         // reaches to the knee-high wall.
@@ -227,12 +300,17 @@ impl Default for Range {
             slide: Vec3::ZERO,
             color,
         };
-        // The airdrop crate with the rifle's kit, against the knee-high
-        // wall ahead of the start. It names no gestures of its own here
-        // (PROVISIONAL: its prefab is not read) and nothing of it is drawn
-        // moving.
-        let airdrop = body(&mut solids, AIRDROP, Vec3::new(1.0, 0.5, 0.6), Color::srgb(0.27, 0.33, 0.21));
-        things.push(container("airdrop crate", Thing::container(None, None, 0.0, 0.0), airdrop, Part::None, 0));
+        // The airdrop crate with the kit, against the knee-high wall ahead
+        // of the start: since 2026-10-14, night, a lid on it hinged along its
+        // back edge, which opens with the gestures recorded for a lid hinged
+        // up (PROVISIONAL: its prefab, and whatever gestures that names, are
+        // not read).
+        let airdrop_size = Vec3::new(1.0, 0.5, 0.6);
+        let airdrop_green = Color::srgb(0.27, 0.33, 0.21);
+        let airdrop = body(&mut solids, AIRDROP, airdrop_size, airdrop_green);
+        let airdrop_opens = Thing::container(Some(Interaction::ContainerHingeUpOpen), Some(Interaction::ContainerHingeUpClose), 0.0, -AIRDROP_OPENS);
+        let airdrop_lid = lid_of(Vec3::new(AIRDROP[0], airdrop_size.y, AIRDROP[1]), airdrop_size, Vec3::Z, airdrop_green.darker(0.04));
+        things.push(container("airdrop crate", airdrop_opens, airdrop, airdrop_lid, 0));
         // Behind the door wall, from left to right. A technical supply crate,
         // its lid at waist height (recorded: gestures 29 and 30, the lid from
         // 0 to 4.78 degrees).
@@ -273,6 +351,42 @@ impl Default for Range {
         let crate_size = Vec3::new(1.0, 0.44, 0.6);
         let crate_body = body(&mut solids, WOODEN_CRATE, crate_size, wood);
         things.push(container("wooden crate", hinged_up(), crate_body, lid(WOODEN_CRATE, crate_size, Vec3::NEG_X, wood.darker(0.05)), 1));
+        // The tables of weapons, against the knee-high wall to the airdrop
+        // crate's right: on each a green gun case with the class's weapons,
+        // under it a black box with what loads them, its front with the
+        // table's. Each opens as the range's crates do (the gestures
+        // recorded for a lid hinged up, 29 and 30), its lid hinged along
+        // its back edge, by the wall, and lifted towards it.
+        let (case_green, box_black) = (Color::srgb(0.24, 0.33, 0.19), Color::srgb(0.05, 0.05, 0.06));
+        for (index, name) in WEAPON_CRATES.into_iter().enumerate() {
+            let ([x, z], front) = weapon_table(index);
+            let (along, middle) = (Vec3::Y.cross(front), Vec3::new(x, 0.0, z));
+            // A box's size in the range's axes, from its length along the
+            // table, its height and its depth from back to front.
+            let sized = |size: Vec3| along.abs() * size.x + Vec3::Y * size.y + front.abs() * size.z;
+            // The table: its top, and a leg at each corner.
+            solids.push(block(middle + Vec3::Y * (WEAPON_TABLE.y - TABLE_SLAB / 2.0), sized(Vec3::new(WEAPON_TABLE.x, TABLE_SLAB, WEAPON_TABLE.z)), wood));
+            for (across, out) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let leg = middle + along * across * (WEAPON_TABLE.x - TABLE_LEG) / 2.0 + front * out * (WEAPON_TABLE.z - TABLE_LEG) / 2.0 + Vec3::Y * (WEAPON_TABLE.y - TABLE_SLAB) / 2.0;
+                solids.push(block(leg, sized(Vec3::new(TABLE_LEG, WEAPON_TABLE.y - TABLE_SLAB, TABLE_LEG)), wood));
+            }
+            // (Each thing's name is the prompt's, made once for the run.)
+            let named = |what: &str| -> &'static str { Box::leak(format!("{} {what}", name.to_lowercase()).into_boxed_str()) };
+            let case = block(middle + Vec3::Y * (WEAPON_TABLE.y + GUN_CASE.y / 2.0), sized(GUN_CASE), case_green);
+            solids.push(case);
+            let mut opens = hinged_up();
+            opens.open_angle = -GUN_CASE_OPENS;
+            let lid = lid_of(middle + Vec3::Y * (WEAPON_TABLE.y + GUN_CASE.y), GUN_CASE, front, case_green.darker(0.04));
+            things.push(container(named("weapon case"), opens, case, lid, GUN_CASE_HOLDS + index));
+            // The box under it, its front with the table's.
+            let below = middle + front * (WEAPON_TABLE.z - MAGAZINE_BOX.z) / 2.0;
+            let magazines = block(below + Vec3::Y * MAGAZINE_BOX.y / 2.0, sized(MAGAZINE_BOX), box_black);
+            solids.push(magazines);
+            let mut opens = hinged_up();
+            opens.open_angle = -MAGAZINE_BOX_OPENS;
+            let lid = lid_of(below + Vec3::Y * MAGAZINE_BOX.y, MAGAZINE_BOX, front, box_black.lighter(0.04));
+            things.push(container(named("magazine box"), opens, magazines, lid, MAGAZINE_BOX_HOLDS + index));
+        }
         // A table and a shelf with things lying on them (`LYING`), and
         // nothing more.
         body(&mut solids, TABLE, Vec3::new(1.0, TABLE_TOP, 0.6), wood);
@@ -330,6 +444,116 @@ impl Default for Range {
         }
         // The game's figure, until `main` has read it from the install.
         Self { solids, radius: 0.366, site: Site { ground: 0.0, blocks }, things, thing_settings: None }
+    }
+}
+
+/// Where a table of weapons stands, by its class's place in
+/// `WEAPON_CRATES`: the middle of its top across the lane and along it, and
+/// the level way from its back to its front, the side it is stood before.
+/// Along the wall a table's back is to the wall; in the arm, to the right.
+fn weapon_table(index: usize) -> ([f32; 2], Vec3) {
+    let wall = KNEE_WALL_Z + WALL_THICK / 2.0 + 0.02;
+    match index.checked_sub(ALONG_THE_WALL) {
+        None => ([WEAPON_TABLE_FIRST + index as f32 * WEAPON_TABLE_STEP, wall + WEAPON_TABLE.z / 2.0], Vec3::Z),
+        Some(on) => ([ARM_X, wall + ARM_FROM_WALL + WEAPON_TABLE.x / 2.0 + on as f32 * WEAPON_TABLE_STEP], Vec3::NEG_X),
+    }
+}
+
+/// The lid of a box `size` long, high and deep whose top's middle is at
+/// `top` and whose front is the way `front`: a slab on it, hinged along its
+/// back edge and lifted towards the back by a negative angle (a turn the
+/// left hand's way about the line along the box, `front`'s up and over).
+fn lid_of(top: Vec3, size: Vec3, front: Vec3, color: Color) -> Part {
+    let along = Vec3::Y.cross(front);
+    let centre = top + Vec3::Y * 0.015;
+    Part::Moving {
+        centre,
+        size: along.abs() * size.x + Vec3::Y * 0.03 + front.abs() * size.z,
+        pivot: centre - front * size.z / 2.0,
+        axis: along,
+        slide: Vec3::ZERO,
+        color,
+    }
+}
+
+/// Each label drawn over a container and where: the tables' over their
+/// gun cases, and the airdrop crate's over it, a hand above the lid, in
+/// Bevy's axes.
+pub fn weapon_crate_labels() -> impl Iterator<Item = (&'static str, Vec3)> {
+    let tables = WEAPON_CRATES.into_iter().enumerate().map(|(index, name)| {
+        let ([x, z], _) = weapon_table(index);
+        (name, Vec3::new(x, WEAPON_TABLE.y + GUN_CASE.y + 0.25, z))
+    });
+    tables.chain(std::iter::once((AIRDROP_LABEL, Vec3::new(AIRDROP[0], 0.5 + 0.25, AIRDROP[1]))))
+}
+
+/// Where in `Carried::away` the gun case of a class's table keeps what it
+/// holds, by the class's place in `WEAPON_CRATES`.
+pub fn gun_case_of(class: usize) -> usize {
+    GUN_CASE_HOLDS + class
+}
+
+/// What the screen calls the container whose contents lie at that place in
+/// `Carried::away`, where the range names it: the airdrop crate by what it
+/// holds, a table's gun case or magazine box by its class.
+pub fn weapon_crate_label(holds: usize) -> Option<String> {
+    if holds == 0 {
+        return Some(AIRDROP_LABEL.to_owned());
+    }
+    let case = holds.checked_sub(GUN_CASE_HOLDS).and_then(|at| WEAPON_CRATES.get(at)).map(|label| format!("{label} weapon case"));
+    case.or_else(|| holds.checked_sub(MAGAZINE_BOX_HOLDS).and_then(|at| WEAPON_CRATES.get(at)).map(|label| format!("{label} magazine box")))
+}
+
+/// Which crate of weapons a start's name is: its label in small letters,
+/// a dash for each space.
+fn weapon_crate_named(name: &str) -> Option<usize> {
+    WEAPON_CRATES.iter().position(|label| label.to_lowercase().replace(' ', "-") == name)
+}
+
+/// A crate's label, at its place in the world, drawn where the camera
+/// sees that place.
+#[derive(Component)]
+pub struct CrateLabel(Vec3);
+
+/// How wide a label's box is, and how far off a label is still drawn, in
+/// pixels and metres: the app's. Within that reach two crates side by
+/// side are further apart on the screen than a label is wide.
+const LABEL_WIDTH: f32 = 160.0;
+const LABEL_REACH: f32 = 6.0;
+
+pub fn spawn_labels(mut commands: Commands) {
+    for (name, at) in weapon_crate_labels() {
+        let node = Node { position_type: PositionType::Absolute, width: Val::Px(LABEL_WIDTH), justify_content: JustifyContent::Center, ..default() };
+        commands.spawn((CrateLabel(at), node, Visibility::Hidden, GlobalZIndex(-1))).with_children(|label| {
+            let inside = Node { padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)), ..default() };
+            label.spawn((inside, BackgroundColor(Color::srgba(0.07, 0.08, 0.07, 0.7)))).with_children(|inside| {
+                inside.spawn(crate::inventory_view::words(name, 14.0, Color::srgb(0.90, 0.88, 0.78)));
+            });
+        });
+    }
+}
+
+/// Puts each label where the camera sees its crate; none is drawn behind
+/// the camera, further off than `LABEL_REACH`, or under an open screen.
+pub fn place_labels(
+    camera: Query<(&Camera, &GlobalTransform), With<crate::MainCamera>>,
+    controller: Res<crate::controller::Controller>,
+    mut labels: Query<(&CrateLabel, &mut Node, &mut Visibility)>,
+) {
+    let Ok((camera, eye)) = camera.single() else { return };
+    for (label, mut node, mut shown) in &mut labels {
+        let near = eye.translation().distance(label.0) < LABEL_REACH && !controller.inventory_open;
+        let at = camera.world_to_viewport(eye, label.0).ok().filter(|_| near);
+        let wanted = if at.is_some() { Visibility::Inherited } else { Visibility::Hidden };
+        if *shown != wanted {
+            *shown = wanted;
+        }
+        if let Some(at) = at {
+            let (left, top) = (Val::Px(at.x - LABEL_WIDTH / 2.0), Val::Px(at.y - 10.0));
+            if node.left != left || node.top != top {
+                (node.left, node.top) = (left, top);
+            }
+        }
     }
 }
 
@@ -418,6 +642,10 @@ impl Range {
             "stairs" => [STAIRS_LEFT + 1.25, STAIRS_FOOT + 2.0],
             "doors" => [doorway, DOOR_WALL_Z - 1.3],
             "yard" => [doorway, DOOR_WALL_Z + 0.75],
+            // Before the airdrop crate, the clothing.
+            "clothing" => [AIRDROP[0], AIRDROP[1] + 0.3 + 0.75],
+            // Before the window on the lane's side, to vault through it.
+            "window" => [(WINDOW[0] + WINDOW[1]) / 2.0, DOOR_WALL_Z - 1.3],
             "car" => by(CAR, -3.0, 0.0),
             "wooden-crate" => by(WOODEN_CRATE, 0.0, -0.9),
             "supply-crate" => by(SUPPLY_CRATE, 0.0, -1.075),
@@ -426,7 +654,13 @@ impl Range {
             "table" => by(TABLE, 0.0, -1.0),
             "high-shelf" => by(HIGH_SHELF, 0.0, -0.7),
             "floor" => by(ROUNDS, 0.0, -0.8),
-            _ => return None,
+            // Before a table of weapons, by its label (`rifles`,
+            // `machine-guns`), three quarters of a metre from its front.
+            _ => {
+                let ([x, z], front) = weapon_table(weapon_crate_named(name)?);
+                let at = Vec3::new(x, 0.0, z) + front * (WEAPON_TABLE.z / 2.0 + 0.75);
+                [at.x, at.z]
+            }
         };
         let at = [bevy[0], -bevy[1]];
         Some([at[0], self.ground_height(at[0], at[1]), at[1]])
@@ -437,6 +671,8 @@ impl Range {
     pub fn start_view(name: &str) -> Option<[f32; 2]> {
         Some(match name {
             "doors" => [180.0, 5.0],
+            "window" => [180.0, 5.0],
+            "clothing" => [0.0, 45.0],
             "yard" => [0.0, 5.0],
             "car" => [90.0, 32.0],
             "wooden-crate" => [180.0, 60.0],
@@ -446,7 +682,12 @@ impl Range {
             "table" => [180.0, 36.0],
             "high-shelf" => [180.0, 11.0],
             "floor" => [180.0, 80.0],
-            _ => return None,
+            // (The gun case on the table, its front faced; the magazine box
+            // under it is reached crouched.)
+            _ => {
+                let (_, front) = weapon_table(weapon_crate_named(name)?);
+                [(-front.x).atan2(front.z).to_degrees(), 35.0]
+            }
         })
     }
 
@@ -619,8 +860,9 @@ mod tests {
         let lifted = range.push_out([0.0, 0.1, 0.0], half, tipped.to_array(), margin);
         assert!(lifted[1].abs() < 1e-5, "{lifted:?}");
         // The door wall's face on the start's side is 5.8 m behind the
-        // start (-5.8 in the simulation's axes); the box's back is 3 cm into it.
-        let out = range.push_out([2.5, 1.5, -(DOOR_WALL_Z - WALL_THICK / 2.0) + 0.115 - 0.03], half, level, margin);
+        // start (-5.8 in the simulation's axes); the box's back is 3 cm into
+        // it, to the window's right.
+        let out = range.push_out([3.5, 1.5, -(DOOR_WALL_Z - WALL_THICK / 2.0) + 0.115 - 0.03], half, level, margin);
         assert!((out[2] - 0.031).abs() < 1e-5 && out[0].abs() < 1e-6 && out[1].abs() < 1e-6, "{out:?}");
     }
 
@@ -677,8 +919,9 @@ mod tests {
     fn the_low_wall_stops_a_walk() {
         let range = Range::default();
         let height = Capsule { underside: 0.0, top: 1.6, lift: true };
-        // Ahead of the start, to the right of the airdrop crate.
-        let mut at = [2.5, 0.0, 2.0];
+        // Ahead of the start, to the left of the airdrop crate (to its
+        // right the crates of weapons stand along the wall).
+        let mut at = [-2.5, 0.0, 2.0];
         for _ in 0..300 {
             let to = range.obstructed(at, [at[0], at[1], at[2] + 0.0235], height);
             at = [to[0], to[1].max(range.ground_height(to[0], to[2])), to[2]];
@@ -771,30 +1014,71 @@ mod tests {
         assert_eq!(gesture("dead Scav"), Some(21));
         assert_eq!(gesture("drawer"), Some(25));
         assert_eq!(gesture("trunk"), Some(27));
-        assert_eq!(gesture("airdrop crate"), Some(27));
+        assert_eq!(gesture("airdrop crate"), Some(29));
         // The car's trunk seen from behind it, a metre off.
         let rear = CAR[0] - 2.1;
         let seen = range.looked_at(Vec3::new(rear - 1.0, 1.5, CAR[1]), Vec3::new(rear + 0.2, 0.6, CAR[1]), 1.15);
         assert_eq!(seen.map(|i| range.things[i].name), Some("trunk"));
         // Every place before a thing is clear of everything solid.
         let height = Capsule { underside: 0.0, top: 1.6, lift: true };
-        for name in ["doors", "yard", "car", "wooden-crate", "supply-crate", "scav", "drawer", "table", "high-shelf", "floor", "stairs"] {
+        for name in ["doors", "yard", "window", "clothing", "car", "wooden-crate", "supply-crate", "scav", "drawer", "table", "high-shelf", "floor", "stairs", "rifles", "custom"] {
             let at = range.place(name).unwrap();
             assert_eq!(range.obstructed(at, at, height), at, "{name} stands in something");
         }
     }
 
+    /// The window is vaulted through by the game's own rules (the
+    /// simulation's measuring and choosing, with the install's settings):
+    /// from the lane's side, its sill is an obstacle 0.9 m high and as deep
+    /// as the wall, and the move is a vault; before the wall beside it,
+    /// nothing is.
+    #[test]
+    fn the_window_is_vaulted_through() {
+        use trp_sim::vaulting::{Move, Standing, Vaulting, VaultingSettings};
+        let Ok(install) = trp_data::Install::locate() else {
+            eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+            return;
+        };
+        let db = trp_data::Database::load(&install).expect("database");
+        let settings = VaultingSettings::new(&db.config).expect("vaulting settings");
+        let range = Range::default();
+        let standing = Standing { vaulting: false, backing: false, grounded: true, in_transition: false, jumping: false, sprinting: false, can_vault: true, can_climb: true };
+        // Standing 0.45 m before the wall's face on the lane's side (in the
+        // simulation's axes the wall is at -6 m), facing it: half round.
+        let try_at = |x: f32| {
+            let feet = [x, 0.0, -(DOOR_WALL_Z - WALL_THICK / 2.0) + 0.45];
+            let mut vaulting = Vaulting::default();
+            vaulting.measure(&settings, &range, feet, 180.0, 0.0, false);
+            vaulting.measure(&settings, &range, feet, 180.0, 0.0, false);
+            (vaulting.choose(&settings, &standing), vaulting.obstacle.height, vaulting.obstacle.length)
+        };
+        let (chosen, height, length) = try_at((WINDOW[0] + WINDOW[1]) / 2.0);
+        println!("before the window: {chosen:?}, an obstacle {height:.2} m high and {length:.2} m deep");
+        assert_eq!(chosen, Some(Move::Vault));
+        assert!((height - SILL).abs() < 0.11 && length <= 0.41, "{height} {length}");
+        let (beside, ..) = try_at(WINDOW[1] + 0.5);
+        assert_eq!(beside, None);
+    }
+
     /// The things of the row stand a pace apart and none in another; the
-    /// lower platform reaches to the knee-high wall; the airdrop crate is
-    /// against that wall; and the ring is clear of everything.
+    /// tables of weapons' cases and boxes are clear of one another, a case
+    /// over its own box, and the first half a metre from the airdrop crate;
+    /// the lower platform reaches to the knee-high wall; the airdrop crate
+    /// is against that wall; and the ring is clear of everything.
     #[test]
     fn the_range_is_laid_out_as_drawn() {
         let range = Range::default();
-        let things: Vec<Block> = range.things.iter().filter(|p| p.leaf.is_none()).map(|p| p.hit).collect();
-        for (i, a) in things.iter().enumerate() {
-            for b in &things[i + 1..] {
+        let on_tables = |placed: &Placed| placed.holds.is_some_and(|holds| holds >= GUN_CASE_HOLDS);
+        let things: Vec<(Block, bool)> = range.things.iter().filter(|p| p.leaf.is_none()).map(|p| (p.hit, on_tables(p))).collect();
+        for (i, (a, a_table)) in things.iter().enumerate() {
+            for (b, b_table) in &things[i + 1..] {
                 let apart = |k: usize| (a.low[k] - b.high[k]).max(b.low[k] - a.high[k]);
-                assert!(apart(0).max(apart(2)) >= 0.5, "{a:?} and {b:?} are under half a metre apart");
+                let least = if *a_table && *b_table { 0.2 } else { 0.5 };
+                assert!(apart(0).max(apart(1)).max(apart(2)) > 0.0, "{a:?} and {b:?} are in one another");
+                // (A case and its box: one over the other.)
+                if !(*a_table && *b_table && apart(1) > 0.3) {
+                    assert!(apart(0).max(apart(2)) >= least, "{a:?} and {b:?} are under {least} m apart");
+                }
             }
         }
         // The lower platform's right side is the knee-high wall's left end.
