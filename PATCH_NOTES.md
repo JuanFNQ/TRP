@@ -1,5 +1,10 @@
 # Patch notes
 
+## TRP 0.42.1: the installer asks for each folder, it doesn't search (2026-10-17)
+
+- **Asked, not searched for**: `Install.bat` and the first start no longer look through your drives for SPT, GAMMA or Anomaly. Each question offers only the folder you gave before, so press Enter to keep it, or paste another.
+- **One question per folder**: SPT (needed), then GAMMA and Anomaly (both optional). Anomaly's folder is asked for even if GAMMA's Mod Organizer names one.
+
 ## TRP 0.42.0: health, Tarkov's own interface, sound, and a two-click install (2026-10-17)
 
 The first public release since 0.9.1 (2026-10-14): forty-nine versions of work at once, so this one is long. TRP reads SPT 4.1.6 (game client 0.16.9.5), SPT's last version, so nothing it reads moves under it.

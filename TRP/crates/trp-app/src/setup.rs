@@ -1,9 +1,10 @@
 //! The first start's questions, asked in the console the app runs in:
-//! where the user's games are (`docs/manual.md`, "The first start"). Two at
-//! most, each offering for Enter the folder kept from before or found in
-//! the usual places: SPT, which is needed, and S.T.A.L.K.E.R. (GAMMA's Mod
-//! Organizer folder or Anomaly's own), which is not. A third comes only
-//! where GAMMA's Mod Organizer names no Anomaly folder. The answers are
+//! where the user's games are (`docs/manual.md`, "The first start"). One
+//! question for each folder, each offering for Enter only the folder kept
+//! from before: none is looked for on the drives or worked out from another
+//! (the user, 2026-10-17: "no dont do automatic search!", and "make sure the
+//! installer asks where each of the folders are"). SPT's is needed; GAMMA's
+//! Mod Organizer folder and Anomaly's own are not. The answers are
 //! written to the workspace's `local` folder as a person would write them
 //! by hand, one plain file a folder: `eft_dir.txt` for Single Player
 //! Tushonka (SPT), `gamma_dir.txt` and `anomaly_dir.txt` for S.T.A.L.K.E.R.
@@ -85,71 +86,28 @@ fn has(file: &'static str, what: &'static str) -> impl Fn(&Path) -> std::result:
     }
 }
 
-/// S.T.A.L.K.E.R.'s folders as one answer gives them.
-#[derive(Debug, Clone, Default, PartialEq)]
-struct Stalker {
-    /// GAMMA's Mod Organizer folder.
-    gamma: Option<PathBuf>,
-    /// Anomaly's own folder: the one GAMMA's Mod Organizer names, or the
-    /// one given.
-    anomaly: Option<PathBuf>,
-}
-
-/// What a folder given for S.T.A.L.K.E.R. is: GAMMA's Mod Organizer folder
-/// (its `ModOrganizer.ini`), with the Anomaly it names where that one has
-/// its `fsgame.ltx`; or Anomaly's own folder.
-fn stalker_at(folder: &Path) -> std::result::Result<Stalker, String> {
-    if folder.join("ModOrganizer.ini").is_file() {
-        let anomaly = trp_data::xray::Stalker::organizer_game(folder).filter(|game| game.join("fsgame.ltx").is_file());
-        return Ok(Stalker { gamma: Some(folder.to_path_buf()), anomaly });
-    }
-    if folder.join("fsgame.ltx").is_file() {
-        return Ok(Stalker { gamma: None, anomaly: Some(folder.to_path_buf()) });
-    }
-    match folder.is_dir() {
-        false => Err(format!("{} is not a folder.", folder.display())),
-        true => Err(format!("{} is neither GAMMA's folder (it has no ModOrganizer.ini) nor Anomaly's (no fsgame.ltx).", folder.display())),
-    }
-}
-
-/// The drives there are, `C:\` to `Z:\`.
-fn drives() -> impl Iterator<Item = PathBuf> {
-    (b'C'..=b'Z').map(|letter| PathBuf::from(format!("{}:\\", letter as char))).filter(|root| root.is_dir())
-}
-
-/// The first of the usual folders, on any drive, that `fits`.
-fn found(names: &[&str], fits: impl Fn(&Path) -> bool) -> Option<PathBuf> {
-    drives().flat_map(|drive| names.iter().map(move |name| drive.join(name)).collect::<Vec<_>>()).find(|folder| fits(folder))
-}
-
-/// Asks where the games are and writes the answers to `local`: Single
-/// Player Tushonka, which is needed, and S.T.A.L.K.E.R., which is not.
-/// What `local` holds already, else what is found in the usual folders,
-/// is each question's answer for Enter.
+/// Asks where each game's folder is and writes the answers to `local`:
+/// Single Player Tushonka's, which is needed, then GAMMA's and Anomaly's,
+/// which are not. What `local` holds already is each question's answer for
+/// Enter.
 pub fn run(input: &mut dyn BufRead) -> Result<()> {
     let local = local_folder();
     let kept = |file: &str| read_hint(&local.join(file)).map(PathBuf::from);
     println!();
     println!("Where are your games?");
     println!();
-    let spt_offered = kept("eft_dir.txt").or_else(|| found(&["SPT", "SPTarkov", "Games\\SPT", "Games\\SPTarkov"], |folder| trp_data::Install::check(folder).is_ok()));
-    let spt = ask(input, "1. Single Player Tushonka (SPT), needed: the folder with EscapeFromTarkov.exe and SPT_Runtime.", spt_offered.as_deref(), false, &|folder| {
+    let spt = ask(input, "1. Single Player Tushonka (SPT), needed: the folder with EscapeFromTarkov.exe and SPT_Runtime.", kept("eft_dir.txt").as_deref(), false, &|folder| {
         trp_data::Install::check(folder).map(|_| folder.to_path_buf()).map_err(|e| format!("{e:#}"))
     })
     .ok_or_else(|| anyhow!("no folder was given for Single Player Tushonka"))?;
     println!();
-    let stalker_offered = kept("gamma_dir.txt")
-        .or_else(|| kept("anomaly_dir.txt"))
-        .or_else(|| found(&["GAMMA", "Games\\GAMMA", "Anomaly", "Games\\Anomaly"], |folder| stalker_at(folder).is_ok()));
-    let mut stalker = ask(input, "2. S.T.A.L.K.E.R. Anomaly or GAMMA, optional (for the S.T.A.L.K.E.R. suits): GAMMA's folder, with ModOrganizer.exe, or Anomaly's.", stalker_offered.as_deref(), true, &stalker_at)
-        .unwrap_or_default();
-    if stalker.gamma.is_some() && stalker.anomaly.is_none() {
-        println!();
-        println!("  GAMMA's Mod Organizer names no Anomaly folder with fsgame.ltx in it.");
-        stalker.anomaly = ask(input, "   Anomaly's own folder, the one with fsgame.ltx.", kept("anomaly_dir.txt").as_deref(), true, &has("fsgame.ltx", "Anomaly's folder"));
-    }
+    println!("S.T.A.L.K.E.R., optional (for its suits): either may be skipped.");
+    println!();
+    let gamma = ask(input, "2. GAMMA: the folder with ModOrganizer.exe and ModOrganizer.ini.", kept("gamma_dir.txt").as_deref(), true, &has("ModOrganizer.ini", "GAMMA's folder"));
+    println!();
+    let anomaly = ask(input, "3. S.T.A.L.K.E.R. Anomaly: the folder with fsgame.ltx.", kept("anomaly_dir.txt").as_deref(), true, &has("fsgame.ltx", "Anomaly's folder"));
     std::fs::create_dir_all(&local).with_context(|| local.display().to_string())?;
-    for (file, folder) in [("eft_dir.txt", Some(spt)), ("gamma_dir.txt", stalker.gamma), ("anomaly_dir.txt", stalker.anomaly)] {
+    for (file, folder) in [("eft_dir.txt", Some(spt)), ("gamma_dir.txt", gamma), ("anomaly_dir.txt", anomaly)] {
         let path = local.join(file);
         match folder {
             Some(folder) => std::fs::write(&path, folder.display().to_string()).with_context(|| path.display().to_string())?,
@@ -196,22 +154,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&good);
     }
 
-    /// One answer for S.T.A.L.K.E.R.: GAMMA's folder brings the Anomaly its
-    /// Mod Organizer names (every `\` doubled, as Mod Organizer writes it),
-    /// where that has its `fsgame.ltx`; Anomaly's folder is Anomaly alone;
-    /// any other folder is neither.
+    /// Each game's question takes that game's folder alone: GAMMA's names
+    /// an Anomaly (every `\` doubled, as Mod Organizer writes it), and still
+    /// Anomaly's question is asked and answered for itself; a GAMMA folder
+    /// given for Anomaly is refused, and asked again.
     #[test]
-    fn gamma_or_anomaly_is_one_answer() {
+    fn each_folder_is_asked_for_itself() {
         let anomaly = folder_with("anomaly", &[("fsgame.ltx", "")]);
         let named = anomaly.display().to_string().replace('\\', "\\\\");
         let gamma = folder_with("gamma", &[("ModOrganizer.ini", &format!("[General]\ngamePath=@ByteArray({named})\n"))]);
-        let lost = folder_with("gamma-lost", &[("ModOrganizer.ini", "[General]\ngamePath=@ByteArray(C:\\\\not\\\\there)\n")]);
-        let neither = folder_with("neither", &[]);
-        assert_eq!(stalker_at(&gamma), Ok(Stalker { gamma: Some(gamma.clone()), anomaly: Some(anomaly.clone()) }));
-        assert_eq!(stalker_at(&anomaly), Ok(Stalker { gamma: None, anomaly: Some(anomaly.clone()) }));
-        assert_eq!(stalker_at(&lost), Ok(Stalker { gamma: Some(lost.clone()), anomaly: None }));
-        assert!(stalker_at(&neither).is_err());
-        for dir in [anomaly, gamma, lost, neither] {
+        let gamma_check = has("ModOrganizer.ini", "GAMMA's folder");
+        let anomaly_check = has("fsgame.ltx", "Anomaly's folder");
+        assert_eq!(ask(&mut format!("{}\n", gamma.display()).as_bytes(), "?", None, true, &gamma_check), Some(gamma.clone()));
+        // Nothing offered for Anomaly though GAMMA names one: Enter skips it.
+        assert_eq!(ask(&mut "\n".as_bytes(), "?", None, true, &anomaly_check), None);
+        let typed = format!("{}\n{}\n", gamma.display(), anomaly.display());
+        assert_eq!(ask(&mut typed.as_bytes(), "?", None, true, &anomaly_check), Some(anomaly.clone()));
+        for dir in [anomaly, gamma] {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

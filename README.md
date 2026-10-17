@@ -14,7 +14,7 @@ A Rust rewrite, on Bevy, of the first-person character controller of the game Si
 ## Install and play
 
 1. Download TRP: on GitHub, **Code > Download ZIP** (or the latest release's source code), and unzip it. Or `git clone https://github.com/JuanFNQ/TRP.git`.
-2. Double-click **`Install.bat`**, once. It checks for the C++ build tools and Rust and offers to install what is missing, builds TRP (several minutes the first time; about 10 GB on disk in all), and asks where your SPT folder is.
+2. Double-click **`Install.bat`**, once. It checks for the C++ build tools and Rust and offers to install what is missing, builds TRP (several minutes the first time; about 10 GB on disk in all), and asks where each of your games' folders is (SPT, then GAMMA and Anomaly if you have them).
 3. Double-click **`Play.bat`** to play. After an update it rebuilds by itself first.
 
 On the range, the crate straight ahead holds a rifle, a vest and a backpack; the tables along the low wall hold every weapon of the install. `F1` shows the keys.

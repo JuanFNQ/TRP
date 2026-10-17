@@ -14,7 +14,7 @@ echo  Sets TRP up once. After this, double-click Play.bat to play.
 echo.
 echo   1. Checks for the C++ build tools and Rust, and offers to install what is missing.
 echo   2. Builds TRP (several minutes the first time).
-echo   3. Asks where your SPT folder is.
+echo   3. Asks where each of your games' folders is: SPT, then GAMMA and Anomaly if you have them.
 echo.
 
 rem The C++ build tools before Rust: Rust's own installer asks for them.
