@@ -4194,7 +4194,7 @@ dependencies = [
 
 [[package]]
 name = "trp-app"
-version = "0.42.3"
+version = "0.42.4"
 dependencies = [
  "anyhow",
  "bevy",
@@ -4209,7 +4209,7 @@ dependencies = [
 
 [[package]]
 name = "trp-data"
-version = "0.42.3"
+version = "0.42.4"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -4225,7 +4225,7 @@ dependencies = [
 
 [[package]]
 name = "trp-physics"
-version = "0.42.3"
+version = "0.42.4"
 dependencies = [
  "anyhow",
  "physx-sys",
@@ -4235,7 +4235,7 @@ dependencies = [
 
 [[package]]
 name = "trp-sim"
-version = "0.42.3"
+version = "0.42.4"
 dependencies = [
  "anyhow",
  "serde_json",

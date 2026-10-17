@@ -1,5 +1,9 @@
 # Patch notes
 
+## TRP 0.42.4 (2026-10-17)
+
+- Tarkov's interface is now on by default. To use the app's own look instead, turn off Options > FEATURES > TARKOV UI.
+
 ## TRP 0.42.3 (2026-10-17)
 
 Everything new since 0.9.1.

@@ -216,7 +216,9 @@ impl Default for Features {
             icon_generation: true,
             compatible_highlight: true,
             character_model: true,
-            tarkov_ui: false,
+            // On unless switched (the user, 2026-10-17: "is tarkov ui on by
+            // default? it should be."; off until 0.42.4).
+            tarkov_ui: true,
             movement: true,
             vaulting: true,
             stamina: true,
@@ -1996,7 +1998,7 @@ mod tests {
         let graphics = Graphics { vsync: false, field_of_view: 68.0, mode: Mode::Borderless, resolution: [2560, 1440], texture_quality: 0, mip_streaming: false, shadow_quality: 3, renderer: crate::backend::Renderer::Dx12 };
         let mouse = Mouse { sensitivity: 0.42, aiming: 0.31, optic: 2.5, invert: [false, true] };
         let path = std::env::temp_dir().join(format!("trp-options-test-{}.json", std::process::id()));
-        let kept = Features { custom_hands: false, smooth_animations: false, icon_generation: false, compatible_highlight: false, character_model: false, tarkov_ui: true, stamina: false, world_interactions: false, ..Features::default() };
+        let kept = Features { custom_hands: false, smooth_animations: false, icon_generation: false, compatible_highlight: false, character_model: false, tarkov_ui: false, stamina: false, world_interactions: false, ..Features::default() };
         use crate::battle_view::{BattleModes, Shows};
         let game = BattleModes { quick: Shows::Never, stamina: Shows::Always, health: Shows::Autohide, green_to_red: true };
         use crate::ui_sound::Levels;
@@ -2010,7 +2012,7 @@ mod tests {
         let mut pointer = Mouse { sensitivity: 0.7, aiming: 0.5, optic: 1.0, invert: [false; 2] };
         // A switch of the features' list is on until a file says it is not.
         let mut switched = Features::default();
-        assert!(switched.custom_hands);
+        assert!(switched.custom_hands && switched.tarkov_ui);
         // The GAME page's settings over the install's.
         let mut hud = BattleModes { quick: Shows::Always, stamina: Shows::Autohide, health: Shows::Never, green_to_red: false };
         let mut volumes = Levels { overall: 1, interface: 1 };
@@ -2018,7 +2020,7 @@ mod tests {
         assert_eq!(hud, game, "the battle screen's settings are kept");
         assert_eq!(volumes, sound, "the SOUND page's volumes are kept");
         assert!(!switched.custom_hands && !switched.smooth_animations && !switched.icon_generation && !switched.compatible_highlight && !switched.character_model);
-        assert!(switched.tarkov_ui, "the one switch that starts off is kept on");
+        assert!(!switched.tarkov_ui, "TARKOV UI, on unless switched, is kept off");
         assert_eq!(switched, kept, "every switch is kept, the systems' among them");
         // A file kept before there was such a switch leaves it as it is.
         let older = path.with_extension("older.json");
