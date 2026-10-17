@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 # One number for all the crates, raised with every change: docs\manual.md, "Versions".
-version = "0.42.2"
+version = "0.42.3"
 edition = "2021"
 publish = false
 
