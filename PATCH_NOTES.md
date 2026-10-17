@@ -1,5 +1,9 @@
 # Patch notes
 
+## TRP 0.42.2: the installer waits for you (2026-10-17)
+
+- `Install.bat` now says what it will do and what you need, then waits for a key before it installs or builds anything. To stop, close the window.
+
 ## TRP 0.42.1: the installer asks for each folder, it doesn't search (2026-10-17)
 
 - **Asked, not searched for**: `Install.bat` and the first start no longer look through your drives for SPT, GAMMA or Anomaly. Each question offers only the folder you gave before, so press Enter to keep it, or paste another.

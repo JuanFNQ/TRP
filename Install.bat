@@ -1,5 +1,6 @@
 @echo off
 rem TRP's installer: run once (double-click). Afterwards Play.bat starts TRP.
+rem It first says what it will do, and waits for a key before doing any of it:
 rem   1. the C++ build tools and Rust, each offered through winget where it is missing
 rem   2. TRP built (cargo build --release)
 rem   3. where the games are asked (trp.exe --setup-only)
@@ -15,6 +16,12 @@ echo.
 echo   1. Checks for the C++ build tools and Rust, and offers to install what is missing.
 echo   2. Builds TRP (several minutes the first time).
 echo   3. Asks where each of your games' folders is: SPT, then GAMMA and Anomaly if you have them.
+echo.
+echo  You need your own Escape from Tarkov with SPT 4.1 installed over it, and about 10 GB free.
+echo  Nothing is installed or built until you press a key. To stop now, close this window.
+echo.
+echo  Press any key to begin . . .
+pause >nul
 echo.
 
 rem The C++ build tools before Rust: Rust's own installer asks for them.
