@@ -127,6 +127,21 @@ pub struct FirearmSettings {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Shot { strength: f32 },
+    /// The shot's sound is to play, as the shot is made (`MakeShot`,
+    /// `PlayFireBulletSound`): `trigger` is whether the controller still
+    /// holds the trigger then (an automatic weapon's fire plays as a loop
+    /// while it does), `doublet` whether two chambers fire together
+    /// (`multiShot`). One for each chamber fired (`docs/spec/sound.md`,
+    /// "The shots").
+    FireSound { trigger: bool, doublet: bool },
+    /// The controller's trigger let go (`IsTriggerPressed`'s setter, which
+    /// then tells the weapon's sound player to end its loop: `BreakLoop`).
+    TriggerReleased,
+    /// The sights brought up or down by the aim's call (`SetAim`), which
+    /// the game sounds: the kit's rattle either way, the weapon's aiming
+    /// sound coming up (`docs/spec/sound.md`, "The aiming's sounds"). What
+    /// else lowers them (a sprint, a reload, the body's state) is silent.
+    Aimed(bool),
     ShellEject,
     DryFire,
     Sound(String),
@@ -143,6 +158,9 @@ pub enum Event {
     /// The old magazine has left the hand (the mark `MagHide`,
     /// `OnMagPuttedToRig`): one that had nowhere to go falls now.
     MagazineHidden,
+    /// The next magazine has appeared in the hand (the mark `MagShow`,
+    /// `OnMagAppeared`): the weapon draws one again.
+    MagazineShown,
     FireMode(FireMode),
     /// The weapon has appeared in the hands: its draw's last mark.
     Appeared,
@@ -533,7 +551,8 @@ impl Firearm {
         // weapon is taken in hand (`SyncWithCharacterSkills`).
         self.animator.set("SpeedReload", self.settings.reload_speed);
         self.animator.set("SpeedDraw", self.settings.draw_speed);
-        (self.trigger, self.aiming, self.interrupted) = (false, false, false);
+        self.trigger_to(false);
+        (self.aiming, self.interrupted) = (false, false);
         (self.inventory, self.reload_flag, self.hands_busy, self.shot_made) = (false, false, false, false);
         self.marks.clear();
     }
@@ -584,7 +603,7 @@ impl Firearm {
             }
             Operation::Single { planned, .. } | Operation::Automatic { planned, .. } => {
                 *planned = Some(Planned::Hide(fast));
-                self.trigger = false;
+                self.trigger_to(false);
                 // A bolt action puts its sights down and works the bolt
                 // before it goes (`BoltActionFireOperation.HideWeapon`).
                 if self.settings.bolt_action {
@@ -724,14 +743,14 @@ impl Firearm {
             Operation::Idle => self.idle_trigger(pressed),
             Operation::Single { second_shot, .. } => {
                 *second_shot |= pressed && self.settings.can_queue_second_shot;
-                self.trigger &= pressed;
+                self.trigger_to(self.trigger && pressed);
                 // A bolt action's bolt is worked once the trigger is no
                 // longer held (`BoltActionFireOperation.SetTriggerPressed`).
                 if self.settings.bolt_action {
                     self.animator.set_flag("BoltActionReload", !self.trigger);
                 }
             }
-            Operation::Automatic { .. } => self.trigger = pressed,
+            Operation::Automatic { .. } => self.trigger_to(pressed),
             // A press cuts the filling of a tube short, once a round has
             // shown in the hand; before that it is lost.
             Operation::Shells { can_abort, aborted, .. } => *aborted |= pressed && *can_abort,
@@ -739,7 +758,7 @@ impl Firearm {
             // A shot from a cylinder or from barrels only lets go of the
             // trigger.
             Operation::CylinderFire { .. } | Operation::BarrelsFire { .. } => {
-                self.trigger &= pressed;
+                self.trigger_to(self.trigger && pressed);
                 // A rocket launcher's animator has the trigger
                 // (`RocketLauncherFire.PrepareShot`).
                 if self.settings.rocket_launcher {
@@ -785,7 +804,7 @@ impl Firearm {
         if self.settings.barrels > 0 {
             return self.barrels_trigger(pressed);
         }
-        self.trigger = pressed;
+        self.trigger_to(pressed);
         if pressed && self.chamber {
             // One shot a press in the two single modes; anything else
             // fires for as long as the trigger is held.
@@ -920,7 +939,11 @@ impl Firearm {
         // Whoever uses the key, an obstacle no longer has the sights to
         // give back.
         self.interrupted = false;
+        let was = self.aiming;
         self.aim(want, allowed);
+        if self.aiming != was {
+            self.events.push(Event::Aimed(self.aiming));
+        }
     }
 
     /// The call the aim key makes, as the operation in hand takes it.
@@ -1061,7 +1084,7 @@ impl Firearm {
             }
             Operation::Single { planned, .. } | Operation::Automatic { planned, .. } if planned.is_none() => {
                 *planned = Some(Planned::Reload(rounds, quick));
-                self.trigger = false;
+                self.trigger_to(false);
                 self.work_bolt_for_reload();
             }
             Operation::Single { .. } => self.work_bolt_for_reload(),
@@ -1138,7 +1161,7 @@ impl Firearm {
             }
             Operation::Single { planned, .. } | Operation::Automatic { planned, .. } if planned.is_none() => {
                 *planned = Some(Planned::Shells(within_reach));
-                self.trigger = false;
+                self.trigger_to(false);
                 self.work_bolt_for_reload();
             }
             Operation::Single { .. } => self.work_bolt_for_reload(),
@@ -1268,6 +1291,13 @@ impl Firearm {
         self.animator.set_layer_weight("Catch", caught as u8 as f32);
     }
 
+    /// The operation in hand, by the name of its kind, as a tool reading a
+    /// recording beside the logic says it (`byhand`).
+    pub fn operation_said(&self) -> String {
+        let said = format!("{:?}", self.operation);
+        said.split([' ', '(']).next().unwrap_or("").to_owned()
+    }
+
     /// Whether the bolt is held open, as the animator has it.
     pub fn bolt_caught(&self) -> bool {
         self.animator.flag("BoltCatch")
@@ -1284,7 +1314,7 @@ impl Firearm {
         if !self.settings.foldable || !self.is_idling() {
             return false;
         }
-        self.trigger = false;
+        self.trigger_to(false);
         self.animator.set_flag("Inventory", false);
         self.animator.trigger("StockSwitch");
         self.hands_busy = true;
@@ -1500,6 +1530,15 @@ impl Firearm {
         self.fire_round();
     }
 
+    /// The trigger as the controller has it, set; let go, the weapon's
+    /// sound player is told (`Event::TriggerReleased`).
+    fn trigger_to(&mut self, pressed: bool) {
+        if self.trigger && !pressed {
+            self.events.push(Event::TriggerReleased);
+        }
+        self.trigger = pressed;
+    }
+
     /// Takes the chambered round and feeds the next from the magazine.
     fn take_round(&mut self) {
         self.chamber = match &mut self.magazine {
@@ -1516,6 +1555,7 @@ impl Firearm {
     fn fire_round(&mut self) {
         self.take_round();
         self.events.push(Event::Shot { strength: self.settings.shot_strength });
+        self.events.push(Event::FireSound { trigger: self.trigger, doublet: false });
         if let Operation::Automatic { shots, .. } = &mut self.operation {
             *shots += 1;
         }
@@ -1533,6 +1573,19 @@ impl Firearm {
     /// the marks that update passed, each to the operation then in hand.
     /// Returns what happened.
     pub fn step(&mut self, dt: f32) -> Vec<Event> {
+        self.step_on_clock(dt, dt)
+    }
+
+    /// `step`, the operation's own update on the player's clock
+    /// (`player_dt`: the game's arms are updated with the player's
+    /// whole-millisecond frame time, `Player.ArmsUpdate`) and the animator
+    /// on the engine's (`dt`). The single shot's cooldown, the automatic
+    /// fire's cycle and a look's wait go by the first (recorded: the
+    /// Five-seveN's cooldown of 0.133 s ran out after 16 frames or 17 as
+    /// the frames' whole milliseconds came to 133.3 or not, 2026-10-16;
+    /// with it the scripted recordings' automatic fire has the game's round
+    /// count on every frame, where a shot of each had come a frame off).
+    pub fn step_on_clock(&mut self, dt: f32, player_dt: f32) -> Vec<Event> {
         // The animator hears of the sights whenever they have changed.
         if self.aiming != self.aim_told {
             self.tell_aim();
@@ -1547,7 +1600,7 @@ impl Firearm {
         }
         match &mut self.operation {
             Operation::Single { cooldown, ready, .. } => {
-                *cooldown -= dt;
+                *cooldown -= player_dt;
                 if *cooldown <= 0.0 && *ready {
                     self.end_single();
                 }
@@ -1556,8 +1609,8 @@ impl Firearm {
             Operation::Automatic { clock, .. } => {
                 let cycle = 60.0 / self.settings.fire_rate;
                 let start = *clock % cycle / cycle;
-                let end = start + dt / cycle;
-                *clock += dt;
+                let end = start + player_dt / cycle;
+                *clock += player_dt;
                 let mut spans = vec![(start, end.min(1.0))];
                 let mut rest = end - 1.0;
                 while rest > 0.0 {
@@ -1574,7 +1627,7 @@ impl Firearm {
                     self.operation = Operation::Utility { ready: true, time: 0.0, in_inventory: false, examine: *examine };
                     self.idle_started();
                 } else {
-                    *time += dt;
+                    *time += player_dt;
                 }
             }
             _ => {}
@@ -1634,7 +1687,11 @@ impl Firearm {
             // The shot itself, a frame after its round was taken.
             ("FiringBullet", Operation::Single { fired, .. }) => {
                 *fired = true;
-                (self.shot_made, self.trigger) = (true, false);
+                // Its sound with the trigger still held, then let go
+                // (`FireOperation.OnFireEvent`).
+                self.events.push(Event::FireSound { trigger: self.trigger, doublet: false });
+                self.shot_made = true;
+                self.trigger_to(false);
                 self.animator.set_flag("Fire", false);
             }
             ("FiringBullet", Operation::Automatic { running, .. }) => *running = true,
@@ -1644,7 +1701,7 @@ impl Firearm {
                 self.animator_rounds();
                 self.animator.set_flag("Fire", self.trigger);
             }
-            ("FireEnd", Operation::Single { .. }) => self.trigger = false,
+            ("FireEnd", Operation::Single { .. }) => self.trigger_to(false),
             // A draw that racked the bolt.
             ("AddAmmoInChamber", Operation::Spawn { arms: true, .. }) => self.animator_rounds(),
             ("MagOut", Operation::Reload { mag_out, .. }) if !*mag_out => {
@@ -1657,6 +1714,7 @@ impl Firearm {
             }
             ("MagShow", Operation::Reload { mag_shown, .. }) if !*mag_shown => {
                 *mag_shown = true;
+                self.events.push(Event::MagazineShown);
                 self.animator.set_flag("Inventory", self.inventory);
             }
             ("MagHide", Operation::Reload { mag_hidden, .. }) if !*mag_hidden => {
@@ -1828,13 +1886,14 @@ impl Firearm {
         self.animator_rounds();
         if self.mode() == FireMode::Burst {
             if shots < self.settings.burst_count && self.chamber {
-                self.trigger = true;
+                self.trigger_to(true);
                 return;
             }
-            self.trigger = false;
+            self.trigger_to(false);
         }
         if let Some(planned) = planned {
-            (self.trigger, self.aiming) = (false, false);
+            self.trigger_to(false);
+            self.aiming = false;
             self.animator.set_flag("Fire", false);
             self.animator.play(&self.settings.rest_state, REST_AFTER_AUTO);
             self.events.push(Event::AutoFire(false));
@@ -1860,7 +1919,7 @@ impl Firearm {
     /// Handing back to idling, the animator is asked for its resting
     /// state outright, a tenth in.
     fn automatic_to_idle(&mut self, open_inventory: bool) {
-        self.trigger = false;
+        self.trigger_to(false);
         self.animator.set_flag("Inventory", open_inventory);
         self.animator.set_flag("Fire", false);
         self.animator.play(&self.settings.rest_state, REST_AFTER_AUTO);
@@ -2580,6 +2639,28 @@ pub(crate) mod tests {
         w.set_aim(true, true);
         assert!(w.aiming());
         w.lower_aim();
+        assert!(!w.aiming());
+    }
+
+    /// The aim's call that moves the sights says so, up or down, for the
+    /// sounds (`SetAim`); a call that leaves them as they are, or what
+    /// lowers them otherwise, says nothing.
+    #[test]
+    fn the_sights_moved_by_the_aim_s_call_are_told() {
+        let mut w = rifle();
+        let aimed = |w: &mut Firearm| -> Vec<bool> {
+            w.step(0.0).into_iter().filter_map(|e| if let Event::Aimed(up) = e { Some(up) } else { None }).collect()
+        };
+        aimed(&mut w);
+        w.set_aim(true, true);
+        assert_eq!(aimed(&mut w), [true]);
+        w.set_aim(true, true);
+        assert_eq!(aimed(&mut w), Vec::<bool>::new());
+        w.set_aim(false, true);
+        assert_eq!(aimed(&mut w), [false]);
+        w.set_aim(true, true);
+        w.lower_aim();
+        assert_eq!(aimed(&mut w), [true]);
         assert!(!w.aiming());
     }
 }

@@ -9,12 +9,13 @@
 //! game's: the standard material with a few lines of shader over its base
 //! colour (`grid.wgsl`), compiled into the app.
 
-use bevy::asset::{load_internal_asset, weak_handle};
+use bevy::asset::{load_internal_asset, uuid_handle};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, ShaderRef, ShaderType};
+use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::shader::ShaderRef;
 
-const GRID_SHADER: Handle<Shader> = weak_handle!("6f0c6f0e-6a1d-4b53-9d0a-5c1f2b9e7a41");
+const GRID_SHADER: Handle<Shader> = uuid_handle!("6f0c6f0e-6a1d-4b53-9d0a-5c1f2b9e7a41");
 
 /// The standard material with the grid's lines over its base colour.
 pub type GridMaterial = ExtendedMaterial<StandardMaterial, GridLines>;

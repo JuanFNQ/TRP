@@ -2,6 +2,20 @@
 //! They are reproduced as Unity defines them, clamping included, because
 //! the formulas depend on those details.
 
+/// `Mathf.Clamp`, which unlike Rust's accepts a lower bound above the upper
+/// one (Rust's stops the program): the lower then wins below it and the
+/// upper above it. The game relies on what it returns then (a sprint's
+/// limit of nought after a hard landing: `SprintAcceleration`).
+pub fn unity_clamp(value: f32, min: f32, max: f32) -> f32 {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
+
 /// `Mathf.Lerp`: `t` is clamped to 0..1.
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t.clamp(0.0, 1.0)

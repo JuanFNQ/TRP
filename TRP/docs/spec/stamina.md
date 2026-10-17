@@ -126,7 +126,7 @@ The app shows it as the game's panel does (`crates/trp-app/src/hud.rs`): at the 
 
 A vault's and a climb's gate and charges are in since 2026-10-10 (`Stamina::can_vault`, `vault`, `climb`; `vaulting.md`). The cost of aiming is kept as the game keeps it (`Stamina::aim` works it out afresh when the sights or the weight change, `set_pose` when the stance class does, `resettle` when the skills do; a change of hydration alone does not reach it).
 
-Taken as constant: hydration, energy and health (a host may set the two factors), no medicine, no damaged limbs.
+Taken as constant: hydration, energy and health (a host may set the two factors), no medicine, no damaged limbs. **Since 0.10.0, with the options' `HEALTH SYSTEM` on, health gives them** (`health.md`, "What health does to the character"; `Stamina::set_health`, `set_aim_factor`, `health_lets_sprint`): energy and hydration as they fall and are eaten and drunk back, the common health's share in the oxygen's capacity (re-read only on a change of energy, as the game keeps it), damaged arms' 1.5 or 2 on aiming's cost, and no sprint paid for with medicine at work or a damaged leg without a painkiller; and 15 s on spent legs gives health a fatigue (`take_fatigues`). From the code; compared with nothing.
 
 Holding breath is in since 2026-10-10 (`Stamina::hold_breath`: 4 a second off the oxygen on full legs, 8 on empty ones; `weapon-handling.md`, "Breathing", has its rules), and the weapon's breathing takes the pools' levels (`Stamina::breath_stamina`, `breath_oxygen`).
 

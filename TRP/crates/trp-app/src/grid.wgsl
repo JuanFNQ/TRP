@@ -25,7 +25,7 @@ struct GridLines {
     strength: vec4<f32>,
 }
 
-@group(2) @binding(100)
+@group(#{MATERIAL_BIND_GROUP}) @binding(100)
 var<uniform> grid: GridLines;
 
 // How much of this pixel one level of lines covers, 0 to 1. `at` is the

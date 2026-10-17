@@ -164,11 +164,13 @@ pub fn play_clips(
 /// Puts the rig in the hands as its animator has it at the moment drawn
 /// (`Controller::rig_shown`): every bone but the rig's root, which hangs
 /// in the view's frame, and the bone the procedural motion moves, which
-/// the weapon motion places. Scales are the prefab's own: none of the
-/// stock rifle's clips moves one.
+/// the weapon motion places. A bone that a clip scales takes its scale as
+/// the animator last had it (an item used is drawn by its bone scaled up
+/// from nought); the rest keep the prefab's own.
 pub fn pose_rig(
     controller: Res<crate::controller::Controller>,
     rig: Option<Res<WeaponRig>>,
+    hands: Option<Res<crate::weapon::HandsRig>>,
     mut player: ResMut<ClipPlayer>,
     mut transforms: Query<&mut Transform>,
 ) {
@@ -187,6 +189,15 @@ pub fn pose_rig(
         if let Ok(mut transform) = transforms.get_mut(*entity) {
             transform.translation = convert::position(*at);
             transform.rotation = convert::rotation(*turn);
+        }
+    }
+    for (bone, scale) in hands.iter().flat_map(|hands| hands.animator()).flat_map(|animator| animator.scales()) {
+        let Some(entity) = rig.bones.get(bone).filter(|entity| bone > 0 && Some(**entity) != rig.weapon_root_anim) else { continue };
+        if let Ok(mut transform) = transforms.get_mut(*entity) {
+            let scale = Vec3::from(scale);
+            if transform.scale != scale {
+                transform.scale = scale;
+            }
         }
     }
     player.sampled = true;

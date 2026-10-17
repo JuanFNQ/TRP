@@ -163,3 +163,75 @@ fn the_camera_takes_the_head_s_turn() {
     settle(&mut hands, &aiming);
     assert!((settle(&mut hands, &still()) - hip).abs() < 0.05);
 }
+
+/// The user's recording of the free look (recorder 0.8.0, course 8 of
+/// `local/traces/courses1`, 2026-10-15): its keys put through the game's
+/// input manager by the install's bindings, its mouse axes given to the
+/// look or the turn by them, the look's share to the head. On every frame
+/// the head's rotation is the game's within a hundredth of a degree, and
+/// the mouse's hold and the looking flag are the game's; on every frame
+/// the view turned, the turn's share is what it turned by. Skipped where
+/// the recording or the install is not there.
+#[test]
+fn the_recorded_free_look_is_followed() {
+    use trp_sim::bindings::{code, Code, Preset, LOOK_BINDING};
+    use trp_sim::head_look::{HeadLook, HeadLookInput, HeadLookSettings};
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../local/traces/courses1/8-free-look/free-look.jsonl");
+    let (Ok(text), Ok(install)) = (std::fs::read_to_string(path), Install::locate()) else {
+        eprintln!("skipped: no recording of course 8 or no install");
+        return;
+    };
+    let controls = trp_sim::bindings::install_controls(&install);
+    let axis = |name: &str| install.axis_sensitivity(name).unwrap_or(5.0);
+    let (look, turn) = ([axis("LookX"), axis("LookY")], [axis("TurnX"), axis("TurnY")]);
+    let sensitivity = install.player_settings().mouse_sensitivity.unwrap_or(1.0);
+    let group = controls.keys.iter().position(|binding| binding.name == LOOK_BINDING).expect("the free look's binding");
+    let mut preset = Preset::new(&controls);
+    let mut head = HeadLook::new(HeadLookSettings::default());
+    let mut held: Vec<Code> = Vec::new();
+    let mut was: Option<[f32; 2]> = None;
+    let (mut frames, mut turned, mut lost) = (0, 0, 0);
+    for line in text.lines().skip(1).filter(|line| !line.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line).expect("a frame");
+        let floats = |name: &str| -> Vec<f32> { v[name].as_array().map_or_else(Vec::new, |a| a.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect()) };
+        let words = |name: &str| -> Vec<Code> { v[name].as_array().map_or_else(Vec::new, |a| a.iter().filter_map(|x| code(x.as_str()?)).collect()) };
+        let flag = |name: &str| v[name].as_bool().unwrap_or(false);
+        let (t, dt) = (v["t"].as_f64().unwrap_or(0.0) as f32, v["dt"].as_f64().unwrap_or(0.0) as f32);
+        let (axes, view, game) = (floats("mouse_axes"), floats("look"), floats("head_rot"));
+        held.extend(words("keys_down"));
+        let up = words("keys_up");
+        held.retain(|key| !up.contains(key));
+        let heard = preset.update(&|key| held.contains(&key), 0, dt);
+        let mouse = preset.mouse([axes[0], axes[1]]);
+        lost += (0..2).filter(|&k| axes[k] != 0.0 && mouse.look[k] == 0.0 && mouse.turn[k] == 0.0).count();
+        assert!(!flag("inventory_open"), "no screen is opened in this course");
+        if heard.given.contains(&group) {
+            head.reset();
+        }
+        head.frame(&HeadLookInput {
+            travel: [mouse.look[0] * look[0], -mouse.look[1] * look[1]],
+            dt,
+            aiming: flag("aiming"),
+            camera_pitch: was.map_or(view[1], |before| before[1]),
+            sprinting: flag("sprinting"),
+        });
+        let model = head.rotation();
+        assert!((0..2).all(|k| (model[k] - game[k]).abs() < 0.01), "at {t:.3} s the head is {model:?} here and {game:?} in the game");
+        assert_eq!(head.control(), flag("mouse_look"), "the mouse's hold at {t:.3} s");
+        assert_eq!(head.looking(), flag("head_looking"), "the looking flag at {t:.3} s");
+        // The view's turn, with the sights down.
+        if let Some(before) = was.filter(|_| !flag("aiming")) {
+            let mut by = [view[0] - before[0], view[1] - before[1]];
+            by[0] -= 360.0 * (by[0] / 360.0).round();
+            let asked = [mouse.turn[0] * turn[0] * sensitivity, -mouse.turn[1] * turn[1] * sensitivity];
+            for k in 0..2 {
+                assert!((by[k] - asked[k]).abs() < 1e-3, "at {t:.3} s the view turned {by:?} and the model gave the turn {asked:?}");
+                turned += usize::from(by[k] != 0.0);
+            }
+        }
+        was = Some([view[0], view[1]]);
+        frames += 1;
+    }
+    println!("{frames} frames followed; the view turned along an axis on {turned}; {lost} frames' travel along an axis went to neither");
+    assert!(frames > 4000 && turned > 300 && lost > 100);
+}

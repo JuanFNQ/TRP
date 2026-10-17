@@ -10,7 +10,7 @@ pub mod texture;
 pub mod typetree;
 pub mod value;
 
-pub use assets::{Assets, ObjRef};
+pub use assets::{Assets, ObjRef, ResourcePlace};
 pub use bundle::Bundle;
 pub use serialized::SerializedFile;
 pub use value::{PPtr, Value};

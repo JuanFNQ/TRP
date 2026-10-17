@@ -69,6 +69,10 @@ pub struct Database {
     pub presets: Vec<Preset>,
     /// `globals.json` `config` section: movement, stamina, aiming and inertia settings.
     pub config: Json,
+    /// `settings.json` `config` section: what the game's client settings
+    /// are read from (`ClientSettingsConfig`; the sounds of moving's
+    /// multipliers). Null where the install has no such file.
+    pub client: Json,
     /// The weapons that are not the install's but one's own, by their
     /// item templates (`crate::custom`): each is in `items` and `presets`
     /// like any other, and this says how it is put together.
@@ -78,6 +82,9 @@ pub struct Database {
     pub outfits: HashMap<String, std::sync::Arc<crate::outfit::Definition>>,
     /// Why a weapon or an outfit of one's own was left out, if one was.
     pub custom_notes: Vec<String>,
+    /// The weapons whose stock presets the app put a magazine into, by
+    /// their item templates (`fit_magazines`).
+    pub given_magazines: Vec<String>,
 }
 
 impl Database {
@@ -98,7 +105,13 @@ impl Database {
             _ => Vec::new(),
         };
         let config = globals.get_mut("config").map(Json::take).unwrap_or(Json::Null);
-        let mut db = Self { items, presets, config, custom: HashMap::new(), outfits: HashMap::new(), custom_notes: Vec::new() };
+        let client = read("settings.json")
+            .ok()
+            .and_then(|text| serde_json::from_str::<Json>(&text).ok())
+            .and_then(|mut settings| settings.get_mut("config").map(Json::take))
+            .unwrap_or(Json::Null);
+        let mut db = Self { items, presets, config, client, custom: HashMap::new(), outfits: HashMap::new(), custom_notes: Vec::new(), given_magazines: Vec::new() };
+        db.fit_magazines();
         // And the weapons and the outfits of one's own, which are no part
         // of the install: none of the install's own entries is changed by
         // them.
@@ -124,7 +137,36 @@ impl Database {
         false
     }
 
-    /// The stock build of a weapon.
+    /// Puts a magazine into each stock preset of a weapon fed from
+    /// magazines (`ReloadMode` `ExternalMagazine`) that has nothing in its
+    /// magazine slot: the one its template names as its default
+    /// (`defMagType`), if the slot takes it. Of SPT 4.1's presets only the
+    /// RPK-16's is such ("RPK16 nomag"). **The app's**, so that every weapon
+    /// in a crate has a magazine to fill; the game's client never reads
+    /// `defMagType`, and SPT's server takes it as the magazine of a weapon
+    /// whose build has none (`GetWeaponsDefaultMagazineTpl`, for the spare
+    /// magazines it gives a bot). Inventory spec, "Built": the tables of
+    /// weapons.
+    fn fit_magazines(&mut self) {
+        const SLOT: &str = "mod_magazine";
+        for preset in &mut self.presets {
+            let Some(weapon) = preset.encyclopedia.as_deref().and_then(|id| self.items.get(id)) else { continue };
+            if weapon.props.get("ReloadMode").and_then(Json::as_str) != Some("ExternalMagazine") || preset.items.iter().any(|item| item.slot.as_deref() == Some(SLOT)) {
+                continue;
+            }
+            let Some(magazine) = weapon.props.get("defMagType").and_then(Json::as_str).filter(|id| self.items.contains_key(*id)) else { continue };
+            let takes = weapon.props.get("Slots").and_then(Json::as_array).into_iter().flatten().filter(|slot| slot.get("_name").and_then(Json::as_str) == Some(SLOT));
+            let filters = takes.filter_map(|slot| slot.pointer("/_props/filters")?.as_array()).flatten();
+            if !filters.filter_map(|filter| filter.get("Filter")?.as_array()).flatten().any(|id| id.as_str() == Some(magazine)) {
+                continue;
+            }
+            preset.items.push(PresetItem { id: format!("{}-magazine", preset.root), template: magazine.to_owned(), parent: Some(preset.root.clone()), slot: Some(SLOT.into()) });
+            self.given_magazines.push(weapon.id.clone());
+        }
+    }
+
+    /// The stock build of a weapon: its stock preset as the install has it,
+    /// with a magazine where the app puts one (`fit_magazines`).
     pub fn default_preset(&self, weapon_template: &str) -> Result<&Preset> {
         self.presets
             .iter()

@@ -1,7 +1,7 @@
 //! Sets a recording made by hand (recorder 0.6.0 on, `free-*.jsonl`)
 //! beside the logic of what the hands hold.
 //!
-//!   byhand <folder> [--from S] [--to S] [part of a name ...]
+//!   byhand <folder> [--from S] [--to S] [--trigger-flag] [part of a name ...]
 //!
 //! A recording by hand has no script, so the simulation cannot be walked
 //! through it as the replay walks a scenario. What the hands hold can be:
@@ -45,6 +45,9 @@ const RESTING: [&str; 3] = ["IDLE", "IN INVENTORY", "SPAWN"];
 struct Frame {
     t: f32,
     dt: f32,
+    /// The player's whole-millisecond frame time (`clock_dt`), which the
+    /// weapon's operations go by; the engine's where a recording has none.
+    clock_dt: f32,
     controller: String,
     operation: String,
     anim: u32,
@@ -73,6 +76,17 @@ struct Frame {
     /// first; the item in the hands; the weapon's fire mode, and its
     /// animator's hammer and bolt flags.
     keys_up: Vec<String>,
+    /// Recorder 0.7.0 on: the engine's two mouse axes as read this frame,
+    /// the head's free look as the game has it after the frame (its
+    /// rotation, whether the mouse has it, whether it is looking), the
+    /// view's yaw, and the sights and the sprint.
+    mouse_axes: [f32; 2],
+    head_rot: Option<[f32; 3]>,
+    mouse_look: bool,
+    head_looking: bool,
+    yaw: f32,
+    aiming: bool,
+    sprinting: bool,
     held: Vec<String>,
     mouse: Option<[f32; 2]>,
     screen: Option<[f32; 2]>,
@@ -161,6 +175,13 @@ fn read(path: &Path) -> Result<(Json, Vec<Frame>)> {
         });
         frames.push(Frame {
             keys_up: words("keys_up"),
+            mouse_axes: pair("mouse_axes").unwrap_or_default(),
+            head_rot: v.get("head_rot").map(|_| three("head_rot")),
+            mouse_look: flag("mouse_look"),
+            head_looking: flag("head_looking"),
+            yaw: v.get("look").and_then(|l| l.get(0)).and_then(Json::as_f64).unwrap_or(0.0) as f32,
+            aiming: flag("aiming"),
+            sprinting: flag("sprinting"),
             held: words("held"),
             mouse: pair("mouse"),
             screen: pair("screen"),
@@ -176,6 +197,7 @@ fn read(path: &Path) -> Result<(Json, Vec<Frame>)> {
             working_snap: v.get("working_snap").and_then(Json::as_bool),
             t: number("t").unwrap_or(0.0),
             dt: number("dt").unwrap_or(0.0),
+            clock_dt: number("clock_dt").or_else(|| number("dt")).unwrap_or(0.0),
             controller: word("hands_controller"),
             operation: word("operation"),
             anim: number("hands_anim").unwrap_or(0.0) as u32,
@@ -219,9 +241,13 @@ fn main() -> Result<()> {
     let mut folder: Option<PathBuf> = None;
     let mut wanted: Vec<String> = Vec::new();
     let (mut from, mut to) = (f32::MAX, f32::MIN);
+    // `--trigger-flag`: the trigger by the recorded flag even where the
+    // keys are on record, as before 0.36.1.
+    let mut trigger_flag = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--trigger-flag" => trigger_flag = true,
             "--from" => from = args.next().and_then(|v| v.parse().ok()).context("--from needs seconds")?,
             "--to" => to = args.next().and_then(|v| v.parse().ok()).context("--to needs seconds")?,
             _ if folder.is_none() => folder = Some(PathBuf::from(arg)),
@@ -237,6 +263,14 @@ fn main() -> Result<()> {
     let rules = Rules::of(&db);
     let panel = trp_data::screen::GearPanel::load(&install).unwrap_or_default();
     let controls = trp_sim::bindings::install_controls(&install);
+    // What the engine's mouse axes are multiplied by for the free look and
+    // for the turn (`docs/spec/free-look.md`, "The scale"): the bindings'
+    // own figures and the player's sensitivity.
+    let mouse_scale = MouseScale {
+        look: [install.axis_sensitivity("LookX").unwrap_or(5.0), install.axis_sensitivity("LookY").unwrap_or(5.0)],
+        turn: [install.axis_sensitivity("TurnX").unwrap_or(5.0), install.axis_sensitivity("TurnY").unwrap_or(5.0)],
+        sensitivity: install.player_settings().mouse_sensitivity.unwrap_or(1.0),
+    };
     let mut assets = Assets::new(install)?;
     let empty_rig = trp_data::weapon::assemble_prefab(&mut assets, trp_data::weapon::EMPTY_HANDS)?;
     let empty_data = WeaponAnimatorData::load(&assets, &empty_rig)?;
@@ -275,11 +309,19 @@ fn main() -> Result<()> {
             }
         }
         let name_of = |n: u32| names.iter().find(|(known, _)| *known == n).map_or_else(|| n.to_string(), |(_, name)| name.clone());
+        // The trigger by the keys where they are on record (recorder 0.6.0
+        // on): the `Shoot` binding given and taken back, as the game's
+        // input manager hears the keys. The recorded trigger flag misses a
+        // single shot, which takes the press and lets it go in one frame.
+        let shots = binding_frames(&controls, &frames, "Shoot").filter(|_| !trigger_flag);
+        let chamber_looks = binding_frames(&controls, &frames, "CheckChamber");
         let mode_of = |name: &str| match name {
             "single" => Some(FireMode::Single),
             "fullauto" => Some(FireMode::FullAuto),
             "burst" => Some(FireMode::Burst),
             "semiauto" => Some(FireMode::SemiAuto),
+            "doubleaction" => Some(FireMode::DoubleAction),
+            "doublet" => Some(FireMode::Doublet),
             _ => None,
         };
         println!(
@@ -457,25 +499,73 @@ fn main() -> Result<()> {
                     match cur.operation.as_str() {
                         // The recorded count is the new magazine's after a
                         // round has gone to an empty chamber.
-                        "ReloadExternalMagOperation" => firearm.reload_with(cur.magazine.unwrap_or(0) + (cur.chamber && !prev.chamber) as u32),
+                        // The quick reload is the same operation: the game's
+                        // going on to `RELOAD OUT ALL` says it (`R` is not
+                        // among the keys on record).
+                        "ReloadExternalMagOperation" => {
+                            let rounds = cur.magazine.unwrap_or(0) + (cur.chamber && !prev.chamber) as u32;
+                            if frames[i..].iter().take(30).any(|f| name_of(f.anim) == "RELOAD OUT ALL") {
+                                firearm.quick_reload_with(rounds)
+                            } else {
+                                firearm.reload_with(rounds)
+                            }
+                        }
                         // A tube filled from what was carried the frame
-                        // before (an empty chamber has taken its round by now).
-                        "ReloadInternalMagOperation" => {
+                        // before (an empty chamber has taken its round by
+                        // now); as the app does, the same for every kind of
+                        // magazine that stays in the weapon: the SKS's
+                        // through its open bolt, barrels, a cylinder.
+                        "ReloadInternalMagOperation" | "ReloadInternalMagWithOpenBoltOperation" | "ReloadMultiBarrelOperation" | "ReloadCylinderMagOperation" => {
                             firearm.chamber = prev.chamber;
                             firearm.reload_shells(reach(carried_now.as_ref()) + (cur.chamber && !prev.chamber) as u32)
                         }
                         "Remove" => firearm.hide(false),
+                        "FoldStockOperation" => {
+                            firearm.fold_stock();
+                        }
                         // Which look it is shows in the state the game's
                         // animator goes to.
                         "UtilityOperation" => {
-                            let chamber = frames[i..].iter().take(12).any(|f| name_of(f.anim).contains("CHECK CHAMBER"));
-                            if chamber { firearm.check_chamber() } else { firearm.check_magazine() }
+                            // Which look: the chamber's by its key where it
+                            // is on record (within the half second its double
+                            // press may take: not every key is on record);
+                            // else by the first look's state the game goes to
+                            // within half a second (which may wait for the
+                            // screen to shut): `LOOK` the look all over,
+                            // `FIREMODE CHECK` the selector, `CHECK CHAMBER`
+                            // the chamber, `CHECK` the magazine's, or the
+                            // chamber's where the weapon has barrels.
+                            let keyed = chamber_looks.as_ref().is_some_and(|looks| looks.iter().any(|(at, given)| *given && *at <= i && cur.t - frames[*at].t <= 0.5));
+                            let look = frames[i..].iter().take(60).map(|f| name_of(f.anim)).find(|name| matches!(name.as_str(), "LOOK" | "FIREMODE CHECK" | "CHECK CHAMBER" | "CHECK"));
+                            match look.as_deref() {
+                                _ if keyed => firearm.check_chamber(),
+                                Some("LOOK") => {
+                                    firearm.examine();
+                                }
+                                Some("FIREMODE CHECK") => {
+                                    firearm.check_fire_mode();
+                                }
+                                Some("CHECK CHAMBER") => firearm.check_chamber(),
+                                Some("CHECK") if settings.barrels > 0 => firearm.check_chamber(),
+                                _ => firearm.check_magazine(),
+                            }
                         }
                         _ => {}
                     }
                 }
-                if held == Held::Weapon && cur.trigger != prev.trigger {
-                    firearm.set_trigger(cur.trigger, true);
+                match &shots {
+                    // With a screen open the key is the screen's, not the
+                    // weapon's: a press is not handed on (its letting go
+                    // may be).
+                    Some(shots) => {
+                        for (_, pressed) in shots.iter().filter(|(at, _)| *at == i) {
+                            if held == Held::Weapon && !(*pressed && (cur.inventory || prev.inventory)) {
+                                firearm.set_trigger(*pressed, true);
+                            }
+                        }
+                    }
+                    None if held == Held::Weapon && cur.trigger != prev.trigger => firearm.set_trigger(cur.trigger, true),
+                    None => {}
                 }
                 if let Some(mode) = mode_of(&cur.fire_mode).filter(|_| held == Held::Weapon && cur.fire_mode != prev.fire_mode && cur.controller == prev.controller) {
                     firearm.set_fire_mode(mode);
@@ -494,11 +584,12 @@ fn main() -> Result<()> {
                 _ if !updated => Vec::new(),
                 Held::Weapon => {
                     firearm.set_aim_angle(cur.pitch);
-                    firearm.step(cur.dt)
+                    firearm.step_on_clock(cur.dt, cur.clock_dt)
                 }
                 Held::Empty => empty.step(cur.dt, cur.pitch),
                 Held::Nothing => Vec::new(),
             };
+
             for event in &events {
                 match event {
                     FirearmEvent::Appeared => said.push(format!("{:.3}: the simulation's {} appeared", cur.t, if held == Held::Weapon { "weapon has" } else { "empty hands have" })),
@@ -542,7 +633,7 @@ fn main() -> Result<()> {
             }
             if cur.t >= from && cur.t <= to {
                 println!(
-                    "    {:7.3} dt {:.4}  game {:<22} {:8.4}  sim {:<22} {:8.4}  screen {} told {}",
+                    "    {:7.3} dt {:.4}  game {:<22} {:8.4}  sim {:<22} {:8.4}  screen {} told {}  game {} {:?}+{}  sim {} {:?}+{}",
                     cur.t,
                     cur.dt,
                     name_of(cur.anim),
@@ -550,7 +641,13 @@ fn main() -> Result<()> {
                     name_of(state),
                     time,
                     cur.inventory as u8,
-                    cur.hands_inventory as u8
+                    cur.hands_inventory as u8,
+                    cur.operation,
+                    cur.magazine,
+                    cur.chamber as u8,
+                    firearm.operation_said(),
+                    firearm.magazine,
+                    firearm.chamber as u8
                 );
             }
         }
@@ -577,13 +674,166 @@ fn main() -> Result<()> {
         things_worked(&frames, &thing_settings);
         inventory_moves(&db, &rules, &panel, &header, &frames);
         keys_heard(&controls, &frames);
+        free_look(&controls, &frames, &mouse_scale, (from, to));
     }
     Ok(())
+}
+
+/// What the engine's mouse axes are multiplied by: the look's bindings
+/// and the turn's (across, then down), and the player's sensitivity.
+struct MouseScale {
+    look: [f32; 2],
+    turn: [f32; 2],
+    sensitivity: f32,
+}
+
+/// The head's free look set beside the game's (recorder 0.7.0 on): the
+/// recorded keys through the game's input manager as `keys_heard` puts
+/// them, the recorded mouse axes given to the look or to the turn by it
+/// (`Preset::mouse`), the look's share handed to the head's own logic on
+/// each frame the keys reach the character, and its rotation, its hold on
+/// the mouse and its looking flag set beside the recorded ones. The turn's
+/// share is set beside the view's own turn on that frame: whether it
+/// turned, and by how much. The engine's mouse axes are positive to the
+/// right and up; the look's binding across takes them as they come and
+/// the one up and down the other way about (the install's `Control.ini`).
+fn free_look(controls: &Controls, frames: &[Frame], scale: &MouseScale, (from, to): (f32, f32)) {
+    use trp_sim::head_look::{HeadLook, HeadLookInput, HeadLookSettings};
+    if frames.iter().all(|frame| frame.head_rot.is_none_or(|rot| rot == [0.0; 3])) {
+        return;
+    }
+    let mut preset = Preset::new(controls);
+    let mut held: Vec<Code> = Vec::new();
+    let mut head = HeadLook::new(HeadLookSettings::default());
+    let look_group = controls.keys.iter().position(|binding| binding.name == trp_sim::bindings::LOOK_BINDING);
+    let (mut compared, mut worst, mut worst_at, mut off_frames) = (0usize, 0.0f32, 0.0f32, 0usize);
+    let (mut control_differs, mut looking_differs) = (0usize, 0usize);
+    // The turn: frames' axes the view turned on and the model gave the
+    // turn travel, the one without the other each way, and the largest
+    // difference in degrees where both turned.
+    let (mut turned_both, mut turned_game, mut turned_model, mut turn_worst) = (0usize, 0usize, 0usize, 0.0f32);
+    // The frames' axes the mouse moved along with the free look's keys
+    // held, and of those how many gave the look nothing.
+    let (mut moved_held, mut lost) = (0usize, 0usize);
+    let mut presses = 0usize;
+    let mut was: Option<[f32; 2]> = None;
+    for (at, frame) in frames.iter().enumerate() {
+        held.extend(frame.keys.iter().filter_map(|key| code(key)));
+        held.retain(|key| !frame.keys_up.iter().any(|up| code(up) == Some(*key)));
+        let heard = preset.update(&|key| held.contains(&key), 0, frame.dt);
+        let moved = frame.mouse_axes;
+        let mouse = preset.mouse(moved);
+        let reset = look_group.is_some_and(|group| heard.given.contains(&group));
+        presses += frame.keys.iter().filter(|key| key.as_str() == "Mouse2").count();
+        let look_held = held.iter().any(|key| Some(*key) == code("Mouse2"));
+        for axis in 0..2 {
+            if look_held && moved[axis] != 0.0 {
+                moved_held += 1;
+                lost += usize::from(mouse.look[axis] == 0.0);
+            }
+        }
+        // Each frame the keys reach the character: none with a screen open.
+        if !frame.inventory {
+            if reset {
+                head.reset();
+            }
+            let pitch_before = at.checked_sub(1).map_or(frame.pitch, |before| frames[before].pitch);
+            head.frame(&HeadLookInput {
+                travel: [mouse.look[0] * scale.look[0], -mouse.look[1] * scale.look[1]],
+                dt: frame.dt,
+                aiming: frame.aiming,
+                camera_pitch: pitch_before,
+                sprinting: frame.sprinting,
+            });
+        }
+        // The view's own turn on this frame beside the model's share of
+        // the mouse for it (the yaw kept within half a turn).
+        let now = [frame.yaw, frame.pitch];
+        if let Some(before) = was {
+            let mut turned = [now[0] - before[0], now[1] - before[1]];
+            turned[0] -= 360.0 * (turned[0] / 360.0).round();
+            let asked = [mouse.turn[0] * scale.turn[0] * scale.sensitivity, -mouse.turn[1] * scale.turn[1] * scale.sensitivity];
+            if !frame.inventory && !frame.aiming {
+                for axis in 0..2 {
+                    match (turned[axis].abs() > 1e-4, asked[axis] != 0.0) {
+                        (true, true) => {
+                            turned_both += 1;
+                            turn_worst = turn_worst.max((turned[axis] - asked[axis]).abs());
+                        }
+                        (true, false) => turned_game += 1,
+                        (false, true) => turned_model += 1,
+                        (false, false) => {}
+                    }
+                }
+            }
+        }
+        was = Some(now);
+        let Some(game) = frame.head_rot else { continue };
+        let model = head.rotation();
+        let off = (0..2).map(|k| (game[k] - model[k]).abs()).fold(0.0, f32::max);
+        compared += 1;
+        off_frames += usize::from(off > 0.01);
+        if off > worst {
+            (worst, worst_at) = (off, frame.t);
+        }
+        control_differs += usize::from(head.control() != frame.mouse_look);
+        looking_differs += usize::from(head.looking() != frame.head_looking);
+        if (from..=to).contains(&frame.t) {
+            println!(
+                "  look {at:5} {:7.3} axes {:+.3} {:+.3} look {:+.3} {:+.3} turn {:+.3} {:+.3}{} | head {:+8.3} {:+8.3} here {:+8.3} {:+8.3} | mouse {} {} looking {} {}",
+                frame.t,
+                moved[0],
+                moved[1],
+                mouse.look[0],
+                mouse.look[1],
+                mouse.turn[0],
+                mouse.turn[1],
+                if reset { " RESET" } else { "" },
+                game[0],
+                game[1],
+                model[0],
+                model[1],
+                u8::from(frame.mouse_look),
+                u8::from(head.control()),
+                u8::from(frame.head_looking),
+                u8::from(head.looking()),
+            );
+        }
+    }
+    println!(
+        "  free look: {presses} presses of its key; of {moved_held} frames' travel along an axis with the key held, {lost} gave the look nothing; the head's rotation on {compared} frames: {off_frames} differ by more than 0.01 degrees, at most {worst:.4} (at {worst_at:.3} s); the mouse's hold differs on {control_differs}, the looking flag on {looking_differs}"
+    );
+    println!(
+        "  the turn beside the view's: both turned on {turned_both} frames' axes (at most {turn_worst:.4} degrees apart), the game alone on {turned_game}, the model alone on {turned_model} (sights down, no screen open)"
+    );
 }
 
 /// The weapon a recording was made with: what its first line names, else
 /// the first item a weapon's controller had in the hands, by the list of
 /// what was carried on that frame.
+/// The frames a binding is given (true) and taken back (false) on, the
+/// recorded keys put through the game's input manager as `keys_heard` puts
+/// them; none where no key is on record.
+fn binding_frames(controls: &Controls, frames: &[Frame], wanted: &str) -> Option<Vec<(usize, bool)>> {
+    if frames.iter().all(|frame| frame.keys.is_empty() && frame.keys_up.is_empty()) {
+        return None;
+    }
+    let mut preset = Preset::new(controls);
+    let mut held: Vec<Code> = Vec::new();
+    let mut out = Vec::new();
+    for (at, frame) in frames.iter().enumerate() {
+        held.extend(frame.keys.iter().filter_map(|key| code(key)));
+        held.retain(|key| !frame.keys_up.iter().any(|up| code(up) == Some(*key)));
+        let heard = preset.update(&|key| held.contains(&key), 0, frame.dt);
+        for (group, given) in heard.given.iter().map(|group| (*group, true)).chain(heard.taken_back.iter().map(|group| (*group, false))) {
+            if controls.keys[group].name == wanted {
+                out.push((at, given));
+            }
+        }
+    }
+    Some(out)
+}
+
 /// The recorded keys put through the game's input manager as it is written
 /// here (`trp_sim::bindings`, settings spec), by the install's own
 /// bindings and each frame's own length: every binding it gives out is
@@ -1172,8 +1422,24 @@ fn axis_named(name: &str) -> [f32; 3] {
 /// compared frame by frame. A door's gesture by where the player stands is
 /// tried on every frame it was looked at, for each way its forward axis
 /// could lie (the recorder does not write it), against the game's own number.
+fn length(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
 fn things_worked(frames: &[Frame], settings: &ThingSettings) {
-    let Some(id) = frames.iter().find_map(|f| f.thing.as_ref().filter(|s| s.state == "Interacting").map(|s| s.id.clone())) else { return };
+    // Each thing worked, in the order it was first worked.
+    let mut ids: Vec<String> = Vec::new();
+    for seen in frames.iter().filter_map(|f| f.thing.as_ref()).filter(|s| s.state == "Interacting") {
+        if !ids.contains(&seen.id) {
+            ids.push(seen.id.clone());
+        }
+    }
+    for id in ids {
+        thing_worked(frames, settings, id);
+    }
+}
+
+fn thing_worked(frames: &[Frame], settings: &ThingSettings, id: String) {
     fn seen_in<'a>(f: &'a Frame, id: &str) -> Option<&'a Seen> {
         f.thing.as_ref().filter(|s| s.id == id)
     }
@@ -1236,6 +1502,16 @@ fn things_worked(frames: &[Frame], settings: &ThingSettings) {
     // A kick under way: what the model said of it at the key, and whether
     // it has landed.
     let mut kick: Option<(trp_sim::things::Breach, bool)> = None;
+    // A container's search under way: how far it stood at the key, and
+    // the time waited since (`OnContainerOpen` after `DelayToOpenContainer`,
+    // the key's frame not counted, as `Movement::search` has it).
+    let mut searching: Option<(f32, f32)> = None;
+    // A lock being opened with its key: held from the key
+    // (`LockForInteraction`), and unlocked when the hand is laid, 1.6 s
+    // into the body's state for it, a firearm's animator giving no
+    // progress of its own (interactions spec, "Unlocking"); the time in
+    // that state so far.
+    let mut unlocking: Option<f32> = None;
     for (i, f) in frames.iter().enumerate() {
         let prev = i.checked_sub(1).map(|p| &frames[p]);
         // A kick lands 0.45 of the way through the body's state for it
@@ -1269,7 +1545,15 @@ fn things_worked(frames: &[Frame], settings: &ThingSettings) {
                     // the recording has it looked at shut or open. Without
                     // that, which side the kick comes from cannot be told,
                     // and what the kick did is taken from the recording.
-                    let by = if forward_found.is_some() {
+                    let game_opens = frames[i..].iter().filter_map(seen).find(|later| later.state != "Interacting").is_some_and(|later| later.state == "Open");
+                    let by = if forward_found.is_some() && breach.opens && !game_opens && thing.can_be_breached {
+                        // The side was right for it and the game's door held:
+                        // a door that cannot be breached (its `CanBeBreached`,
+                        // not on record), taken so from here on.
+                        thing.can_be_breached = false;
+                        breach.opens = false;
+                        "by the model it would open from this side, and the game's held: a door that cannot be breached (not on record), so"
+                    } else if forward_found.is_some() {
                         "by the model"
                     } else {
                         breach.opens = frames[i..].iter().filter_map(seen).find(|later| later.state != "Interacting").is_some_and(|later| later.state == "Open");
@@ -1285,9 +1569,16 @@ fn things_worked(frames: &[Frame], settings: &ThingSettings) {
                     ));
                     kick = Some((breach, false));
                 }
+            } else if s.state == "Interacting" && was == "Locked" && !f.keys.is_empty() {
+                thing.hold();
+                unlocking = Some(0.0);
+                said.push(format!("{:7.3}  unlocked with its key (the key {}): held until the hand is laid", f.t, f.keys.join("+")));
             } else if s.state == "Interacting" && was != "Interacting" && !f.keys.is_empty() {
                 let opens = was == "Shut";
                 let gesture = thing.work(opens, f.pos, settings);
+                if opens && first.kind == "LootableContainer" {
+                    searching = Some((length(s.from_player), -1.0));
+                }
                 said.push(format!(
                     "{:7.3}  worked to {} (the key {}); the model's gesture {:?}, the game's {}",
                     f.t,
@@ -1296,6 +1587,40 @@ fn things_worked(frames: &[Frame], settings: &ThingSettings) {
                     gesture.map(Interaction::index),
                     f.gesture_index
                 ));
+            }
+        }
+        // The hand laid on the lock: more than 1.6 s of the body's state for
+        // it, counted from the frame after the state is entered, as
+        // `Movement::act` counts it.
+        if let Some(time) = unlocking {
+            if f.state == "DoorInteraction" {
+                let entered = prev.is_some_and(|p| p.state != "DoorInteraction");
+                let time = if entered { time } else { time + f.clock_dt };
+                if time > 1.6 {
+                    thing.unlock();
+                    unlocking = None;
+                    said.push(format!("{:7.3}  the hand is laid: unlocked, shut", f.t));
+                } else {
+                    unlocking = Some(time);
+                }
+            }
+        }
+        // The search's wait over: the character a quarter of a metre further
+        // off than at the key, or in a jump, and the container is told to
+        // shut (`OnContainerOpen`); else its screen opens.
+        if let Some((at_key, waited)) = searching {
+            // (The key's own frame, marked below nothing, is not counted.)
+            let waited = if waited < 0.0 { 0.0 } else { waited + f.dt };
+            searching = Some((at_key, waited));
+            if waited + 1e-6 >= settings.answers_after {
+                searching = None;
+                let off = seen(f).map_or(f32::MAX, |s| length(s.from_player)) - at_key;
+                if f.state == "Jump" || off > 0.25 {
+                    thing.tell(false, settings);
+                    said.push(format!("{:7.3}  the search's wait is over {off:.3} m further off than at the key: told to shut", f.t));
+                } else {
+                    said.push(format!("{:7.3}  the search's wait is over {off:.3} m further off than at the key: its screen is to open", f.t));
+                }
             }
         }
         // The screen of a searched container shuts: it is told to shut.

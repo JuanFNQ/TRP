@@ -705,6 +705,7 @@ pub fn build(definition: &Definition, hierarchy: &mut Hierarchy) -> Result<Build
             placer: None,
             // No object of the install's.
             transform: ObjRef { file: usize::MAX, path_id: made },
+            colliders: Vec::new(),
         });
         hierarchy.nodes.len() - 1
     };

@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use bevy::prelude::*;
 use bevy::render::render_resource::PipelineCache;
-use bevy::render::RenderSet;
+use bevy::render::RenderSystems;
 
 /// A frame longer than this is printed, in milliseconds, unless the
 /// variable says another.
@@ -149,7 +149,7 @@ fn main_last(mut stamps: ResMut<MainStamps>, ui: Res<UiStamps>, nodes: Query<(),
     stamps.last = Some(now);
 }
 
-/// The interface's stages in `PostUpdate` (Bevy's `UiSystem`), in order.
+/// The interface's stages in `PostUpdate` (Bevy's `UiSystems`), in order.
 const UI_STAGES: [&str; 4] = ["Prepare", "Content (text measured)", "Layout", "PostLayout (text laid out)"];
 
 /// The clock at the boundaries of the interface's stages this frame, and
@@ -172,26 +172,59 @@ fn reached<const N: usize>(mut stamps: ResMut<UiStamps>) {
 
 /// Adds the clock's readings to the main world's schedules, if asked for.
 pub fn add_main(app: &mut App) {
-    use bevy::ui::UiSystem;
+    use bevy::ui::UiSystems;
     if std::env::var_os("TRP_RENDER_TIMING").is_none() {
         return;
     }
-    app.add_systems(PreUpdate, reached::<0>).add_systems(Update, reached::<1>).add_systems(PostUpdate, reached::<2>.before(UiSystem::Prepare));
+    app.add_systems(PreUpdate, reached::<0>).add_systems(Update, reached::<1>).add_systems(PostUpdate, reached::<2>.before(UiSystems::Prepare));
     app.insert_resource(MainStamps { slow: slow_ms(), ..default() }).init_resource::<UiStamps>().add_systems(First, main_first).add_systems(Last, main_last).add_systems(
         PostUpdate,
         (
-            ui_stamp::<0>.before(UiSystem::Prepare),
-            ui_stamp::<1>.after(UiSystem::Prepare).before(UiSystem::Content),
-            ui_stamp::<2>.after(UiSystem::Content).before(UiSystem::Layout),
-            ui_stamp::<3>.after(UiSystem::Layout).before(UiSystem::PostLayout),
-            ui_stamp::<4>.after(UiSystem::PostLayout),
+            ui_stamp::<0>.before(UiSystems::Prepare),
+            ui_stamp::<1>.after(UiSystems::Prepare).before(UiSystems::Content),
+            ui_stamp::<2>.after(UiSystems::Content).before(UiSystems::Layout),
+            ui_stamp::<3>.after(UiSystems::Layout).before(UiSystems::PostLayout),
+            ui_stamp::<4>.after(UiSystems::PostLayout),
         ),
     );
 }
 
 /// Adds the clock's readings to the renderer's schedule, if asked for.
+/// `TRP_GPU_MEMORY` in the environment: the graphics card's memory as the
+/// renderer's allocator has it, every two seconds (wgpu's
+/// `generate_allocator_report`: what is allocated, and the blocks reserved
+/// for it).
+pub fn add_memory(renderer: &mut SubApp) {
+    if std::env::var_os("TRP_GPU_MEMORY").is_none() {
+        return;
+    }
+    renderer.add_systems(bevy::render::Render, report_memory.after(RenderSystems::Cleanup));
+}
+
+fn report_memory(device: Res<bevy::render::renderer::RenderDevice>, pictures: Res<bevy::render::render_asset::RenderAssets<bevy::render::texture::GpuImage>>, mut last: Local<Option<std::time::Instant>>) {
+    if last.is_some_and(|at| at.elapsed().as_secs_f32() < 2.0) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    // The pictures the renderer holds, by their sizes and formats (every
+    // level, every layer).
+    let (mut count, mut bytes) = (0usize, 0u64);
+    for (_, picture) in pictures.iter() {
+        let (block_w, block_h) = picture.texture_format.block_dimensions();
+        let block = picture.texture_format.block_copy_size(None).unwrap_or(4) as u64;
+        for level in 0..picture.mip_level_count {
+            let (w, h) = ((picture.size.width >> level).max(1), (picture.size.height >> level).max(1));
+            bytes += w.div_ceil(block_w) as u64 * h.div_ceil(block_h) as u64 * block * picture.size.depth_or_array_layers as u64;
+        }
+        count += 1;
+    }
+    if let Some(report) = device.wgpu_device().generate_allocator_report() {
+        info!("graphics memory: {} MB allocated in {} MB of blocks, {} allocations; {count} pictures of {} MB", report.total_allocated_bytes >> 20, report.total_reserved_bytes >> 20, report.allocations.len(), bytes >> 20);
+    }
+}
+
 pub fn add(renderer: &mut SubApp) {
-    use RenderSet::*;
+    use RenderSystems::*;
     if std::env::var_os("TRP_RENDER_TIMING").is_none() {
         return;
     }
@@ -215,30 +248,5 @@ pub fn add(renderer: &mut SubApp) {
             (stamp::<12>, report).chain().after(PostCleanup),
         ),
     );
-    renderer.add_systems(bevy::render::Render, count_samplers.in_set(Cleanup));
 }
 
-/// What holds the graphics card's places for samplers, which on DirectX 12
-/// are 2,048 for everything drawn at once (wgpu's shader-visible sampler
-/// heap): every material's bind group (six for the standard material, which
-/// the range's lined material has too) and every picture the interface
-/// draws (one each), printed when it has changed by a material's worth.
-fn count_samplers(
-    device: Res<bevy::render::renderer::RenderDevice>,
-    standard: Res<bevy::render::render_asset::RenderAssets<bevy::pbr::PreparedMaterial<StandardMaterial>>>,
-    lined: Res<bevy::render::render_asset::RenderAssets<bevy::pbr::PreparedMaterial<crate::grid::GridMaterial>>>,
-    interface: Res<bevy::ui::ImageNodeBindGroups>,
-    mut last: Local<Option<usize>>,
-) {
-    let (materials, lines, pictures) = (standard.iter().count(), lined.iter().count(), interface.values.len());
-    let slots = 6 * (materials + lines) + pictures;
-    if last.is_some_and(|last| last.abs_diff(slots) < 6) {
-        return;
-    }
-    if last.is_none() {
-        let bindless = bevy::pbr::material_uses_bindless_resources::<StandardMaterial>(&device);
-        info!("samplers: bindless materials {bindless}; the device's samplers a stage {}", device.limits().max_samplers_per_shader_stage);
-    }
-    *last = Some(slots);
-    info!("samplers: {materials} standard materials, {lines} lined, {pictures} interface pictures: some {slots} of 2048 places");
-}

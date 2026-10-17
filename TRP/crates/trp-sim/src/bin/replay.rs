@@ -30,8 +30,8 @@ use trp_sim::rig::{ArmNodes, WeaponRig};
 use trp_sim::script::Scenario;
 use trp_sim::vaulting::Obstacle;
 use trp_sim::{
-    AimPoint, Body, Firearm, FirearmEvent, FireMode, Hands, HandsInput, Input, Movement, MovementSettings, State, ViewSettings,
-    World,
+    AimPoint, Body, Firearm, FirearmEvent, FireMode, Hands, HandsInput, Input, Movement, MovementSettings, PointOfView, State,
+    ViewSettings, World,
 };
 use serde_json::Value as Json;
 
@@ -42,6 +42,17 @@ const WEAPON_AT_REST: &str = "IDLE";
 
 /// One line of a trace: named values, each one or more numbers.
 type Sample = BTreeMap<String, Vec<f32>>;
+
+/// How far the weapon and the arms are drawn in along the view: the wide
+/// field of view's squeeze for the character's own eyes, none for
+/// another's (third-person spec, "What the switch does").
+fn squeeze(hands: &Hands) -> f32 {
+    if hands.point_of_view() == PointOfView::ThirdPerson {
+        1.0
+    } else {
+        hands.fov_scale()
+    }
+}
 
 /// A rotation as its axis times its angle in degrees, which compares
 /// sensibly component by component.
@@ -205,6 +216,9 @@ struct Holding {
     /// settings from the player prefab.
     arms: [ArmNodes; 2],
     limbs: [LimbData; 2],
+    /// The left hand's marker and the weapon's marker for the vest, which
+    /// a character seen from outside reaches toward (third-person spec).
+    vest: Option<[usize; 2]>,
 }
 
 impl Holding {
@@ -218,6 +232,10 @@ impl Holding {
             sights: trp_sim::rig::SightNodes::find(&weapon.hierarchy),
             arms: [arm(true)?, arm(false)?],
             limbs,
+            vest: rig
+                .bone("Weapon_root/Weapon_root_anim/weapon/weapon_L_IK_marker")
+                .zip(rig.bone("Weapon_root/Weapon_root_anim/weapon/weapon_vest_IK_marker"))
+                .map(|(left, vest)| [left, vest]),
             rig,
         })
     }
@@ -913,6 +931,7 @@ fn replay(
     holding: &mut Holding,
 ) -> (Vec<(f32, Sample)>, Option<[f32; 2]>) {
     let Rig { movement, hands, firearm } = rig;
+    let outside = hands.point_of_view() == PointOfView::ThirdPerson;
     let mut out = Vec::new();
     let mut leftover = None;
     let mut pressed = vec![false; scenario.presses.len()];
@@ -1100,10 +1119,13 @@ fn replay(
         // that frame, and the springs feel the shot on their next step.
         firearm.set_trigger(scenario.held("fire", time), can_fire);
         let was_reloading = firearm.reloading();
-        for event in firearm.step(frame.dt) {
+        for event in firearm.step_on_clock(frame.dt, frame.player_dt) {
             match event {
                 FirearmEvent::Shot { strength } => hands.shoot(strength),
                 FirearmEvent::AutoFire(on) => hands.set_auto_fire(on),
+                // The body's part in the weapon leaving and coming to the
+                // hands, told whoever is looking (third-person spec).
+                FirearmEvent::BodyAction(action) => movement.body.set_weapon_action(action),
                 _ => {}
             }
         }
@@ -1121,7 +1143,7 @@ fn replay(
             if let Some(bone) = frame.weapon_bone {
                 holding.rig.set_local(holding.weapon, bone);
             }
-            if let Some(length) = trp_sim::weapon_length_squeezed(&holding.rig, &holding.ends, hands.fov_scale()) {
+            if let Some(length) = trp_sim::weapon_length_squeezed(&holding.rig, &holding.ends, squeeze(hands)) {
                 hands.settings.weapon_length = length;
             }
             holding.rig.set_local(holding.weapon, kept);
@@ -1129,6 +1151,17 @@ fn replay(
         // The weapon's animator as this frame left it, for what the arms
         // take from its rig.
         holding.rig.pose(firearm.animator().pose(), Some(holding.moved));
+        // Seen from outside, the body reaches for the vest as the left
+        // hand's marker nears the weapon's marker for it, while a reload is
+        // in hand and not in a sprint (`Player.AdjustUtilityLayerWeight`).
+        if outside {
+            let reach = holding.vest.map(|[left, vest]| {
+                let (left, vest) = (holding.rig.placed(left).0, holding.rig.placed(vest).0);
+                (0..3).map(|k| (left[k] - vest[k]).powi(2)).sum::<f32>().sqrt()
+            });
+            let reaching = firearm.reloading() && !movement.sprinting;
+            movement.body.weigh_reach_for_vest(reach.is_some(), reach.filter(|_| reaching), frame.dt);
+        }
 
         let m = &*movement;
         // The iron sights' line and the muzzle as the rig has them now.
@@ -1148,12 +1181,22 @@ fn replay(
         let (placed_position, placed_rotation) = hands.weapon_transform();
         let aim = geometry.aim_point(placed_position, placed_rotation, frame.weapon_bone);
         hands.body_camera = Some(m.body.camera_bone());
-        let mut camera = hands.frame(frame.dt, geometry.camera_bone, Some(aim));
-        // Last of all in the game's frame, the camera's box is pushed out
-        // of the world, and the camera with it.
-        let shape = &geometry.camera_box;
-        let push = m.camera_push(ground, camera.position, camera.rotation, shape.size, shape.centre);
-        camera.position = hands.push_camera(push);
+        // The camera is moved for the character's own eyes only: seen from
+        // outside it is left where it stood
+        // (`ThirdPersonStrategy.ApplyCameraTransformations`), and what the
+        // replay says of it is not the game's.
+        let mut camera = trp_sim::CameraPose { position: [0.0; 3], rotation: [0.0, 0.0, 0.0, 1.0], field_of_view: hands.settings.field_of_view };
+        let mut push = [0.0; 3];
+        if outside {
+            hands.frame_outside();
+        } else {
+            camera = hands.frame(frame.dt, geometry.camera_bone, Some(aim));
+            // Last of all in the game's frame, the camera's box is pushed
+            // out of the world, and the camera with it.
+            let shape = &geometry.camera_box;
+            push = m.camera_push(ground, camera.position, camera.rotation, shape.size, shape.centre);
+            camera.position = hands.push_camera(push);
+        }
         let springs = hands.spring_values();
         let mut sample = Sample::new();
         let mut put = |name: &str, values: &[f32]| {
@@ -1187,19 +1230,23 @@ fn replay(
             let (root_position, root_rotation) = geometry.weapon_root;
             let hanging = quat_rotate(root_rotation, position);
             let mut at: [f32; 3] = std::array::from_fn(|i| root_position[i] + hanging[i]);
-            at[2] *= hands.fov_scale();
+            at[2] *= squeeze(hands);
             let back = [-camera.rotation[0], -camera.rotation[1], -camera.rotation[2], camera.rotation[3]];
             quat_rotate(back, std::array::from_fn(|i| at[i] - camera.position[i]))
         };
         put("weapon_pos", &weapon_position);
         put("weapon_rot", &rotation_vector(&weapon_rotation));
-        put("weapon_seen", &seen(weapon_position));
+        if !outside {
+            put("weapon_seen", &seen(weapon_position));
+        }
         // The eye from the feet, in the body's axes: the ribcage, and the
         // camera's place beside it turned to where the player looks.
         let look = quat_mul(quat_axis(1, m.yaw - m.body_yaw), quat_axis(0, m.pitch));
         let beside = quat_rotate(look, camera.position);
         let ribcage = m.ribcage();
-        put("eye", &[ribcage[0] + beside[0], ribcage[1] + beside[1], ribcage[2] + beside[2]]);
+        if !outside {
+            put("eye", &[ribcage[0] + beside[0], ribcage[1] + beside[1], ribcage[2] + beside[2]]);
+        }
         put("ribcage", &ribcage);
         // The body's own bones, where a recording has them (recorder 0.3.0
         // on): its weapon bone, and its arms.
@@ -1225,6 +1272,7 @@ fn replay(
         // How far the first-person weapon follows that bone, and how much
         // of each hand is still the weapon's.
         put("weapon_3rd_authority", &[m.carried().map_or(0.0, |c| c.authority)]);
+        put("reach_for_vest", &[m.body.reach_for_vest()]);
         put("right_hand_first_person", &[arms::hand_weight(&m.arm_pose(true))]);
         put("left_hand_first_person", &[arms::hand_weight(&m.arm_pose(false))]);
         // The arms as the game's solver leaves them: on the weapon, or the
@@ -1237,8 +1285,8 @@ fn replay(
         // recorder reads as the frame is drawn, when the game has turned
         // the ribcage to the view and squeezed it along the view for a
         // wide field of view: what hangs from it is drawn in.
-        let from_rig = |at: [f32; 3], squeeze: bool| {
-            let scale = if squeeze { hands.fov_scale() } else { 1.0 };
+        let from_rig = |at: [f32; 3], squeezed: bool| {
+            let scale = if squeezed { squeeze(hands) } else { 1.0 };
             let turned = quat_rotate(look, [at[0], at[1], at[2] * scale]);
             [ribcage[0] + turned[0], ribcage[1] + turned[1], ribcage[2] + turned[2]]
         };
@@ -1267,7 +1315,7 @@ fn replay(
                 let bones = arms::solve(&arms::found(&body, &on_rig), given.palm, given.goal, weight, &holding.limbs[index]);
                 put(&format!("{side}_upperarm_given_q"), &quat_mul(look, bones[0].1));
                 put(&format!("{side}_forearm_given_q"), &quat_mul(look, bones[1].1));
-                let elbow = quat_rotate(look, [bones[1].0[0], bones[1].0[1], bones[1].0[2] * hands.fov_scale()]);
+                let elbow = quat_rotate(look, [bones[1].0[0], bones[1].0[1], bones[1].0[2] * squeeze(hands)]);
                 put(&format!("{side}_forearm_given_p"), &std::array::from_fn::<f32, 3, _>(|k| given.ribcage[k] + elbow[k]));
             }
         }
@@ -1313,7 +1361,9 @@ fn replay(
             let [x, y, z]: [f32; 3] = std::array::from_fn(|k| rig_at[k] + turned[k]);
             y - Terrain(ground).ground_height(x, z)
         };
-        put("camera_push", &push);
+        if !outside {
+            put("camera_push", &push);
+        }
         put("line_clearance", &[over_ground(line_from), over_ground(line_to)]);
         put("turn_away", &[hands.turn_away_value()]);
         let (away_position, away_rotation) = hands.turn_away_offsets();
@@ -1381,9 +1431,11 @@ fn replay(
         put("grounded", &[m.grounded as u8 as f32]);
         put("pos", &m.position);
         put("movement_state", &[state_number(m.state)]);
-        put("camera_pos", &camera.position);
-        put("camera_rot", &rotation_vector(&camera.rotation));
-        put("fov", &[camera.field_of_view]);
+        if !outside {
+            put("camera_pos", &camera.position);
+            put("camera_rot", &rotation_vector(&camera.rotation));
+            put("fov", &[camera.field_of_view]);
+        }
         // The weapon animator's parameters that its logic sets, under the
         // recorder's names for them (0.6.2 on), and the fire mode by the
         // game's number.
@@ -1445,6 +1497,9 @@ fn read_trace(path: &Path) -> Result<(Json, Vec<(f32, Sample)>)> {
     // weapon animator's parameters, the fire mode, what is carried) is
     // carried on from frame to frame here.
     let mut standing: Sample = Sample::new();
+    // Seen from outside the share of the first-person rig is 1 whatever
+    // the curve says (third-person spec, "Whose arms, whose weapon").
+    let outside = header.get("point_of_view").and_then(Json::as_str) == Some("ThirdPerson");
     if let Some(list) = header.get("equipment") {
         standing.insert("rounds_in_reach".into(), vec![rounds_in_reach(list) as f32]);
     }
@@ -1503,8 +1558,15 @@ fn read_trace(path: &Path) -> Result<(Json, Vec<(f32, Sample)>)> {
         // (The recorder's own figure for it is not in the traces.)
         if let (Some(carry), Some(share)) = (sample.get("p_Weapon_3rd"), sample.get("p_First_Person_Curve_Weight")) {
             if let (Some(carry), Some(share), false) = (carry.first(), share.first(), sample.contains_key("weapon_3rd_authority")) {
-                sample.insert("weapon_3rd_authority".into(), vec![(carry.min(1.0) * share.min(1.0)).clamp(0.0, 1.0)]);
+                let share = if outside { 1.0 } else { share.min(1.0) };
+                sample.insert("weapon_3rd_authority".into(), vec![(carry.min(1.0) * share).clamp(0.0, 1.0)]);
             }
+        }
+        // The weight of the layer that reaches for the vest
+        // (`UtilityOperation`, the body animator's third), which the game
+        // sets for a character seen from outside.
+        if let Some(weight) = sample.get("layers").and_then(|layers| layers.get(2 * 4 + 2)).copied() {
+            sample.insert("reach_for_vest".into(), vec![weight]);
         }
         // The arm's bones a second time, to set beside what the solver
         // makes of the game's own palm and goal.
@@ -1983,6 +2045,12 @@ fn main() -> Result<()> {
             if let (true, Some(now), Some(next)) = (same, at(0, "body_anim_time"), at(1, "body_anim_time")) {
                 movement.body.set_progress(now - (next - now));
             }
+            // And every other layer where the recording has it (recorder
+            // 0.3.0 on): a breath, a lean into a turn, are somewhere in
+            // their play as a scenario begins.
+            if let Some(layers) = frames[0].1.get("layers") {
+                movement.body.start_layers_as(layers, frames[1].1.get("layers").map(Vec::as_slice));
+            }
         }
         // Stamina, as the recording's character has it and where the
         // recording has it.
@@ -2046,7 +2114,14 @@ fn main() -> Result<()> {
             hands.possible_tilt = reach;
         }
         let mut rig = Rig { movement, hands, firearm };
-        let squeeze = rig.hands.fov_scale();
+        // A recording made from outside (recorder 0.7.0 on) is set beside
+        // the character as others see it (third-person spec).
+        if header("point_of_view").and_then(Json::as_str) == Some("ThirdPerson") {
+            println!("  seen from outside: the character as others see it");
+            rig.movement.body.set_point_of_view(PointOfView::ThirdPerson);
+            rig.hands.set_point_of_view(PointOfView::ThirdPerson);
+        }
+        let squeeze = squeeze(&rig.hands);
 
         // The frames to play: the recording's own, or sixty a second.
         if recorded.is_none() && !scenario.gates.is_empty() {

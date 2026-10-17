@@ -4,8 +4,8 @@ use std::collections::{HashMap, VecDeque};
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use bevy::render::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
-use bevy::render::view::NoFrustumCulling;
+use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
+use bevy::camera::visibility::NoFrustumCulling;
 use trp_data::unity::anim::path_hash;
 
 use crate::animation::{ClipLibrary, ClipPlayer};
@@ -178,6 +178,10 @@ pub struct HandsRig {
     /// own controller on their own animator.
     pub firearm: Option<trp_sim::Firearm>,
     pub empty: Option<trp_sim::EmptyHands>,
+    /// For the rig of an item used (medicine, food or drink, from its
+    /// `UsePrefab`): its controller on its own animator (health spec, "The
+    /// hands").
+    pub meds: Option<trp_sim::MedsHands>,
     /// The rig with no engine, for what the simulation reads off it.
     pub frame: RigFrame,
     pub aiming: bool,
@@ -190,13 +194,20 @@ pub struct HandsRig {
     /// How many cells wide the weapon is with its stock folded, if it has
     /// one that folds: what the body's animator is then told.
     pub folded_width: Option<f32>,
+    /// Its own sound player's sounds (`hands_sound`), where it has one and
+    /// the options' `HANDS SOUNDS` is on.
+    pub sounds: Option<std::sync::Arc<crate::hands_sound::RigSounds>>,
 }
 
 impl HandsRig {
-    /// The animator of whatever this rig is: the weapon's, or the empty
-    /// hands'.
+    /// The animator of whatever this rig is: the weapon's, the empty
+    /// hands', or an item's.
     pub fn animator(&self) -> Option<&trp_sim::weapon_animator::WeaponAnimator> {
-        self.firearm.as_ref().map(|firearm| firearm.animator()).or(self.empty.as_ref().map(|empty| empty.animator()))
+        self.firearm
+            .as_ref()
+            .map(|firearm| firearm.animator())
+            .or(self.empty.as_ref().map(|empty| empty.animator()))
+            .or(self.meds.as_ref().and_then(|meds| meds.animator()))
     }
 }
 
@@ -266,44 +277,10 @@ const FREE_AFTER: f32 = 30.0;
 /// the one carried longest ago is let go of. `ESTIMATE`: the app's choice.
 const MOST_UNCARRIED: usize = 4;
 
-/// The graphics card's places for samplers that what is drawn holds now,
-/// as the renderer counts them (`count_places`): on DirectX 12 there are
-/// 2,048 for everything drawn at once (wgpu-hal 24's shader-visible sampler
-/// heap, `dx12::Device::new`), and a bind group that asks for more than are
-/// left stops the renderer. Bindless materials, which would share them, are
-/// not to be had there (`docs/findings.md`).
-#[derive(Resource, Clone, Default)]
-pub struct SamplerPlaces(pub std::sync::Arc<std::sync::atomic::AtomicUsize>);
-
-impl SamplerPlaces {
-    pub fn now(&self) -> usize {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-/// Each material holds six (the standard material's six samplers, as the
-/// range's lined one does: `bevy_pbr` 0.16, `StandardMaterial`); each
-/// picture the interface draws, one.
-const PLACES_A_MATERIAL: usize = 6;
-/// Rigs are let go of, the one carried longest ago first, while more than
-/// this many are held, and none is made ahead of its being hung then. The
-/// count leaves out the cameras' own bind groups and what comes and goes
-/// in a frame; this leaves them a quarter. `ESTIMATE`.
-const PLACES_FOR_RIGS: usize = 1536;
-/// What a rig about to be made ahead is allowed, at the most: the largest
-/// seen held some 25 materials. `ESTIMATE`.
-const PLACES_A_RIG: usize = 160;
-
-/// In the renderer's world: the places for samplers held now.
-pub fn count_places(
-    places: Res<SamplerPlaces>,
-    standard: Res<bevy::render::render_asset::RenderAssets<bevy::pbr::PreparedMaterial<StandardMaterial>>>,
-    lined: Res<bevy::render::render_asset::RenderAssets<bevy::pbr::PreparedMaterial<crate::grid::GridMaterial>>>,
-    interface: Res<bevy::ui::ImageNodeBindGroups>,
-) {
-    let held = PLACES_A_MATERIAL * (standard.iter().count() + lined.iter().count()) + interface.values.len();
-    places.0.store(held, std::sync::atomic::Ordering::Relaxed);
-}
+// (Until 0.12.4 the rigs were also held to the graphics card's places for
+// samplers: on DirectX 12, wgpu 24 copied every bind group's samplers into
+// one heap of 2,048. wgpu 26, Bevy 0.17's, keeps each distinct sampler once
+// for the device, `docs/findings.md`.)
 
 /// The rigs put into the world whose meshes and pictures are still going
 /// up to the graphics card, a few megabytes a frame (`UPLOAD_BUDGET`), and
@@ -380,8 +357,7 @@ pub struct RigBuilder<'w, 's> {
     bindposes: ResMut<'w, Assets<SkinnedMeshInverseBindposes>>,
     uploads: Res<'w, UploadWatch>,
     shared: ResMut<'w, crate::render_data::SharedPictures>,
-    places: Res<'w, SamplerPlaces>,
-    exit: EventWriter<'w, AppExit>,
+    exit: MessageWriter<'w, AppExit>,
 }
 
 impl RigBuilder<'_, '_> {
@@ -466,35 +442,64 @@ struct Seed {
     view: trp_sim::ViewSettings,
     mastering: u32,
     weapon_skill: u32,
+    /// Which of the rigs' sounds are read (`HANDS SOUNDS`, `SHOT SOUNDS`).
+    sounds: crate::hands_sound::Wanted,
 }
 
 /// That thread's own reader of the install and its own database, made
 /// there the first time and kept from one rig to the next (the bundles a
-/// rig loaded stay loaded for the next that shares them).
+/// rig loaded stay loaded for the next that shares them), and the game's
+/// Vorbis setup headers as the rigs' sounds have asked for them.
 struct Worker {
     unity: trp_data::unity::Assets,
     db: trp_data::Database,
     seed: Seed,
+    setups: trp_data::sound::VorbisSetups,
 }
 
 impl Worker {
     fn new(seed: &Seed) -> anyhow::Result<Self> {
         let began = std::time::Instant::now();
-        let worker = Self { unity: trp_data::unity::Assets::new(seed.install.clone())?, db: trp_data::Database::load(&seed.install)?, seed: seed.clone() };
+        let worker = Self {
+            unity: trp_data::unity::Assets::new(seed.install.clone())?,
+            db: trp_data::Database::load(&seed.install)?,
+            seed: seed.clone(),
+            setups: trp_data::sound::VorbisSetups::new(&seed.install),
+        };
         info!("the thread that makes rigs ready: its reader of the install and its database in {:.2} s", began.elapsed().as_secs_f32());
         Ok(worker)
     }
 
-    /// A weapon's rig, all but its entities.
+    /// A weapon's rig, or an item's (medicine, food or drink: its
+    /// `UsePrefab`), all but its entities.
     fn prepare(&mut self, template: &str) -> anyhow::Result<Prepared> {
         let began = std::time::Instant::now();
         let Seed { hard, engine, hands_data, view, mastering, weapon_skill, .. } = &self.seed;
-        let weapon = trp_data::weapon::assemble(&mut self.unity, &self.db, template)?;
+        let medicine = trp_sim::health::Medicine::of(&self.db, template);
+        let weapon = match &medicine {
+            Some(_) => {
+                let item = self.db.items.get(template).ok_or_else(|| anyhow::anyhow!("no item {template}"))?;
+                let path = item.props["UsePrefab"]["path"].as_str().filter(|path| !path.is_empty()).ok_or_else(|| anyhow::anyhow!("{} has no hands to be used by", item.name))?;
+                trp_data::weapon::assemble_prefab(&mut self.unity, path)?
+            }
+            None => trp_data::weapon::assemble(&mut self.unity, &self.db, template)?,
+        };
         let assembled = began.elapsed().as_secs_f32();
-        let hands = hands_of(&mut self.unity, &self.db, hard, engine, hands_data.clone(), &weapon, *view, *mastering, *weapon_skill)
-            .ok_or_else(|| anyhow::anyhow!("its motion could not be made"))?;
-        // A weapon with no logic of its own cannot be worked.
-        anyhow::ensure!(hands.firearm.is_some(), "it has no logic of its kind");
+        let hands = match medicine {
+            Some(medicine) => {
+                let variants = self.db.items.get(template).and_then(|item| item.props["AnimationVariantsNumber"].as_u64()).unwrap_or(0) as u32;
+                item_hands_of(&self.unity, &self.db, hard, engine, hands_data.clone(), &weapon, *view, medicine, variants).ok_or_else(|| anyhow::anyhow!("its hands could not be made"))?
+            }
+            None => {
+                let hands = hands_of(&mut self.unity, &self.db, hard, engine, hands_data.clone(), &weapon, *view, *mastering, *weapon_skill)
+                    .ok_or_else(|| anyhow::anyhow!("its motion could not be made"))?;
+                // A weapon with no logic of its own cannot be worked.
+                anyhow::ensure!(hands.firearm.is_some(), "it has no logic of its kind");
+                hands
+            }
+        };
+        let mut hands = hands;
+        hands.sounds = crate::hands_sound::read(&self.unity, &weapon, &mut self.setups, self.seed.sounds);
         let animated = began.elapsed().as_secs_f32();
         let mut looks = PreparedLooks::default();
         let mut parts = vec![Vec::new(); weapon.hierarchy.nodes.len()];
@@ -654,18 +659,11 @@ pub fn prepare_rigs(preparing: Option<ResMut<Preparing>>, stowed: Option<ResMut<
     if preparing.task.is_some() {
         return;
     }
-    // Nothing hung waits: the rig asked for ahead, if any, where there is
-    // room on the graphics card for it.
+    // Nothing hung waits: the rig asked for ahead, if any.
     if preparing.queue.is_empty() {
-        let room = builder.places.now() + PLACES_A_RIG <= PLACES_FOR_RIGS;
-        let ahead = preparing.ahead.take().filter(|template| !stowed.has_rig(template) && !stowed.failed.contains(template));
-        match ahead {
-            Some(template) if room => {
-                info!("{template}: its rig made ahead of its being hung");
-                preparing.queue.push_back(template);
-            }
-            Some(template) => info!("{template}: its rig not made ahead: {} of the card's places for samplers are held", builder.places.now()),
-            None => {}
+        if let Some(template) = preparing.ahead.take().filter(|template| !stowed.has_rig(template) && !stowed.failed.contains(template)) {
+            info!("{template}: its rig made ahead of its being hung");
+            preparing.queue.push_back(template);
         }
     }
     while let Some(template) = preparing.queue.pop_front() {
@@ -707,23 +705,18 @@ pub fn prepare_rigs(preparing: Option<ResMut<Preparing>>, stowed: Option<ResMut<
 /// Lets go of the rigs nobody carries (a weapon hung where the hands can
 /// take it, or in them, is carried; a rig still going up to the graphics
 /// card is let be): one carried for the last time `FREE_AFTER` ago; the
-/// one carried longest ago while more than `MOST_UNCARRIED` are kept; and
-/// the same while the rigs hold more than `PLACES_FOR_RIGS` of the card's
-/// places for samplers (one a look, the count being the renderer's of the
-/// frame before, which a rig let go of leaves a frame or two later).
-/// Looked at twice a second, and ten times a second while they run short.
+/// one carried longest ago while more than `MOST_UNCARRIED` are kept.
+/// Looked at twice a second.
 pub fn free_rigs(
     mut commands: Commands,
     carried: Res<crate::inventory_view::Carried>,
     stowed: Option<ResMut<Stowed>>,
-    places: Res<SamplerPlaces>,
     mut shared: ResMut<crate::render_data::SharedPictures>,
     mut looked: Local<Option<std::time::Instant>>,
 ) {
     let Some(mut stowed) = stowed else { return };
     let now = std::time::Instant::now();
-    let short = places.now() > PLACES_FOR_RIGS;
-    if looked.is_some_and(|at| now.duration_since(at).as_secs_f32() < if short { 0.1 } else { 0.5 }) {
+    if looked.is_some_and(|at| now.duration_since(at).as_secs_f32() < 0.5) {
         return;
     }
     *looked = Some(now);
@@ -745,8 +738,6 @@ pub fn free_rigs(
             format!("nobody having carried it for {FREE_AFTER:.0} s")
         } else if left > MOST_UNCARRIED {
             format!("{} rigs nobody carries being kept, and it carried longest ago", left)
-        } else if short && going.is_empty() {
-            format!("{} of the graphics card's places for samplers being held", places.now())
         } else {
             continue;
         };
@@ -806,8 +797,8 @@ fn rig_of(
 
 /// What kind of thing the body's animator is told a weapon is. The game
 /// takes anything that is not a pistol, a knife, a thing thrown or a
-/// launcher for a rifle (`Player.GetWeaponAnimationType`); a revolver is
-/// a pistol to it.
+/// launcher for a rifle (`Player.GetWeaponAnimationType`), an item used
+/// among them; a revolver is a pistol to it.
 fn kind_of(db: &trp_data::Database, template: &str) -> f32 {
     let pistol = db.items.get(template).is_some_and(|item| db.is_a(item, "Pistol") || db.is_a(item, "Revolver"));
     if pistol { trp_sim::body::hands_kind::PISTOL } else { trp_sim::body::hands_kind::RIFLE }
@@ -929,6 +920,11 @@ fn spawn_tree(
     spawn_nodes(commands, hierarchy, pivot, shared, &parts, &skins, &extra)
 }
 
+/// The colliders a node of a rig has in its prefab, in its own axes (the
+/// game's): what a weapon let fall falls on (`death`).
+#[derive(Component, Clone)]
+pub struct NodeColliders(pub Vec<trp_data::unity::extract::NodeCollider>);
+
 /// The bones a node's skinned mesh is drawn on, by their places in the
 /// tree, where it is skinned and every one of them is there (a weapon's
 /// part on bones of its own: the AS VAL's and the VSS's hammer spring,
@@ -978,6 +974,11 @@ fn spawn_nodes(
         }
         let entity = commands.spawn((Name::new(node.name.clone()), transform, visibility)).id();
         commands.entity(node.parent.map_or(pivot, |p| entities[p])).add_child(entity);
+        // Its colliders, for the weapon let fall (`death`): the game's own
+        // on its parts.
+        if !node.colliders.is_empty() {
+            commands.entity(entity).insert(NodeColliders(node.colliders.clone()));
+        }
         entities.push(entity);
         by_path.insert(path, entity);
         let own = &parts[index];
@@ -1060,12 +1061,14 @@ fn hands_of(
         hands,
         firearm,
         empty: None,
+        meds: None,
         frame: RigFrame::new(&weapon.hierarchy),
         aiming: false,
         aim_sensitivity,
         aim_mass,
         width: weapon.cell_width as f32,
         folded_width: weapon.fold.map(|fold| fold.cell_width as f32),
+        sounds: None,
     })
 }
 
@@ -1080,8 +1083,11 @@ pub fn spawn_weapon(
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut clip_player: ResMut<ClipPlayer>,
     mut controller: ResMut<crate::controller::Controller>,
+    features: Res<crate::options_view::Features>,
 ) {
     let GameData { unity, db, hard, engine, hands_data } = &mut *game;
+    // The game's Vorbis setup headers, as the rigs' sounds ask for them.
+    let mut setups = trp_data::sound::VorbisSetups::new(&unity.install);
     // The first rig, which every rig of the hands built after it hangs
     // from and shares the arms' and the camera's bones with: the run's own
     // weapon's when the run begins with a weapon in hand (or plays clips
@@ -1166,7 +1172,7 @@ pub fn spawn_weapon(
                             // it (recorded, tenth recording: drawn,
                             // shadow casting off). The arms' shadow on
                             // the ground is the upper body's sleeves.
-                            bevy::pbr::NotShadowCaster,
+                            bevy::light::NotShadowCaster,
                         ))
                         .id();
                     commands.entity(entities[0]).add_child(part);
@@ -1195,7 +1201,11 @@ pub fn spawn_weapon(
         seed: options.seed,
         aim_speed_bonus: options.aim_speed_bonus,
     };
-    let in_hand = first.as_ref().and_then(|weapon| hands_of(unity, db, hard, engine, hands_data.clone(), weapon, view, options.mastering, options.weapon_skill));
+    let in_hand = first.as_ref().and_then(|weapon| {
+        let mut hands = hands_of(unity, db, hard, engine, hands_data.clone(), weapon, view, options.mastering, options.weapon_skill)?;
+        hands.sounds = crate::hands_sound::read(unity, weapon, &mut setups, crate::hands_sound::Wanted::of(&features));
+        Some(hands)
+    });
     if let Some(hands) = &in_hand {
         controller.movement.stamina.aim_mass = hands.aim_mass;
     }
@@ -1220,7 +1230,16 @@ pub fn spawn_weapon(
     // in memory.
     commands.insert_resource(Preparing {
         queue: options.measure_rigs.iter().cloned().collect(),
-        seed: Seed { install: unity.install.clone(), hard: hard.clone(), engine: *engine, hands_data: hands_data.clone(), view, mastering: options.mastering, weapon_skill: options.weapon_skill },
+        seed: Seed {
+            install: unity.install.clone(),
+            hard: hard.clone(),
+            engine: *engine,
+            hands_data: hands_data.clone(),
+            view,
+            mastering: options.mastering,
+            weapon_skill: options.weapon_skill,
+            sounds: crate::hands_sound::Wanted::of(&features),
+        },
         worker: None,
         task: None,
         measuring: (!options.measure_rigs.is_empty()).then(Measured::default),
@@ -1241,7 +1260,10 @@ pub fn spawn_weapon(
             if let Some(empty) = &empty {
                 let tree = spawn_tree(&mut commands, unity, &mut converted, &mut meshes, &mut images, &mut materials, &mut bindposes, &empty.hierarchy, pivot, Some(&by_path), None);
                 let stood = empty_hands_of(unity, db, hard, engine, hands_data.clone(), empty, &tree.entities, &tree.by_path, pivot, limbs, view);
-                standing.extend(stood.map(|(rig, hands)| (None, rig, hands)));
+                standing.extend(stood.map(|(rig, mut hands)| {
+                    hands.sounds = crate::hands_sound::read(unity, empty, &mut setups, crate::hands_sound::Wanted::of(&features));
+                    (None, rig, hands)
+                }));
             }
             (rig, in_hand, Some(options.weapon.clone()), vec![options.weapon.clone()])
         }
@@ -1249,10 +1271,11 @@ pub fn spawn_weapon(
         // rig yet.
         None => {
             let empty = empty.as_ref().expect("the first rig is the empty hands'");
-            let Some((rig, hands)) = empty_hands_of(unity, db, hard, engine, hands_data.clone(), empty, &entities, &by_path, pivot, limbs, view) else {
+            let Some((rig, mut hands)) = empty_hands_of(unity, db, hard, engine, hands_data.clone(), empty, &entities, &by_path, pivot, limbs, view) else {
                 error!("the empty hands could not be made: no hands");
                 return;
             };
+            hands.sounds = crate::hands_sound::read(unity, empty, &mut setups, crate::hands_sound::Wanted::of(&features));
             (rig, Some(hands), None, Vec::new())
         }
     };
@@ -1313,14 +1336,62 @@ fn empty_hands_of(
         hands: trp_sim::Hands::new(settings),
         firearm: None,
         empty: Some(trp_sim::EmptyHands::new(&animator)),
+        meds: None,
         frame: RigFrame::new(&empty.hierarchy),
         aiming: false,
         aim_sensitivity: 1.0,
         aim_mass: 0.0,
         width: empty.cell_width as f32,
         folded_width: None,
+        sounds: None,
     };
     Some((rig, hands))
+}
+
+/// The hands that use an item (health spec, "The hands"): its rig from its
+/// `UsePrefab`, its controller on the rig's own animator, and its motion,
+/// which is the empty hands' (no weight and no recoil of its own:
+/// PROVISIONAL, `docs/status.md`).
+#[allow(clippy::too_many_arguments)]
+fn item_hands_of(
+    unity: &trp_data::unity::Assets,
+    db: &trp_data::Database,
+    hard: &trp_data::hard_settings::HardSettings,
+    engine: &trp_data::engine::EngineSettings,
+    hands_data: Option<trp_data::player::HandsData>,
+    rig: &trp_data::weapon::Weapon,
+    view: trp_sim::ViewSettings,
+    medicine: trp_sim::health::Medicine,
+    variants: u32,
+) -> Option<HandsRig> {
+    let animator = match trp_sim::weapon_animator::WeaponAnimatorData::load_scaled(unity, rig) {
+        Ok(animator) => animator,
+        Err(e) => {
+            warn!("the animator of {}: {e:#}", rig.name);
+            return None;
+        }
+    };
+    let settings = match trp_sim::empty_hands_settings(hands_data?, db, hard, engine, rig, view) {
+        Ok(settings) => settings,
+        Err(e) => {
+            warn!("the motion of {}: {e:#}", rig.name);
+            return None;
+        }
+    };
+    info!("{}: {} bones, {} clips, {variants} variants; its clips scale {}", rig.name, rig.hierarchy.nodes.len(), animator.clip_count(), animator.scaled_bones().len());
+    Some(HandsRig {
+        hands: trp_sim::Hands::new(settings),
+        firearm: None,
+        empty: None,
+        meds: Some(trp_sim::MedsHands::new(Some(&animator), std::sync::Arc::new(medicine), variants)),
+        frame: RigFrame::new(&rig.hierarchy),
+        aiming: false,
+        aim_sensitivity: 1.0,
+        aim_mass: 0.0,
+        width: rig.cell_width as f32,
+        folded_width: None,
+        sounds: None,
+    })
 }
 
 /// The clips of a weapon or of a rig like one, by the names its animator

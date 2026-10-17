@@ -33,12 +33,15 @@ pub(crate) fn to_game(v: Vec3) -> [f32; 3] {
 /// last frames put them (`Controller::shown`): the simulation has already
 /// worked out the procedural motion, the body's carrying of the weapon and
 /// the camera's pose on frames of its own.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_hands(
     view: Res<View>,
     controller: Res<Controller>,
     rig: Option<Res<WeaponRig>>,
     hands: Option<Res<HandsRig>>,
+    down: Res<crate::feet_down::FeetDown>,
     eye: Query<Entity, With<Eye>>,
+    globals: Query<&GlobalTransform>,
     mut transforms: Query<&mut Transform, Without<MainCamera>>,
     mut camera: Query<(&mut Transform, &mut Projection), With<MainCamera>>,
 ) {
@@ -54,6 +57,14 @@ pub fn apply_hands(
             scale: Vec3::ONE,
         };
     }
+    // Seen from outside, the rig (the weapon, the arms that hold it and
+    // the shoulders hung on it) comes down with a body drawn down onto the
+    // ground (`feet_down`); for the character's own eyes it stays where the
+    // game has it, and so does the eye either way.
+    let lowered = match (globals.get(rig.pivot).ok(), *view != View::FirstPerson && down.by != 0.0) {
+        (Some(pivot), true) => pivot.affine().inverse().transform_vector3(Vec3::NEG_Y * down.by),
+        _ => Vec3::ZERO,
+    };
 
     // At a wide field of view the game squeezes the weapon and arms along
     // the view while they are drawn, so that they fill about the same part
@@ -66,12 +77,14 @@ pub fn apply_hands(
     let Ok(mut root) = transforms.get_mut(rig.root) else { return };
     let squeeze = if *view == View::FirstPerson { hands.hands.fov_scale() } else { 1.0 };
     root.scale = Vec3::new(1.0, 1.0, squeeze);
+    root.translation = lowered;
     let root = *root;
     // The character's own eyes are where the first-person camera would be,
-    // whatever camera the picture is drawn from.
+    // whatever camera the picture is drawn from: from the rig's own origin,
+    // the pivot's, however the rig is drawn.
     let pose = shown.camera;
     let seeing = Transform {
-        translation: root.translation + root.rotation * convert::position(pose.position),
+        translation: root.rotation * convert::position(pose.position),
         rotation: root.rotation * convert::rotation(pose.rotation),
         scale: Vec3::ONE,
     };

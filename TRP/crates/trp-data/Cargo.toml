@@ -13,3 +13,6 @@ lz4_flex.workspace = true
 lzma-rs.workspace = true
 miniz_oxide.workspace = true
 png.workspace = true
+ttf-parser.workspace = true
+crc32fast.workspace = true
+lewton.workspace = true

@@ -49,6 +49,48 @@ fn stock_akm_assembles_with_every_part() {
     }
 }
 
+/// A texture's levels read again from its bundle's file, only the blocks
+/// they are in decompressed (`ResourcePlace`, for the streaming of
+/// pictures), are the bytes the whole bundle gave.
+#[test]
+fn a_texture_read_again_from_its_bundle_is_the_same() {
+    let Some((assets, weapon)) = akm() else { return };
+    let mut checked = 0;
+    for renderer in weapon.hierarchy.nodes.iter().filter_map(|n| n.renderer.as_ref()) {
+        for material in renderer.materials.iter().flatten() {
+            let material = trp_data::unity::extract::read_material(&assets, *material).expect("material");
+            for texture in material.textures.values() {
+                let (texture, place) = trp_data::unity::extract::read_texture_shared(&assets, *texture).expect("texture");
+                let Some(place) = place else { continue };
+                assert_eq!(place.read().expect("read again"), texture.data, "{}", texture.name);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 10, "only {checked} textures kept beside their files");
+}
+
+/// The game's engine streams a texture by its levels only where it was
+/// imported so (`m_StreamingMipmaps`), and draws the rest whole when
+/// streaming is on. Every one of the AKM's 27 is (read 2026-10-15, each of
+/// priority 0).
+#[test]
+fn the_weapon_s_textures_are_marked_for_streaming() {
+    let Some((assets, weapon)) = akm() else { return };
+    let mut seen = std::collections::BTreeMap::new();
+    for renderer in weapon.hierarchy.nodes.iter().filter_map(|n| n.renderer.as_ref()) {
+        for material in renderer.materials.iter().flatten() {
+            let material = trp_data::unity::extract::read_material(&assets, *material).expect("material");
+            for texture in material.textures.values() {
+                let texture = read_texture(&assets, *texture).expect("texture");
+                seen.insert(texture.name.clone(), texture.streaming_mipmaps);
+            }
+        }
+    }
+    assert_eq!(seen.len(), 27);
+    assert!(seen.values().all(|streamed| *streamed), "not streamed: {:?}", seen.iter().filter(|(_, s)| !**s).collect::<Vec<_>>());
+}
+
 /// The idle clip starts in the pose the prefab is stored in, so its first
 /// frame must reproduce the prefab's rotations. This is what pins down the
 /// order Euler angles are applied in.
@@ -708,4 +750,317 @@ fn a_weapon_of_one_s_own_s_pictures_compress_closely() {
         }
     }
     println!("{checked} pictures checked");
+}
+
+/// The inventory's health panel as the install's scene has it
+/// (`docs/spec/health.md`, "The HEALTH tab"): its seven views and their
+/// pieces named by the panel's own scripts, its figures, the left panel's
+/// size on a screen 1920 by 1080, and its pictures read through trees
+/// borrowed from a bundle; the views' glow hidden as their animator
+/// stands, and the arrows' bob, by the scene's own clips.
+#[test]
+fn the_health_panel_is_read_as_the_scene_has_it() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let gear = trp_data::screen::GearPanel::load(&install).expect("the equipment panel");
+    let health = trp_data::screen::HealthPanel::load(&install, &gear.file).expect("the health panel");
+    let views = &health.views;
+    assert_eq!(views.parts.len(), 7);
+    let names: Vec<&str> = views.parts.iter().map(|view| health.panel.nodes[view.view].name.as_str()).collect();
+    assert_eq!(names, ["Head", "Chest", "Stomach", "Left Arm", "Right Arm", "Left Leg", "Right Leg"]);
+    for view in &views.parts {
+        for piece in [view.value, view.bar, view.border, view.shape, view.broken, view.effects] {
+            assert!(piece.is_some(), "{}: a piece of its view is not named", health.panel.nodes[view.view].name);
+        }
+    }
+    for name in ["OverallHealth", "Poisoning", "Radiation", "BloodPressure", "Energy", "Hydration", "Temperature"] {
+        assert!(views.parameter(name).and_then(|figure| figure.current).is_some(), "{name}");
+    }
+    assert!(views.parameter("Weight").is_none(), "the health tab has no weight");
+    // The left side's width (a share of the screen and a size) shared by
+    // its two children, with the space between them.
+    let left = health.left_panel([1920.0, 1080.0]);
+    assert!((left[0] - 604.163).abs() < 0.01 && (left[1] - 902.0).abs() < 0.01, "{left:?}");
+    let [x, y, w, h] = health.gear_in(left);
+    assert!((x - (left[0] - 494.0) / 2.0).abs() < 0.01 && (y - 100.0).abs() < 0.01 && w == 494.0 && h == 650.0, "{:?}", [x, y, w, h]);
+    // The chest's view where its anchors and offset put it.
+    let chest = views.parts[1].view;
+    let [cx, cy, cw, ch] = health.panel.rect(chest, left);
+    assert!((cx - (left[0] * 0.5 - 50.9)).abs() < 0.01 && (cy - (902.0 - (0.887_820_5 * 902.0 - 162.948_12))).abs() < 0.01 && cw == 130.0 && ch == 19.0, "{:?}", [cx, cy, cw, ch]);
+    // The silhouette's picture and its texture.
+    let mut pictures = trp_data::screen::ScenePictures::new(&install).expect("the trees to read pictures by");
+    let silhouette = health.panel.find("Silhouette/Character Silhouette").expect("the silhouette");
+    let (file, id) = health.panel.nodes[silhouette].image.and_then(|image| image.sprite).expect("its sprite");
+    let name = health.panel.externals[file as usize - 1].clone();
+    let cut = pictures.sprite(&name, id).expect("the sprite");
+    let texture = pictures.texture(&cut.texture.0, cut.texture.1).expect("its texture");
+    assert!(texture.width >= cut.rect[2] as u32 && texture.height >= cut.rect[3] as u32 && !texture.data.is_empty(), "{cut:?}");
+    let covers = cut.covers();
+    assert!(covers.iter().all(|c| (0.0..=1.0).contains(c)) && covers[0] < covers[2] && covers[1] < covers[3], "{covers:?}");
+    // The scene's clips: the views' glow standing, and the arrows' bob.
+    let shared: Vec<String> = health.panel.externals.iter().filter(|name| name.starts_with("sharedassets")).cloned().collect();
+    let clips = trp_data::screen::scene_clips(&install, &mut pictures, &shared).expect("the scene's clips");
+    let bound = |clip: &Clip, path: &str, property: &str| clip.others.iter().find(|b| b.path == path_hash(path) && b.attribute == path_hash(property)).map(|b| b.curve);
+    let standing = clips.iter().find(|(_, _, clip)| clip.name == "Normal" && bound(clip, "BackGlowImage", "m_Color.a").is_some()).expect("the views' standing clip");
+    let mut values = Vec::new();
+    standing.2.sample(0.0, &mut values);
+    assert_eq!(values[bound(&standing.2, "BackGlowImage", "m_Color.a").unwrap()], 0.0, "the glow is hidden standing");
+    let bob = clips.iter().find(|(_, _, clip)| clip.name == "BuffPaneActive").expect("the arrows' bob");
+    assert!(bob.2.looping && bound(&bob.2, "", "m_AnchoredPosition.y").is_some(), "{}", bob.2.name);
+}
+
+/// The GEAR tab's strip of figures as its row lays it out while the game
+/// runs (`HorizontalLayoutGroup`: four panels asking 208 each in a strip
+/// of 532.08 on a 16:9 screen, so 133.02 each from 36 units in), what its
+/// script names, and the game's own fonts kept whole in `resources.assets`
+/// (the panel's texts drawn in Bender).
+#[test]
+fn the_gear_tab_s_strip_and_the_game_s_fonts_are_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let gear = trp_data::screen::GearPanel::load(&install).expect("the equipment panel");
+    let health = trp_data::screen::HealthPanel::load(&install, &gear.file).expect("the health panel");
+    let strip = health.strip.as_ref().expect("the strip of figures");
+    let left = health.left_panel([1920.0, 1080.0]);
+    let names = ["Weight", "Overall Health", "Hydration", "Energy"];
+    for (n, name) in names.iter().enumerate() {
+        let index = strip.find(name).unwrap_or_else(|| panic!("{name}"));
+        let [x, y, w, h] = strip.placed_in(index, left).rect;
+        let width = (0.620_111_8 * left[0] + 157.430_18) / 4.0;
+        assert!((w - width).abs() < 0.05 && (x - (left[0] * 0.189_944_1 - 157.430_18 / 2.0 + n as f32 * width)).abs() < 0.05, "{name}: {:?}", [x, y, w, h]);
+        assert!((y - (902.0 - 20.6 - 46.8)).abs() < 0.05 && (h - 46.8).abs() < 0.01, "{name}: {:?}", [x, y, w, h]);
+    }
+    for name in ["Weight", "OverallHealth", "Hydration", "Energy"] {
+        assert!(trp_data::screen::figure_named(&health.strip_figures, name).and_then(|f| f.current).is_some(), "{name}");
+    }
+    let weight = trp_data::screen::figure_named(&health.strip_figures, "Weight").unwrap();
+    assert!(weight.alternative[3] > 0.0, "the weight has a colour of its own between its limits");
+    // The fonts: Bender kept whole, and the panel's font assets made from it.
+    let fonts = trp_data::screen::build_fonts(&install, "resources.assets").expect("the build's fonts");
+    let bender = fonts.iter().find(|(name, _)| name == "Jovanny Lemonad - Bender").expect("Bender");
+    assert_eq!(&bender.1[..4], b"OTTO");
+    let header = health.panel.find("Chest/Header/Text").and_then(|text| health.panel.nodes[text].text.clone()).expect("a header's text");
+    let file = health.panel.externals[header.font.0 as usize - 1].clone();
+    let asset = trp_data::screen::script_name(&install, &file, header.font.1).expect("its font asset's name");
+    assert_eq!(trp_data::screen::font_for(&asset, &fonts).map(|(name, _)| name.as_str()), Some("Jovanny Lemonad - Bender"), "{asset}");
+}
+
+/// The game's GEAR tab as `TARKOV UI` draws it (`docs/spec/inventory.md`,
+/// "The game's own look"): the equipment panel's eleven slot views named
+/// by its script with their borders, fills and pictures; the views of a
+/// thing in a slot and in a grid read from the build's Resources; the
+/// containers' column with its row template, its grid view and its rows'
+/// spacing; a container's own layout of its grids; the slots' pictures;
+/// and the database's colours and layouts of the items.
+#[test]
+fn the_game_s_gear_tab_is_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let gear = trp_data::screen::GearPanel::load(&install).expect("the equipment panel");
+    let health = trp_data::screen::HealthPanel::load(&install, &gear.file).expect("the left panel");
+    assert_eq!(health.slot_views.len(), 11, "{:?}", health.slot_views.iter().map(|(slot, _)| *slot).collect::<Vec<_>>());
+    for (slot, parts) in &health.slot_views {
+        for part in [parts.full_border, parts.back_image, parts.background, parts.empty_border, parts.header] {
+            assert!(part.is_some(), "{slot}: a part of its view is not named");
+        }
+    }
+    let gear_panel = health.gear_panel.as_ref().expect("the equipment panel's objects");
+    assert!(gear_panel.find("CharacterGear").is_some(), "the character's outline behind the slots");
+    // The views of a thing.
+    let items = trp_data::screen::ItemViews::load(&install).expect("the views of a thing");
+    let slot = items.slot.as_ref().expect("a slot's view");
+    let grid = items.grid.as_ref().expect("a grid's view");
+    assert!(slot.find("Info Panel/Name").is_some() && grid.find("Info Panel/Caption").is_some());
+    let caption = grid.find("Info Panel/Caption").and_then(|index| grid.nodes[index].text.clone()).expect("the caption's text");
+    assert_eq!(caption.size, 11.0);
+    // The containers' column.
+    let containers = trp_data::screen::ContainerViews::load(&install, &gear.file).expect("the containers' column");
+    let column = containers.column.expect("its column of rows");
+    assert!(column.vertical && column.spacing == 45.0 && column.padding[2] == 120.0, "{column:?}");
+    assert!(containers.header.is_some() && containers.slot_panel.is_some());
+    let row = containers.grids_row.expect("the default row of grids");
+    assert_eq!(row.spacing, 6.0);
+    let view = containers.grid.as_ref().expect("a grid's view");
+    assert!(view.find("Background Tile").is_some() && view.find("Border").is_some());
+    // A container's own layout: the AVS's twelve grids in their order.
+    let (_, grids) = trp_data::screen::rig_layout(&install, "avs").expect("the AVS's layout");
+    assert_eq!(grids.len(), 12);
+    let layouts = trp_data::screen::rig_layouts(&install, &["avs".to_owned()]);
+    assert_eq!(layouts["avs"].1[0], [0.0, -1.0, 64.0, 127.0]);
+    assert!(trp_data::screen::resource_sprite(&install, "Slots/Equipment/TacticalVest").is_some());
+    // The database's colours and layouts.
+    let db = Database::load(&install).expect("database");
+    assert!(db.items.values().filter(|item| item.background_color() != "default").count() > 100);
+    assert!(db.items.values().filter(|item| !item.grid_layout_name().is_empty()).count() > 20);
+    // The column's scroll view and its bar, by the pointers of their
+    // scripts: a notch of the wheel 63 units, stopped at its ends, the bar
+    // hidden while everything shows, from the bottom up, its handle tinted.
+    let scrolling = containers.scrolling.expect("the column's scroll view");
+    assert!(scrolling.vertical && !scrolling.across && scrolling.clamped && scrolling.hides && scrolling.sensitivity == 63.0, "{scrolling:?}");
+    let at = |index: Option<usize>| index.map(|index| containers.panel.nodes[index].path.as_str());
+    assert_eq!(at(scrolling.view), Some("Scrollview Parent/Containers Scrollview"));
+    assert_eq!(at(scrolling.content), Some("Scrollview Parent/Containers Scrollview/Content"));
+    let bar = scrolling.bar.expect("its bar");
+    assert!(bar.bottom_up && bar.tinted == bar.handle, "{bar:?}");
+    assert_eq!(at(bar.handle), Some("Scrollbar/Sliding Area/Handle"));
+    let tints = bar.tints.expect("the bar's tints");
+    assert!((tints.pressed[0] - 0.784).abs() < 1e-3 && (tints.highlighted[0] - 0.961).abs() < 1e-3 && (tints.fade - 0.1).abs() < 1e-6, "{tints:?}");
+    // The handle up and down its sliding area, 10 in from the bar's ends,
+    // 8 longer at each end than its share, and 6 wide.
+    let handle = bar.handle_in(&containers.panel, [604.2, 902.0], 1.0, 0.5).expect("the handle's place");
+    let near = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 0.05);
+    assert!(near(handle, [596.2, 2.0, 6.0, 457.0]), "{handle:?}");
+    // The screen's places at 1920 by 1080: the left side, the right's
+    // panel, the left panel's ground and the left side's frame, whose
+    // texture is sampled at its nearest pixel (its middle is clear).
+    let screen = [1920.0, 1080.0];
+    assert!(near(health.left_side_in(screen), [11.6, 48.0, 1213.3, 902.0]), "{:?}", health.left_side_in(screen));
+    assert!(near(health.stash_in(screen).expect("the right's panel"), [1228.0, 75.0, 680.0, 873.0]), "{:?}", health.stash_in(screen));
+    assert!(health.left_ground.is_some_and(|ground| (ground[3] - 0.498).abs() < 1e-3));
+    let border = health.border.as_ref().expect("the left side's frame");
+    let (outside, sprite) = border.nodes[0].image.and_then(|image| image.sprite).expect("the frame's sprite");
+    let mut pictures = trp_data::screen::ScenePictures::new(&install).expect("the screens' pictures");
+    let cut = pictures.sprite(&border.file_of(outside).expect("its file"), sprite).expect("the frame's sprite");
+    assert!(pictures.texture(&cut.texture.0, cut.texture.1).expect("its texture").point);
+    // The bar of tabs: eight tabs in the game's order, 26 over one another,
+    // each its words' sample and 85 more; the widest is ACHIEVEMENTS.
+    let mut bar = trp_data::screen::TabBar::load(&install, &gear.file).expect("the bar of tabs");
+    assert_eq!(bar.gap, -26.0);
+    let keys: Vec<&str> = bar.tabs.iter().map(|tab| tab.key.as_str()).collect();
+    assert_eq!(keys, ["OVERALL", "GEAR", "HEALTH_TAB", "SKILLS", "MAP", "TASKS", "ACHIEVEMENTS", "Prestige"]);
+    assert!(bar.tabs.iter().enumerate().all(|(order, tab)| tab.order == order as i32 && tab.width_adjustment == 85.0 && tab.normal.is_some() && tab.selected.is_some() && tab.hover.is_some()));
+    // TextMeshPro's width of a text: the Bender asset's advances at its
+    // sampling size of 48 and 2 hundredths of the size after every letter
+    // but the last, as the scene keeps the tabs' samples (65.59).
+    let sample = bar.panel.nodes[bar.tabs[0].size_definers[0]].text.clone().expect("the tab's sample");
+    let font = trp_data::screen::TmpFont::read(&install, &bar.panel.file_of(sample.font.0).expect("its font's file"), sample.font.1).expect("Bender's asset");
+    assert_eq!((font.point_size, font.normal_spacing), (48.0, 2.0));
+    assert!(font.bold.is_some(), "its bold typeface");
+    assert_eq!(font.width("OVERALL", 16.0, 0.0, false), 65.59);
+    let texts = trp_data::inventory::texts(&install, "en", &keys).expect("the install's words");
+    let say = |key: &str| texts.get(&key.to_lowercase()).cloned();
+    let width = bar.width(&install, &say);
+    assert!((width - (font.width("ACHIEVEMENTS", 16.0, 0.0, false) + 85.0)).abs() < 1e-3, "{width}");
+    bar.lay_out(width);
+    let places: Vec<f32> = bar.tabs.iter().map(|tab| bar.panel.placed_in(tab.object, screen).rect[0]).collect();
+    assert!(places.iter().enumerate().all(|(order, x)| (x - (10.0 + order as f32 * (width - 26.0))).abs() < 1e-3), "{places:?}");
+    // A line's height as TextMeshPro has it: Bender's ascent to descent at
+    // 16, 17.61, which with its padding (4 and 6) is the 27.61 the scene
+    // keeps for the corpse panel's box of a container's name.
+    assert_eq!(font.height(16.0), 17.61);
+    // The panel for a container opened: what its script names, its 18
+    // filters in a column 34 apart (a vertical group laid out), its scroll
+    // view elastic with no elasticity (back at once) and its bar.
+    let mut stash = trp_data::screen::StashViews::load(&install, &gear.file).expect("the panel for a container opened");
+    let path = |index: Option<usize>| index.map(|index| stash.panel.nodes[index].path.clone());
+    assert_eq!(path(stash.name).as_deref(), Some("Simple Panel/Container Name/Text"));
+    assert_eq!(path(stash.grids).as_deref(), Some("Simple Panel/Mask/Scroll Area/Content"));
+    assert_eq!(stash.filter_tabs.len(), 18);
+    let size = [680.0, 873.0];
+    let tops: Vec<f32> = stash.filter_tabs.iter().filter_map(|tab| tab.normal).map(|normal| stash.panel.rect(normal, size)[1]).collect();
+    assert!(tops.windows(2).all(|pair| (pair[1] - pair[0] - 34.0).abs() < 1e-3), "{tops:?}");
+    let scrolling = stash.scrolling.expect("its scrolling");
+    assert!(scrolling.elastic && scrolling.elasticity == 0.0 && scrolling.sensitivity == 63.0 && scrolling.bar.is_some_and(|bar| bar.bottom_up), "{scrolling:?}");
+    // The quick-use panel: twelve views in the game's order of their
+    // bindings, each with what its script names, 70 apart and 10 more
+    // between the two groups, the panel where the game's screen has it.
+    let mut quick = trp_data::screen::QuickViews::load(&install, &gear.file).expect("the quick-use panel");
+    let keys: Vec<&str> = quick.slots.iter().map(|slot| slot.key.as_str()).collect();
+    assert_eq!(keys, ["Grenade", "ItemV", "Item1", "Item2", "Item3", "Item4", "Item5", "Item6", "Item7", "Item8", "Item9", "Item10"]);
+    assert!(quick.slots.iter().all(|slot| slot.install.is_some() && slot.hot_key.is_some() && slot.caption.is_some() && slot.border.is_some()));
+    for slot in quick.slots.clone() {
+        quick.panel.nodes[slot.object].active = true;
+    }
+    let place = quick.quick_in(screen);
+    assert!(near(place, [558.5, 935.0, 854.2, 115.0]), "{place:?}");
+    let lefts: Vec<f32> = quick.slots.iter().map(|slot| quick.panel.rect(slot.object, [place[2], place[3]])[0]).collect();
+    let expected = [0.0, 70.0, 140.0, 210.0, 280.0, 354.0, 424.0, 494.0, 564.0, 634.0, 704.0, 774.0];
+    assert!(lefts.iter().zip(expected).all(|(left, wanted)| (left - wanted).abs() < 1e-3), "{lefts:?}");
+    // Its header on, its row sized to it (`ContentSizeFitter`): above the
+    // panel's top, as the game shows it.
+    let header = stash.header.expect("its header");
+    stash.panel.nodes[header].active = true;
+    let [_, panel_top, ..] = stash.panel.rect(stash.simple, size);
+    let [_, top, _, height] = stash.panel.rect(header, size);
+    assert!(height == 20.0 && top + height <= panel_top, "{top} {height} {panel_top}");
+}
+
+/// The things' sounds kept as Vorbis (`sound.md`, "Vorbis"): each names a
+/// setup header the game's engine holds, and decodes to its own count of
+/// frames. And an AI-2's hands have their own sound player, whose sounds
+/// its animator's marks name (`hands_sounds`).
+#[test]
+fn vorbis_clips_decode_and_an_item_s_hands_have_their_sounds() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let clips = trp_data::sound::item_vorbis(&install).expect("the things' Vorbis clips");
+    assert!(clips.len() >= 10, "{} Vorbis clips", clips.len());
+    let mut setups = trp_data::sound::VorbisSetups::new(&install);
+    for (name, sample) in &clips {
+        let setup = setups.get(sample.setup_crc).unwrap_or_else(|e| panic!("{name}: {e:#}")).to_vec();
+        let samples = trp_data::sound::decode_vorbis(sample, &setup).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert_eq!(samples.len() as u64, sample.frames * sample.channels as u64, "{name}: frames decoded");
+        assert!(samples.iter().any(|s| s.unsigned_abs() > 1000), "{name}: silent");
+    }
+    let db = Database::load(&install).expect("database");
+    let mut assets = Assets::new(install).expect("manifest");
+    let path = db.items["5755356824597772cb798962"].props["UsePrefab"]["path"].as_str().expect("the AI-2's hands").to_owned();
+    let rig = trp_data::weapon::assemble_prefab(&mut assets, &path).expect("the AI-2's rig");
+    let sounds = trp_data::sound::hands_sounds(&assets, &rig, &mut setups, true).expect("read").expect("a sound player");
+    assert_eq!(sounds.player, "BaseSoundPlayer");
+    assert!(sounds.shots.is_none(), "an item's hands have no shots");
+    for mark in ["Draw", "Open", "Take", "CapRemove", "Inject", "Discard", "Holster"] {
+        let element = sounds.for_mark(mark).unwrap_or_else(|| panic!("no sound for the mark {mark}"));
+        assert!(!element.clips.is_empty() && element.clips.iter().all(|clip| !clip.samples.is_empty()), "{mark}");
+    }
+    println!("{} Vorbis clips decoded; the AI-2's {}: {} sounds", clips.len(), sounds.player, sounds.additional.len());
+}
+
+/// A weapon's banks of shots (`WeaponSoundPlayer`): the AKM's fire a loop
+/// of sixteen beats at its rate of 600 a minute and a tail, with silenced
+/// banks; the SV-98's each shot whole; the MP-43's both barrels' own bank.
+#[test]
+fn a_weapon_s_shots_are_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let db = Database::load(&install).expect("database");
+    let mut setups = trp_data::sound::VorbisSetups::new(&install);
+    let mut assets = Assets::new(install).expect("manifest");
+    let mut shots_of = |template: &str| {
+        let weapon = trp_data::weapon::assemble(&mut assets, &db, template).expect("the weapon");
+        let sounds = trp_data::sound::hands_sounds(&assets, &weapon, &mut setups, true).expect("read").expect("a sound player");
+        assert_eq!(sounds.player, "WeaponSoundPlayer", "{template}");
+        sounds.shots.expect("its shots")
+    };
+    let close = |shots: &trp_data::sound::ShotSounds, bank: &str| -> f32 {
+        let bank = shots.bank(bank).unwrap_or_else(|| panic!("no {bank}"));
+        let clip = shots.clips[bank.lists[0][0]].1.as_ref().expect("the close clip read");
+        clip.samples.len() as f32 / clip.channels as f32 / clip.frequency as f32
+    };
+    let akm = shots_of("59d6088586f774275f37482f");
+    assert!(!akm.non_auto);
+    let body = akm.bank("Body").expect("the AKM's body");
+    // Sixteen beats of 60 / 600 s.
+    assert!((body.clip_length - 1.6).abs() < 1e-4, "{}", body.clip_length);
+    assert!((close(&akm, "Body") - 1.6).abs() < 1e-3);
+    assert!(close(&akm, "Tail") > 3.0);
+    assert!(akm.bank("BodySilenced").is_some() && akm.bank("Doublet").is_none());
+    assert_eq!(body.blend.as_deref(), Some(&[5.0, 30.0, 55.0, 100.0][..]));
+    let sv98 = shots_of("55801eed4bdc2d89578b4588");
+    assert!(sv98.non_auto && sv98.bank("Tail").is_none());
+    let mp43 = shots_of("5580223e4bdc2d1c128b457f");
+    assert!(mp43.non_auto);
+    assert_eq!(mp43.bank("Doublet").expect("both barrels").lists[0].len(), 2);
+    let silenced = trp_data::weapon::assemble(&mut assets, &db, "59d6088586f774275f37482f").expect("the AKM").silenced;
+    assert!(!silenced, "the stock AKM has no silencer");
 }

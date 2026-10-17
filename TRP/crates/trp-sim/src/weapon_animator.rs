@@ -37,10 +37,27 @@ impl WeaponAnimatorData {
     /// every clip of every state. The bones posed are the rig's own, in
     /// the order of its hierarchy.
     pub fn load(assets: &Assets, weapon: &Weapon) -> Result<Self> {
+        Self::load_with(assets, weapon, false)
+    }
+
+    /// As `load`, keeping the clips' scale of the bones too: for an item's
+    /// rig, whose item is drawn by its bone scaled up from nought. (A
+    /// weapon's clips scale nearly every bone, by the look of it to what it
+    /// rests at; they are not taken, `docs/findings.md`.)
+    pub fn load_scaled(assets: &Assets, weapon: &Weapon) -> Result<Self> {
+        Self::load_with(assets, weapon, true)
+    }
+
+    fn load_with(assets: &Assets, weapon: &Weapon, scaled: bool) -> Result<Self> {
         let table = StateTable::load(assets, weapon)?;
         let tree = &weapon.hierarchy;
         let mut bones: Vec<BoneRest> = (0..tree.nodes.len())
-            .map(|index| BoneRest { path: tree.path(index), position: tree.nodes[index].translation, rotation: tree.nodes[index].rotation })
+            .map(|index| BoneRest {
+                path: tree.path(index),
+                position: tree.nodes[index].translation,
+                rotation: tree.nodes[index].rotation,
+                scale: scaled.then_some(tree.nodes[index].scale),
+            })
             .collect();
         // A weapon of one's own has the bones its edits move resting
         // where the edits have them; the animator is the donor's and
@@ -82,6 +99,11 @@ impl WeaponAnimatorData {
     /// How many clips were read for it.
     pub fn clip_count(&self) -> usize {
         self.controller.clips.len()
+    }
+
+    /// The paths of the bones some clip scales.
+    pub fn scaled_bones(&self) -> Vec<&str> {
+        self.controller.scaled.iter().map(|bone| self.controller.bones[*bone].path.as_str()).collect()
     }
 
     /// The marks of one of the hands' states, by its full name, each with
@@ -220,6 +242,13 @@ impl WeaponAnimator {
     /// which the game asks of `IDLE`.
     pub fn current_is(&self, state: &str) -> bool {
         self.animator.state(self.hands).0.name == state
+    }
+
+    /// The scale of each bone of the rig that some clip scales, by the
+    /// bone's place, after the last update: an item used is drawn by its
+    /// bone scaled up from nought.
+    pub fn scales(&self) -> impl Iterator<Item = (usize, [f32; 3])> + '_ {
+        self.animator.scales()
     }
 
     /// Every bone of the rig, each in its parent, after the last update.

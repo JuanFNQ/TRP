@@ -231,6 +231,56 @@ pub fn short_names(install: &Install, language: &str) -> Result<std::collections
     Ok(texts.into_iter().filter_map(short).collect())
 }
 
+/// What the game's window that shows a thing says of it, by template, in
+/// one of the languages the database has texts for: its name
+/// (`<id> Name`), its description (`<id> Description`), and its kind as
+/// the handbook files it (`templates/handbook.json`: the item's category
+/// and its parents', from the first, each in the language's words, joined
+/// by " > ", as `ItemSpecificationPanel` writes its type); and the words
+/// for a weight's unit (" kg").
+#[derive(Debug, Clone, Default)]
+pub struct ItemTexts {
+    pub names: std::collections::HashMap<String, String>,
+    pub descriptions: std::collections::HashMap<String, String>,
+    pub kinds: std::collections::HashMap<String, String>,
+    pub kg: String,
+}
+
+pub fn item_texts(install: &Install, language: &str) -> Result<ItemTexts> {
+    let path = install.database_dir().join(format!("locales/global/{language}.json"));
+    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let texts: std::collections::HashMap<String, Json> = serde_json::from_str(&text).with_context(|| path.display().to_string())?;
+    let said = |key: &str| texts.get(key).and_then(|value| value.as_str()).map(str::to_owned);
+    let mut out = ItemTexts { kg: said(" kg").unwrap_or_else(|| " kg".to_owned()), ..ItemTexts::default() };
+    for (key, value) in &texts {
+        let Some(words) = value.as_str() else { continue };
+        if let Some(id) = key.strip_suffix(" Name") {
+            out.names.insert(id.to_owned(), words.to_owned());
+        } else if let Some(id) = key.strip_suffix(" Description") {
+            out.descriptions.insert(id.to_owned(), words.to_owned());
+        }
+    }
+    let path = install.database_dir().join("templates/handbook.json");
+    let handbook: Json = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?)?;
+    let parents: std::collections::HashMap<String, String> = handbook["Categories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|category| Some((category["Id"].as_str()?.to_owned(), category["ParentId"].as_str().unwrap_or_default().to_owned())))
+        .collect();
+    for item in handbook["Items"].as_array().into_iter().flatten() {
+        let (Some(id), Some(mut at)) = (item["Id"].as_str(), item["ParentId"].as_str()) else { continue };
+        let mut chain = Vec::new();
+        while !at.is_empty() && chain.len() < 16 {
+            chain.push(said(at).unwrap_or_else(|| at.to_owned()));
+            at = parents.get(at).map_or("", String::as_str);
+        }
+        chain.reverse();
+        out.kinds.insert(id.to_owned(), chain.join(" > "));
+    }
+    Ok(out)
+}
+
 /// A slot of an item, or a grid: its name and what it takes.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Holder {
@@ -329,6 +379,19 @@ impl ItemTemplate {
     /// Whether its parts count toward its size (`MergesWithChildren`).
     pub fn merges_with_parts(&self) -> bool {
         self.props.get("MergesWithChildren").and_then(Json::as_bool).unwrap_or(false)
+    }
+
+    /// The name of its own layout of its grids in the inventory, where it
+    /// has one (`RigLayoutName` for a vest, `GridLayoutName` for a
+    /// backpack: `UI/Rig Layouts/<name>`); empty where it has none.
+    pub fn grid_layout_name(&self) -> &str {
+        ["RigLayoutName", "GridLayoutName"].iter().find_map(|key| self.props.get(*key).and_then(Json::as_str).filter(|name| !name.is_empty())).unwrap_or("")
+    }
+
+    /// The colour of its view's ground in the inventory (`BackgroundColor`:
+    /// `blue`, `violet`, `default` and the like, `TaxonomyColor`).
+    pub fn background_color(&self) -> &str {
+        self.props.get("BackgroundColor").and_then(Json::as_str).unwrap_or("default")
     }
 
     /// How many of it one stack holds (`StackMaxSize`); 1 for what does

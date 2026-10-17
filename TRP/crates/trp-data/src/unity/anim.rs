@@ -65,6 +65,18 @@ pub struct FloatCurve {
 /// The `customType` the engine gives its own motion curves.
 pub const MOTION_CURVE: u8 = 8;
 
+/// A curve that drives a property of a component of an object: the
+/// CRC-32 of the object's path below the root, the component's class, the
+/// CRC-32 of the property's name (`m_Color.a`, `m_IsActive`), and the
+/// curve's index.
+#[derive(Debug, Clone, Copy)]
+pub struct Binding {
+    pub path: u32,
+    pub class: i32,
+    pub attribute: u32,
+    pub curve: usize,
+}
+
 #[derive(Debug, Clone)]
 struct StreamedKey {
     curve: usize,
@@ -78,8 +90,20 @@ struct StreamedFrame {
     keys: Vec<StreamedKey>,
 }
 
+/// A call a clip makes as its playing passes a time (`AnimationEvent`): the
+/// time in seconds from the clip's start, the method called on the
+/// animator's object, and the string it is given.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipEvent {
+    pub time: f32,
+    pub function: String,
+    pub data: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Clip {
+    /// Its animation events (`m_Events`).
+    pub events: Vec<ClipEvent>,
     pub name: String,
     pub start_time: f32,
     pub stop_time: f32,
@@ -95,6 +119,9 @@ pub struct Clip {
     /// import settings decide each.
     pub root_stays_level: bool,
     pub root_stays_upright: bool,
+    /// Its other curves: a property of a component of an object below the
+    /// root (a script's colour, an object's being on).
+    pub others: Vec<Binding>,
     streamed: Vec<StreamedFrame>,
     streamed_curves: usize,
     dense_frames: usize,
@@ -107,7 +134,11 @@ pub struct Clip {
 
 impl Clip {
     pub fn read(assets: &Assets, obj: ObjRef) -> Result<Self> {
-        let v = assets.read(obj)?;
+        Self::of(&assets.read(obj)?)
+    }
+
+    /// A clip from its read fields.
+    pub fn of(v: &Value) -> Result<Self> {
         let muscle = v.req("m_MuscleClip")?;
         let data = muscle.req("m_Clip.data")?;
 
@@ -136,7 +167,19 @@ impl Clip {
         let dense_clip = data.req("m_DenseClip")?;
         let constant = data.req("m_ConstantClip.data")?.as_floats().unwrap_or(&[]).to_vec();
 
+        let events = v
+            .get("m_Events")
+            .and_then(Value::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .map(|e| ClipEvent {
+                time: e.get("time").and_then(Value::as_f32).unwrap_or(0.0),
+                function: e.get("functionName").and_then(Value::as_str).unwrap_or("").to_owned(),
+                data: e.get("data").and_then(Value::as_str).unwrap_or("").to_owned(),
+            })
+            .collect();
         let mut clip = Clip {
+            events,
             name: v.req("m_Name")?.as_str().unwrap_or("").to_owned(),
             start_time: muscle.req("m_StartTime")?.as_f32().unwrap_or(0.0),
             stop_time: muscle.req("m_StopTime")?.as_f32().unwrap_or(0.0),
@@ -154,6 +197,7 @@ impl Clip {
             dense_begin: dense_clip.req("m_BeginTime")?.as_f32().unwrap_or(0.0),
             dense: dense_clip.req("m_SampleArray")?.as_floats().unwrap_or(&[]).to_vec(),
             constant,
+            others: Vec::new(),
         };
         if clip.dense.len() < clip.dense_frames * clip.dense_curves {
             bail!("dense clip data is truncated");
@@ -180,6 +224,9 @@ impl Clip {
             } else if b.req("typeID")?.as_i64() == Some(class::ANIMATOR as i64) {
                 let name = b.req("attribute")?.as_u32().unwrap_or(0);
                 clip.floats.push(FloatCurve { name, curve, custom_type });
+            } else {
+                let (path, attribute) = (b.req("path")?.as_u32().unwrap_or(0), b.req("attribute")?.as_u32().unwrap_or(0));
+                clip.others.push(Binding { path, class: b.req("typeID")?.as_i64().unwrap_or(0) as i32, attribute, curve });
             }
             curve += width;
         }
@@ -273,6 +320,7 @@ impl Clip {
             Vec::new()
         };
         Clip {
+            events: self.events.clone(),
             name: self.name.clone(),
             start_time: self.start_time,
             stop_time: self.stop_time,
@@ -300,6 +348,7 @@ impl Clip {
             dense_begin: self.dense_begin,
             dense,
             constant,
+            others: Vec::new(),
         }
     }
 
@@ -500,6 +549,7 @@ mod tests {
     fn sampled(curves: usize, samples: Vec<f32>) -> Clip {
         let frames = samples.len() / curves;
         Clip {
+            events: Vec::new(),
             name: String::new(),
             start_time: 0.0,
             stop_time: (frames - 1) as f32 / 10.0,
@@ -517,6 +567,7 @@ mod tests {
             dense_begin: 0.0,
             dense: samples,
             constant: Vec::new(),
+            others: Vec::new(),
         }
     }
 
@@ -621,6 +672,7 @@ mod tests {
     #[test]
     fn dense_curves_interpolate_and_constants_follow() {
         let clip = Clip {
+            events: Vec::new(),
             name: String::new(),
             start_time: 0.0,
             stop_time: 1.0,
@@ -646,6 +698,7 @@ mod tests {
             dense_begin: 0.0,
             dense: vec![0.0, 10.0, 20.0],
             constant: vec![9.0],
+            others: Vec::new(),
         };
         let mut v = Vec::new();
         clip.sample(0.25, &mut v);

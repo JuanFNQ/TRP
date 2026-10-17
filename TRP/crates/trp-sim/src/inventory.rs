@@ -70,6 +70,42 @@ pub struct Kind {
     pub not_raid_moddable: bool,
     /// The equipment slots it is not taken out of in a raid.
     pub kept_in: Vec<String>,
+    /// The colour of its view's ground in the inventory, by the game's name
+    /// for it (`BackgroundColor`); empty where not read.
+    pub color: String,
+    /// Its own layout of its grids in the inventory, by name; empty for
+    /// the default row.
+    pub layout: String,
+    /// What its view in the inventory writes (`GridItemView.UpdateInfo`):
+    /// a medkit's whole resource (`MaxHpResource`), food's, drink's or a
+    /// barter thing's (`MaxResource`), a key's uses (`MaximumNumberOfUsage`),
+    /// a weapon's round (`ammoCaliber`) and how a weapon's or a knife's
+    /// durability stands as made and at most (`Durability`, `MaxDurability`).
+    pub max_hp_resource: f32,
+    pub max_resource: f32,
+    pub key_uses: u32,
+    pub caliber: String,
+    pub durability: [f32; 2],
+    /// How many rounds a magazine or a box of rounds holds (its
+    /// `Cartridges` or `StackSlots`' `_max_count`); 0 for anything else.
+    pub capacity: u32,
+    /// Not shown in the slot it is in (`NotShownInSlot`: the pockets).
+    pub not_shown_in_slot: bool,
+    /// Its sounds' group (`ItemSound`: `weap_ar`, `gear_generic`), which
+    /// names its clips (`<group>_drop` and the rest).
+    pub sound: String,
+    /// What the right click's menu goes by (`item_menu`): a weapon's way
+    /// of being loaded (`ReloadMode`), whether it is a quest's, whether it
+    /// has a switch on a hinge (`HasHinge`) or is a face shield
+    /// (`FaceShieldComponent`), whether it folds or slides in (`Foldable`,
+    /// `Retractable`) and the slot that must hold something for it to
+    /// (`FoldedSlot`).
+    pub reload_mode: String,
+    pub quest: bool,
+    pub hinge: bool,
+    pub face_shield: bool,
+    pub foldable: bool,
+    pub folded_slot: String,
 }
 
 impl Kind {
@@ -91,6 +127,25 @@ impl Kind {
             stack_max: item.stack_max(),
             not_raid_moddable: !item.raid_moddable(),
             kept_in: item.kept_in_slots(),
+            color: item.background_color().to_owned(),
+            layout: item.grid_layout_name().to_owned(),
+            max_hp_resource: item.prop_f32("MaxHpResource").unwrap_or(0.0),
+            max_resource: item.prop_f32("MaxResource").unwrap_or(0.0),
+            key_uses: item.prop_f32("MaximumNumberOfUsage").unwrap_or(0.0).max(0.0) as u32,
+            caliber: item.props.get("ammoCaliber").and_then(|caliber| caliber.as_str()).unwrap_or_default().to_owned(),
+            durability: [item.prop_f32("Durability").unwrap_or(0.0), item.prop_f32("MaxDurability").unwrap_or(0.0)],
+            capacity: ["Cartridges", "StackSlots"]
+                .iter()
+                .find_map(|list| item.props.get(*list)?.get(0)?.get("_max_count")?.as_u64())
+                .unwrap_or(0) as u32,
+            not_shown_in_slot: item.props.get("NotShownInSlot").and_then(|shown| shown.as_bool()).unwrap_or(false),
+            sound: item.props.get("ItemSound").and_then(|sound| sound.as_str()).unwrap_or_default().to_owned(),
+            reload_mode: item.props.get("ReloadMode").and_then(|mode| mode.as_str()).unwrap_or_default().to_owned(),
+            quest: item.props.get("QuestItem").and_then(|quest| quest.as_bool()).unwrap_or(false),
+            hinge: item.props.get("HasHinge").and_then(|hinge| hinge.as_bool()).unwrap_or(false),
+            face_shield: item.props.get("FaceShieldComponent").and_then(|shield| shield.as_bool()).unwrap_or(false),
+            foldable: ["Foldable", "Retractable"].iter().any(|name| item.props.get(*name).and_then(|on| on.as_bool()).unwrap_or(false)),
+            folded_slot: item.props.get("FoldedSlot").and_then(|slot| slot.as_str()).unwrap_or_default().to_owned(),
         })
     }
 
@@ -160,12 +215,15 @@ pub struct Item {
     pub grids: Vec<Vec<(Place, Item)>>,
     /// What it holds outside slots and grids: a magazine's rounds.
     pub loose: Vec<Item>,
+    /// What a medkit, food or drink has left once it has been used
+    /// (health's `Event::Resource`); none while it is as new.
+    pub resource: Option<f32>,
 }
 
 impl Item {
     pub fn new(kind: Arc<Kind>) -> Self {
         let (slots, grids) = (vec![None; kind.slots.len()], vec![Vec::new(); kind.grids.len()]);
-        Self { id: next_id(), kind, count: 1, slots, grids, loose: Vec::new() }
+        Self { id: next_id(), kind, count: 1, slots, grids, loose: Vec::new(), resource: None }
     }
 
     /// Everything directly in it.
@@ -789,6 +847,24 @@ pub fn take_out(roots: &mut [&mut Item], id: Id, rules: &Rules) -> Result<Item, 
     let from = root_of(roots, id)?;
     may_leave(roots, from, id, rules)?;
     roots[from].take(id).ok_or(Refusal::NoSuchPlace)
+}
+
+/// What a medkit, food or drink in here holds now, as its use left it
+/// (health's `Event::Resource`). Whether it was found.
+pub fn set_resource(root: &mut Item, id: Id, left: f32) -> bool {
+    match root.find_mut(id) {
+        Some(item) => {
+            item.resource = Some(left);
+            true
+        }
+        None => false,
+    }
+}
+
+/// An item used up (health's `Event::UsedUp`): it is gone from wherever it
+/// lay in here.
+pub fn use_up(root: &mut Item, id: Id) -> Option<Item> {
+    root.take(id)
 }
 
 /// Splits so many off a stack into a place of its own

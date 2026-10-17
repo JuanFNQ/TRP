@@ -96,7 +96,7 @@ impl Firearm {
     /// (`Idling.SetTriggerPressed`, `FireCylinderMagOperation.Start`): a
     /// press fires the chamber in turn, or falls on an empty one.
     pub(super) fn cylinder_trigger(&mut self, pressed: bool) {
-        self.trigger = pressed;
+        self.trigger_to(pressed);
         if !pressed {
             self.animator.set_flag("Fire", false);
             return;
@@ -130,9 +130,13 @@ impl Firearm {
         }
         self.animator.set("CamoraIndex", self.camora as f32);
         self.animator.set_flag("Fire", self.trigger);
-        if from_closed {
-            self.animator.play(DOUBLE_ACTION_FIRE, FIRE_STATE_START);
-        }
+        // The shot's state is played from its fifth, as any single shot's
+        // (`FireOperation.StartFireAnimation`): the double action's with the
+        // hammer down, the plain one's with it cocked (recorded: the Rhino's
+        // cocked shot 0.3044 into `FIRE` on its first frame after a frame
+        // of 13 ms, 2026-10-16).
+        let state = if from_closed { DOUBLE_ACTION_FIRE.to_owned() } else { self.settings.fire_state.clone() };
+        self.animator.play(&state, FIRE_STATE_START);
         self.count_chambers();
         self.animator.set("AmmoInMag", self.count(Chamber::Round) as f32);
         self.operation = Operation::CylinderFire { fired: false, dry: false };
@@ -216,6 +220,7 @@ impl Firearm {
         match (name, self.operation.clone()) {
             ("FiringBullet", Operation::CylinderFire { fired: false, dry }) => {
                 self.operation = Operation::CylinderFire { fired: true, dry };
+                self.events.push(Event::FireSound { trigger: self.trigger, doublet: false });
                 self.shot_made = true;
             }
             ("AddAmmoInChamber", Operation::CylinderFire { .. }) => {
@@ -227,7 +232,7 @@ impl Firearm {
                 self.animator.set("DoubleActionFireModeFloat", self.hammer_closed as u8 as f32);
             }
             ("IdleStart", Operation::CylinderFire { fired: true, .. }) => {
-                self.trigger = false;
+                self.trigger_to(false);
                 self.animator.set_flag("Fire", false);
                 self.to_idle();
             }
@@ -306,7 +311,7 @@ impl Firearm {
     /// press, the first that is loaded, or all of them together in the
     /// mode for that.
     pub(super) fn barrels_trigger(&mut self, pressed: bool) {
-        self.trigger = pressed;
+        self.trigger_to(pressed);
         let loaded: Vec<usize> = (0..self.in_chambers.len()).filter(|index| self.in_chambers[*index] == Chamber::Round).collect();
         if !pressed || loaded.is_empty() {
             // The animator has the trigger, and a press only clicks.
@@ -392,7 +397,7 @@ impl Firearm {
         if pressed && !self.aiming && self.aim_flags {
             return;
         }
-        self.trigger = pressed;
+        self.trigger_to(pressed);
         self.animator.set_flag("Fire", pressed);
         if pressed && self.in_chambers.first() == Some(&Chamber::Round) {
             self.aiming = false;
@@ -412,9 +417,10 @@ impl Firearm {
                 self.in_chambers[0] = Chamber::Empty;
                 self.count_chambers();
                 self.events.push(Event::Shot { strength: self.settings.shot_strength });
+                self.events.push(Event::FireSound { trigger: self.trigger, doublet: false });
             }
             ("FireEnd", Operation::BarrelsFire { fired: true, .. }) if rocket => {
-                self.trigger = false;
+                self.trigger_to(false);
                 self.animator.set_flag("Fire", false);
                 self.animator.set("AmmoInChamber", 0.0);
                 self.to_idle();
@@ -448,7 +454,12 @@ impl Firearm {
                 for _ in 0..shots {
                     self.events.push(Event::Shot { strength: self.settings.shot_strength });
                 }
-                self.trigger = false;
+                // Each chamber's shot sounds (`Shot`, `multiShot` with more
+                // than one), the trigger still held.
+                for _ in 0..shots {
+                    self.events.push(Event::FireSound { trigger: self.trigger, doublet: shots > 1 });
+                }
+                self.trigger_to(false);
                 self.animator.set_flag("Fire", false);
                 self.animator.set("AmmoInChamber", self.count(Chamber::Round) as f32);
                 self.animator.set("ShellsInWeapon", self.count(Chamber::Shell) as f32);

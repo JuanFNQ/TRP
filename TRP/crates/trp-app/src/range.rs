@@ -28,16 +28,87 @@ use trp_sim::movement::Capsule;
 use trp_sim::things::{turn, Hinge, Thing, ThingSettings};
 use trp_sim::Interaction;
 
-/// A box, upright and square to the axes, in Bevy's axes.
+/// A box, upright and square to the axes, in Bevy's axes, and what it is
+/// made of for the sounds of moving (`BaseBallistic.ESurfaceSound`'s
+/// number, `trp_data::sound::SURFACES`).
 #[derive(Clone, Copy)]
 pub struct Solid {
     pub centre: Vec3,
     pub size: Vec3,
     pub color: Color,
+    pub surface: u8,
+}
+
+/// The surfaces the range's boxes are made of (`ESurfaceSound`); anything
+/// not said is concrete, the game's surface for a thing without one.
+const METAL: u8 = 1;
+const WOOD: u8 = 2;
+const PLASTIC: u8 = 16;
+
+/// The sampler of surfaces on the ground (the user, 2026-10-16: "May want
+/// to add different materials on the ground to walk on"): a square of
+/// `SQUARE` metres for each of the game's twenty surfaces, by number, in
+/// rows of `SAMPLER_COLUMNS` across the lane, to the right of the tables'
+/// arm: `SAMPLER_FROM` is its corner nearest the knee-high wall's end, in
+/// Bevy's x and z. The squares are drawn on the ground and are no solids:
+/// a step's line down meets the ground inside one, and hears its surface
+/// (`docs/spec/footsteps.md`). Their places, sizes and colours are the
+/// app's.
+const SAMPLER_FROM: [f32; 2] = [8.8, -4.5];
+const SQUARE: f32 = 1.8;
+const SAMPLER_COLUMNS: usize = 4;
+const SURFACE_COLORS: [[f32; 3]; 20] = [
+    [0.60, 0.60, 0.58],
+    [0.42, 0.46, 0.50],
+    [0.50, 0.36, 0.22],
+    [0.36, 0.27, 0.18],
+    [0.30, 0.45, 0.20],
+    [0.20, 0.20, 0.21],
+    [0.60, 0.78, 0.80],
+    [0.55, 0.52, 0.46],
+    [0.58, 0.62, 0.66],
+    [0.22, 0.30, 0.36],
+    [0.30, 0.33, 0.38],
+    [0.85, 0.84, 0.80],
+    [0.38, 0.26, 0.15],
+    [0.30, 0.33, 0.20],
+    [0.40, 0.35, 0.28],
+    [0.45, 0.32, 0.24],
+    [0.20, 0.45, 0.70],
+    [0.70, 0.88, 0.90],
+    [0.65, 0.50, 0.32],
+    [0.93, 0.94, 0.96],
+];
+
+/// The sampler's squares: each surface's number, its middle on the ground
+/// (Bevy's axes) and its colour.
+pub fn surface_squares() -> impl Iterator<Item = (u8, Vec3, Color)> {
+    SURFACE_COLORS.into_iter().enumerate().map(|(surface, [r, g, b])| {
+        let (row, column) = (surface / SAMPLER_COLUMNS, surface % SAMPLER_COLUMNS);
+        let x = SAMPLER_FROM[0] + (column as f32 + 0.5) * SQUARE;
+        let z = SAMPLER_FROM[1] + (row as f32 + 0.5) * SQUARE;
+        (surface as u8, Vec3::new(x, 0.0, z), Color::srgb(r, g, b))
+    })
+}
+
+/// The side of the sampler's squares, for drawing them.
+pub const SURFACE_SQUARE: f32 = SQUARE;
+
+/// The surface of the ground at a place (Bevy's x and z): a square's of the
+/// sampler, or concrete.
+fn ground_surface(x: f32, z: f32) -> u8 {
+    let (column, row) = ((x - SAMPLER_FROM[0]) / SQUARE, (z - SAMPLER_FROM[1]) / SQUARE);
+    let rows = SURFACE_COLORS.len().div_ceil(SAMPLER_COLUMNS);
+    if column < 0.0 || row < 0.0 || column >= SAMPLER_COLUMNS as f32 || row >= rows as f32 {
+        return trp_sim::steps::CONCRETE;
+    }
+    let at = row as usize * SAMPLER_COLUMNS + column as usize;
+    if at < SURFACE_COLORS.len() { at as u8 } else { trp_sim::steps::CONCRETE }
 }
 
 /// A thing of the range the hands work: the game's model of it, the name
 /// the prompt gives it, what of it moves, and what a line of sight meets.
+#[derive(Clone)]
 pub struct Placed {
     pub name: &'static str,
     pub thing: Thing,
@@ -115,7 +186,25 @@ const LINTEL: f32 = 1.9;
 /// without a place (submachine guns, machine guns, launchers) are the
 /// app's. `main` fills them in this order: the gun cases are the range's
 /// containers from `CONTAINERS`' last on, the magazine boxes after them.
-pub const WEAPON_CRATES: [&str; 8] = ["RIFLES", "SMGS", "MACHINE GUNS", "SNIPERS", "SHOTGUNS", "PISTOLS", "LAUNCHERS", "CUSTOM"];
+pub const WEAPON_CRATES: [&str; 9] = ["RIFLES", "SMGS", "MACHINE GUNS", "SNIPERS", "SHOTGUNS", "PISTOLS", "LAUNCHERS", "CUSTOM", MEDICAL];
+/// The last table holds no weapons: every medical item of the install in
+/// its case, and every food and drink in its box under it (the user,
+/// 2026-10-14, night: "A table of all of them", the case `MEDICAL` and the
+/// box `PROVISIONS`). The app's.
+pub const MEDICAL: &str = "MEDICAL";
+pub const PROVISIONS: &str = "PROVISIONS";
+/// Barbed wire across the ground between the start and the knee-high wall,
+/// its lowest and highest corners in Bevy's axes (the user, 2026-10-14,
+/// night: "Falls + barbed wire"). It is no solid: the character walks into
+/// it, slowed and cut (health spec, "Barbed wire"). The game's coils have
+/// their boxes in the maps' scenes; this one's shape and place are the
+/// app's.
+pub const BARBED_WIRE: [Vec3; 2] = [Vec3::new(-3.6, 0.0, -3.4), Vec3::new(-1.6, 0.7, -2.4)];
+/// A ledge high enough to be hurt falling from (the game's falls hurt from
+/// 3 m: health spec, "Falls"): a second flight of stairs leads on from the
+/// platform, the same rise a step, to a ledge 6 m up. The app's.
+const LEDGE: f32 = 6.0;
+const LEDGE_STEPS: usize = 35;
 /// Where the first table stands across the lane (its gun case half a metre
 /// from the airdrop crate), and how far each next one is from the last.
 const WEAPON_TABLE_FIRST: f32 = 1.5;
@@ -158,7 +247,7 @@ const MAGAZINE_BOX_OPENS: f32 = 55.0;
 const GUN_CASE_HOLDS: usize = 5;
 const MAGAZINE_BOX_HOLDS: usize = GUN_CASE_HOLDS + WEAPON_CRATES.len();
 
-#[derive(Resource)]
+#[derive(Clone, Resource)]
 pub struct Range {
     pub solids: Vec<Solid>,
     /// The radius of the character's capsule, in metres, from the player
@@ -230,10 +319,12 @@ fn in_sim(v: Vec3) -> [f32; 3] {
 impl Default for Range {
     fn default() -> Self {
         let mut solids = Vec::new();
-        let block = |centre: Vec3, size: Vec3, color: Color| Solid { centre, size, color };
-        // A ring of blocks all round, to judge turning against.
+        let block = |centre: Vec3, size: Vec3, color: Color| Solid { centre, size, color, surface: trp_sim::steps::CONCRETE };
+        // A ring of blocks all round, to judge turning against. The eighth
+        // stands 15 degrees on from its place, out of the second flight's
+        // way to the ledge.
         for i in 0..12 {
-            let angle = i as f32 / 12.0 * std::f32::consts::TAU;
+            let angle = (i as f32 * 30.0 + if i == 7 { 15.0 } else { 0.0 }).to_radians();
             solids.push(block(
                 Vec3::new(angle.sin() * RING, 0.5, angle.cos() * RING),
                 Vec3::ONE,
@@ -259,7 +350,7 @@ impl Default for Range {
         // Somewhere to fall from, to the left of the start: stairs going the
         // lane's way up to a platform, and a lower platform beside it that
         // reaches to the knee-high wall.
-        let floor = |low: Vec3, high: Vec3, color: Color| Solid { centre: (low + high) / 2.0, size: high - low, color };
+        let floor = |low: Vec3, high: Vec3, color: Color| Solid { centre: (low + high) / 2.0, size: high - low, color, surface: trp_sim::steps::CONCRETE };
         let (left, stair_right, tread) = (STAIRS_LEFT, STAIRS_LEFT + 2.5, TREAD);
         for i in 0..STAIRS {
             let top = PLATFORM * (i + 1) as f32 / (STAIRS + 1) as f32;
@@ -273,6 +364,18 @@ impl Default for Range {
         let far = STAIRS_FOOT - (STAIRS as f32) * tread;
         solids.push(floor(Vec3::new(left, 0.0, far - 5.0), Vec3::new(left + 5.0, PLATFORM, far), Color::srgb(0.45, 0.47, 0.50)));
         solids.push(floor(Vec3::new(left + 5.0, 0.0, far - 5.0), Vec3::new(left + 8.0, SHELF, far), Color::srgb(0.42, 0.50, 0.45)));
+        // From the platform's far edge, on its right half, a second flight
+        // on the way the first goes, to the ledge beyond: straight on from
+        // the start's side, no turning back (the user, 2026-10-14).
+        let rise = (LEDGE - PLATFORM) / LEDGE_STEPS as f32;
+        let (flight_left, flight_right, edge) = (stair_right, left + 5.0, far - 5.0);
+        for i in 0..LEDGE_STEPS {
+            let top = PLATFORM + rise * (i + 1) as f32;
+            let near = edge - i as f32 * tread;
+            solids.push(floor(Vec3::new(flight_left, 0.0, near - tread), Vec3::new(flight_right, top, near), Color::srgb(0.50, 0.52, 0.47 + 0.01 * (i % 2) as f32)));
+        }
+        let ledge = edge - LEDGE_STEPS as f32 * tread;
+        solids.push(floor(Vec3::new(flight_left, 0.0, ledge - 3.0), Vec3::new(flight_right, LEDGE, ledge), Color::srgb(0.40, 0.42, 0.46)));
 
         // The things for the hands. Each container's or trunk's body is a
         // solid; what moves is drawn apart (`Part`).
@@ -308,6 +411,7 @@ impl Default for Range {
         let airdrop_size = Vec3::new(1.0, 0.5, 0.6);
         let airdrop_green = Color::srgb(0.27, 0.33, 0.21);
         let airdrop = body(&mut solids, AIRDROP, airdrop_size, airdrop_green);
+        made_of(&mut solids, METAL);
         let airdrop_opens = Thing::container(Some(Interaction::ContainerHingeUpOpen), Some(Interaction::ContainerHingeUpClose), 0.0, -AIRDROP_OPENS);
         let airdrop_lid = lid_of(Vec3::new(AIRDROP[0], airdrop_size.y, AIRDROP[1]), airdrop_size, Vec3::Z, airdrop_green.darker(0.04));
         things.push(container("airdrop crate", airdrop_opens, airdrop, airdrop_lid, 0));
@@ -350,6 +454,7 @@ impl Default for Range {
         // degrees).
         let crate_size = Vec3::new(1.0, 0.44, 0.6);
         let crate_body = body(&mut solids, WOODEN_CRATE, crate_size, wood);
+        made_of(&mut solids, WOOD);
         things.push(container("wooden crate", hinged_up(), crate_body, lid(WOODEN_CRATE, crate_size, Vec3::NEG_X, wood.darker(0.05)), 1));
         // The tables of weapons, against the knee-high wall to the airdrop
         // crate's right: on each a green gun case with the class's weapons,
@@ -359,6 +464,12 @@ impl Default for Range {
         // its back edge, by the wall, and lifted towards it.
         let (case_green, box_black) = (Color::srgb(0.24, 0.33, 0.19), Color::srgb(0.05, 0.05, 0.06));
         for (index, name) in WEAPON_CRATES.into_iter().enumerate() {
+            // The medical table's case is light, and its two hold no
+            // weapons: their names say what they do hold.
+            let medical = name == MEDICAL;
+            let case_green = if medical { Color::srgb(0.74, 0.73, 0.68) } else { case_green };
+            let (case_word, box_word) = if medical { ("case", "box") } else { ("weapon case", "magazine box") };
+            let box_name = if medical { PROVISIONS } else { name };
             let ([x, z], front) = weapon_table(index);
             let (along, middle) = (Vec3::Y.cross(front), Vec3::new(x, 0.0, z));
             // A box's size in the range's axes, from its length along the
@@ -366,18 +477,20 @@ impl Default for Range {
             let sized = |size: Vec3| along.abs() * size.x + Vec3::Y * size.y + front.abs() * size.z;
             // The table: its top, and a leg at each corner.
             solids.push(block(middle + Vec3::Y * (WEAPON_TABLE.y - TABLE_SLAB / 2.0), sized(Vec3::new(WEAPON_TABLE.x, TABLE_SLAB, WEAPON_TABLE.z)), wood));
+            made_of(&mut solids, WOOD);
             for (across, out) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
                 let leg = middle + along * across * (WEAPON_TABLE.x - TABLE_LEG) / 2.0 + front * out * (WEAPON_TABLE.z - TABLE_LEG) / 2.0 + Vec3::Y * (WEAPON_TABLE.y - TABLE_SLAB) / 2.0;
                 solids.push(block(leg, sized(Vec3::new(TABLE_LEG, WEAPON_TABLE.y - TABLE_SLAB, TABLE_LEG)), wood));
+                made_of(&mut solids, WOOD);
             }
             // (Each thing's name is the prompt's, made once for the run.)
-            let named = |what: &str| -> &'static str { Box::leak(format!("{} {what}", name.to_lowercase()).into_boxed_str()) };
-            let case = block(middle + Vec3::Y * (WEAPON_TABLE.y + GUN_CASE.y / 2.0), sized(GUN_CASE), case_green);
+            let named = |of: &str, what: &str| -> &'static str { Box::leak(format!("{} {what}", of.to_lowercase()).into_boxed_str()) };
+            let case = Solid { surface: PLASTIC, ..block(middle + Vec3::Y * (WEAPON_TABLE.y + GUN_CASE.y / 2.0), sized(GUN_CASE), case_green) };
             solids.push(case);
             let mut opens = hinged_up();
             opens.open_angle = -GUN_CASE_OPENS;
             let lid = lid_of(middle + Vec3::Y * (WEAPON_TABLE.y + GUN_CASE.y), GUN_CASE, front, case_green.darker(0.04));
-            things.push(container(named("weapon case"), opens, case, lid, GUN_CASE_HOLDS + index));
+            things.push(container(named(name, case_word), opens, case, lid, GUN_CASE_HOLDS + index));
             // The box under it, its front with the table's.
             let below = middle + front * (WEAPON_TABLE.z - MAGAZINE_BOX.z) / 2.0;
             let magazines = block(below + Vec3::Y * MAGAZINE_BOX.y / 2.0, sized(MAGAZINE_BOX), box_black);
@@ -385,17 +498,21 @@ impl Default for Range {
             let mut opens = hinged_up();
             opens.open_angle = -MAGAZINE_BOX_OPENS;
             let lid = lid_of(below + Vec3::Y * MAGAZINE_BOX.y, MAGAZINE_BOX, front, box_black.lighter(0.04));
-            things.push(container(named("magazine box"), opens, magazines, lid, MAGAZINE_BOX_HOLDS + index));
+            things.push(container(named(box_name, box_word), opens, magazines, lid, MAGAZINE_BOX_HOLDS + index));
         }
         // A table and a shelf with things lying on them (`LYING`), and
         // nothing more.
         body(&mut solids, TABLE, Vec3::new(1.0, TABLE_TOP, 0.6), wood);
+        made_of(&mut solids, WOOD);
         body(&mut solids, HIGH_SHELF, Vec3::new(0.9, SHELF_TOP, 0.35), wood);
+        made_of(&mut solids, WOOD);
         // A car at the row's right end, its back to the row: the trunk opens
         // with the default gestures, its lid from 0 to 60 degrees (recorded).
         let red = Color::srgb(0.45, 0.16, 0.14);
         let car = body(&mut solids, CAR, Vec3::new(4.2, 1.0, 1.8), red);
+        made_of(&mut solids, METAL);
         solids.push(block(Vec3::new(CAR[0] + 0.1, 1.225, CAR[1]), Vec3::new(2.0, 0.45, 1.6), red.darker(0.1)));
+        made_of(&mut solids, METAL);
         let trunk_lid = Part::Moving {
             centre: Vec3::new(CAR[0] - 1.6, 1.02, CAR[1]),
             size: Vec3::new(1.0, 0.04, 1.6),
@@ -404,7 +521,7 @@ impl Default for Range {
             slide: Vec3::ZERO,
             color: red.darker(0.05),
         };
-        let trunk_hit = Solid { centre: Vec3::new(CAR[0] - 1.6, 0.52, CAR[1]), size: Vec3::new(1.0, 1.04, 1.8), color: red };
+        let trunk_hit = Solid { centre: Vec3::new(CAR[0] - 1.6, 0.52, CAR[1]), size: Vec3::new(1.0, 1.04, 1.8), color: red, surface: METAL };
         things.push(Placed {
             name: "trunk",
             thing: Thing::trunk(None, None, 0.0, 60.0),
@@ -447,6 +564,13 @@ impl Default for Range {
     }
 }
 
+/// The last box put among the solids is made of that.
+fn made_of(solids: &mut [Solid], surface: u8) {
+    if let Some(last) = solids.last_mut() {
+        last.surface = surface;
+    }
+}
+
 /// Where a table of weapons stands, by its class's place in
 /// `WEAPON_CRATES`: the middle of its top across the lane and along it, and
 /// the level way from its back to its front, the side it is stood before.
@@ -484,7 +608,30 @@ pub fn weapon_crate_labels() -> impl Iterator<Item = (&'static str, Vec3)> {
         let ([x, z], _) = weapon_table(index);
         (name, Vec3::new(x, WEAPON_TABLE.y + GUN_CASE.y + 0.25, z))
     });
-    tables.chain(std::iter::once((AIRDROP_LABEL, Vec3::new(AIRDROP[0], 0.5 + 0.25, AIRDROP[1]))))
+    let [low, high] = BARBED_WIRE;
+    let wire = ("BARBED WIRE", Vec3::new((low.x + high.x) / 2.0, high.y + 0.25, (low.z + high.z) / 2.0));
+    // Each square of the sampler by its surface's name, on the ground.
+    let squares = surface_squares().map(|(surface, at, _)| (trp_data::sound::SURFACES[surface as usize], at + Vec3::Y * 0.05));
+    tables.chain([(AIRDROP_LABEL, Vec3::new(AIRDROP[0], 0.5 + 0.25, AIRDROP[1])), wire]).chain(squares)
+}
+
+/// How the barbed wire is drawn: a post at each corner and three strands
+/// along each long side, plain thin boxes (centre and size, Bevy's axes).
+/// The app's look; the game's coil is not read.
+pub fn barbed_wire_look() -> Vec<(Vec3, Vec3)> {
+    let [low, high] = BARBED_WIRE;
+    let mut parts = Vec::new();
+    for x in [low.x, high.x] {
+        for z in [low.z, high.z] {
+            parts.push((Vec3::new(x, high.y / 2.0, z), Vec3::new(0.04, high.y, 0.04)));
+        }
+    }
+    for z in [low.z, (low.z + high.z) / 2.0, high.z] {
+        for share in [0.3, 0.6, 0.9] {
+            parts.push((Vec3::new((low.x + high.x) / 2.0, high.y * share, z), Vec3::new(high.x - low.x, 0.012, 0.012)));
+        }
+    }
+    parts
 }
 
 /// Where in `Carried::away` the gun case of a class's table keeps what it
@@ -500,8 +647,8 @@ pub fn weapon_crate_label(holds: usize) -> Option<String> {
     if holds == 0 {
         return Some(AIRDROP_LABEL.to_owned());
     }
-    let case = holds.checked_sub(GUN_CASE_HOLDS).and_then(|at| WEAPON_CRATES.get(at)).map(|label| format!("{label} weapon case"));
-    case.or_else(|| holds.checked_sub(MAGAZINE_BOX_HOLDS).and_then(|at| WEAPON_CRATES.get(at)).map(|label| format!("{label} magazine box")))
+    let case = holds.checked_sub(GUN_CASE_HOLDS).and_then(|at| WEAPON_CRATES.get(at)).map(|label| if *label == MEDICAL { format!("{label} case") } else { format!("{label} weapon case") });
+    case.or_else(|| holds.checked_sub(MAGAZINE_BOX_HOLDS).and_then(|at| WEAPON_CRATES.get(at)).map(|label| if *label == MEDICAL { format!("{PROVISIONS} box") } else { format!("{label} magazine box") }))
 }
 
 /// Which crate of weapons a start's name is: its label in small letters,
@@ -638,6 +785,10 @@ impl Range {
         let doorway = (DOORWAY[0] + DOORWAY[1]) / 2.0;
         let bevy = match name {
             "platform" => [STAIRS_LEFT + 2.5, far - 3.0],
+            // On the ledge 6 m up, by its far edge.
+            "ledge" => [STAIRS_LEFT + 3.75, far - 5.0 - LEDGE_STEPS as f32 * TREAD - 2.4],
+            // Before the barbed wire, on the start's side.
+            "wire" => [(BARBED_WIRE[0].x + BARBED_WIRE[1].x) / 2.0, BARBED_WIRE[1].z + 1.0],
             "shelf" => [STAIRS_LEFT + 6.5, far - 3.0],
             "stairs" => [STAIRS_LEFT + 1.25, STAIRS_FOOT + 2.0],
             "doors" => [doorway, DOOR_WALL_Z - 1.3],
@@ -654,6 +805,12 @@ impl Range {
             "table" => by(TABLE, 0.0, -1.0),
             "high-shelf" => by(HIGH_SHELF, 0.0, -0.7),
             "floor" => by(ROUNDS, 0.0, -0.8),
+            // Before the sampler of surfaces, on the start's side of it,
+            // facing it.
+            "surfaces" => {
+                let rows = SURFACE_COLORS.len().div_ceil(SAMPLER_COLUMNS) as f32;
+                [SAMPLER_FROM[0] + 1.5 * SQUARE, SAMPLER_FROM[1] + rows * SQUARE + 1.0]
+            }
             // Before a table of weapons, by its label (`rifles`,
             // `machine-guns`), three quarters of a metre from its front.
             _ => {
@@ -666,12 +823,34 @@ impl Range {
         Some([at[0], self.ground_height(at[0], at[1]), at[1]])
     }
 
+    /// Every box of the range as it stands, in Bevy's axes (middle, size,
+    /// turn about the upright): the character's collision's (the solids
+    /// and the doors' leaves) and the things' own (the containers, the
+    /// tables). What a corpse falls against (`death`).
+    pub fn boxes(&self) -> Vec<(Vec3, Vec3, Quat)> {
+        let things = self.things.iter().filter(|placed| placed.leaf.is_none()).map(|placed| &placed.hit);
+        self.site
+            .blocks
+            .iter()
+            .chain(things)
+            .map(|block| {
+                let middle = [(block.low[0] + block.high[0]) / 2.0, (block.low[1] + block.high[1]) / 2.0, (block.low[2] + block.high[2]) / 2.0];
+                let size = Vec3::new(block.high[0] - block.low[0], block.high[1] - block.low[1], block.high[2] - block.low[2]);
+                // The game's turn about straight up, in Bevy's mirrored
+                // axes: the other way about.
+                (in_bevy(middle), size, Quat::from_rotation_y(-block.turn))
+            })
+            .collect()
+    }
+
     /// Which way to look from a place of `place` (degrees right of the
     /// lane, degrees below level) for what is there to be in reach.
     pub fn start_view(name: &str) -> Option<[f32; 2]> {
         Some(match name {
             "doors" => [180.0, 5.0],
             "window" => [180.0, 5.0],
+            "ledge" => [0.0, 35.0],
+            "wire" => [0.0, 25.0],
             "clothing" => [0.0, 45.0],
             "yard" => [0.0, 5.0],
             "car" => [90.0, 32.0],
@@ -682,6 +861,7 @@ impl Range {
             "table" => [180.0, 36.0],
             "high-shelf" => [180.0, 11.0],
             "floor" => [180.0, 80.0],
+            "surfaces" => [0.0, 20.0],
             // (The gun case on the table, its front faced; the magazine box
             // under it is reached crouched.)
             _ => {
@@ -758,6 +938,20 @@ impl World for Range {
         let ground = (from.y >= 0.0 && to.y < 0.0).then(|| from.y / (from.y - to.y));
         let nearest = self.solids.iter().filter_map(|solid| solid.entered(from, to)).chain(ground).chain(leaves).reduce(f32::min)?;
         Some(nearest * length)
+    }
+
+    /// What a step's line down meets first: a box's surface, a door's leaf
+    /// (wood), or the ground's where it is hit (a square of the sampler's,
+    /// or concrete).
+    fn surface(&self, from: [f32; 3], to: [f32; 3]) -> Option<u8> {
+        let leaves = self.things.iter().filter_map(|placed| placed.leaf).filter_map(|leaf| self.site.blocks[leaf].entered(from, to)).map(|t| (t, WOOD));
+        let (from, to) = (in_bevy(from), in_bevy(to));
+        let ground = (from.y >= 0.0 && to.y < 0.0).then(|| from.y / (from.y - to.y)).map(|t| {
+            let at = from + (to - from) * t;
+            (t, ground_surface(at.x, at.z))
+        });
+        let solids = self.solids.iter().filter_map(|solid| solid.entered(from, to).map(|t| (t, solid.surface)));
+        solids.chain(ground).chain(leaves).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, surface)| surface)
     }
 
     /// Whatever a line hits above the ground is something standing on it.
@@ -901,7 +1095,7 @@ mod tests {
         let (stopped, _) = walk([STAIRS_LEFT - 1.0, 0.0, top + 2.5], [0.0235, 0.0], &|at| at[0] > STAIRS_LEFT + 1.0);
         assert!((stopped[0] - (STAIRS_LEFT - range.radius)).abs() < 1e-4 && stopped[1] == 0.0, "{stopped:?}");
         // Off the far edge: nothing under the feet.
-        let (edge, middle) = (top + 5.0, STAIRS_LEFT + 2.5);
+        let (edge, middle) = (top + 5.0, STAIRS_LEFT + 1.25);
         assert_eq!(range.ground_height(middle, edge - 0.01), PLATFORM);
         assert_eq!(range.ground_height(middle, edge + 0.01), 0.0);
         // Falling with its axis a centimetre past the edge, the capsule
@@ -911,6 +1105,14 @@ mod tests {
         // And it cannot walk back in under the platform's top.
         let (back, _) = walk([middle, 0.0, edge + 1.0], [0.0, -0.0235], &|at| at[2] < edge);
         assert!((back[2] - (edge + range.radius)).abs() < 1e-4, "{back:?}");
+        // From the platform, the second flight climbs to the ledge, 6 m up
+        // (health spec, "Falls"), on the way the first goes.
+        let across = STAIRS_LEFT + 3.75;
+        let ledge = top + 5.0 + LEDGE_STEPS as f32 * TREAD;
+        let (up, frames) = walk([across, PLATFORM, top + 4.0], [0.0, 0.0235], &|at| at[2] > ledge + 1.0);
+        println!("the second flight: {frames} frames to the ledge");
+        assert!((up[1] - LEDGE).abs() < 1e-4, "{up:?} after {frames} frames");
+        assert_eq!(range.place("ledge").map(|at| at[1]), Some(LEDGE));
     }
 
     /// The knee-high wall is not walked onto: the capsule's foot meets

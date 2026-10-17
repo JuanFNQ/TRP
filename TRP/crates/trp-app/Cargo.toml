@@ -14,22 +14,48 @@ anyhow.workspace = true
 serde_json.workspace = true
 trp-data = { path = "../trp-data" }
 trp-sim = { path = "../trp-sim" }
-bevy = { version = "0.16", default-features = false, features = [
+bevy = { version = "0.18", default-features = false, features = [
     "std",
     "async_executor",
     "multi_threaded",
     "bevy_asset",
+    # The interface's and the things' sounds (`ui_sound.rs`), mixed into one
+    # source of the app's own.
+    "bevy_audio",
     "bevy_color",
     "bevy_core_pipeline",
     "bevy_gizmos",
     "bevy_log",
+    # Systems and parameters named in what the engine reports (0.17 leaves them out without it).
+    "debug",
     "bevy_pbr",
     "bevy_render",
     "bevy_text",
     "bevy_ui",
+    "bevy_ui_render",
     "bevy_window",
     "bevy_winit",
     "default_font",
     "png",
     "tonemapping_luts",
+    # The tonemapping tables are packed with zstd: its Rust decoder.
+    "zstd_rust",
 ] }
+# The game's own physics engine (PhysX 4.1) for a corpse and things let fall
+# (`death.rs`, `crates/trp-physics`).
+trp-physics = { path = "../trp-physics" }
+# The graphics engine's own types, for its settings Bevy does not name (the shader model DXC
+# is asked for): the version Bevy's wgpu is.
+wgpu-types = "27"
+# The graphics library itself, to ask which backends find a graphics card before the engine
+# starts (`backend.rs`): Bevy's version, with features Bevy's already has.
+wgpu = { version = "27", default-features = false, features = ["dx12", "vulkan"] }
+
+[features]
+# Every system's and schedule's span written as a Chrome trace, to the file `TRACE_CHROME` names
+# (`docs/workbench.md`, "Profiling"): for profiling alone, the spans cost time of their own.
+profile = ["bevy/trace_chrome"]
+
+[dev-dependencies]
+# The sound source tested through the audio library Bevy plays it with, at the version it uses.
+rodio = { version = "=0.20.1", default-features = false }

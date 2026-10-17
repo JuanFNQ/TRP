@@ -118,6 +118,50 @@ fn every_weapon_is_put_together_drawn_fired_and_reloaded() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
+/// Every weapon fed from magazines is found with one in it (the RPK-16's
+/// stock preset has none: `Database::fit_magazines`): the item in the
+/// crate has it in its magazine slot, the rig has its model hung, and the
+/// logic is told how many rounds it holds.
+#[test]
+fn every_weapon_fed_from_magazines_has_one_in_it() {
+    use trp_sim::inventory::{Item, MAGAZINE_SLOT};
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let db = Database::load(&install).expect("database");
+    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("settings object");
+    let mut assets = Assets::new(install).expect("manifest");
+    let mut failed = Vec::new();
+    let mut counted = 0;
+    for (name, id) in weapons(&db) {
+        let template = db.item(&id).expect("its template");
+        if template.props.get("ReloadMode").and_then(serde_json::Value::as_str) != Some("ExternalMagazine") {
+            continue;
+        }
+        counted += 1;
+        let checked = (|| -> anyhow::Result<()> {
+            let (item, _) = Item::of_list(&db, &trp_data::inventory::Loadout::of_preset(&db, &id)?)?;
+            let magazine = item.in_slot(MAGAZINE_SLOT).ok_or_else(|| anyhow::anyhow!("the item has nothing in its magazine slot"))?;
+            let weapon = trp_data::weapon::assemble(&mut assets, &db, &id)?;
+            anyhow::ensure!(!weapon.skipped.iter().any(|part| part.contains(MAGAZINE_SLOT)), "its magazine was not hung: {:?}", weapon.skipped);
+            let settings = trp_sim::firearm_settings(&assets, &db, &hard, &weapon)?;
+            anyhow::ensure!(settings.magazine_capacity > 0, "its logic holds no rounds");
+            anyhow::ensure!(weapon.magazine_capacity == Some(settings.magazine_capacity), "the rig says {:?} rounds, the logic {}", weapon.magazine_capacity, settings.magazine_capacity);
+            if db.given_magazines.contains(&id) {
+                println!("{name}: its stock preset has no magazine; given {} ({} rounds)", magazine.kind.name, settings.magazine_capacity);
+            }
+            Ok(())
+        })();
+        if let Err(e) = checked {
+            println!("FAIL {name}: {e:#}");
+            failed.push(format!("{name}: {e:#}"));
+        }
+    }
+    println!("{counted} weapons fed from magazines, {} given one, {} failed", db.given_magazines.len(), failed.len());
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
 /// The empty hands' rig can be what every weapon's rig hangs from (the
 /// user, 2026-10-14, night: the AKM to be made when first wanted, as the
 /// rest are): it has every bone the arms are skinned to, and every node a

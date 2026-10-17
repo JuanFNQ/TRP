@@ -159,6 +159,11 @@ impl Sway {
         self.velocity[component] += velocity;
     }
 
+    /// New tuning, the spring keeping where it is and how fast it goes.
+    pub fn set(&mut self, frequency: f32, damping: f32) {
+        (self.frequency, self.damping) = (frequency, damping.min(0.9999));
+    }
+
     pub fn step(&mut self, dt: f32) {
         let decay = self.frequency * self.damping;
         let alpha = self.frequency * (1.0 - self.damping * self.damping).sqrt();
@@ -193,6 +198,9 @@ pub struct HandsSettings {
     /// overrides the prefab's.
     pub sway_frequency: f32,
     pub sway_damping: f32,
+    /// The same for both arms damaged (`SWAY_FREQ_NORMAL_DAMAGED.y`,
+    /// `SWAY_DAMPING_NORMAL_DAMAGED.y`); one arm takes half the way.
+    pub sway_damaged: [f32; 2],
     pub sway_strength_per_kg: Curve,
     pub displacement_strength_per_kg: Curve,
     pub aiming: AimingConfig,
@@ -411,6 +419,10 @@ pub struct Hands {
     rig_view: Option<[f32; 2]>,
 
     walk_clocks: Vec<f32>,
+    /// The lame bob's clocks, and whether it is the one played
+    /// (`WalkEffector.CurrentWalkPreset`: a damaged leg, no painkiller).
+    walk_clocks_lame: Vec<f32>,
+    lame: bool,
     walking: bool,
     pub step_frequency: f32,
 
@@ -590,6 +602,8 @@ impl Hands {
             last_forward: None,
             rig_view: None,
             walk_clocks: d.walk_normal.iter().map(|e| e.time_shift).collect(),
+            walk_clocks_lame: d.walk_lame.iter().map(|e| e.time_shift).collect(),
+            lame: false,
             walking: false,
             step_frequency: d.walk_step_frequency,
             sway_strength: settings.sway_strength_per_kg.evaluate(ergonomic_weight),
@@ -652,6 +666,20 @@ impl Hands {
     /// the breath, the walk), the lean does not roll the weapon and it
     /// does not turn away from what it would stick into; with the recoil
     /// off a shot is felt by neither the weapon nor the camera.
+    /// What the character's health does to the weapon in its hands
+    /// (`ProceduralWeaponAnimation.PhysicalConditionUpdated`): damaged arms
+    /// soften the sway spring, half the way for one and all of it for both
+    /// (the carried weight's share, which the game adds, is not in here);
+    /// a damaged leg without a painkiller plays the lame bob. The tremor
+    /// and a broken arm's shake are the breathing's (`Wind`).
+    pub fn set_health(&mut self, conditions: crate::health::Conditions) {
+        let s = &self.settings;
+        let factor = conditions.sway_damage();
+        let (frequency, damping) = (lerp(s.sway_frequency, s.sway_damaged[0], factor), lerp(s.sway_damping, s.sway_damaged[1], factor));
+        self.sway.set(frequency, damping);
+        self.lame = conditions.lame();
+    }
+
     pub fn set_systems(&mut self, systems: &crate::Systems) {
         (self.motion, self.recoil_on) = (systems.weapon_motion, systems.recoil);
     }
@@ -1287,8 +1315,10 @@ impl Hands {
 
         if !input.walking {
             if self.walking {
-                // Stopping rewinds every curve to its start.
-                self.walk_clocks.iter_mut().for_each(|c| *c = 0.0);
+                // Stopping rewinds every curve of the bob played to its
+                // start.
+                let clocks = if self.lame { &mut self.walk_clocks_lame } else { &mut self.walk_clocks };
+                clocks.iter_mut().for_each(|c| *c = 0.0);
             }
             self.walking = false;
             return;
@@ -1296,10 +1326,15 @@ impl Hands {
         self.walking = true;
         let range = self.settings.data.walk_intensity_range;
         let intensity = lerp(range[0], range[1], input.speed);
-        for index in 0..self.walk_clocks.len() {
-            self.walk_clocks[index] += dt * self.step_frequency;
-            let entry = &self.settings.data.walk_normal[index];
-            let value = looped(&entry.curve, self.walk_clocks[index]) * intensity;
+        let count = if self.lame { self.walk_clocks_lame.len() } else { self.walk_clocks.len() };
+        for index in 0..count {
+            let (clock, entry) = if self.lame {
+                (&mut self.walk_clocks_lame[index], &self.settings.data.walk_lame[index])
+            } else {
+                (&mut self.walk_clocks[index], &self.settings.data.walk_normal[index])
+            };
+            *clock += dt * self.step_frequency;
+            let value = looped(&entry.curve, *clock) * intensity;
             if value.abs() < 1e-6 {
                 continue;
             }

@@ -16,7 +16,7 @@ use crate::head_look::{HeadLook, HeadLookInput};
 use crate::interactions::{AnimatedInteractions, Interaction, Show};
 use crate::math::{
     body_to_view, delta_angle, dot, inverse_lerp, length, lerp, lerp_angle, lerp_turn, normalize, quat_axis, quat_euler, quat_look,
-    quat_mul, quat_rotate, quat_to_euler, smooth_damp,
+    quat_mul, quat_rotate, quat_to_euler, smooth_damp, unity_clamp,
 };
 use crate::settings::MovementSettings;
 use crate::stamina::Stamina;
@@ -415,6 +415,16 @@ pub trait World {
         false
     }
 
+    /// What a step's line down from `from` to `to` meets first, for the
+    /// sounds of moving (`steps.rs`): `None` if nothing, else the surface of
+    /// what it hit (`BaseBallistic.ESurfaceSound`'s number;
+    /// `trp_data::sound::SURFACES`). Left alone, whatever `line` hits is
+    /// concrete, which is the game's surface for a thing without one of its
+    /// own.
+    fn surface(&self, from: [f32; 3], to: [f32; 3]) -> Option<u8> {
+        self.line(from, to).map(|_| crate::steps::CONCRETE)
+    }
+
     /// Whether a character whose feet are at `at` is held up by something
     /// it touches other than what lies under its axis: the edge of a
     /// ledge its foot overhangs. The game's controller counts a character
@@ -497,7 +507,7 @@ fn is_zero(v: [f32; 2]) -> bool {
     v[0] == 0.0 && v[1] == 0.0
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MoveData {
     /// Inertia-smoothed velocity command, world axes. Its length is the speed parameter.
     speed: [f32; 2],
@@ -546,7 +556,7 @@ impl MoveData {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct JumpData {
     time: f32,
     airborne: bool,
@@ -578,7 +588,7 @@ struct JumpData {
 /// value the step runs to (1 right, -1 left). The last two fields are the
 /// state's own playback speed for the step and whether it last worked a
 /// way out, which lowers where that speed rests.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StepData {
     part: i32,
     progress: f32,
@@ -623,6 +633,7 @@ struct VaultData {
     capsule: [f32; 2],
 }
 
+#[derive(Clone)]
 pub struct Movement {
     pub settings: MovementSettings,
     /// Which of its systems run (`crate::Systems`): all, unless a host
@@ -654,6 +665,19 @@ pub struct Movement {
     /// shows from the next frame's upkeep on.
     landing_limit_in_effect: Option<f32>,
     limits_changed: bool,
+    /// What the character's health allows (health spec, "What health does
+    /// to the character"), as a host's health system sets it
+    /// (`set_conditions`): nothing is held back unless one does.
+    pub conditions: crate::health::Conditions,
+    /// The speed limits health and barbed wire put on the character
+    /// (`ESpeedLimit.HealthCondition`, `ESpeedLimit.BarbedWire`), and the
+    /// same as the frame's upkeep has worked them in.
+    held_limits: [Option<f32>; 2],
+    held_limits_in_effect: [Option<f32>; 2],
+    /// What happened in the frame that health takes (`take_moved`).
+    moved: Vec<Moved>,
+    /// How far the sprint under way has gone (`Pedometer`).
+    sprint_distance: f32,
     /// The engine's time added up over the frames so far.
     frame_clock: f32,
     /// The highest the character has been since it last stood on the
@@ -794,6 +818,8 @@ pub struct Movement {
     /// seen pass.
     stopwatch: Stopwatch,
     unstepped: f32,
+    /// The last frame's time by the player's own clock (`player_dt`).
+    last_player_dt: f32,
     /// How far the player's clock is behind the frames' own, in seconds:
     /// the frame time passed less the player's time passed. Before this
     /// frame, and after it.
@@ -830,6 +856,19 @@ pub struct Movement {
     last_step: f32,
     step_side: f32,
     footstep: Option<f32>,
+    /// Whether a footstep was heard on this step; the crawl's marks the
+    /// body's animation passed on it; the ground found again on it (how
+    /// far below the highest point and how far above the take-off); and
+    /// the height the feet left the ground at. The sounds of moving go by
+    /// them (`sounds`).
+    stepped: bool,
+    crawl_marks: usize,
+    landed: Option<(f32, f32)>,
+    fly_from: f32,
+    /// The sounds of moving: the game's rules for when each plays, run on
+    /// every step (`docs/spec/footsteps.md`). The host takes what they ask
+    /// for (`StepSounds::take`).
+    pub sounds: crate::steps::StepSounds,
     /// Vaulting and climbing (vaulting spec): the grid and what it last
     /// measured; how long the key has been held; the two flags a chosen
     /// move raises for the animator, and the one that is up while a move
@@ -915,6 +954,25 @@ pub struct WorldInteraction {
     /// How high the thing is reached for, in the world: a low one is
     /// crouched to.
     pub height: f32,
+}
+
+/// What the movement did in a frame that the character's health takes
+/// (`Movement::take_moved`; health spec, "Falls", "What health does to the
+/// character").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Moved {
+    /// On the ground again after falling so far (`HandleFall`).
+    Fell(f32),
+    /// A jump begun: every wound pushed by 1.
+    JumpStarted,
+    /// A jump over: each damaged leg hurt by 3.
+    JumpEnded,
+    /// A sprint begun: on a damaged leg it starts the self-damage.
+    SprintStarted,
+    /// A sprint over on the ground, so far: every wound pushed by a tenth.
+    SprintEnded(f32),
+    /// A vault begun over something so high: a damaged left leg hurt by 3.
+    Vaulted(f32),
 }
 
 /// What came of something the character was doing to a thing of the world.
@@ -1041,6 +1099,7 @@ impl Movement {
     pub fn new(settings: MovementSettings, body: Body) -> Self {
         let stamina = Stamina::new(settings.stamina.clone());
         let speed_memo = settings.max_speed;
+        let sounds = crate::steps::StepSounds::new(settings.steps.clone());
         Self {
             systems: crate::Systems::default(),
             head_look: HeadLook::new(settings.head_look),
@@ -1051,6 +1110,11 @@ impl Movement {
             landing_limit: None,
             landing_limit_in_effect: None,
             limits_changed: false,
+            conditions: crate::health::Conditions::default(),
+            held_limits: [None; 2],
+            held_limits_in_effect: [None; 2],
+            moved: Vec::new(),
+            sprint_distance: 0.0,
             frame_clock: 0.0,
             fall_from: 0.0,
             was_grounded: true,
@@ -1136,6 +1200,7 @@ impl Movement {
             frame_dt: 0.0,
             stopwatch: Stopwatch::default(),
             unstepped: 0.0,
+            last_player_dt: 0.0,
             clock_lag_before: 0.0,
             clock_lag: 0.0,
             mv: MoveData::fresh(),
@@ -1153,6 +1218,11 @@ impl Movement {
             last_step: 0.0,
             step_side: 1.0,
             footstep: None,
+            stepped: false,
+            crawl_marks: 0,
+            landed: None,
+            fly_from: 0.0,
+            sounds,
             vaulting: Vaulting::default(),
             vault_time: 0.0,
             vault_key: false,
@@ -1202,6 +1272,9 @@ impl Movement {
         if let Some(landing) = self.landing_limit_in_effect {
             limit = limit.min(landing);
         }
+        for held in self.held_limits_in_effect.into_iter().flatten() {
+            limit = limit.min(held);
+        }
         self.character_speed.clamp(0.0, limit)
     }
 
@@ -1216,7 +1289,67 @@ impl Movement {
         if let Some(landing) = self.landing_limit_in_effect {
             limit = limit.min(landing);
         }
+        for held in self.held_limits_in_effect.into_iter().flatten() {
+            limit = limit.min(held);
+        }
         limit.min(self.settings.max_speed)
+    }
+
+    /// What the character's health allows now (`Player.UpdateSpeedLimitByHealth`,
+    /// `UpdateArmsCondition` and the effects' handlers setting the
+    /// movement context's physical conditions): a damaged leg holds the
+    /// speed down and ends a sprint, unless a painkiller is at work; the
+    /// stamina is told what it goes by (stamina spec, "Who calls it").
+    pub fn set_conditions(&mut self, conditions: crate::health::Conditions) {
+        if conditions == self.conditions {
+            return;
+        }
+        let before = std::mem::replace(&mut self.conditions, conditions);
+        let limit = conditions.speed_limit();
+        if limit != self.held_limits[0] {
+            self.held_limits[0] = limit;
+            self.limits_changed = true;
+        }
+        self.stamina.health_lets_sprint = conditions.can_sprint_drain();
+        if conditions.leg_damaged() && !conditions.on_painkillers {
+            self.enable_sprint(false);
+        }
+        if (before.left_arm, before.right_arm, before.on_painkillers) != (conditions.left_arm, conditions.right_arm, conditions.on_painkillers) {
+            self.stamina.set_aim_factor(conditions.aim_cost());
+        }
+    }
+
+    /// Whether the character is in barbed wire (`BarbedWire`): `inside`,
+    /// its capsule in the wire's box, holds the speed to 0.15 of the top
+    /// while it is (`AddPenalty`, on the trigger's entering); `cut`, one of
+    /// its hit colliders in the box, ends a sprint on every frame of it
+    /// (`ProceedDamage`, which runs for the hit colliders alone: recorded,
+    /// a sprint into wire ended ten frames after the speed was held down).
+    pub fn set_in_barbed_wire(&mut self, inside: bool, cut: bool) {
+        /// `BarbedWire._speedLimitPenalty`.
+        const PENALTY: f32 = 0.15;
+        let limit = inside.then_some(PENALTY);
+        if limit != self.held_limits[1] {
+            self.held_limits[1] = limit;
+            self.limits_changed = true;
+        }
+        if cut && self.sprinting {
+            self.enable_sprint(false);
+        }
+    }
+
+    /// What happened in the frame that health takes: falls, jumps, sprints
+    /// and vaults (health spec, "Falls", "What health does to the
+    /// character").
+    pub fn take_moved(&mut self) -> Vec<Moved> {
+        std::mem::take(&mut self.moved)
+    }
+
+    /// A walk or a sprint goes on (`MovementContext.CanWalk`): not locked
+    /// against an obstacle, and not with medicine at work that cannot be
+    /// used walking.
+    fn walk_refused(&self) -> bool {
+        self.blocked || !self.conditions.can_walk()
     }
 
     /// A change of the speed asked of the movement state in hand
@@ -1528,6 +1661,8 @@ impl Movement {
             stamina: self.stamina.breath_stamina(),
             oxygen: self.stamina.breath_oxygen(),
             held: self.stamina.holding_breath(),
+            tremor: self.conditions.tremor_on(),
+            fracture: self.conditions.arms_fractured(),
         }
     }
 
@@ -1639,7 +1774,40 @@ impl Movement {
         if gap > SHORTEST_GAP && self.freefall_time < longest_fall {
             self.last_step = self.clock;
             self.footstep = Some(gap);
+            self.stepped = true;
         }
+    }
+
+    /// The sounds of moving's rules on this step (`steps.rs`): told the
+    /// footstep, the crawl's marks and the landing of the step, the state,
+    /// the stance, the speeds and the load, and asking the world what the
+    /// line down from the collider's middle meets (`CalculateMovementSurface`:
+    /// as long as the collider's height and half a metre).
+    fn hear(&mut self, dt: f32, world: &dyn World) {
+        let capsule = self.capsule();
+        let middle = self.position[1] + (capsule.underside + capsule.top) / 2.0;
+        let reach = capsule.top - capsule.underside + 0.5;
+        let from = [self.position[0], middle, self.position[2]];
+        let to = [self.position[0], middle - reach, self.position[2]];
+        let moment = crate::steps::Moment {
+            clock: self.clock,
+            dt,
+            state: self.state,
+            footstep: std::mem::take(&mut self.stepped),
+            crawl_marks: std::mem::take(&mut self.crawl_marks),
+            landed: self.landed.take(),
+            prone: self.prone,
+            pose_level: self.pose_level,
+            smoothed_pose_level: self.smoothed_pose_level,
+            clamped_speed: self.clamped_speed(),
+            speed: self.character_speed,
+            max_speed: self.settings.max_speed,
+            overweight: self.stamina.settings.overweight,
+            leg_damaged: self.conditions.leg_damaged(),
+            yaw: self.yaw,
+            hands_to_body: self.hands_to_body,
+        };
+        self.sounds.update(&moment, &mut self.last_step, &mut || world.surface(from, to));
     }
 
     /// What the body's animator is told this step.
@@ -1972,8 +2140,13 @@ impl Movement {
         std::mem::take(&mut self.acted)
     }
 
-    /// Moves the state for the hands on the world on by a frame of the
-    /// engine's clock, which is what the game's two states time by.
+    /// Moves the state for the hands on the world on by a frame. The
+    /// game's two states time by the real clock (`DoorInteractState`,
+    /// `PickUpState`: `Time.realtimeSinceStartup` since they were entered),
+    /// which the player's whole-millisecond stopwatch is read from: so it
+    /// is given the player's frame time (recorded: a lock opened with its
+    /// key shut on the game's frame with it, a frame late with the
+    /// engine's, 2026-10-16).
     fn act(&mut self, dt: f32) {
         match &mut self.acting {
             Some(Acting::Working { time, worked, snap }) => {
@@ -2020,7 +2193,16 @@ impl Movement {
     /// the simulation on steps of its own; one that draws frames calls
     /// `frame`.
     pub fn step(&mut self, dt: f32, input: &Input, world: &dyn World) {
+        self.last_player_dt = dt;
         self.step_on_clock(dt, dt, input, world);
+    }
+
+    /// The last frame's time by the player's own clock, in whole
+    /// milliseconds (none where it did not see a millisecond pass): what
+    /// the game's health is updated by as well (health spec, "Compared with
+    /// what": the recordings' effects end on it, not on the frames' time).
+    pub fn player_dt(&self) -> f32 {
+        self.last_player_dt
     }
 
     /// One drawn frame of `dt` seconds, timed as the game times it: the
@@ -2031,6 +2213,7 @@ impl Movement {
     pub fn frame(&mut self, dt: f32, input: &Input, world: &dyn World) {
         self.unstepped += dt;
         let player_dt = self.stopwatch.tick(dt);
+        self.last_player_dt = player_dt;
         if player_dt > 0.0 {
             let dt = std::mem::take(&mut self.unstepped);
             self.step_on_clock(dt, player_dt, input, world);
@@ -2046,6 +2229,9 @@ impl Movement {
     /// by up to half a millisecond a frame. A host with one clock calls
     /// `step`.
     pub fn step_on_clock(&mut self, dt: f32, player_dt: f32, input: &Input, world: &dyn World) {
+        // What health was to take of the last frame has been taken, or
+        // nobody takes it.
+        self.moved.clear();
         // The keys of a system switched off are not heard, and the
         // stamina is told which of its two parts run.
         let heard = self.systems.heard(input);
@@ -2090,7 +2276,7 @@ impl Movement {
             self.body.set_head_turn(self.head_look.bones_turn());
         }
         self.hands_idle = input.hands_idle;
-        self.act(dt);
+        self.act(player_dt);
         self.commands(input, world);
         self.watch_sprint();
         self.manual_update(player_dt, world);
@@ -2103,6 +2289,7 @@ impl Movement {
         // of its states enters the movement state it names, and this
         // happens when a blend into it starts, not when it ends.
         let entered = self.body.update(dt, &self.body_input());
+        self.crawl_marks += self.body.take_crawl_marks();
         for entered in entered {
             if let Some(state) = State::from_number(entered.state) {
                 self.enter_state(state, entered);
@@ -2137,7 +2324,16 @@ impl Movement {
             match self.state {
                 State::Idle => self.update_idle(player_dt, world),
                 State::Move => self.update_move(player_dt, world),
-                State::Sprint => self.update_sprint(player_dt, world),
+                State::Sprint => {
+                    let from = self.position;
+                    self.update_sprint(player_dt, world);
+                    self.sprint_distance += ((self.position[0] - from[0]).powi(2) + (self.position[2] - from[2]).powi(2)).sqrt();
+                    // Health may forbid it (`SprintPlayerState`, after the
+                    // move: `CanSprint`).
+                    if !self.conditions.can_sprint() {
+                        self.sprint_flag = false;
+                    }
+                }
                 State::Jump => self.update_jump(player_dt, world),
                 State::SprintStop => self.update_sprint_stop(player_dt, world),
                 State::Landing => self.update_landing(player_dt, world),
@@ -2164,6 +2360,7 @@ impl Movement {
         }
         self.watch_sprint();
         self.watch_footsteps(dt);
+        self.hear(dt, world);
         self.lag_body_height(player_dt);
         self.wait_for_search(dt);
     }
@@ -2281,6 +2478,11 @@ impl Movement {
                 self.step = 0;
             }
             State::Sprint => {
+                // A sprint's distance pushes the wounds (`DoWoundRelapse`),
+                // from the ground.
+                if self.grounded {
+                    self.moved.push(Moved::SprintEnded(self.sprint_distance));
+                }
                 self.enable_sprint(false);
                 self.sprint_flag = false;
                 self.reset_speed_after_sprint();
@@ -2291,6 +2493,12 @@ impl Movement {
                 }
             }
             State::Jump => {
+                // Lying down was asked for in the air: only if the
+                // character may lie (`JumpPlayerState.Exit`).
+                if self.prone && !self.conditions.can_prone() {
+                    self.prone = false;
+                }
+                self.moved.push(Moved::JumpEnded);
                 self.tilt = 0.0;
                 // A landing caps the selected speed for a while.
                 let s = &self.settings;
@@ -2302,7 +2510,7 @@ impl Movement {
                 // Out of a sprint, the sprint is asked for again and the
                 // move is over at once; otherwise it is over when the
                 // landing is left.
-                if self.vault.from_sprint && !self.blocked {
+                if self.vault.from_sprint && !self.walk_refused() {
                     self.enable_sprint(true);
                     self.is_vaulting = false;
                 }
@@ -2402,6 +2610,8 @@ impl Movement {
             }
             State::Move => self.enter_move(from),
             State::Sprint => {
+                self.sprint_distance = 0.0;
+                self.moved.push(Moved::SprintStarted);
                 // The sprint is a state object of its own in the game, so
                 // what the walking state holds stays as the walk left it.
                 self.mv.smoothed_yaw = self.body_yaw;
@@ -2412,7 +2622,10 @@ impl Movement {
                 self.turn_factor *= self.settings.sprint_sensitivity;
                 self.turn_limit *= self.settings.sprint_sensitivity;
             }
-            State::Jump => self.enter_jump(from),
+            State::Jump => {
+                self.moved.push(Moved::JumpStarted);
+                self.enter_jump(from);
+            }
             State::SprintStop => {
                 self.sprint_flag = false;
                 self.tilt = 0.0;
@@ -2729,7 +2942,7 @@ impl Movement {
                 // The animator takes it from here: its jump state starts
                 // the jump proper. Legs at or under the threshold do not
                 // jump, and nothing else happens for the key.
-                if self.stamina.can_jump() {
+                if self.stamina.can_jump() && self.conditions.can_jump() {
                     self.jump_flag = true;
                 }
             } else {
@@ -2799,14 +3012,20 @@ impl Movement {
     /// Standing still, a movement key only tells the animator to start
     /// walking; the walk itself begins when the animator's walking state does.
     fn idle_move(&mut self, d: [f32; 2]) {
+        // Lying, the keys are not heard at all where the character may not
+        // crawl (`PronePlayerState.Move`).
+        if self.state == State::ProneIdle && !self.conditions.can_crawl() {
+            return;
+        }
         if d[0].abs() <= MIN_INPUT && d[1].abs() <= MIN_INPUT {
             self.movement_direction = [0.0; 2];
             return;
         }
         let signs = [if d[0] == 0.0 { 0.0 } else { d[0].signum() }, if d[1] == 0.0 { 0.0 } else { d[1].signum() }];
         self.movement_direction = [signs[0] * 0.01, signs[1] * 0.01];
-        // Locked against an obstacle, nothing starts.
-        if self.blocked {
+        // Locked against an obstacle, nothing starts; nor with medicine at
+        // work that cannot be used walking.
+        if self.walk_refused() {
             return;
         }
         // The states built on standing each keep their own note of a held
@@ -2826,9 +3045,11 @@ impl Movement {
             // Standing still, a toggle does nothing.
             State::Idle => {
                 if !is_toggle {
-                    self.idle_sprint_held = enable;
+                    self.idle_sprint_held = enable && self.conditions.can_sprint();
                 }
             }
+            // Health may forbid it (`MovementContext.CanSprint`).
+            State::Move if !self.conditions.can_sprint() => {}
             State::Move => {
                 if self.movement_direction[1] > 0.1 {
                     self.enable_sprint(enable);
@@ -2842,8 +3063,8 @@ impl Movement {
                     self.mv.sprint_postponed = enable;
                 }
             }
-            State::Sprint => self.enable_sprint(enable),
-            State::Jump => self.jump.from_sprint &= enable,
+            State::Sprint => self.enable_sprint(enable && self.conditions.can_sprint()),
+            State::Jump => self.jump.from_sprint &= enable && self.conditions.can_sprint(),
             // Crawling, the key winds the speed setting up instead.
             State::ProneMove => self.prone_sprint = enable,
             State::SprintStop
@@ -2881,8 +3102,10 @@ impl Movement {
                 self.prone = false;
             }
             self.pose_level = self.pose_memo.clamp(0.0, 1.0);
-        } else if !refused {
-            // The animator takes it from here, when it can.
+        } else if !refused && self.conditions.can_prone() {
+            // The animator takes it from here, when it can. Health may
+            // forbid lying down (`MovementContext.CanProne`; the room to
+            // lie in, its other half, is not read).
             self.prone = true;
         }
     }
@@ -2976,6 +3199,15 @@ impl Movement {
         if self.grounded {
             let fallen = self.fall_from - height;
             self.fall_from = height;
+            // Health is told the height on every frame on the ground
+            // (`HandleFall`), which is 0 but on a landing's.
+            if fallen > 0.0 {
+                self.moved.push(Moved::Fell(fallen));
+            }
+            // The sounds hear a landing by both heights (`OnGrounded`).
+            if !self.was_grounded {
+                self.landed = Some((fallen, height - self.fly_from));
+            }
             let s = &self.settings;
             if !self.was_grounded && fallen >= s.fall_threshold {
                 let (limit, duration) = (s.fall_speed_limit.evaluate(fallen), s.fall_limit_duration.evaluate(fallen));
@@ -2983,8 +3215,13 @@ impl Movement {
                     self.limit_after_landing(limit, duration);
                 }
             }
-        } else if height > self.fall_from {
-            self.fall_from = height;
+        } else {
+            if self.was_grounded {
+                self.fly_from = height;
+            }
+            if height > self.fall_from {
+                self.fall_from = height;
+            }
         }
         self.was_grounded = self.grounded;
     }
@@ -3003,6 +3240,7 @@ impl Movement {
     fn work_in_limits(&mut self) {
         if std::mem::take(&mut self.limits_changed) {
             self.landing_limit_in_effect = self.landing_limit.map(|(limit, _)| limit);
+            self.held_limits_in_effect = self.held_limits;
         }
         if self.landing_limit.is_some_and(|(_, until)| self.frame_clock >= until) {
             self.landing_limit = None;
@@ -3247,6 +3485,9 @@ impl Movement {
         self.update_move(dt, world);
         std::mem::swap(&mut self.mv, &mut self.mv_prone);
         self.align_to_surface(dt, world);
+        if !self.conditions.can_crawl() {
+            self.inert = false;
+        }
         // The sprint key held: the speed setting climbs a notch a frame
         // until it is at the top.
         if self.prone_sprint {
@@ -3419,8 +3660,9 @@ impl Movement {
         let no_input_for_long = self.mv.time_without_input > s.max_time_without_input
             && length(self.mv.speed) < s.exit_speed_threshold
             && self.mv.reversal_pause <= 0.0;
-        // So is it when the character is locked against an obstacle.
-        if no_input_for_long || self.blocked {
+        // So is it when the character is locked against an obstacle, or
+        // may not walk.
+        if no_input_for_long || self.walk_refused() {
             self.inert = false;
         }
 
@@ -3574,7 +3816,7 @@ impl Movement {
         // an update has already dropped its input (below): that one goes
         // on to sprint with none.
         let dropped = self.frame_count == self.sprint_dropped_in;
-        if (input[1].abs() < f32::EPSILON || self.blocked) && !dropped {
+        if (input[1].abs() < f32::EPSILON || self.walk_refused()) && !dropped {
             self.sprint_flag = false;
             if input[0].abs() < f32::EPSILON {
                 self.inert = false;
@@ -3658,8 +3900,10 @@ impl Movement {
         };
         let floor = s.sprint_speed_inertia.evaluate(f32::MAX) * (2.0 - s.inertia);
         let turn = s.sprint_speed_inertia.evaluate(turn_rate.abs()).max(floor);
-        let limit = (limit * turn).clamp(0.1, limit);
-        self.sprint_speed = (self.sprint_speed + step * sign(limit - self.sprint_speed)).clamp(0.01, limit);
+        // `Mathf.Clamp`: a landing's limit of nought leaves 0.1 (the lower
+        // bound wins), and the sprint's speed between 0.01 and that.
+        let limit = unity_clamp(limit * turn, 0.1, limit);
+        self.sprint_speed = unity_clamp(self.sprint_speed + step * sign(limit - self.sprint_speed), 0.01, limit);
     }
 
     fn enter_jump(&mut self, from: State) {
@@ -3689,7 +3933,13 @@ impl Movement {
             direction,
             initial_speed: speed,
             speed,
-            lift: s.lift_velocity_by_speed.evaluate(speed),
+            // The push off the ground is weaker the heavier the load, and
+            // as weak as at full overweight on a damaged leg without
+            // painkillers (`JumpPlayerState.Enter`).
+            lift: s.lift_velocity_by_speed.evaluate(speed) * {
+                let c = self.conditions;
+                if c.leg_damaged() && !c.on_painkillers { 0.66 } else { lerp(1.0, 0.66, self.stamina.settings.overweight) }
+            },
             lift_delay: s.jump_delay_by_speed.evaluate(speed),
             from_sprint: from == State::Sprint,
             potential_height: self.position[1],
@@ -3788,7 +4038,7 @@ impl Movement {
             self.jump_flag = false;
             self.landing_flag = true;
             let move_dir = self.jump.move_dir;
-            if dot(move_dir, move_dir) > 0.1 {
+            if dot(move_dir, move_dir) > 0.1 && self.conditions.can_walk() {
                 self.enable_sprint(self.jump.from_sprint && move_dir[1] > 0.1);
                 self.sprint_flag = self.sprinting;
                 self.movement_direction = move_dir;
@@ -3839,11 +4089,17 @@ impl Movement {
         self.stamina.set_pose(self.prone, self.pose_level);
         let (now, st) = (self.frame_clock, &self.settings.stamina);
         let overweight = if self.pose_level < 0.11 { st.overweight } else { st.walk_overweight };
+        // A damaged limb takes the move at the slow end of its range, as
+        // full overweight does (`SetVaultingSpeed`).
+        let slowed = self.conditions.vault_slowing(kind == Move::Climb, height, clear, s.climb.max_one_hand);
         match kind {
             Move::Vault => self.stamina.vault(height > clear, now),
             Move::Climb => self.stamina.climb(height > clear, height > s.climb.max_one_hand, now),
         }
-        self.vaulting_speed = s.pace(kind, overweight);
+        self.vaulting_speed = s.pace(kind, overweight.max(slowed));
+        if kind == Move::Vault {
+            self.moved.push(Moved::Vaulted(height));
+        }
         if hands {
             // The sights go down and the view is the move's own.
             self.aim_taken = true;

@@ -1,0 +1,2 @@
+# Windows' command scripts need Windows' line ends, in a clone and in GitHub's zip alike.
+*.bat text eol=crlf

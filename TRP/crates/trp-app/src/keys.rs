@@ -210,6 +210,8 @@ pub fn tapped(word: &str) -> Option<Key> {
         "rmb" => "Mouse1",
         "mmb" => "Mouse2",
         "f1" => "F1",
+        "f7" => "F7",
+        "f8" => "F8",
         _ => "",
     };
     let name = match word.as_bytes() {

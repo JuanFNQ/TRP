@@ -25,10 +25,10 @@ use std::collections::HashMap;
 use bevy::asset::RenderAssetUsages;
 use bevy::math::Affine3A;
 use bevy::prelude::*;
-use bevy::render::camera::RenderTarget;
-use bevy::render::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
+use bevy::camera::RenderTarget;
+use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
-use bevy::render::view::{NoFrustumCulling, RenderLayers};
+use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::window::PrimaryWindow;
 
 use crate::convert;
@@ -90,8 +90,11 @@ pub struct Figure {
 }
 
 /// Builds the figure beside the body, piece by piece as `body_view::
-/// spawn_body` makes the body's own.
+/// spawn_body` makes the body's own. The corpse the character becomes
+/// (`death`) is built the same way: the same meshes on a skeleton of its
+/// own, hidden until it is wanted.
 pub struct Builder {
+    made: Made,
     root: Entity,
     by_path: HashMap<String, usize>,
     paths: Vec<String>,
@@ -101,6 +104,17 @@ pub struct Builder {
     meshes: Vec<Handle<Mesh>>,
     materials: Vec<Handle<StandardMaterial>>,
     pieces: usize,
+    /// The corpse's outfits, each to be posed on its skeleton as it falls.
+    outfits: Vec<crate::death::CorpseOutfit>,
+}
+
+/// What a builder makes.
+#[derive(Clone, Copy, PartialEq)]
+enum Made {
+    /// The gear page's character model, on a layer of its own.
+    Figure,
+    /// The corpse, in the world with the body.
+    Corpse,
 }
 
 impl Builder {
@@ -108,19 +122,47 @@ impl Builder {
     /// parent before what hangs from it), put where `pose` has it.
     pub fn new(commands: &mut Commands, paths: &[String], pose: &trp_sim::body::Pose) -> Self {
         let root = commands.spawn((Name::new("Character model"), Transform { translation: PLACE, rotation: convert::rotation(TURN), ..default() }, Visibility::default())).id();
+        Self::on(Made::Figure, commands, root, paths, |index| convert::transform(pose[index].0, pose[index].1, [1.0; 3]))
+    }
+
+    /// The corpse's skeleton, at the world's origin and hidden: its bones
+    /// are given the body's pose when the character dies.
+    pub fn corpse(commands: &mut Commands, paths: &[String]) -> Self {
+        let root = commands.spawn((Name::new("Corpse"), Transform::default(), Visibility::Hidden)).id();
+        Self::on(Made::Corpse, commands, root, paths, |_| Transform::default())
+    }
+
+    fn on(made: Made, commands: &mut Commands, root: Entity, paths: &[String], local_of: impl Fn(usize) -> Transform) -> Self {
         let mut by_path = HashMap::with_capacity(paths.len());
         let (mut bones, mut world) = (Vec::with_capacity(paths.len()), Vec::with_capacity(paths.len()));
-        for (index, (path, (position, rotation))) in paths.iter().zip(pose).enumerate() {
-            let local = convert::transform(*position, *rotation, [1.0; 3]);
+        let whose = if made == Made::Corpse { "the corpse's" } else { "the model's" };
+        for (index, path) in paths.iter().enumerate() {
+            let local = local_of(index);
             let parent = path.rfind('/').and_then(|at| by_path.get(&path[..at]).copied());
             let name = path.rsplit('/').next().unwrap_or(path);
-            let entity = commands.spawn((Name::new(format!("{name}, the model's")), local, Visibility::default())).id();
+            let entity = commands.spawn((Name::new(format!("{name}, {whose}")), local, Visibility::default())).id();
             commands.entity(parent.map_or(root, |parent| bones[parent])).add_child(entity);
             world.push(parent.map_or(Affine3A::IDENTITY, |parent: usize| world[parent]) * local.compute_affine());
             bones.push(entity);
             by_path.insert(path.clone(), index);
         }
-        Self { root, by_path, paths: paths.to_vec(), bones, world, meshes: Vec::new(), materials: Vec::new(), pieces: 0 }
+        Self { made, root, by_path, paths: paths.to_vec(), bones, world, meshes: Vec::new(), materials: Vec::new(), pieces: 0, outfits: Vec::new() }
+    }
+
+    /// The render layer its pieces are drawn on.
+    fn layer(&self) -> RenderLayers {
+        match self.made {
+            Made::Figure => RenderLayers::layer(LAYER),
+            Made::Corpse => RenderLayers::layer(crate::body_view::SEEN),
+        }
+    }
+
+    /// A piece of it marked as the twin of a piece of the body.
+    fn twin(&self, commands: &mut Commands, piece: Entity, original: Entity) {
+        match self.made {
+            Made::Figure => commands.entity(piece).insert(Twin(original)),
+            Made::Corpse => commands.entity(piece).insert(crate::death::CorpseTwin(original)),
+        };
     }
 
     /// The bone a mesh's bone is drawn on: that one, or the nearest above it
@@ -145,28 +187,30 @@ impl Builder {
     }
 
     /// A skinned piece of the body, on the bones it names.
-    pub fn skinned(&mut self, commands: &mut Commands, original: Entity, drawn: (&Handle<Mesh>, &Handle<StandardMaterial>), poses: &Handle<SkinnedMeshInverseBindposes>, bone_paths: &[String], hidden: bool) {
+    pub fn skinned(&mut self, commands: &mut Commands, original: Entity, drawn: (&Handle<Mesh>, &Handle<StandardMaterial>), poses: &Handle<SkinnedMeshInverseBindposes>, bone_paths: &[String], hidden: bool) -> Entity {
         let joints = bone_paths.iter().map(|path| self.joint(path)).collect();
-        self.skinned_on(commands, original, drawn, poses, joints, hidden);
+        self.skinned_on(commands, original, drawn, poses, joints, hidden)
     }
 
     /// A skinned piece on joints of its own (an outfit's, `outfit`).
-    pub fn skinned_on(&mut self, commands: &mut Commands, original: Entity, (mesh, material): (&Handle<Mesh>, &Handle<StandardMaterial>), poses: &Handle<SkinnedMeshInverseBindposes>, joints: Vec<Entity>, hidden: bool) {
+    pub fn skinned_on(&mut self, commands: &mut Commands, original: Entity, (mesh, material): (&Handle<Mesh>, &Handle<StandardMaterial>), poses: &Handle<SkinnedMeshInverseBindposes>, joints: Vec<Entity>, hidden: bool) -> Entity {
         let visibility = if hidden { Visibility::Hidden } else { Visibility::Inherited };
+        let name = if self.made == Made::Corpse { "Corpse, a piece" } else { "Character model, a piece" };
         let piece = commands
             .spawn((
-                Name::new("Character model, a piece"),
+                Name::new(name),
                 Mesh3d(mesh.clone()),
                 MeshMaterial3d(material.clone()),
                 SkinnedMesh { inverse_bindposes: poses.clone(), joints },
                 NoFrustumCulling,
-                RenderLayers::layer(LAYER),
+                self.layer(),
                 visibility,
-                Twin(original),
             ))
             .id();
+        self.twin(commands, piece, original);
         commands.entity(self.root).add_child(piece);
         self.keep(mesh, material);
+        piece
     }
 
     fn keep(&mut self, mesh: &Handle<Mesh>, material: &Handle<StandardMaterial>) {
@@ -183,9 +227,25 @@ impl Builder {
     /// given the figure's bones as they stand, once, as `body_view::
     /// see_outfit` gives it the body's every frame. `rest` is each rig
     /// bone's own matrix for a point of a mesh. The entities its meshes
-    /// hang on.
-    pub fn outfit(&mut self, commands: &mut Commands, rig: &trp_data::outfit::Rig, rest: &[Affine3A]) -> Vec<Entity> {
+    /// hang on. The corpse's is kept to be posed as the corpse falls
+    /// (`death`).
+    pub fn outfit(&mut self, commands: &mut Commands, item: &str, rig: &trp_data::outfit::Rig, rest: &[Affine3A]) -> Vec<Entity> {
         use trp_data::outfit::Move;
+        if self.made == Made::Corpse {
+            let ours: Vec<Entity> = rig
+                .bones
+                .iter()
+                .map(|bone| {
+                    let name = bone.path.rsplit('/').next().unwrap_or(&bone.path);
+                    let entity = commands.spawn((Name::new(format!("{name}, the corpse's outfit's")), Transform::default(), Visibility::default())).id();
+                    commands.entity(self.root).add_child(entity);
+                    entity
+                })
+                .collect();
+            let theirs = rig.bones.iter().map(|bone| self.at(&bone.path)).collect();
+            self.outfits.push(crate::death::CorpseOutfit { item: item.to_owned(), rig: rig.clone(), theirs, rest: rest.to_vec(), ours: ours.clone() });
+            return ours;
+        }
         let theirs: Vec<Move> = rig
             .bones
             .iter()
@@ -214,17 +274,26 @@ impl Builder {
     pub fn hung(&mut self, commands: &mut Commands, parent: Option<Entity>, transform: Transform, visibility: Visibility, original: Option<Entity>) -> Entity {
         let entity = commands.spawn((transform, visibility)).id();
         if let Some(original) = original {
-            commands.entity(entity).insert(Twin(original));
+            self.twin(commands, entity, original);
         }
         commands.entity(parent.unwrap_or(self.root)).add_child(entity);
         entity
     }
 
     /// A mesh drawn as it lies, on such an object.
-    pub fn rigid(&mut self, commands: &mut Commands, on: Entity, mesh: &Handle<Mesh>, material: &Handle<StandardMaterial>) {
-        let piece = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), Transform::default(), RenderLayers::layer(LAYER))).id();
+    pub fn rigid(&mut self, commands: &mut Commands, on: Entity, mesh: &Handle<Mesh>, material: &Handle<StandardMaterial>) -> Entity {
+        let piece = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), Transform::default(), self.layer())).id();
         commands.entity(on).add_child(piece);
         self.keep(mesh, material);
+        piece
+    }
+
+    /// The corpse as built, for `death`: its skeleton by path, and its
+    /// outfits.
+    pub fn finish_corpse(self, commands: &mut Commands) {
+        let parents = self.paths.iter().map(|path| path.rfind('/').and_then(|at| self.by_path.get(&path[..at]).copied())).collect();
+        info!("the corpse: {} bones, {} pieces, {} outfits", self.bones.len(), self.pieces, self.outfits.len());
+        commands.insert_resource(crate::death::Corpse { root: self.root, paths: self.paths, bones: self.bones, parents, outfits: self.outfits });
     }
 
     /// Its camera and light, and the resource that draws it.
@@ -246,7 +315,15 @@ impl Builder {
                 // As the world's own camera draws but for its picture: the
                 // same kinds of pipelines, built once for both.
                 Camera { is_active: false, order: -4, clear_color: ClearColorConfig::Custom(Color::NONE), ..default() },
-                Projection::Perspective(PerspectiveProjection { fov: 2.0 * (half_height / AHEAD).atan(), near: 0.5, far: AHEAD * 3.0, ..default() }),
+                // Bevy's own clipping plane at the near plane too (it is
+                // 0.1 m unless told).
+                Projection::Perspective(PerspectiveProjection {
+                    fov: 2.0 * (half_height / AHEAD).atan(),
+                    near: 0.5,
+                    near_clip_plane: Vec4::new(0.0, 0.0, -1.0, -0.5),
+                    far: AHEAD * 3.0,
+                    ..default()
+                }),
                 Transform::from_translation(eye).looking_at(PLACE + Vec3::Y * UP, Vec3::Y),
                 layer.clone(),
             ))
@@ -305,7 +382,7 @@ fn draw(
     waiting: Res<crate::PipelinesWaiting>,
     carried: Res<Carried>,
     window: Query<&Window, With<PrimaryWindow>>,
-    mut cameras: Query<&mut Camera>,
+    mut cameras: Query<(&mut Camera, &mut RenderTarget)>,
 ) {
     let Some(mut figure) = figure else { return };
     let figure = &mut *figure;
@@ -317,7 +394,7 @@ fn draw(
     if !figure.on_card && !uploads.take(|name| name == ON_CARD).is_empty() {
         figure.on_card = true;
     }
-    let Ok(mut camera) = cameras.get_mut(figure.camera) else { return };
+    let Ok((mut camera, mut render_target)) = cameras.get_mut(figure.camera) else { return };
     // A picture of the panel's size in the window's own pixels: made again
     // when that changes, and drawn on.
     if let Ok(window) = window.single() {
@@ -334,7 +411,7 @@ fn draw(
             if let Some(old) = image.0.replace(target.clone()) {
                 images.remove(&old);
             }
-            camera.target = RenderTarget::Image(target.into());
+            *render_target = RenderTarget::Image(target.into());
             figure.wanted = true;
         }
     }

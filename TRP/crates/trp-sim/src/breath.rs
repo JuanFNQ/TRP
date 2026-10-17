@@ -25,12 +25,17 @@ pub struct Wind {
     pub stamina: f32,
     pub oxygen: f32,
     pub held: bool,
+    /// A tremor at work and no painkiller (`BreathEffector.TremorOn`), and
+    /// a broken or destroyed arm (`Fracture`): health spec, "What health
+    /// does to the character".
+    pub tremor: bool,
+    pub fracture: bool,
 }
 
 impl Default for Wind {
-    /// Rested, with breath to spare.
+    /// Rested, with breath to spare, and sound.
     fn default() -> Self {
-        Self { stamina: 1.0, oxygen: 1.0, held: false }
+        Self { stamina: 1.0, oxygen: 1.0, held: false, tremor: false, fracture: false }
     }
 }
 
@@ -86,6 +91,9 @@ pub struct Breath {
     y: SmoothRandom,
     hip_x: SmoothRandom,
     hip_z: SmoothRandom,
+    /// The hands' tremor, which takes the wander's place while it shakes
+    /// them or an arm is broken.
+    tremor: [SmoothRandom; 3],
     /// Clock of each breath curve.
     clocks: Vec<f32>,
     /// How much shots from the hip have widened the wander.
@@ -113,6 +121,7 @@ impl Breath {
             y: SmoothRandom::new(data.y),
             hip_x: SmoothRandom::new(data.hip_x),
             hip_z: SmoothRandom::new(data.hip_z),
+            tremor: data.tremor.map(SmoothRandom::new),
             clocks: data.curves.iter().map(|c| c.time_shift).collect(),
             gain: Blender::new(0.0, gain[2]),
             hardness,
@@ -161,7 +170,12 @@ impl Breath {
     /// aiming factor; `head_bobbing` is the player's setting; `wind` is
     /// how tired the character is and whether it holds its breath.
     pub fn step(&mut self, dt: f32, now: f32, intensity: f32, aiming: bool, head_bobbing: f32, wind: Wind) -> BreathStep {
-        let (stamina, oxygen) = (wind.stamina, wind.oxygen);
+        let (mut stamina, oxygen) = (wind.stamina, wind.oxygen);
+        // A broken arm lets the hands count as rested so far and no
+        // further (`StaminaLevel`'s top, `EnergyFractureLimit`).
+        if wind.fracture {
+            stamina = stamina.min(self.data.fracture_limit);
+        }
         let mut out = BreathStep::default();
 
         let widened = self.gain.value(now).sqrt();
@@ -200,8 +214,23 @@ impl Breath {
             out.pushes.push((2, component as u8, value * shake * intensity));
         }
 
-        // The muzzle wanders when the weapon is not at the shoulder.
-        let wander = if aiming {
+        // The muzzle wanders when the weapon is not at the shoulder. A
+        // tremor or a broken arm shakes it instead, aimed or not: the
+        // tremor at half its pace for a broken arm alone, and a broken arm
+        // not aimed throws it up by the breath's roll, the more the more
+        // rested the hands (`BreathEffector.Process`).
+        let wander = if wind.tremor || wind.fracture {
+            let step = if wind.tremor { dt } else { dt / 2.0 };
+            let mut shake = [0.0; 3];
+            for (value, random) in shake.iter_mut().zip(self.tremor.iter_mut()) {
+                *value = random.value(step, &mut self.rng);
+            }
+            if wind.fracture && !aiming {
+                let limit = self.data.fracture_limit;
+                shake[0] += roll.max(0.0) * (1.0 + (100.0 / limit - 1.0) * stamina);
+            }
+            shake.map(|value| value * intensity)
+        } else if aiming {
             [0.0; 3]
         } else {
             let scale = intensity * self.data.hip_penalty;

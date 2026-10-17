@@ -9,16 +9,16 @@ use anyhow::Result;
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
-use bevy::render::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
+use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::render::render_resource::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
-use trp_data::unity::extract::{read_material, read_mesh, read_texture, MeshData, TextureData};
+use trp_data::unity::extract::{read_material, read_mesh, read_texture_shared, MeshData, TextureData};
 use trp_data::unity::texture::{self, format};
 use trp_data::unity::{Assets as UnityAssets, ObjRef};
 
 use crate::convert;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Role {
+pub(crate) enum Role {
     Color,
     Normal,
     Gloss,
@@ -74,8 +74,8 @@ impl Converted {
             let tex = *data.textures.get(slot)?;
             self.images
                 .entry((tex, role))
-                .or_insert_with(|| match read_texture(unity, tex).and_then(|t| build_image(&t, role)) {
-                    Ok(image) => Some(images.add(image)),
+                .or_insert_with(|| match picture_of(unity, tex, role) {
+                    Ok((image, source)) => Some(crate::streaming::add(images, image, source)),
                     Err(e) => {
                         warn!("texture for {slot} of {}: {e:#}", data.name);
                         None
@@ -130,7 +130,7 @@ impl Converted {
                     warn!("the pictures of {}: {e:#}", material.name);
                     Default::default()
                 });
-                let mut add = |picture: Option<trp_data::custom::Picture>, format: TextureFormat| picture.map(|picture| images.add(picture_image(picture, format)));
+                let mut add = |picture: Option<trp_data::custom::Picture>, format: TextureFormat| picture.map(|picture| crate::streaming::add(images, picture_image(picture, format), crate::streaming::Source::Kept));
                 let surface = add(pictures.surface, TextureFormat::Rgba8Unorm);
                 materials.add(StandardMaterial {
                     base_color_texture: add(pictures.colour, TextureFormat::Rgba8UnormSrgb),
@@ -153,7 +153,7 @@ impl Converted {
     /// an approximation as the install's own materials are.
     pub fn outfit_material(&mut self, picture: &trp_data::xray::Picture, images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>) -> Handle<StandardMaterial> {
         let (format, size) = stalker_picture(picture);
-        let colour = images.add(image(&size, format, picture.levels as usize, picture.data.clone()));
+        let colour = crate::streaming::add(images, image(&size, format, picture.levels as usize, picture.data.clone()), crate::streaming::Source::Kept);
         materials.add(StandardMaterial { base_color_texture: Some(colour), perceptual_roughness: CLOTH, metallic: 0.0, ..default() })
     }
 
@@ -178,7 +178,7 @@ fn stalker_picture(picture: &trp_data::xray::Picture) -> (TextureFormat, Texture
         Packing::Bc7 => TextureFormat::Bc7RgbaUnormSrgb,
         Packing::Rgba => TextureFormat::Rgba8UnormSrgb,
     };
-    (format, TextureData { name: String::new(), width: picture.width, height: picture.height, format: 0, mip_count: picture.levels, srgb: true, data: Vec::new() })
+    (format, TextureData { name: String::new(), width: picture.width, height: picture.height, format: 0, mip_count: picture.levels, srgb: true, data: Vec::new(), streaming_mipmaps: false, point: false, clamp: [false; 2] })
 }
 
 /// A material made ready away from the engine's own thread: what a
@@ -206,6 +206,9 @@ pub struct PreparedMaterial {
 pub struct PreparedLooks {
     pub meshes: Vec<Mesh>,
     images: Vec<Image>,
+    /// Where each picture's levels are had again when they are streamed
+    /// (`streaming::Source`).
+    again: Vec<crate::streaming::Source>,
     /// Each picture's mark, where they have been marked (`mark_pictures`).
     marks: Vec<u64>,
     materials: Vec<PreparedMaterial>,
@@ -258,9 +261,10 @@ impl PreparedLooks {
             Some(Ok(data)) => {
                 let mut texture = |slot: &str, role: Role| -> Option<usize> {
                     let tex = *data.textures.get(slot)?;
-                    *self.by_image.entry((tex, role)).or_insert_with(|| match read_texture(unity, tex).and_then(|t| build_image(&t, role)) {
-                        Ok(image) => {
+                    *self.by_image.entry((tex, role)).or_insert_with(|| match picture_of(unity, tex, role) {
+                        Ok((image, source)) => {
                             self.images.push(image);
+                            self.again.push(source);
                             Some(self.images.len() - 1)
                         }
                         Err(e) => {
@@ -294,6 +298,7 @@ impl PreparedLooks {
                 let mut add = |picture: Option<trp_data::custom::Picture>, format: TextureFormat| {
                     picture.map(|picture| {
                         self.images.push(picture_image(picture, format));
+                        self.again.push(crate::streaming::Source::Kept);
                         self.images.len() - 1
                     })
                 };
@@ -310,6 +315,7 @@ impl PreparedLooks {
     pub fn stalker_material(&mut self, picture: &trp_data::xray::Picture) -> usize {
         let (format, size) = stalker_picture(picture);
         self.images.push(image(&size, format, picture.levels as usize, picture.data.clone()));
+        self.again.push(crate::streaming::Source::Kept);
         self.materials.push(PreparedMaterial { base_color: Color::WHITE, base: Some(self.images.len() - 1), normal: None, gloss: None, surface: None, fallback: false, roughness: Some(CLOTH) });
         self.materials.len() - 1
     }
@@ -359,9 +365,12 @@ impl PreparedLooks {
     }
 
     /// Into the engine's stores: the handles of the meshes, of the
-    /// materials and of the pictures, each in its place.
+    /// materials and of the pictures, each in its place; the pictures
+    /// whole, whatever the settings of their levels (`streaming`), as the
+    /// game draws an item for its picture (`ItemIconCreator`:
+    /// `requestedMipmapLevel` 0).
     pub fn add_with_pictures(self, meshes: &mut Assets<Mesh>, images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>) -> (Vec<Handle<Mesh>>, Vec<Handle<StandardMaterial>>, Vec<Handle<Image>>) {
-        let (meshes, materials, pictures, _) = self.add_sharing(meshes, images, materials, None);
+        let (meshes, materials, pictures, _) = self.add_looks(meshes, images, materials, None, false);
         (meshes, materials, pictures)
     }
 
@@ -369,44 +378,33 @@ impl PreparedLooks {
     /// taken from `shared` in place of its own, and those put there for
     /// any that come after; with the marks of all it draws with, to let go
     /// of when it goes (`SharedPictures::release`), and how many of its
-    /// pictures and their bytes were already on the card.
+    /// pictures and their bytes were already on the card. The pictures by
+    /// the settings of their levels (`streaming`).
     pub fn add_sharing(
         self,
         meshes: &mut Assets<Mesh>,
         images: &mut Assets<Image>,
         materials: &mut Assets<StandardMaterial>,
+        shared: Option<&mut SharedPictures>,
+    ) -> (Vec<Handle<Mesh>>, Vec<Handle<StandardMaterial>>, Vec<Handle<Image>>, Shared) {
+        self.add_looks(meshes, images, materials, shared, true)
+    }
+
+    fn add_looks(
+        self,
+        meshes: &mut Assets<Mesh>,
+        images: &mut Assets<Image>,
+        materials: &mut Assets<StandardMaterial>,
         mut shared: Option<&mut SharedPictures>,
+        streamed: bool,
     ) -> (Vec<Handle<Mesh>>, Vec<Handle<StandardMaterial>>, Vec<Handle<Image>>, Shared) {
         // For the renderer's world alone: handed over to it they are moved
         // there, where what the main world keeps as well is copied, on the
         // main thread and all in the frame they come (Bevy's
         // `extract_render_asset`): 36 ms of the frame the StG 44's rig came
         // in. Nothing reads them in the main world after this.
-        let marked = self.marks.len() == self.images.len();
         let mut kept = Shared::default();
-        let pictures: Vec<Handle<Image>> = self
-            .images
-            .into_iter()
-            .enumerate()
-            .map(|(index, mut image)| {
-                let mark = self.marks.get(index).copied().filter(|_| marked);
-                if let (Some(mark), Some(shared)) = (mark, shared.as_deref_mut()) {
-                    kept.marks.push(mark);
-                    if let Some((handle, holders)) = shared.0.get_mut(&mark) {
-                        *holders += 1;
-                        kept.already += 1;
-                        kept.bytes_spared += image.data.as_ref().map_or(0, Vec::len);
-                        return handle.clone();
-                    }
-                    image.asset_usage = RenderAssetUsages::RENDER_WORLD;
-                    let handle = images.add(image);
-                    shared.0.insert(mark, (handle.clone(), 1));
-                    return handle;
-                }
-                image.asset_usage = RenderAssetUsages::RENDER_WORLD;
-                images.add(image)
-            })
-            .collect();
+        let pictures = add_pictures(self.images, self.again, &self.marks, images, shared.as_deref_mut(), &mut kept, streamed);
         let picture = |at: Option<usize>| at.map(|at| pictures[at].clone());
         let made = self
             .materials
@@ -437,6 +435,48 @@ impl PreparedLooks {
             .collect();
         (meshes, made, pictures, kept)
     }
+
+}
+
+/// Pictures into the engine's store, for the renderer's world alone: one
+/// marked as one already there (`PreparedLooks::mark_pictures`) taken from
+/// `shared` in place of its own, and those put there for any that come
+/// after; what was taken noted in `kept`. `streamed`: by the settings of
+/// their levels (`streaming::add`); else whole.
+fn add_pictures(
+    own: Vec<Image>,
+    again: Vec<crate::streaming::Source>,
+    marks: &[u64],
+    images: &mut Assets<Image>,
+    mut shared: Option<&mut SharedPictures>,
+    kept: &mut Shared,
+    streamed: bool,
+) -> Vec<Handle<Image>> {
+    let marked = marks.len() == own.len();
+    let mut add = |image: Image, again: crate::streaming::Source| if streamed { crate::streaming::add(images, image, again) } else { images.add(image) };
+    let again = again.into_iter().chain(std::iter::repeat_with(|| crate::streaming::Source::Kept));
+    own.into_iter()
+        .zip(again)
+        .enumerate()
+        .map(|(index, (mut image, again))| {
+            let mark = marks.get(index).copied().filter(|_| marked);
+            if let (Some(mark), Some(shared)) = (mark, shared.as_deref_mut()) {
+                kept.marks.push(mark);
+                if let Some((handle, holders)) = shared.0.get_mut(&mark) {
+                    *holders += 1;
+                    kept.already += 1;
+                    kept.bytes_spared += image.data.as_ref().map_or(0, Vec::len);
+                    return handle.clone();
+                }
+                image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+                let handle = add(image, again);
+                shared.0.insert(mark, (handle.clone(), 1));
+                return handle;
+            }
+            image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+            add(image, again)
+        })
+        .collect()
 }
 
 /// The pictures of the weapons' rigs on the graphics card, each once, by
@@ -559,7 +599,32 @@ fn build_mesh(data: &MeshData, indices: &[u32]) -> Mesh {
     mesh
 }
 
-fn build_image(tex: &TextureData, role: Role) -> Result<Image> {
+/// A picture of the install's as the engine takes it, and where its levels
+/// are had again when they are streamed (`streaming::Source`): not at all
+/// where the game's engine does not stream it; read again from its bundle's
+/// file, made again as it was made, where they are kept beside its
+/// serialized file; else kept.
+fn picture_of(unity: &UnityAssets, tex: ObjRef, role: Role) -> Result<(Image, crate::streaming::Source)> {
+    use crate::streaming::Source;
+    let (texture, place) = read_texture_shared(unity, tex)?;
+    let image = build_image(&texture, role)?;
+    let source = match place {
+        _ if !texture.streaming_mipmaps => Source::Whole,
+        None => Source::Kept,
+        Some(place) => {
+            let mut header = texture;
+            header.data = Vec::new();
+            Source::Bundle(std::sync::Arc::new(move || {
+                let mut texture = header.clone();
+                texture.data = place.read().ok()?;
+                build_image(&texture, role).ok()
+            }))
+        }
+    };
+    Ok((image, source))
+}
+
+pub(crate) fn build_image(tex: &TextureData, role: Role) -> Result<Image> {
     let mips = texture::mips(tex)?;
     let block_aligned = tex.width % 4 == 0 && tex.height % 4 == 0;
     match role {
@@ -636,7 +701,7 @@ fn picture_image(picture: trp_data::custom::Picture, format: TextureFormat) -> I
         (Some(Blocks::Bc5), _) => TextureFormat::Bc5RgUnorm,
         (None, format) => format,
     };
-    let size = TextureData { name: String::new(), width: picture.width, height: picture.height, format: 0, mip_count: picture.mips, srgb: false, data: Vec::new() };
+    let size = TextureData { name: String::new(), width: picture.width, height: picture.height, format: 0, mip_count: picture.mips, srgb: false, data: Vec::new(), streaming_mipmaps: false, point: false, clamp: [false; 2] };
     image(&size, format, picture.mips as usize, picture.data)
 }
 

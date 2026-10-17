@@ -46,8 +46,8 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
-use bevy::render::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
-use bevy::render::view::{NoFrustumCulling, RenderLayers};
+use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
+use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use trp_data::dress::{Under, Worn};
 use trp_data::unity::anim::path_hash;
 use trp_data::unity::extract::Hierarchy;
@@ -69,10 +69,11 @@ fn a_collarbone(path: &str) -> bool {
     COLLARBONES.iter().any(|collarbone| path.ends_with(collarbone))
 }
 
-/// The render layer the camera draws, and the one for what only casts a
-/// shadow in first person. The light is on both.
+/// The render layer the camera and the sun see. What only casts a shadow
+/// in first person stays on it, drawn by a material that keeps no pixel
+/// (`shadow_only`): Bevy 0.17 on lets a camera's shadow maps take only what
+/// is on that camera's layers.
 pub const SEEN: usize = 0;
-pub const SHADOW_ONLY: usize = 1;
 /// A layer nothing draws and no light shines on: where the body is put
 /// for the character's own eyes with the options' `FIRST-PERSON BODY`
 /// off.
@@ -81,6 +82,7 @@ pub const NOWHERE: usize = 2;
 /// A mesh of the upper body: drawn from outside, a shadow and nothing
 /// more in first person.
 #[derive(Component)]
+#[require(crate::shadow_only::ShadowOnly)]
 pub struct UpperBody;
 
 /// A mesh of the rest of the body: drawn in every view.
@@ -128,6 +130,8 @@ pub struct BodyParts {
     /// one; and the pose the game's screens stand them in, once read.
     pub standing: Vec<String>,
     pub standing_pose: Option<trp_sim::body::Pose>,
+    /// Which of `parts` is the head's, if one is.
+    pub head: Option<usize>,
 }
 
 /// A piece of an outfit that is not the install's (`trp_data::outfit`;
@@ -237,12 +241,15 @@ impl BodyParts {
     pub fn load(unity: &mut UnityAssets, db: &trp_data::Database, keys: &[&str], worn: &[String], custom_hands: bool) -> Self {
         let (mut parts, mut upper, mut items) = (Vec::new(), Vec::new(), Vec::new());
         let (mut of_outfit, mut top) = (Vec::new(), Vec::new());
-        let mut legs = None;
+        let (mut legs, mut head) = (None, None);
         for (index, key) in keys.iter().enumerate().filter(|(_, key)| !key.is_empty() && **key != "none") {
             match trp_data::arms::load(unity, key) {
                 Ok(part) => {
                     if index == 1 {
                         legs = Some(parts.len());
+                    }
+                    if index == 2 {
+                        head = Some(parts.len());
                     }
                     parts.push(part);
                     upper.push(index != 1);
@@ -413,7 +420,7 @@ impl BodyParts {
             }
         }
         standing.sort_by_key(|path| path.matches('/').count());
-        Self { parts, upper, bones, on_head, item: items, armour, vests, outfits, of_outfit, top, their_hands, standing, standing_pose: None }
+        Self { parts, upper, bones, on_head, item: items, armour, vests, outfits, of_outfit, top, their_hands, standing, standing_pose: None, head }
     }
 
     /// What an outfit has to draw in place of the character's own: a
@@ -529,6 +536,40 @@ impl BodyRig {
     pub fn bone(&self, parts: &BodyParts, end: &str) -> Option<Entity> {
         parts.bones.iter().position(|path| path.ends_with(end)).map(|at| self.bones[at])
     }
+
+    /// The entity a bone of the skeleton (by its path) is drawn on, as
+    /// `spawn_body` ties the meshes to it: the ribcage as drawn, a kept
+    /// collarbone, the weapon rig's own bone for an arm's (the nearest
+    /// above it that the rig in hand has), or the body's own.
+    pub fn drawn(&self, parts: &BodyParts, weapon: &WeaponRig, path: &str) -> Option<Entity> {
+        if path.ends_with(RIBCAGE) {
+            return Some(self.ribcage_drawn);
+        }
+        if a_collarbone(path) {
+            let index = parts.bones.iter().filter(|known| a_collarbone(known)).position(|known| known == path)?;
+            return self.collarbones.get(index).map(|(_, kept)| *kept);
+        }
+        if of_an_arm(path) {
+            let mut on_rig = &path[path.find(RIBCAGE).map_or(0, |at| at + RIBCAGE.len() + 1)..];
+            loop {
+                if let Some(entity) = weapon.by_hash.get(&path_hash(on_rig)) {
+                    return Some(*entity);
+                }
+                on_rig = &on_rig[..on_rig.rfind('/')?];
+            }
+        }
+        parts.bones.iter().position(|known| known == path).map(|at| self.bones[at])
+    }
+
+    /// What the drawn body hangs from.
+    pub fn root(&self) -> Entity {
+        self.root
+    }
+
+    /// The ribcage as the body's animation has it, and as it is drawn.
+    pub fn ribcages(&self) -> (Option<Entity>, Entity) {
+        (self.ribcage_animated, self.ribcage_drawn)
+    }
 }
 
 /// Where the kept collarbones go this frame, in the rig root's frame, and
@@ -601,6 +642,9 @@ pub fn spawn_body(
     // The character model on the gear page, where the options have it: the
     // same meshes on a skeleton of its own, standing (`figure_view`).
     let mut figure = parts.standing_pose.as_ref().map(|pose| crate::figure_view::Builder::new(&mut commands, &parts.standing, pose));
+    // And the corpse the character becomes, likewise, hidden until then
+    // (`death`).
+    let mut corpse = crate::figure_view::Builder::corpse(&mut commands, &parts.standing);
 
     // The entity a mesh's bone is tied to.
     let joint = |path: &str| -> Entity {
@@ -628,7 +672,7 @@ pub fn spawn_body(
     };
 
     let mut drawn = 0;
-    for (((part, upper), item), (of_outfit, top)) in parts.parts.iter().zip(&parts.upper).zip(&parts.item).zip(parts.of_outfit.iter().zip(&parts.top)) {
+    for (index, (((part, upper), item), (of_outfit, top))) in parts.parts.iter().zip(&parts.upper).zip(&parts.item).zip(parts.of_outfit.iter().zip(&parts.top)).enumerate() {
         let entry = match converted.mesh(unity, part.mesh, &mut meshes) {
             Ok(entry) => entry,
             Err(e) => {
@@ -665,6 +709,10 @@ pub fn spawn_body(
             commands.entity(root).add_child(piece);
             if let Some(figure) = figure.as_mut() {
                 figure.skinned(&mut commands, piece, (mesh, &material), &inverse_bindposes, &part.bone_paths, item.is_none() && of_outfit.is_some());
+            }
+            let corpse_piece = corpse.skinned(&mut commands, piece, (mesh, &material), &inverse_bindposes, &part.bone_paths, item.is_none() && of_outfit.is_some());
+            if parts.head == Some(index) {
+                commands.entity(corpse_piece).insert(crate::death::CorpseHead);
             }
             drawn += 1;
         }
@@ -719,10 +767,9 @@ pub fn spawn_body(
     for (item, outfit) in &parts.outfits {
         let ours = if outfit.has_body() { skeleton_of(&mut commands, item, &outfit.rig) } else { Vec::new() };
         // The model's own skeleton for it, stood once.
-        let model_ours = figure.as_mut().filter(|_| outfit.has_body()).map(|figure| {
-            let rest: Vec<bevy::math::Affine3A> = outfit.rig.bones.iter().map(|bone| bevy::math::Affine3A::from_mat4(convert::matrix(bone.bind))).collect();
-            figure.outfit(&mut commands, &outfit.rig.in_space(|p| convert::position(p).to_array()), &rest)
-        });
+        let rest: Vec<bevy::math::Affine3A> = outfit.rig.bones.iter().map(|bone| bevy::math::Affine3A::from_mat4(convert::matrix(bone.bind))).collect();
+        let model_ours = figure.as_mut().filter(|_| outfit.has_body()).map(|figure| figure.outfit(&mut commands, item, &outfit.rig.in_space(|p| convert::position(p).to_array()), &rest));
+        let corpse_ours = outfit.has_body().then(|| corpse.outfit(&mut commands, item, &outfit.rig.in_space(|p| convert::position(p).to_array()), &rest));
         for piece in outfit.pieces.iter().filter(|_| outfit.has_body()) {
             // A mesh whose picture was not found is not drawn at all: it
             // would have no colour of its own.
@@ -746,6 +793,9 @@ pub fn spawn_body(
                     .id();
                 if let (Some(figure), Some(model_ours)) = (figure.as_mut(), model_ours.as_ref()) {
                     figure.skinned_on(&mut commands, entity, (&mesh, &material), &inverse_bindposes, model_ours.clone(), true);
+                }
+                if let Some(corpse_ours) = corpse_ours.as_ref() {
+                    corpse.skinned_on(&mut commands, entity, (&mesh, &material), &inverse_bindposes, corpse_ours.clone(), true);
                 }
                 if zone != trp_data::outfit::LEGS {
                     commands.entity(entity).insert((UpperBody, RenderLayers::layer(SEEN)));
@@ -774,7 +824,7 @@ pub fn spawn_body(
                         MeshMaterial3d(material.clone()),
                         SkinnedMesh { inverse_bindposes: inverse_bindposes.clone(), joints: ours.clone() },
                         NoFrustumCulling,
-                        bevy::pbr::NotShadowCaster,
+                        bevy::light::NotShadowCaster,
                         Visibility::Hidden,
                         OutfitArms { item: item.clone() },
                     ))
@@ -807,7 +857,7 @@ pub fn spawn_body(
                     MeshMaterial3d(material),
                     SkinnedMesh { inverse_bindposes: inverse_bindposes.clone(), joints: joints.clone() },
                     NoFrustumCulling,
-                    bevy::pbr::NotShadowCaster,
+                    bevy::light::NotShadowCaster,
                     Visibility::Hidden,
                     OutfitArms { item: item.clone() },
                 ))
@@ -821,9 +871,11 @@ pub fn spawn_body(
     // bone with no offset and the one fixed turn the game gives it.
     let head = parts.bones.iter().position(|path| path.ends_with(HEAD)).map(|at| bones[at]);
     let model_head = figure.as_ref().and_then(|figure| figure.bone(HEAD));
+    let corpse_head = corpse.bone(HEAD);
     for (item, model) in parts.on_head.iter().filter(|_| head.is_some()) {
         let mut entities: Vec<Entity> = Vec::with_capacity(model.nodes.len());
         let mut model_entities: Vec<Entity> = Vec::with_capacity(model.nodes.len());
+        let mut corpse_entities: Vec<Entity> = Vec::with_capacity(model.nodes.len());
         for (index, node) in model.nodes.iter().enumerate() {
             let transform = match index {
                 0 => convert::transform([0.0; 3], [0.5, -0.5, -0.5, -0.5], [1.0; 3]),
@@ -841,6 +893,8 @@ pub fn spawn_body(
                 let on = node.parent.map(|p| model_entities[p]).or(model_head);
                 model_entities.push(figure.hung(&mut commands, on, transform, visibility, (index == 0).then_some(entity)));
             }
+            let on = node.parent.map(|p| corpse_entities[p]).or(corpse_head);
+            corpse_entities.push(corpse.hung(&mut commands, on, transform, visibility, (index == 0).then_some(entity)));
             let Some(renderer) = &node.renderer else { continue };
             let entry = match converted.mesh(unity, renderer.mesh, &mut meshes) {
                 Ok(entry) => entry,
@@ -862,6 +916,10 @@ pub fn spawn_body(
                 if let (Some(figure), Some(on)) = (figure.as_mut(), model_entities.last()) {
                     figure.rigid(&mut commands, *on, mesh, &material);
                 }
+                if let Some(on) = corpse_entities.last() {
+                    let corpse_piece = corpse.rigid(&mut commands, *on, mesh, &material);
+                    commands.entity(corpse_piece).insert(crate::death::CorpseHead);
+                }
                 drawn += 1;
             }
         }
@@ -870,6 +928,7 @@ pub fn spawn_body(
     if let Some(figure) = figure {
         figure.finish(&mut commands);
     }
+    corpse.finish_corpse(&mut commands);
     let ribcage_animated = parts.bones.iter().position(|path| path.ends_with(RIBCAGE)).map(|at| bones[at]);
     commands.insert_resource(BodyRig { root, bones, collarbones, ribcage: rig.root, ribcage_animated, ribcage_drawn });
 }
@@ -985,7 +1044,7 @@ pub fn show_upper_body(
     rig: Option<Res<BodyRig>>,
     outfit: Res<OutfitOn>,
     features: Res<crate::options_view::Features>,
-    mut pieces: Query<(&mut RenderLayers, Has<UpperBody>), Or<(With<UpperBody>, With<LowerBody>)>>,
+    mut pieces: Query<(&mut RenderLayers, Option<&mut crate::shadow_only::ShadowOnly>), Or<(With<UpperBody>, With<LowerBody>)>>,
     mut hands: Query<&mut Visibility, With<FirstPersonHands>>,
     mut outfit_arms: Query<(&OutfitArms, &mut Visibility), Without<FirstPersonHands>>,
 ) {
@@ -1004,15 +1063,19 @@ pub fn show_upper_body(
             *visibility = shown;
         }
     }
-    let upper_layer = if *view == View::FirstPerson || always { SHADOW_ONLY } else { SEEN };
+    // The upper body a shadow alone for these eyes; all of it nowhere with
+    // the switch off.
+    let shadow_only = *view == View::FirstPerson || always;
     for (mut layers, upper) in &mut pieces {
-        let layer = match (unseen, upper) {
-            (true, _) => NOWHERE,
-            (false, true) => upper_layer,
-            (false, false) => SEEN,
-        };
+        let layer = if unseen { NOWHERE } else { SEEN };
         if *layers != RenderLayers::layer(layer) {
             *layers = RenderLayers::layer(layer);
+        }
+        if let Some(mut upper) = upper {
+            let wish = crate::shadow_only::ShadowOnly(shadow_only && !unseen);
+            if *upper != wish {
+                *upper = wish;
+            }
         }
     }
     // The install's own arms: there unless the outfit that is on has arms
@@ -1021,7 +1084,7 @@ pub fn show_upper_body(
     // through the other, to see where the outfit's skin lies inside the
     // install's and where outside it.)
     let both = std::env::var("EFT_OUTFIT_ARMS").is_ok_and(|value| value == "both");
-    let no_upper_body = pieces.iter().all(|(_, upper)| !upper);
+    let no_upper_body = pieces.iter().all(|(_, upper)| upper.is_none());
     let shown = if !unseen && (!outfit.arms || both) && (*view == View::FirstPerson || rig.is_none() || no_upper_body) {
         Visibility::Inherited
     } else {
@@ -1034,16 +1097,22 @@ pub fn show_upper_body(
     }
 }
 
-/// Puts the skeleton where the body's animation has it.
-pub fn pose_body(controller: Res<Controller>, rig: Option<Res<BodyRig>>, mut transforms: Query<&mut Transform>) {
+/// Puts the skeleton where the body's animation has it, drawn down onto
+/// the ground with the options' `GROUNDED FEET` (`feet_down`).
+pub fn pose_body(controller: Res<Controller>, rig: Option<Res<BodyRig>>, down: Res<crate::feet_down::FeetDown>, mut transforms: Query<&mut Transform>) {
     let Some(rig) = rig else { return };
     let Some(pose) = controller.body_shown() else { return };
     if let Ok(mut root) = transforms.get_mut(rig.root) {
-        *root = Transform { translation: pose.at, rotation: pose.turn, scale: Vec3::ONE };
+        *root = Transform { translation: pose.at - Vec3::Y * down.by, rotation: pose.turn, scale: Vec3::ONE };
     }
     for (entity, (position, rotation)) in rig.bones.iter().zip(&pose.bones) {
         if let Ok(mut transform) = transforms.get_mut(*entity) {
             *transform = convert::transform(*position, *rotation, [1.0; 3]);
+        }
+    }
+    if let Some((bone, kept)) = down.spine {
+        if let Some(mut transform) = rig.bones.get(bone).and_then(|entity| transforms.get_mut(*entity).ok()) {
+            *transform = kept;
         }
     }
 }

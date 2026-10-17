@@ -3,8 +3,8 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-# One number for the three crates, raised with every change: docs\manual.md, "Versions".
-version = "0.9.1"
+# One number for all the crates, raised with every change: docs\manual.md, "Versions".
+version = "0.42.0"
 edition = "2021"
 publish = false
 
@@ -16,6 +16,12 @@ lz4_flex = "0.11"
 lzma-rs = "0.3"
 miniz_oxide = "0.8"
 png = "0.18"
+# Fonts' own tables, for how wide a screen's words are (already among Bevy's).
+ttf-parser = "0.25"
+# The CRC32 FMOD names a Vorbis setup header by (already among the build's, through png).
+crc32fast = "1.5"
+# Vorbis's packets decoded (pure Rust; the clips kept so are FMOD's, rebuilt from the install).
+lewton = { version = "0.10", default-features = false }
 
 # Parsing multi-megabyte bundles in an unoptimised build is too slow to iterate on.
 [profile.dev]
@@ -23,6 +29,14 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+# No debug information for the crates we depend on (Bevy, PhysX and the rest): it was most of the
+# build folder and of every program's .pdb, and slowed linking. Our own crates keep theirs, so a
+# panic in them still names its file and line.
+debug = false
+# Nor their checks of themselves that only a debug build makes: the engine's builds for others
+# leave them out (wgpu 26.0.1's check of its indirect draws on DirectX 12, which measures what
+# it wrote by what it read, stopped the app).
+debug-assertions = false
 
 [profile.dev.package.trp-data]
 opt-level = 3

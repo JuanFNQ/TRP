@@ -358,7 +358,7 @@ mod tests {
     }
 
     fn texture(fmt: i32, width: u32, height: u32, mip_count: u32, data: Vec<u8>) -> TextureData {
-        TextureData { name: String::new(), width, height, format: fmt, mip_count, srgb: false, data }
+        TextureData { name: String::new(), width, height, format: fmt, mip_count, srgb: false, data, streaming_mipmaps: false, point: false, clamp: [false; 2] }
     }
 
     #[test]

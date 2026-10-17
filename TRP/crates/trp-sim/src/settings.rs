@@ -12,6 +12,7 @@ use crate::math::{inverse_lerp, lerp};
 use crate::stamina::StaminaSettings;
 use crate::vaulting::VaultingSettings;
 
+#[derive(Clone)]
 pub struct MovementSettings {
     /// Shared, not copied, by the settings for another weight
     /// (`reweighed`): its copy had cost some 9 ms every time what was
@@ -27,6 +28,9 @@ pub struct MovementSettings {
 
     /// Upper end of the speed wheel.
     pub max_speed: f32,
+
+    /// The figures of the sounds of moving (`docs/spec/footsteps.md`).
+    pub steps: crate::steps::StepSettings,
     pub sprinting_speed: f32,
     /// Both of those for an untrained character and at the top of the
     /// Strength skill, and the share of the top walking speed that carried
@@ -215,6 +219,7 @@ impl MovementSettings {
         let after_jump = at(range(inertia_cfg, "SpeedInertiaAfterJump")?, inertia);
 
         Ok(Self {
+            steps: crate::steps::StepSettings::new(config, hard)?,
             move_state: table.state_named("MOVE").context("table has no MOVE state")?,
             sprint_state: table.state_named("Sprint").context("table has no Sprint state")?,
             table,
@@ -321,6 +326,7 @@ impl MovementSettings {
         let mut fresh = Self::new(self.table.clone(), hard, config, weight, self.gravity)?;
         fresh.set_strength(self.strength);
         fresh.prone_key_refused_in_reload = self.prone_key_refused_in_reload;
+        fresh.steps = self.steps.clone();
         Ok(fresh)
     }
 

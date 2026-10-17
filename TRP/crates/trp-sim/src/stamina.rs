@@ -121,6 +121,16 @@ pub struct StaminaSettings {
     pub hydration: f32,
     pub energy_graph: Graph,
     pub hydration_graph: Graph,
+    /// The common health's share of its most, as the oxygen's capacity has
+    /// it: worked in only when energy changes (`Stamina::set_health`).
+    pub health: f32,
+    /// What aiming's cost is multiplied by for damaged arms (1, 1.5 or 2:
+    /// `Conditions::aim_cost`).
+    pub arms_aim: f32,
+    /// How long spent legs go before health is given a fatigue
+    /// (`FatigueAmountToCreateEffect`), and how fast the tally falls
+    /// otherwise (`FatigueRestorationRate`).
+    pub fatigue: [f32; 2],
 }
 
 impl StaminaSettings {
@@ -180,6 +190,9 @@ impl StaminaSettings {
             hydration: 1.0,
             energy_graph: Graph::from(config, "StaminaRestoration")?,
             hydration_graph: Graph::from(config, "StaminaDrain")?,
+            health: 1.0,
+            arms_aim: 1.0,
+            fatigue: [number("FatigueAmountToCreateEffect")?, number("FatigueRestorationRate")?],
         })
     }
 
@@ -255,8 +268,7 @@ impl StaminaSettings {
     }
 
     pub fn oxygen_capacity(&self) -> f32 {
-        // Health is taken as whole.
-        self.oxygen_capacity * (0.5 + 0.5 * self.energy.clamp(0.0, 1.0) * (2.0 * self.endurance_breath + 1.0))
+        self.oxygen_capacity * (0.5 + 0.5 * self.energy.clamp(0.0, 1.0) * (2.0 * self.endurance_breath + self.health))
     }
 }
 
@@ -294,11 +306,21 @@ pub struct Pool {
     /// The engine's clock has to pass this before the pool refills.
     no_refill_until: f32,
     drains: Vec<Drain>,
+    /// How many times the game's pool would have said it changed
+    /// (`Stamina.OnChanged`: a drain started or stopped, a cost taken off
+    /// at once), which raises the game's stance panel.
+    changes: u32,
 }
 
 impl Pool {
     fn new(capacity: f32) -> Self {
-        Self { current: capacity, capacity, no_refill_until: 0.0, drains: Vec::new() }
+        Self { current: capacity, capacity, no_refill_until: 0.0, drains: Vec::new(), changes: 0 }
+    }
+
+    /// The count of its changes so far (`changes`): one that differs from
+    /// the last seen means it changed since.
+    pub fn changes(&self) -> u32 {
+        self.changes
     }
 
     /// Holds the refill off until the engine's clock passes `time`: for a
@@ -324,16 +346,21 @@ impl Pool {
     fn run(&mut self, drain: Drain) {
         if !self.runs(drain) {
             self.drains.push(drain);
+            self.changes = self.changes.wrapping_add(1);
         }
     }
 
     fn stop(&mut self, drain: Drain) {
-        self.drains.retain(|d| *d != drain);
+        if self.runs(drain) {
+            self.drains.retain(|d| *d != drain);
+            self.changes = self.changes.wrapping_add(1);
+        }
     }
 
     /// Takes a cost off at once. Gives back what the pool could not pay,
     /// and whether this emptied it.
     fn charge(&mut self, cost: f32, downtime: Option<f32>, now: f32) -> (f32, bool) {
+        self.changes = self.changes.wrapping_add(1);
         let unpaid = (cost - self.current).max(0.0);
         self.current = (self.current - cost).max(0.0);
         if cost <= 0.0 {
@@ -405,6 +432,14 @@ pub struct Stamina {
     /// `holds_back` off (exhaustion) a spent pool holds nothing back.
     pub drains: bool,
     pub holds_back: bool,
+    /// Whether the character's health lets a sprint be paid for (`Physical`'s
+    /// sprint drain: no medicine at work, no damaged leg without a
+    /// painkiller). Health's; true unless a host's health system says.
+    pub health_lets_sprint: bool,
+    /// The tally of spent legs, and how many fatigues it has given that
+    /// health has not taken (`PhysicalBase`'s `Fatigue`).
+    fatigue: f32,
+    fatigues: u32,
 }
 
 impl Stamina {
@@ -424,6 +459,9 @@ impl Stamina {
             aim_taken: (false, 0.0),
             drains: true,
             holds_back: true,
+            health_lets_sprint: true,
+            fatigue: 0.0,
+            fatigues: 0,
         };
         // A fully overweight character pays for standing about.
         if stamina.settings.overweight >= 1.0 {
@@ -444,6 +482,39 @@ impl Stamina {
         }
         // A skill's new level has the cost of aiming worked out again.
         self.aim_cost = None;
+    }
+
+    /// Energy, hydration and health as health has them, each a share of its
+    /// most (`OnEnergyChanged`, `OnHydrationChanged`). The refills and the
+    /// sprint's and the jump's costs go by them at once; aiming's kept cost
+    /// does not take a change of hydration (stamina spec, "Figures the
+    /// game keeps"); the oxygen's capacity is worked out again only when
+    /// energy changes, with the health of that moment, and its pool keeps
+    /// what it holds up to that.
+    pub fn set_health(&mut self, energy: f32, hydration: f32, health: f32) {
+        self.settings.hydration = hydration;
+        if energy != self.settings.energy {
+            self.settings.energy = energy;
+            self.settings.health = health;
+            self.oxygen.capacity = self.settings.oxygen_capacity();
+            self.oxygen.current = self.oxygen.current.min(self.oxygen.capacity);
+        }
+    }
+
+    /// Damaged arms make aiming dearer (`Physical`'s aim drain, marked stale
+    /// when an arm's condition changes).
+    pub fn set_aim_factor(&mut self, factor: f32) {
+        if factor != self.settings.arms_aim {
+            self.settings.arms_aim = factor;
+            self.aim_cost = None;
+        }
+    }
+
+    /// How many fatigues spent legs have given since this was last asked
+    /// (`PhysicalBase`: 15 s with the legs under the threshold gives the
+    /// health system one, `AddFatigue`).
+    pub fn take_fatigues(&mut self) -> u32 {
+        std::mem::take(&mut self.fatigues)
     }
 
     /// The carried weight has changed: how overweight the character is,
@@ -563,7 +634,7 @@ impl Stamina {
             },
             // The figure kept, or a fresh one where none is.
             Drain::Aim => self.aim_cost.unwrap_or_else(|| {
-                self.aim_mass.max(0.0).sqrt() * s.aim_drain * s.aim_by_pose[self.pose] * (1.0 - s.strength_aim) * s.drain_factor()
+                self.aim_mass.max(0.0).sqrt() * s.aim_drain * s.arms_aim * s.aim_by_pose[self.pose] * (1.0 - s.strength_aim) * s.drain_factor()
             }),
             Drain::OverweightIdle => s.restoration * s.refill_factor(self.pose) + s.overweight_by_pose[self.pose],
             Drain::Crawl => s.prone_cost,
@@ -581,7 +652,7 @@ impl Stamina {
         if on == self.sprinting() {
             return on;
         }
-        let start = on && (!self.holds_back || self.legs.current > EXHAUSTED) && !prone && self.settings.overweight < 1.0;
+        let start = on && (!self.holds_back || self.legs.current > EXHAUSTED) && !prone && self.settings.overweight < 1.0 && self.health_lets_sprint;
         if start {
             self.legs.run(Drain::Sprint);
             self.oxygen.run(Drain::Sprint);
@@ -779,6 +850,19 @@ impl Stamina {
             // Out of oxygen, the breath is let go.
             self.oxygen.stop(Drain::HoldBreath);
         }
+        // The tally of spent legs: under the threshold it runs up, and past
+        // its figure health is given a fatigue and it starts again;
+        // otherwise it falls.
+        let [enough, falls] = self.settings.fatigue;
+        if self.legs.exhausted() {
+            self.fatigue += dt;
+            if self.fatigue > enough {
+                self.fatigues += 1;
+                self.fatigue = 0.0;
+            }
+        } else if self.fatigue > 0.0 {
+            self.fatigue -= falls * dt;
+        }
     }
 }
 
@@ -829,6 +913,9 @@ mod tests {
             hydration: 1.0,
             energy_graph: flat,
             hydration_graph: flat,
+            health: 1.0,
+            arms_aim: 1.0,
+            fatigue: [15.0, 0.42],
         }
     }
 

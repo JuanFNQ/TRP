@@ -41,6 +41,13 @@ pub struct Weapon {
     /// For a weapon of one's own (`crate::custom`): the model's parts on
     /// the donor's rig and the edits to the donor's animation.
     pub custom: Option<std::sync::Arc<crate::custom::Build>>,
+    /// Whether a part of the build silences it (`SilencerComponent`: a
+    /// `Silencer`, or a barrel whose template `IsSilencer`): its shots
+    /// sound from the silenced banks (`WeaponSoundPlayer.IsSilenced`).
+    pub silenced: bool,
+    /// Its kind of sound (`crate::sound::sound_weapon_kind`), for an item's
+    /// weapon; none for a rig that is no item.
+    pub sound_kind: Option<&'static str>,
 }
 
 /// A build with its stock folded (`FoldableComponent`, `Weapon.RecoilDelta`,
@@ -62,13 +69,16 @@ pub struct Fold {
 /// bundle there (`EmptyHandsTemplate`).
 pub const EMPTY_HANDS: &str = "assets/content/weapons/empty hands/weapon_empty_hands_container.bundle";
 
-/// A bundle's `WeaponPrefab` and the tree of the object it names.
+/// A bundle's `WeaponPrefab` and the tree of the object it names: a
+/// weapon's, the empty hands', or an item's hands for using it (medicine,
+/// food: `UsableHandsPrefab`, a `WeaponPrefab` with the bone the item hangs
+/// from besides).
 fn open_prefab(assets: &mut Assets, key: &str) -> Result<(ObjRef, Value, Hierarchy)> {
     let files = assets.load(key)?;
     let (prefab_obj, prefab) = files
         .iter()
         .flat_map(|&f| assets.objects_of(f, class::MONO_BEHAVIOUR))
-        .find(|&obj| script_class(assets, obj).as_deref() == Some("WeaponPrefab"))
+        .find(|&obj| matches!(script_class(assets, obj).as_deref(), Some("WeaponPrefab" | "UsableHandsPrefab")))
         .map(|obj| assets.read(obj).map(|v| (obj, v)))
         .ok_or_else(|| anyhow!("{key} has no WeaponPrefab"))??;
     let weapon_object = prefab
@@ -102,6 +112,8 @@ pub fn assemble_prefab(assets: &mut Assets, key: &str) -> Result<Weapon> {
         held_closer: false,
         fold: None,
         custom: None,
+        silenced: false,
+        sound_kind: None,
     })
 }
 
@@ -275,6 +287,7 @@ pub fn assemble(assets: &mut Assets, db: &Database, weapon_template: &str) -> Re
     // always counts as reaching the shoulder.
     let own_fold_reaches = fold.is_some() && folds(&base.props) && text(&base.props, "FoldedSlot").is_empty();
     let held_closer = compact && !own_fold_reaches && !part_items.iter().any(|part| shoulder(&part.id));
+    let silenced = parts().any(|t| db.is_a(t, "Silencer") || flag(&t.props, "IsSilencer"));
     Ok(Weapon {
         template: weapon_template.to_owned(),
         name: base.name.clone(),
@@ -290,6 +303,8 @@ pub fn assemble(assets: &mut Assets, db: &Database, weapon_template: &str) -> Re
         held_closer,
         fold,
         custom,
+        silenced,
+        sound_kind: Some(crate::sound::sound_weapon_kind(db, base)),
     })
 }
 

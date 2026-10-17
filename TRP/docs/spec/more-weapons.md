@@ -108,7 +108,9 @@ Read from `ReloadSingleBarrelOperation`, `ReloadSingleBarrelResult.Run`, the idl
 
 ## Compared with the running game
 
-**With nothing.** No recording has any of the five. The regression is unchanged (`after45` is `after44` in every figure): no other weapon's logic moved.
+**Course 3 of recorder 0.8.0, by hand** (2026-10-16; `local\traces\courses1\3-*`, set beside the logic with `byhand`, which hands it the recorded operations, the keys as the game's input manager hears them and the player's clock): **the SKS** (filled through its open bolt, fired, filled again, fired out, dry, filled from empty) and **the Rhino 50DS** in both takes (cocked shots, the switch to double action, its shots, the cylinder filled, dry shots) **on the game's states and times on every frame** (4,584, 4,746 and 1,143 frames), each state's time within a ten-thousandth of a cycle; **the MP-43e-1C** the same up to a switch to the other weapon at 32.5 s (`byhand` follows one weapon). What the comparison put right: a cocked revolver's shot plays its fire state from 0.2, as every single shot (`FireOperation.StartFireAnimation`), where it had gone in by the animator's own transition; and the operations on the player's clock (`firing.md`, "A single shot"). Not compared: the M32A1 (no recording).
+
+Before that (2026-10-13), with nothing: the regression was unchanged (`after45` is `after44` in every figure): no other weapon's logic moved.
 
 `PROVISIONAL`: what the animator is told of a cylinder's or the barrels' rounds while idle (`AmmoInChamber` is set to the rounds in all the chambers).
 

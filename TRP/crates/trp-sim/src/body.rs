@@ -371,7 +371,7 @@ impl BodyData {
         let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
         let bones = trp_data::body::bones(assets, &paths)?
             .into_iter()
-            .map(|b| BoneRest { path: b.path, position: b.position, rotation: b.rotation })
+            .map(|b| BoneRest { path: b.path, position: b.position, rotation: b.rotation, scale: None })
             .collect();
         let backpack_drop = table.states.iter().find(|state| state.full_name == BACKPACK_DROP).and_then(|state| state.event_time(BACKPACK_DROP_MARK));
         let mut controller = Controller::load(assets, &table, bones, &wanted)?;
@@ -489,7 +489,7 @@ fn standing(assets: &mut Assets, table: &trp_data::states::StateTable, paths: &[
     let named: Vec<&str> = paths.iter().map(String::as_str).collect();
     let bones = trp_data::body::bones(assets, &named)?
         .into_iter()
-        .map(|b| BoneRest { path: b.path, position: b.position, rotation: b.rotation })
+        .map(|b| BoneRest { path: b.path, position: b.position, rotation: b.rotation, scale: None })
         .collect();
     let firsts: Vec<&str> = table.layers.iter().filter_map(|layer| layer.default_state.as_deref()).collect();
     let prefix = format!("{STANDING_LAYER}.");
@@ -581,6 +581,7 @@ pub struct BodyInput {
 const INTERACTIONS_LAYER: &str = "InteractionsLayer";
 const INTERACTIONS_REST: &str = "InteractionsLayer.Idle";
 
+#[derive(Clone)]
 pub struct Body {
     /// The interactions' layer and its machine, where the controller has
     /// them, and the gestures whose states the last update left, by
@@ -593,6 +594,9 @@ pub struct Body {
     backpack_drop: Option<f32>,
     backpack_passed: bool,
     backpack_dropped: bool,
+    /// The crawl's sound marks the clips have passed and not yet told
+    /// (`PlaySoundBank("Prone")`, `docs/spec/footsteps.md`).
+    crawl_marks: usize,
     animator: Animator,
     ids: Ids,
     faded_layer: usize,
@@ -634,6 +638,14 @@ impl Body {
         std::mem::take(&mut self.backpack_dropped)
     }
 
+    /// How many of the crawl's sound marks the body's clips have passed
+    /// since this was last asked: their events calling `PlaySoundBank`
+    /// with `Prone`, which the player's `GenericEventTranslator` hands on
+    /// (`docs/spec/footsteps.md`).
+    pub fn take_crawl_marks(&mut self) -> usize {
+        std::mem::take(&mut self.crawl_marks)
+    }
+
     /// Puts the interactions' layer back to rest outright, whatever it
     /// was playing (the game's `ResetInteraction`).
     pub fn reset_interactions(&mut self) {
@@ -666,6 +678,7 @@ impl Body {
             backpack_drop: data.backpack_drop,
             backpack_passed: false,
             backpack_dropped: false,
+            crawl_marks: 0,
             animator,
             ids: data.ids,
             faded_layer: data.faded_layer,
@@ -876,6 +889,7 @@ impl Body {
         a.set_layer_weight(self.faded_layer, 1.0 - fade);
 
         let events = self.animator.update(dt);
+        self.crawl_marks += self.animator.passed_events().filter(|event| event.function == "PlaySoundBank" && event.data == "Prone").count();
         // A gesture is over when its state has been left: the state's own
         // script says so in the game. The state's name begins with the
         // number its way in asks for.
@@ -1042,6 +1056,37 @@ impl Body {
             curve(self.ids.aiming_layer)
         ));
         lines
+    }
+
+    /// Starts each layer but the base one where a recording has the
+    /// game's (recorder 0.3.0 on, `layers`: four numbers a layer, the hash
+    /// of its state's own name, how far through it, its weight, and the
+    /// state it is blending into or -1): for a run that takes up where the
+    /// recording's began. A layer is taken up only if it was in no
+    /// transition on the first frame and the state is one of its own; it
+    /// is put a frame back by what it played over the next frame, so that
+    /// the first update lands it on the recorded figure. A layer that
+    /// shares another's machine is left to that one. Returns how many
+    /// were taken up.
+    pub fn start_layers_as(&mut self, first: &[f32], second: Option<&[f32]>) -> usize {
+        let layers = (first.len() / 4).min(self.animator.layer_count());
+        let mut taken = 0;
+        for layer in 1..layers {
+            if !self.animator.owns_machine(layer) {
+                continue;
+            }
+            let [hash, time, _, next] = [0, 1, 2, 3].map(|k| first[layer * 4 + k]);
+            if next >= 0.0 {
+                continue;
+            }
+            let Some(state) = self.animator.state_by_short_hash(layer, hash as u32) else { continue };
+            let played = second
+                .filter(|later| later.len() >= layer * 4 + 4 && later[layer * 4] == hash && later[layer * 4 + 3] < 0.0)
+                .map_or(0.0, |later| later[layer * 4 + 1] - time);
+            self.animator.start_in(layer, state, time - played);
+            taken += 1;
+        }
+        taken
     }
 
     /// Puts the base layer's current state at a point in its play, in

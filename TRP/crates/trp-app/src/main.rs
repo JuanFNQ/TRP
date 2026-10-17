@@ -5,18 +5,35 @@
 
 mod animation;
 mod arms;
+mod battle_view;
+mod step_sound;
+mod ui_sound;
 mod body_view;
 mod controller;
 mod convert;
 mod cursor;
+mod death;
 mod figure_view;
 mod grid;
+mod feet_down;
 mod hands_view;
+mod hands_sound;
+mod shot_sound;
+
+mod health_view;
 mod hud;
 mod icons;
 mod setup;
 mod inventory_view;
+mod item_menu_view;
 mod keys;
+mod loose;
+mod backend;
+mod gamma_ui;
+mod screen_blur;
+mod shadow_only;
+mod shadows;
+mod streaming;
 mod options_view;
 mod range;
 mod render_data;
@@ -41,6 +58,11 @@ use weapon::WeaponRig;
 
 /// Kalashnikov AKM 7.62x39.
 const DEFAULT_WEAPON: &str = "59d6088586f774275f37482f";
+/// The equipment slots whose things are the character's own, which every run
+/// begins with (the pockets and the dogtag).
+const OWN_SLOTS: [&str; 2] = ["Pockets", "Dogtag"];
+/// A BEAR's dogtag (`dogtags_bear`).
+const BEAR_DOGTAG: &str = "59f32bb586f774757e1e8442";
 /// The crate on the range: the install's airdrop crate, a loot container
 /// with one grid of ten by twelve cells, which is the smallest of the
 /// install's that holds a rifle, a vest and a backpack together (its
@@ -196,6 +218,36 @@ fn weapon_crates(db: &trp_data::Database) -> anyhow::Result<(Vec<trp_sim::invent
             Err(e) => eprintln!("the tables of weapons have no {name}: {e:#}"),
         }
     }
+    // The medical table (`range::MEDICAL`): one of every medical item of
+    // the install in its case, one of every food and drink in its box (the
+    // user, 2026-10-14, night: "A table of all of them"); quest items left
+    // out.
+    if let Some(at) = range::WEAPON_CRATES.iter().position(|label| *label == range::MEDICAL) {
+        let quest = |item: &trp_data::database::ItemTemplate| item.props.get("QuestItem").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let mut supplies: Vec<(&String, &String, bool)> = db
+            .items
+            .values()
+            .filter(|item| item.prefab_key().is_some() && !quest(item))
+            .filter_map(|item| {
+                let names = db.class_names(&item.id);
+                let food = names.iter().any(|name| name == "FoodDrink");
+                (food || names.iter().any(|name| name == "Meds")).then_some((&item.name, &item.id, food))
+            })
+            .collect();
+        supplies.sort();
+        for (name, template, food) in supplies {
+            match Kind::of(db, template) {
+                Ok(kind) => {
+                    let into = if food { &mut boxes[at] } else { &mut cases[at] };
+                    if into.stow(Item::new(std::sync::Arc::new(kind))).is_err() {
+                        eprintln!("the medical table has no room for {name}");
+                    }
+                    counts[at] += 1;
+                }
+                Err(e) => eprintln!("the medical table has no {name}: {e:#}"),
+            }
+        }
+    }
     // Each cut to the rows it fills.
     let cut = |item: &mut Item, kind: &Kind| {
         let rows = item.grids[0].iter().map(|(place, thing)| place.y + if place.turned { thing.cells()[0] } else { thing.cells()[1] }).max().unwrap_or(0);
@@ -206,7 +258,11 @@ fn weapon_crates(db: &trp_data::Database) -> anyhow::Result<(Vec<trp_sim::invent
     };
     for (((case, held), label), count) in cases.iter_mut().zip(boxes.iter_mut()).zip(range::WEAPON_CRATES).zip(counts) {
         let (case_rows, box_rows) = (cut(case, &case_kind), cut(held, &box_kind));
-        println!("the table of {label}: {count} weapons in its case ({case_rows} rows), what loads them in its box ({box_rows} rows)");
+        if label == range::MEDICAL {
+            println!("the table of {label}: {count} medical items, food and drink, in its case ({case_rows} rows) and its box ({box_rows} rows)");
+        } else {
+            println!("the table of {label}: {count} weapons in its case ({case_rows} rows), what loads them in its box ({box_rows} rows)");
+        }
     }
     Ok((cases, boxes))
 }
@@ -366,8 +422,17 @@ pub struct Options {
     view_given: bool,
     /// Save one frame here and exit. Used to check the app unattended.
     screenshot: Option<PathBuf>,
+    /// Everything the app's sounds mixed, from the start to the run's end,
+    /// written here as a WAVE file (`--sound-out`): to hear, and set beside
+    /// a recording of the game, what a run played.
+    sound_out: Option<PathBuf>,
+    /// A line for each sound of moving played, written here (`--log-sounds`).
+    log_sounds: Option<PathBuf>,
     /// Frame on which that capture is taken.
     screenshot_frame: u32,
+    /// The window's size as the run begins (`--resolution`; the options'
+    /// own resolution has the last word for someone at the keys).
+    window: [u32; 2],
     /// Write one line per rendered frame here: the clip on screen and
     /// where the weapon and the hands are as the camera sees them.
     log_frames: Option<PathBuf>,
@@ -438,6 +503,12 @@ pub struct Options {
     /// Notches of the wheel to turn in such a run: the drawn frame and
     /// how many, up counted as positive (`--wheel <frame>:<notches>`).
     pub wheel: Vec<(u32, i32)>,
+    /// Damage done in such a run, to look at what health makes of it: on a
+    /// drawn frame, to a part, so much, as a bullet's (`--damage
+    /// <frame>:<part>:<amount>`, the part `head`, `chest`, `stomach`,
+    /// `left-arm`, `right-arm`, `left-leg` or `right-leg`). A capture's
+    /// tool, as `--tap` is: no key does damage in play.
+    pub damage: Vec<(u32, trp_sim::health::Part, f32)>,
     /// Whether the range's ground and boxes carry grid lines (`--grid off`
     /// leaves them plain, as captures made before 2026-10-10 have them).
     grid: bool,
@@ -445,9 +516,13 @@ pub struct Options {
     /// system's own way (`--alt-menu`), which shows the pointer for a
     /// moment at each such key: for setting beside what the app does.
     pub alt_menu: bool,
-    /// Whether the frame-rate readout at the bottom right starts shown
-    /// (`--fps off`); F3 switches it while running.
+    /// Whether the app's panel at the top right (the frame rate, the debug
+    /// figures and the keys) starts shown (`--fps on`); F1 switches it
+    /// while running.
     pub show_fps: bool,
+    /// When the battle screen's three panels show in this run, over the
+    /// install's and the options' (`--hud always|autohide|never`).
+    pub hud: Option<crate::battle_view::Shows>,
     /// The options' switch `CUSTOM FIRST PERSON HANDS` as the run begins,
     /// where the command line says (`--custom-hands on|off`): otherwise
     /// it is as the options' file has it, and on without one.
@@ -458,14 +533,21 @@ pub struct Options {
     /// The switch `ICON GENERATION` as the run begins, the same way
     /// (`--icons on|off`).
     pub icon_generation: Option<bool>,
+    /// The pictures' quality (0 to 2) and their streaming as the run
+    /// begins, over the options' (`--texture-quality <n>`, `--mip-streaming
+    /// on|off`).
+    pub texture_quality: Option<u8>,
+    pub mip_streaming: Option<bool>,
+    /// The shadows' quality (0 to 3) as the run begins, over the options'
+    /// (`--shadow-quality <n>`); what the run took, once it has begun.
+    pub shadow_quality: Option<u8>,
     /// Any switch of the options' features as the run begins, by its name
     /// in the options' file (`--feature stamina=off`, as often as wanted).
     pub feature_switches: Vec<(String, bool)>,
     /// How the window presents its frames: `vsync` (the default), `off`,
     /// or `mailbox`.
     present: String,
-    /// The graphics backend: `dx12` or `vulkan`. Left out, it is DirectX 12
-    /// on Windows (see `backends`).
+    /// The graphics backend, `vulkan` or `dx12`, over the options' (`backend`).
     backend: Option<String>,
     /// Whether frames are rendered on a thread of their own while the next
     /// is worked out, which is the engine's way (`--render-thread on`).
@@ -488,7 +570,7 @@ impl Options {
         !self.unattended() || !self.taps.is_empty() || !self.mouse.is_empty()
     }
 
-    fn unattended(&self) -> bool {
+    pub fn unattended(&self) -> bool {
         self.screenshot.is_some() || (self.scenario.is_some() && self.log_pacing.is_some())
     }
 
@@ -503,29 +585,6 @@ impl Options {
     }
 }
 
-/// Which graphics backends the renderer may pick from.
-///
-/// On Windows the engine would take Vulkan first. Measured on the machine
-/// this was written on (an NVIDIA card, a 165 Hz screen, the window synced
-/// to it): through Vulkan the 165 frames a second come in clumps of four,
-/// one 18.6 ms after the last and three within 1 to 3 ms of each other, so
-/// what moves on screen moves by a ninth, a ninth, a sixth and three times
-/// a fair frame's share; through DirectX 12 every frame comes 6.06 ms after
-/// the last, give or take 0.3 (`--log-pacing`). So DirectX 12 unless told
-/// otherwise, by `--backend` or the engine's own `WGPU_BACKEND`.
-fn backends(options: &Options) -> Option<bevy::render::settings::Backends> {
-    use bevy::render::settings::Backends;
-    match options.backend.as_deref() {
-        Some("vulkan") => Some(Backends::VULKAN),
-        Some("dx12") => Some(Backends::DX12),
-        Some(other) => {
-            eprintln!("ignoring unknown backend {other}");
-            None
-        }
-        None if cfg!(windows) && std::env::var_os("WGPU_BACKEND").is_none() => Some(Backends::DX12),
-        None => None,
-    }
-}
 
 /// DirectX's newer shader compiler, DXC, as its two libraries: beside
 /// `trp.exe`, or in the newest Windows 10 or 11 SDK that has both for this
@@ -611,19 +670,27 @@ fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
         drags: Vec::new(),
         drag_at: 90,
         taps: Vec::new(),
+        damage: Vec::new(),
         mouse: Vec::new(),
         wheel: Vec::new(),
         grid: true,
         alt_menu: false,
-        show_fps: true,
+        show_fps: false,
+        hud: None,
         custom_hands: None,
         smooth_animations: None,
         icon_generation: None,
+        texture_quality: None,
+        mip_streaming: None,
+        shadow_quality: None,
         feature_switches: Vec::new(),
         whole: false,
         map: None,
         screenshot: None,
+        sound_out: None,
+        log_sounds: None,
         screenshot_frame: 90,
+        window: WINDOW_SIZE,
         log_frames: None,
         log_pacing: None,
         turn: 0.0,
@@ -662,6 +729,28 @@ fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
                 match given.split_once(':').and_then(|(frame, notches)| Some((frame.parse().ok()?, notches.parse().ok()?))) {
                     Some(turn) => options.wheel.push(turn),
                     None => eprintln!("ignoring --wheel {given}: wanted <frame>:<notches>"),
+                }
+            }
+            "--damage" => {
+                use trp_sim::health::Part;
+                let given = args.next().unwrap_or_default();
+                let mut parts = given.split(':');
+                let frame = parts.next().and_then(|v| v.parse().ok());
+                let part = parts.next().and_then(|name| {
+                    Some(match name {
+                        "head" => Part::Head,
+                        "chest" | "thorax" => Part::Chest,
+                        "stomach" => Part::Stomach,
+                        "left-arm" => Part::LeftArm,
+                        "right-arm" => Part::RightArm,
+                        "left-leg" => Part::LeftLeg,
+                        "right-leg" => Part::RightLeg,
+                        _ => return None,
+                    })
+                });
+                match (frame, part, parts.next().and_then(|v| v.parse().ok())) {
+                    (Some(frame), Some(part), Some(amount)) => options.damage.push((frame, part, amount)),
+                    _ => eprintln!("--damage takes a frame, a part and an amount: {given}"),
                 }
             }
             "--tap" => {
@@ -760,9 +849,21 @@ fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
             "--grid" => options.grid = args.next().as_deref() != Some("off"),
             "--alt-menu" => options.alt_menu = true,
             "--fps" => options.show_fps = args.next().as_deref() != Some("off"),
+            "--hud" => {
+                let given = args.next().unwrap_or_default();
+                match given.as_str() {
+                    "always" => options.hud = Some(battle_view::Shows::Always),
+                    "autohide" => options.hud = Some(battle_view::Shows::Autohide),
+                    "never" => options.hud = Some(battle_view::Shows::Never),
+                    _ => eprintln!("--hud takes always, autohide or never: {given}"),
+                }
+            }
             "--custom-hands" => options.custom_hands = Some(args.next().as_deref() != Some("off")),
             "--smooth-animations" => options.smooth_animations = Some(args.next().as_deref() != Some("off")),
             "--icons" => options.icon_generation = Some(args.next().as_deref() != Some("off")),
+            "--texture-quality" => options.texture_quality = args.next().and_then(|quality| quality.parse::<u8>().ok()).map(|quality| quality.min(2)),
+            "--mip-streaming" => options.mip_streaming = Some(args.next().as_deref() != Some("off")),
+            "--shadow-quality" => options.shadow_quality = args.next().and_then(|quality| quality.parse::<u8>().ok()).map(|quality| quality.min(3)),
             "--feature" => {
                 let given = args.next().unwrap_or_default();
                 match given.split_once('=') {
@@ -796,8 +897,17 @@ fn parse_options(settings: &trp_data::PlayerSettings) -> Options {
             "--backend" => options.backend = args.next(),
             "--render-thread" => options.render_thread = args.next().as_deref() == Some("on"),
             "--screenshot" => options.screenshot = args.next().map(PathBuf::from),
+            "--sound-out" => options.sound_out = args.next().map(PathBuf::from),
+            "--log-sounds" => options.log_sounds = args.next().map(PathBuf::from),
             "--screenshot-frame" => {
                 options.screenshot_frame = args.next().and_then(|v| v.parse().ok()).unwrap_or(90)
+            }
+            "--resolution" => {
+                let given = args.next().unwrap_or_default();
+                match given.split_once('x').and_then(|(width, height)| Some([width.parse::<u32>().ok()?, height.parse::<u32>().ok()?])) {
+                    Some([width, height]) => options.window = [width.max(640), height.max(360)],
+                    None => eprintln!("--resolution takes a width and a height joined by an x: {given}"),
+                }
             }
             other => eprintln!("ignoring unknown argument {other}"),
         }
@@ -815,9 +925,12 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     // Where the games are: asked in the console on a first start, or with
-    // `--setup` (`setup`).
+    // `--setup` (`setup`); `--setup-only` asks and ends (`Install.bat`).
     if setup::wanted(&args) {
         setup::run(&mut std::io::stdin().lock())?;
+        if args.iter().any(|arg| arg == "--setup-only") {
+            return Ok(());
+        }
     }
     let install = Install::locate()?;
     let settings = install.player_settings();
@@ -869,6 +982,32 @@ fn main() -> anyhow::Result<()> {
     // What was asked to be worn whatever the equipment says (`--wear`).
     let fixed_wear = options.wear.clone();
     let mut equipment = trp_sim::inventory::Equipment::empty(&db)?;
+    // The character's own pockets and dogtag, which a character of the game
+    // always has and keeps in a raid (`CantRemoveFromSlotsDuringRaid`): a
+    // BEAR's of the Standard edition, as the crate's vest and backpack are,
+    // empty (the app's choice of edition and side: `PROVISIONAL`, the
+    // user's profile not read).
+    match trp_data::inventory::Loadout::load(&install, "Standard", "bear").and_then(|list| trp_sim::inventory::Equipment::of_loadout(&db, &list)) {
+        Ok((standard, _)) => {
+            for slot in OWN_SLOTS {
+                let (Some(from), Some(to)) = (standard.item.slot_index(slot), equipment.item.slot_index(slot)) else { continue };
+                if let Some(mut own) = standard.item.slots[from].clone() {
+                    own.grids.iter_mut().for_each(Vec::clear);
+                    own.slots.iter_mut().for_each(|part| *part = None);
+                    equipment.item.slots[to] = Some(own);
+                }
+            }
+        }
+        Err(e) => eprintln!("the character's own pockets and dogtag could not be read: {e:#}"),
+    }
+    // The install's starting characters have no dogtag (SPT's server gives
+    // a profile its own as it is made): a BEAR's tag (`dogtags_bear`).
+    if let Some(slot) = equipment.item.slot_index("Dogtag").filter(|&slot| equipment.item.slots[slot].is_none()) {
+        match trp_sim::inventory::Kind::of(&db, BEAR_DOGTAG) {
+            Ok(kind) => equipment.item.slots[slot] = Some(trp_sim::inventory::Item::new(std::sync::Arc::new(kind))),
+            Err(e) => eprintln!("the character's dogtag could not be made: {e:#}"),
+        }
+    }
     if let Some(loadout) = &options.loadout {
         let (edition, side) = loadout.split_once('/').unwrap_or((loadout.as_str(), "usec"));
         match trp_data::inventory::Loadout::load(&install, edition, side).and_then(|list| trp_sim::inventory::Equipment::of_loadout(&db, &list)) {
@@ -886,6 +1025,11 @@ fn main() -> anyhow::Result<()> {
             Err(e) => eprintln!("the loadout {loadout} could not be read: {e:#}"),
         }
     }
+    // What the window that shows a thing says of it.
+    let texts = trp_data::inventory::item_texts(&install, "en").unwrap_or_else(|e| {
+        eprintln!("the install's item texts could not be read; a thing's window says less: {e:#}");
+        Default::default()
+    });
     let mut names = trp_data::inventory::short_names(&install, "en").unwrap_or_else(|e| {
         eprintln!("the install's item names could not be read: {e:#}");
         Default::default()
@@ -1059,13 +1203,37 @@ fn main() -> anyhow::Result<()> {
     // the features' switches as the run begins, which hold until it ends
     // (each is "restart required": `options_view::Features`).
     let mut bindings = keys::Bindings::of(&unity.install);
-    let options_state = options_view::OptionsState::new(&mut options, &unity.install, &mut bindings, WINDOW_SIZE);
+    let window = options.window;
+    let options_state = options_view::OptionsState::new(&mut options, &unity.install, &mut bindings, window);
+    // The pictures' quality and streaming, as the options have them or the
+    // command line says.
+    let textures = streaming::TextureSettings {
+        quality: options.texture_quality.unwrap_or(options_state.graphics.texture_quality),
+        streaming: options.mip_streaming.unwrap_or(options_state.graphics.mip_streaming),
+    };
+    println!(
+        "pictures: texture quality {} of 2, mip streaming {}",
+        textures.quality,
+        if textures.streaming { format!("on (within {} MB, at most {} levels down)", streaming::BUDGET >> 20, textures.most_reduction()) } else { format!("off ({} of every picture's levels left off)", textures.limit()) }
+    );
+    // Before any picture is made.
+    streaming::set(textures);
+    // The sun's shadows, as the options have them or the command line says.
+    let shadow_quality = options.shadow_quality.unwrap_or(options_state.graphics.shadow_quality).min(3);
+    options.shadow_quality = Some(shadow_quality);
+    println!("shadows: quality {}", shadows::describe(shadow_quality));
     // The clothing the body is drawn in names the bones the animator has
     // to pose for it.
+
     let mut clothing = body_view::BodyParts::load(&mut unity, &db, &[&options.body, &options.legs, &options.head], &options.wear, options_state.features.custom_hands);
     // And, with the options' `CHARACTER MODEL` on, the pose the game's
-    // screens stand the character in, for the gear page's model of it.
-    let standing: &[String] = if options_state.features.character_model { &clothing.standing } else { &[] };
+    // screens stand the character in, for the gear page's model of it;
+    // none with `TARKOV UI` on, whose gear page has the game's flat
+    // outline of the character in its place (the user, 2026-10-15, at
+    // night: "with the feature on, drop the 3d model. 1;1 parity with
+    // tarkov").
+    let model = options_state.features.character_model && !options_state.features.tarkov_ui;
+    let standing: &[String] = if model { &clothing.standing } else { &[] };
     let body_data = match trp_sim::body::BodyData::load_standing(&mut unity, &clothing.bones, standing) {
         Ok((data, standing)) => {
             match standing {
@@ -1158,18 +1326,36 @@ fn main() -> anyhow::Result<()> {
         updates.unfocused_mode = bevy::winit::UpdateMode::Continuous;
     }
     let mut renderer = bevy::render::settings::WgpuSettings::default();
-    if let Some(backends) = backends(&options) {
-        renderer.backends = Some(backends);
+    // The backend (`backend`): the engine's own variable `WGPU_BACKEND` has
+    // the last word, then `--backend`, then the options; the other where
+    // the one chosen finds no graphics card.
+    let mut uses_dx12 = true;
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        let wanted = match options.backend.as_deref() {
+            Some(key) => backend::Renderer::from_key(key).unwrap_or_else(|| {
+                eprintln!("ignoring unknown backend {key}");
+                options_state.graphics.renderer
+            }),
+            None => options_state.graphics.renderer,
+        };
+        let (used, said) = backend::choose(wanted, backend::has_card);
+        println!("{said}");
+        renderer.backends = Some(backend::backends(used));
+        uses_dx12 = used == backend::Renderer::Dx12;
+    } else {
+        println!("renderer: as WGPU_BACKEND says");
     }
     // DirectX 12's shaders by its newer compiler where it is found
     // (`dxc_libraries`); the engine's own choice, the variable
     // `WGPU_DX12_COMPILER`, still has the last word.
-    if bevy::render::settings::Dx12Compiler::from_env().is_none() {
+    if uses_dx12 && bevy::render::settings::Dx12Compiler::from_env().is_none() {
         match dxc_libraries() {
-            Some((dxc, dxil)) => {
+            Some((dxc, _)) => {
                 println!("DirectX 12's shaders by DXC: {}", dxc.display());
+                // (As the engine itself asks for it: shader model 6.7 at the
+                // most, the dll's own signing taking the place of dxil.dll's.)
                 renderer.dx12_shader_compiler =
-                    bevy::render::settings::Dx12Compiler::DynamicDxc { dxc_path: dxc.display().to_string(), dxil_path: dxil.display().to_string() };
+                    bevy::render::settings::Dx12Compiler::DynamicDxc { dxc_path: dxc.display().to_string(), max_shader_model: wgpu_types::DxcShaderModel::V6_7 };
             }
             None if cfg!(windows) => println!("DirectX 12's shaders by FXC: DXC's dxcompiler.dll and dxil.dll are neither beside trp.exe nor in a Windows SDK"),
             None => {}
@@ -1180,7 +1366,7 @@ fn main() -> anyhow::Result<()> {
             primary_window: Some(Window {
                 // `local\window_keys_test.ps1` finds the window by it.
                 title: "TRP (Tushonka Runtime Project)".into(),
-                resolution: bevy::window::WindowResolution::new(WINDOW_SIZE[0] as f32, WINDOW_SIZE[1] as f32),
+                resolution: bevy::window::WindowResolution::new(options.window[0], options.window[1]),
                 present_mode,
                 ..default()
             }),
@@ -1203,14 +1389,77 @@ fn main() -> anyhow::Result<()> {
     if !controller.movement.systems.weight {
         controller.movement.set_weight(&hard, &db.config, 0.0)?;
     }
+    // The character's health, with the options' `HEALTH SYSTEM` on: full,
+    // as every run begins (the user, 2026-10-14, night), its chances drawn
+    // from the run's seed (`--seed`).
+    if options_state.features.health {
+        match trp_sim::health::HealthSettings::new(&db.config) {
+            Ok(settings) => controller.health = Some(trp_sim::health::Health::new(std::sync::Arc::new(settings), options.seed)),
+            Err(e) => eprintln!("the install's figures for health could not be read; the character cannot be hurt: {e:#}"),
+        }
+    }
+    // The game's own health panel for the inventory's HEALTH tab, read
+    // from the scene that has its equipment panel: its layout, where the
+    // app's own look puts its boxes too, and with `TARKOV UI` on its
+    // pictures and clips.
+    let layouts: Vec<String> = db.items.values().map(|item| item.grid_layout_name().to_owned()).filter(|name| !name.is_empty()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let health_look = health_view::HealthLook::read(&unity.install, &panel.file, options_state.features.tarkov_ui, health_view::weight_limits(&db.config), &layouts);
+    let health_words = health_view::Words::load(&unity.install, &health_look.keys());
+    // The ragdoll the character becomes when it dies, and the figure its
+    // bodies go by (`death`).
+    let ragdoll = death::Ragdoll {
+        data: match trp_data::ragdoll::RagdollData::load(&mut unity) {
+            Ok(data) => Some(data),
+            Err(e) => {
+                eprintln!("the player's ragdoll could not be read; a corpse will stand where it died: {e:#}");
+                None
+            }
+        },
+        max_depenetration: hard.float("CorpseMaxDepenetrationVelocity").unwrap_or_else(|e| {
+            eprintln!("{e:#}; the engine's own figure is used for a corpse");
+            10.0
+        }),
+        physics: match trp_data::engine::PhysicsSettings::load(&unity.install) {
+            Ok(settings) => Some(settings),
+            Err(e) => {
+                eprintln!("the engine's physics settings could not be read; a corpse will stand where it died: {e:#}");
+                None
+            }
+        },
+    };
+    // Things on the ground in the game's engine, with the options' `ITEM
+    // PHYSICS` on (`loose`).
+    let loose = loose::Loose::new(unity.install.clone(), ragdoll.physics.clone().filter(|_| options_state.features.item_physics), &hard, options.seed);
+    // The game's step of its physics, at most `MaxSmoothPhysicsDeltaTime`.
+    let physics_clock = death::PhysicsClock::new(hard.float("MaxSmoothPhysicsDeltaTime").unwrap_or(0.03));
+    // What the run begins with, for `Enter` after a death to put back.
+    let start_of_run = death::StartOfRun {
+        controller: controller.clone(),
+        equipment: equipment.clone(),
+        loot: loot.clone(),
+        away: away.clone(),
+        ground: ground.clone(),
+        range: range.clone(),
+    };
 
     // Until the renderer has reported, it counts as having work to do.
     let waiting = PipelinesWaiting(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)));
+    // With `TARKOV UI` the screens are composed in gamma space, as the
+    // game's are (`gamma_ui`).
+    let gamma_composed = options_state.features.tarkov_ui;
+    // The install, for the sounds read away from the frame (`ui_sound`,
+    // `step_sound`), and whether the sounds of moving are wanted.
+    let sound_install = unity.install.clone();
+    let movement_sounds = options_state.features.movement_sounds;
+    let hands_sounds = options_state.features.hands_sounds;
     let mut app = App::new();
     app.insert_resource(ClearColor(Color::srgb(0.55, 0.63, 0.70)))
-        .insert_resource(AmbientLight { color: Color::WHITE, brightness: 400.0, ..default() })
+        .insert_resource(GlobalAmbientLight { color: Color::WHITE, brightness: 400.0, ..default() })
         .insert_resource(controller)
         .insert_resource(inventory_view::Carried {
+            checked: inventory_view::magazines_in(&equipment.item),
+            mastering: options.mastering,
+            slot_keys: Vec::new(),
             equipment,
             names,
             loot,
@@ -1237,10 +1486,19 @@ fn main() -> anyhow::Result<()> {
             asking: None,
             pack_asked: false,
             falling: Vec::new(),
+            thrown: Vec::new(),
+            item_looks: Default::default(),
+            texts,
+            info_size: None,
         })
+        .insert_resource(loose)
+        // The models' pictures by their levels of detail (`streaming`).
+        .insert_resource(streaming::MipStreaming::new(textures))
         .insert_resource(bindings)
         .insert_resource(icons::Icons::new(unity.install.clone(), options_state.features.icon_generation, icons::signatures(&db)))
         .insert_resource(options_state.features.clone())
+        .insert_resource(options_state.game)
+        .insert_resource(options_state.sound)
         .insert_resource(options_state)
         .insert_resource(GameData { unity, db, hard, engine, hands_data })
         .insert_resource(options.view)
@@ -1254,6 +1512,10 @@ fn main() -> anyhow::Result<()> {
         .init_resource::<body_view::OutfitPose>()
         .add_plugins(plugins)
         .add_plugins(grid::GridPlugin)
+        .add_plugins(shadow_only::ShadowOnlyPlugin)
+        .add_plugins(screen_blur::ScreenBlurPlugin)
+        .add_systems(Update, screen_blur::fade.after(inventory_view::ScreenKeys))
+        .init_resource::<feet_down::FeetDown>()
         .insert_resource(FrameMark(std::time::Instant::now()))
         .init_resource::<Watching>()
         .init_resource::<keys::ScriptedMouse>()
@@ -1263,9 +1525,25 @@ fn main() -> anyhow::Result<()> {
         .insert_resource(updates)
         .add_plugins(hud::HudPlugin)
         .add_plugins(inventory_view::InventoryPlugin)
+        .add_plugins(item_menu_view::ItemMenuPlugin)
+        .add_plugins(hands_sound::HandsSoundPlugin)
+        .add_plugins(shot_sound::ShotSoundPlugin)
+
+
+        .add_plugins(health_view::HealthViewPlugin)
+        .add_plugins(battle_view::BattleViewPlugin)
+        .add_plugins(ui_sound::UiSoundPlugin)
+        .add_plugins(step_sound::StepSoundPlugin)
+        .insert_resource(health_words)
+        .insert_resource(health_look)
         .add_plugins(options_view::OptionsPlugin)
         .add_plugins(icons::IconsPlugin)
         .add_plugins(figure_view::FigurePlugin)
+        // A death: its corpse in the game's own engine (`trp_physics`).
+        .add_plugins(death::DeathPlugin)
+        .insert_resource(ragdoll)
+        .insert_resource(physics_clock)
+        .insert_resource(start_of_run)
         .add_systems(Startup, (setup_world, range::spawn_labels, (weapon::spawn_weapon, body_view::spawn_body).chain()))
         .add_systems(
             Update,
@@ -1273,7 +1551,7 @@ fn main() -> anyhow::Result<()> {
                 (mark_frame, keys::hear, weapon::prepare_rigs, weapon::free_rigs).chain(),
                 (switch_view, cursor::hold, cursor::keep_alt).chain(),
                 controller::gather_input.run_if(running),
-                controller::step.run_if(running),
+                (controller::step.run_if(running), feet_down::ground_feet).chain(),
                 fly_camera,
                 controller::apply,
                 (show_things, range::place_labels),
@@ -1284,6 +1562,9 @@ fn main() -> anyhow::Result<()> {
                 (body_view::show_outfit, body_view::show_upper_body).chain(),
                 body_view::pose_body,
                 (body_view::see_collarbones, body_view::keep_collarbones, body_view::see_outfit, body_view::pose_outfit).chain(),
+                // A death, after the body is drawn for the frame; and
+                // things thrown and let fall, stepped with the corpse.
+                (death::die, death::follow, death::fade, death::begin_again, loose::set_going, loose::read_models, loose::fly).chain(),
                 hud::debug,
                 log_frame.run_if(running),
                 log_pacing.run_if(running),
@@ -1296,19 +1577,37 @@ fn main() -> anyhow::Result<()> {
     // answered by the renderer (`weapon::Uploads`).
     let uploads = weapon::UploadWatch::default();
     app.insert_resource(uploads.clone());
-    // The graphics card's places for samplers held, counted by the renderer
-    // (`weapon::SamplerPlaces`).
-    let places = weapon::SamplerPlaces::default();
-    app.insert_resource(places.clone());
     if let Some(renderer) = app.get_sub_app_mut(bevy::render::RenderApp) {
-        use bevy::render::{Render, RenderSet};
-        renderer.insert_resource(waiting).add_systems(Render, count_waiting.in_set(RenderSet::Cleanup));
-        renderer.insert_resource(uploads).add_systems(Render, weapon::watch_uploads.in_set(RenderSet::Cleanup));
-        renderer.insert_resource(places).add_systems(Render, weapon::count_places.in_set(RenderSet::Cleanup));
+        use bevy::render::{Render, RenderSystems};
+        renderer.insert_resource(waiting).add_systems(Render, count_waiting.in_set(RenderSystems::Cleanup));
+        renderer.insert_resource(uploads).add_systems(Render, weapon::watch_uploads.in_set(RenderSystems::Cleanup));
         // Where a slow frame of the renderer's goes, if asked for.
         render_timing::add(renderer);
+        render_timing::add_memory(renderer);
     }
+    // New pictures and materials taken in, and the levels the pictures want
+    // worked out, after the frame and before the card takes what changed
+    // (`streaming`).
+    app.add_systems(Last, (streaming::take_new, streaming::stream).chain());
     render_timing::add_main(&mut app);
+    ui_sound::start_reading(&mut app, sound_install.clone());
+    step_sound::start_reading(&mut app, sound_install.clone(), movement_sounds);
+    hands_sound::start_reading(&mut app, sound_install, hands_sounds);
+    if let Some(path) = app.world().resource::<Options>().log_sounds.clone() {
+        match std::fs::File::create(&path) {
+            Ok(file) => {
+                app.insert_resource(step_sound::SoundLog(std::sync::Mutex::new(std::io::BufWriter::new(file))));
+            }
+            Err(e) => eprintln!("the sounds' log could not be made at {}: {e}", path.display()),
+        }
+    }
+    if app.world().resource::<Options>().sound_out.is_some() {
+        app.world().resource::<ui_sound::Mixer>().0.start_tape();
+        app.add_systems(Last, write_tape);
+    }
+    if gamma_composed {
+        app.add_plugins(gamma_ui::GammaUiPlugin);
+    }
     app.run();
     Ok(())
 }
@@ -1342,6 +1641,18 @@ pub struct Warmup(pub bool);
 /// keys, the scripted presses and drags of an unattended run and the
 /// frames a capture counts all wait for it, so that a run's first frame
 /// is the first one that shows it whole.
+/// The mixed sound of the run written out as it ends (`--sound-out`).
+fn write_tape(mut exit: MessageReader<AppExit>, options: Res<Options>, mixer: Res<ui_sound::Mixer>) {
+    if exit.read().next().is_none() {
+        return;
+    }
+    let (Some(path), Some(wav)) = (&options.sound_out, mixer.0.tape_wav()) else { return };
+    match std::fs::write(path, wav) {
+        Ok(()) => info!("the run's sound written to {}", path.display()),
+        Err(e) => warn!("the run's sound could not be written to {}: {e}", path.display()),
+    }
+}
+
 pub fn running(warmup: Res<Warmup>) -> bool {
     !warmup.0
 }
@@ -1656,9 +1967,13 @@ fn show_things(range: Res<range::Range>, mut parts: Query<(&ThingPart, &mut Tran
 }
 
 
+/// The near plane of the game's camera, as a recorded trace reports it.
+const NEAR_PLANE: f32 = 0.03;
+
 fn setup_world(
     mut commands: Commands,
     options: Res<Options>,
+    features: Res<options_view::Features>,
     range: Res<range::Range>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<grid::GridMaterial>>,
@@ -1666,22 +1981,42 @@ fn setup_world(
     // The warm-up's curtain, over everything, in the sky's colour.
     let curtain = Node { position_type: PositionType::Absolute, width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() };
     commands.spawn((WarmupProp, curtain, BackgroundColor(Color::srgb(0.55, 0.63, 0.70)), GlobalZIndex(1000)));
-    commands.spawn((
+    let camera = commands.spawn((
         MainCamera,
         Camera3d::default(),
         // The field of view follows the weapon motion every frame.
         // The near plane is the game camera's, as a recorded trace reports it.
+        // Bevy 0.18 clips by a plane of its own besides (`near_clip_plane`,
+        // 0.1 m unless told): it is put at the near plane, or everything
+        // nearer than 10 cm is cut away (`docs/findings.md`).
         Projection::Perspective(PerspectiveProjection {
             fov: options.field_of_view.to_radians(),
-            near: 0.03,
+            near: NEAR_PLANE,
+            near_clip_plane: Vec4::new(0.0, 0.0, -1.0, -NEAR_PLANE),
             ..default()
         }),
         Transform::from_xyz(0.0, 1.6, 0.0),
-    ));
+        // The world blurred behind the inventory, as the game's camera
+        // blurs it (`screen_blur`).
+        screen_blur::ScreenBlur::default(),
+    )).id();
+    // With `TARKOV UI` the interface is drawn as the game's engine draws
+    // its own, its edges hard: Bevy's softening of every node's edge over a
+    // pixel left a light seam where two of the game's see-through pieces
+    // meet (a slot's dark ground beside the next one's in the quick-use
+    // bar). The app's own look keeps it (its one rounded corner).
+    if features.tarkov_ui {
+        commands.entity(camera).insert(bevy::ui_render::UiAntiAlias::Off);
+    }
+    // The screens composed in gamma space with `TARKOV UI` (`gamma_ui`).
+    if features.tarkov_ui {
+        commands.entity(camera).insert(gamma_ui::GammaUi);
+    }
     commands.spawn((
         DirectionalLight { illuminance: 12_000.0, shadows_enabled: true, ..default() },
-        // The light also sees what only casts a shadow in first person.
-        bevy::render::view::RenderLayers::from_layers(&[body_view::SEEN, body_view::SHADOW_ONLY]),
+        // Its cascades as the game's shadow quality has them, from the
+        // camera's near plane (`shadows`).
+        shadows::cascades(options.shadow_quality.unwrap_or(shadows::DEFAULT_QUALITY), NEAR_PLANE),
         Transform::from_xyz(3.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
@@ -1716,6 +2051,17 @@ fn setup_world(
     };
     for solid in &range.solids {
         commands.spawn((Mesh3d(meshes.add(Cuboid::from_size(solid.size))), MeshMaterial3d(material(solid.color, true)), Transform::from_translation(solid.centre)));
+    }
+    // The sampler of surfaces: each square a slab a centimetre thick on the
+    // ground, a little apart from the next, drawn only (`range::surface_squares`).
+    let slab = Vec3::new(range::SURFACE_SQUARE - 0.04, 0.01, range::SURFACE_SQUARE - 0.04);
+    for (_, at, color) in range::surface_squares() {
+        commands.spawn((Mesh3d(meshes.add(Cuboid::from_size(slab))), MeshMaterial3d(material(color, false)), Transform::from_translation(at + Vec3::Y * slab.y / 2.0)));
+    }
+    // The barbed wire, which is no solid.
+    let wire = material(Color::srgb(0.22, 0.20, 0.17), false);
+    for (centre, size) in range::barbed_wire_look() {
+        commands.spawn((Mesh3d(meshes.add(Cuboid::from_size(size))), MeshMaterial3d(wire.clone()), Transform::from_translation(centre)));
     }
     // What moves of the things the hands work: a door's leaf, a lid, a
     // drawer. Plain, without the grid.
@@ -1864,7 +2210,7 @@ fn capture(
     controller: Res<Controller>,
     mut frame: Local<u32>,
     mut written: Local<Option<u32>>,
-    mut exit: EventWriter<AppExit>,
+    mut exit: MessageWriter<AppExit>,
 ) {
     let Some(path) = &options.screenshot else {
         // A run that plays a script and logs how it was drawn ends with

@@ -225,6 +225,37 @@ impl Assets {
         }
         Ok(&data[offset..offset + size])
     }
+
+    /// Where the same bytes are in their bundle's file: to be read again
+    /// from it after the reader has gone (`ResourcePlace::read`).
+    pub fn resource_place(&self, path: &str, offset: usize, size: usize) -> Result<ResourcePlace> {
+        let name = file_name(path);
+        let (bundle, range) = self
+            .resources
+            .get(&name)
+            .ok_or_else(|| anyhow!("resource {path:?} is not loaded"))?;
+        if offset + size > range.len() {
+            bail!("resource read {offset}+{size} runs past the end of {path:?}");
+        }
+        let file = bundle.path.clone().ok_or_else(|| anyhow!("resource {path:?} is in a bundle read from no file"))?;
+        Ok(ResourcePlace { file, range: range.start + offset..range.start + offset + size })
+    }
+}
+
+/// Bytes of a bundle's, by its file and their place in its data: a
+/// texture's levels, read again from the install when they are wanted.
+#[derive(Debug, Clone)]
+pub struct ResourcePlace {
+    file: std::path::PathBuf,
+    range: Range<usize>,
+}
+
+impl ResourcePlace {
+    /// The bytes, read from the bundle's file, only the blocks they are in
+    /// decompressed (`Bundle::read_range`).
+    pub fn read(&self) -> Result<Vec<u8>> {
+        Bundle::read_range(&self.file, self.range.clone())
+    }
 }
 
 /// `archive:/CAB-abc/CAB-abc.resS` and `Library/unity default resources`

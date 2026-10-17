@@ -54,7 +54,16 @@ The frame's length is the engine's.
 
 ## Compared with what
 
-**With the game: nothing.** No recording has the free look (recorder 0.7.0, built the same day and not yet run, writes the head's rotation and the engine's two mouse axes on every frame). All of the above is the code as read. Tried against the install (`crates/trp-sim/tests/free_look.rs`, and the unit tests of `head_look.rs` and `bindings.rs`):
+**With the game: the user's recording of course 8** (recorder 0.8.0, `local\traces\courses1\8-free-look`, made 2026-10-15, read 2026-10-16; `cargo run -p trp-sim --bin byhand -- local\traces\courses1\8-free-look`, and `the_recorded_free_look_is_followed` in `crates/trp-sim/tests/free_look.rs`). 38 s at 120 frames a second, the free look's key pressed ten times, the head taken to every limit: across to 40 either way, up to 50, down to 20, and across to 28 with the sights up (990 frames of it aimed). The recorded keys go through the input manager as written here, by the install's bindings; the recorded mouse axes go to the look or the turn by `Preset::mouse`; the look's share, times the look's bindings (5, the axis up and down the other way about), goes to `HeadLook::frame` with the recorded frame time. On **all 4,552 frames**:
+
+- **the head's rotation is the game's** (both figures, within a ten-thousandth of a degree), through the turns, the limits, the cut-back of the look down as the head turns aside, and the ten ways back;
+- **whether the mouse has the head and whether the head is looking are the game's**;
+- **the view's own turn is the turn's share of the mouse** on every one of the 401 frames' axes it turned along with the sights down (times the turn's binding and the player's sensitivity, 0.7), and it did not turn where the model gave the turn nothing: so the frames the look took are the game's too;
+- of 1,951 frames' travel along an axis with the key held, 235 went to neither the look nor the turn, the first frame of each run, as the code reads.
+
+**Seen in the same recording and not set beside the model frame for frame**: with the sights up the field of view goes from the aimed 59 to the hip's 74 within half a second of the mouse taking the head, and back to 59 as it lets go.
+
+Before the recording, tried against the install (`crates/trp-sim/tests/free_look.rs`, and the unit tests of `head_look.rs` and `bindings.rs`):
 
 - the install's limits are the code's own: -40 to 40, -50 to 20, 0.7;
 - thirty degrees across and ten up: the head's rotation is exactly that, held for a second with the mouse still, and the neck's and the head's bones are each turned 15.81 degrees (half of the turn's 31.62); with the key up it is back to nothing in 0.48 s;
@@ -66,7 +75,7 @@ The regression over the sixteen kept recordings is unchanged by it (`after44`).
 
 **Seen** in captures (`local\shots\fl_*_s43.png`): in first person the camera turned to the right and up of a rifle that stays where the body points, and back with the key up; from outside the head turned toward the camera for a look to the left and away for one to the right.
 
-**What a recording would settle** (`docs/manual.md`, item 12 of the "By hand" list; the trace has `mouse_axes`, `head_rot`, `mouse_look` and the view's own turn): that the first frame of each run of travel is lost, which is the one thing here a hand would feel and a reader of the code could have wrong; the rate; and the way back's half second.
+**Not compared**: the camera's and the bones' share of the turn (the recording has the camera's rotation; nothing here sets it beside the model's yet), the sprint's limit down (no sprint in the recording), and the app's own way of handing a drawn frame's mouse to the simulation's frames (the `PROVISIONAL` below).
 
 ## Not built, and open
 

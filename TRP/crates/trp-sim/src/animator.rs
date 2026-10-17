@@ -28,6 +28,10 @@ pub struct BoneRest {
     pub path: String,
     pub position: [f32; 3],
     pub rotation: [f32; 4],
+    /// Its scale at rest, where the clips' scale of it is to be kept too
+    /// (a rig of the hands': an item used is drawn by its bone scaled up
+    /// from nought); none where it is not.
+    pub scale: Option<[f32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +126,7 @@ struct BoneTracks {
     position: Option<usize>,
     /// First curve of the rotation, and whether it is Euler angles.
     rotation: Option<(usize, bool)>,
+    scale: Option<usize>,
 }
 
 pub struct ClipDef {
@@ -146,6 +151,8 @@ pub struct Controller {
     pub root_bone: Option<usize>,
     /// Parameters that some clip carries a curve for.
     curve_driven: Vec<bool>,
+    /// The bones whose scale is kept that some clip scales.
+    pub scaled: Vec<usize>,
 }
 
 impl Controller {
@@ -162,6 +169,7 @@ impl Controller {
         let by_hash: HashMap<u32, usize> =
             table.parameters.iter().enumerate().map(|(i, p)| (path_hash(&p.name), i)).collect();
         let bone_hashes: Vec<u32> = bones.iter().map(|b| path_hash(&b.path)).collect();
+        let scale_hashes: Vec<u32> = bones.iter().filter(|b| b.scale.is_some()).map(|b| path_hash(&b.path)).collect();
         let parameter = |name: &Option<String>| name.as_ref().and_then(|n| by_name.get(n).copied());
         let conditions = |list: &[states::Condition]| -> Vec<Condition> {
             list.iter()
@@ -212,7 +220,7 @@ impl Controller {
                         Some((_, obj)) => Some(match clip_of.get(obj) {
                             Some(index) => *index,
                             None => {
-                                let def = clip_def(&Clip::read(assets, *obj)?, &bone_hashes, &by_hash);
+                                let def = clip_def(&Clip::read(assets, *obj)?, &bone_hashes, &scale_hashes, &by_hash);
                                 for (parameter, _) in &def.curves {
                                     curve_driven[*parameter] = true;
                                 }
@@ -268,6 +276,7 @@ impl Controller {
                     .collect(),
             });
         }
+        let scaled = (0..bones.len()).filter(|i| clips.iter().any(|clip| clip.bones[*i].scale.is_some())).collect();
         Ok(Self {
             parameters: table.parameters.clone(),
             by_name,
@@ -277,6 +286,7 @@ impl Controller {
             bones,
             root_bone: None,
             curve_driven,
+            scaled,
         })
     }
 
@@ -293,6 +303,7 @@ impl Controller {
             clips: Vec::new(),
             bones: Vec::new(),
             root_bone: None,
+            scaled: Vec::new(),
         }
     }
 
@@ -325,10 +336,11 @@ fn node_def(node: &TreeNode, clip: Option<usize>, parameter: &dyn Fn(&Option<Str
     }
 }
 
-/// Cuts a clip down to the animator's bones and the curves it reads.
-fn clip_def(clip: &Clip, bones: &[u32], parameters: &HashMap<u32, usize>) -> ClipDef {
+/// Cuts a clip down to the animator's bones and the curves it reads: a
+/// bone's scale only where it is kept (`scaled`).
+fn clip_def(clip: &Clip, bones: &[u32], scaled: &[u32], parameters: &HashMap<u32, usize>) -> ClipDef {
     let reduced = clip.reduced(
-        |t| bones.contains(&t.path) && t.property != Property::Scale,
+        |t| bones.contains(&t.path) && (t.property != Property::Scale || scaled.contains(&t.path)),
         |f| match f.custom_type {
             0 => parameters.contains_key(&f.name),
             // The root's path and its turning.
@@ -345,7 +357,7 @@ fn clip_def(clip: &Clip, bones: &[u32], parameters: &HashMap<u32, usize>) -> Cli
                     Property::Position => found.position = Some(t.curve),
                     Property::Rotation => found.rotation = Some((t.curve, false)),
                     Property::Euler => found.rotation = Some((t.curve, true)),
-                    Property::Scale => {}
+                    Property::Scale => found.scale = Some(t.curve),
                 }
             }
             found
@@ -473,6 +485,8 @@ pub struct Animator {
     /// How far the root turned over the last update, degrees to the right.
     root_turn: f32,
     pose: Vec<([f32; 3], [f32; 4])>,
+    /// The scale of each bone of the controller's `scaled`, in its order.
+    scales: Vec<[f32; 3]>,
     /// Whether a second pose is worked out at each update **for drawing**,
     /// and that pose: the same states at the same moments, their clips'
     /// sampled curves taken on curves without corners in place of the
@@ -481,6 +495,9 @@ pub struct Animator {
     smooth: bool,
     drawn: Option<Vec<([f32; 3], [f32; 4])>>,
     events: Vec<Event>,
+    /// The clips' animation events passed on the last update, each by its
+    /// clip's place in the controller and its own in the clip.
+    passed: Vec<(usize, usize)>,
     samples: Vec<f32>,
     /// How long the update being worked out is, in seconds.
     step: f32,
@@ -506,6 +523,7 @@ impl Animator {
             .collect();
         let weights = controller.layers.iter().map(|l| l.default_weight).collect();
         let pose = controller.bones.iter().map(|b| (b.position, b.rotation)).collect();
+        let scales = controller.scaled.iter().map(|i| controller.bones[*i].scale.unwrap_or([1.0; 3])).collect();
         // The first layer always plays in full, whatever weight it stores.
         let mut animator =
             Self {
@@ -516,9 +534,11 @@ impl Animator {
                 root_delta: [0.0; 3],
                 root_turn: 0.0,
                 pose,
+                scales,
                 smooth: false,
                 drawn: None,
                 events: Vec::new(),
+                passed: Vec::new(),
                 samples: Vec::new(),
                 step: 0.0,
                 asked: Vec::new(),
@@ -628,6 +648,31 @@ impl Animator {
         (current.time, current.previous) = (time, time);
     }
 
+    /// The state of a layer's machine whose own name hashes to `hash`, as
+    /// the engine's `shortNameHash` gives it (its low 24 bits suffice, as
+    /// the recorder writes them).
+    pub fn state_by_short_hash(&self, layer: usize, hash: u32) -> Option<usize> {
+        let machine = self.controller.layers[layer].machine;
+        self.controller.machines[machine].states.iter().position(|state| {
+            let own = state.name.rsplit('.').next().unwrap_or(&state.name);
+            path_hash(own) & 0x00ff_ffff == hash & 0x00ff_ffff
+        })
+    }
+
+    /// Puts a layer's machine in a state outright, at a point in its play
+    /// (in cycles), with nothing blending: for a run that takes up where a
+    /// recording of one stood. A layer synchronised with another's machine
+    /// moves that machine.
+    pub fn start_in(&mut self, layer: usize, state: usize, time: f32) {
+        let machine = self.controller.layers[layer].machine;
+        if state < self.controller.machines[machine].states.len() {
+            let playing = &mut self.machines[machine];
+            playing.current = Playing { state, time, previous: time };
+            (playing.next, playing.blend, playing.held) = (None, None, None);
+            self.asked[machine] = None;
+        }
+    }
+
     /// Asks a layer for a state outright, at a point in its play (in
     /// cycles): the engine's `Play`. The next update enters it there and
     /// runs none of it; whatever transition was under way is dropped.
@@ -636,6 +681,17 @@ impl Animator {
         if state < self.controller.machines[machine].states.len() {
             self.asked[machine] = Some((state, time));
         }
+    }
+
+    /// How many layers the controller has.
+    pub fn layer_count(&self) -> usize {
+        self.controller.layers.len()
+    }
+
+    /// Whether a layer is its machine's own, not one synchronised with
+    /// another layer's.
+    pub fn owns_machine(&self, layer: usize) -> bool {
+        self.controller.layers.get(layer).is_some_and(|def| def.slot == 0)
     }
 
     /// The states the last update had a look at, in order.
@@ -655,6 +711,12 @@ impl Animator {
     /// The pose of every bone after the last update.
     pub fn pose(&self) -> &[([f32; 3], [f32; 4])] {
         &self.pose
+    }
+
+    /// The scale of each bone whose scale is kept and that some clip
+    /// scales, by the bone's place, after the last update.
+    pub fn scales(&self) -> impl Iterator<Item = (usize, [f32; 3])> + '_ {
+        self.controller.scaled.iter().copied().zip(self.scales.iter().copied())
     }
 
     /// Asks for a pose for drawing beside the pose, from the next update
@@ -720,6 +782,7 @@ impl Animator {
     /// Advances by `dt` seconds and returns what states were entered and left.
     pub fn update(&mut self, dt: f32) -> Vec<Event> {
         self.events.clear();
+        self.passed.clear();
         self.looks.clear();
         let controller = self.controller.clone();
         for machine in 0..controller.machines.len() {
@@ -728,6 +791,15 @@ impl Animator {
         self.step = dt;
         self.evaluate(&controller);
         std::mem::take(&mut self.events)
+    }
+
+    /// The clips' animation events passed on the last update (`m_Events`):
+    /// each a clip with a share in the pose whose time went over the
+    /// event's (`PROVISIONAL`: the engine's own rule for the clips of a
+    /// blend and of a transition is not read; here every clip with a share
+    /// above none passes its own).
+    pub fn passed_events(&self) -> impl Iterator<Item = &trp_data::unity::anim::ClipEvent> + '_ {
+        self.passed.iter().filter_map(|&(clip, event)| self.controller.clips.get(clip)?.clip.events.get(event))
     }
 
     fn look(&mut self, controller: &Controller, machine: usize, state: usize, kind: LookKind, time: f32, leaving: bool) {
@@ -1150,6 +1222,9 @@ impl Animator {
     /// asked for, the pose for drawing, which nothing else is taken from.
     fn evaluate(&mut self, controller: &Controller) {
         let (pose, curves, mut root, mut turn) = self.worked_out(controller, false);
+        if !controller.scaled.is_empty() {
+            self.scales = self.scaled(controller);
+        }
         // A parameter that clips drive holds its default when none of the
         // clips playing carries its curve.
         for (parameter, driven) in controller.curve_driven.iter().enumerate() {
@@ -1178,6 +1253,66 @@ impl Animator {
         self.root_turn = if still { 0.0 } else { turn };
         self.pose = pose;
         self.drawn = self.smooth.then(|| self.worked_out(controller, true).0);
+    }
+
+    /// The scale of each bone of the controller's `scaled`, from where the
+    /// machines now stand: blended as a place is, layer over layer (an
+    /// additive layer adds what its clips scale from their reference pose).
+    fn scaled(&mut self, controller: &Controller) -> Vec<[f32; 3]> {
+        let mut scales: Vec<[f32; 3]> = controller.scaled.iter().map(|i| controller.bones[*i].scale.unwrap_or([1.0; 3])).collect();
+        let mut samples = std::mem::take(&mut self.samples);
+        for (index, layer) in controller.layers.iter().enumerate() {
+            let layer_weight = self.weights[index];
+            if layer_weight <= 0.0 {
+                continue;
+            }
+            let shares = self.shares(controller, layer);
+            let total: f32 = shares.iter().map(|s| s.weight).sum();
+            if total <= 0.0 {
+                continue;
+            }
+            let mut sums = vec![[0.0f32; 3]; scales.len()];
+            for share in &shares {
+                let def = &controller.clips[share.clip];
+                let length = def.clip.duration();
+                let t = share.now + share.offset;
+                def.clip.sample(if def.clip.looping { t.rem_euclid(1.0) * length } else { t.clamp(0.0, 1.0) * length }, &mut samples);
+                let reference = &def.clip.reference_pose;
+                for (j, i) in controller.scaled.iter().enumerate() {
+                    if !layer.moves[*i] {
+                        continue;
+                    }
+                    let rest = controller.bones[*i].scale.unwrap_or([1.0; 3]);
+                    let read = |values: &[f32]| def.bones[*i].scale.map_or(rest, |c| [values[c], values[c + 1], values[c + 2]]);
+                    let s = read(&samples);
+                    if layer.additive {
+                        if reference.len() == samples.len() {
+                            let s0 = read(reference);
+                            (0..3).for_each(|k| sums[j][k] += (s[k] - s0[k]) * share.weight);
+                        }
+                    } else {
+                        (0..3).for_each(|k| sums[j][k] += s[k] * share.weight);
+                    }
+                }
+            }
+            let amount = (layer_weight * total).clamp(0.0, 1.0);
+            for (j, i) in controller.scaled.iter().enumerate() {
+                if !layer.moves[*i] {
+                    continue;
+                }
+                for k in 0..3 {
+                    if layer.additive {
+                        scales[j][k] += sums[j][k] * layer_weight;
+                    } else if index == 0 {
+                        scales[j][k] = sums[j][k] / total;
+                    } else {
+                        scales[j][k] += (sums[j][k] / total - scales[j][k]) * amount;
+                    }
+                }
+            }
+        }
+        self.samples = samples;
+        scales
     }
 
     /// The bones' pose, the parameters the clips' curves give and the
@@ -1212,6 +1347,21 @@ impl Animator {
             for share in &shares {
                 let def = &controller.clips[share.clip];
                 let length = def.clip.duration();
+                // The clip's events its time went over on this update.
+                if !smooth && share.weight > 0.0 && length > 0.0 && share.now > share.previous {
+                    let (from, to) = (share.previous + share.offset, share.now + share.offset);
+                    for (n, event) in def.clip.events.iter().enumerate() {
+                        let at = event.time / length;
+                        let passed = if def.clip.looping {
+                            (to - at).floor() > (from - at).floor()
+                        } else {
+                            from.clamp(0.0, 1.0) < at && at <= to.clamp(0.0, 1.0)
+                        };
+                        if passed {
+                            self.passed.push((share.clip, n));
+                        }
+                    }
+                }
                 let at = |cycles: f32| {
                     let t = cycles + share.offset;
                     if def.clip.looping { t.rem_euclid(1.0) * length } else { t.clamp(0.0, 1.0) * length }
@@ -1456,6 +1606,7 @@ mod tests {
             clips: Vec::new(),
             bones: Vec::new(),
             root_bone: None,
+            scaled: Vec::new(),
         };
         Animator::new(Arc::new(controller))
     }
@@ -1528,5 +1679,29 @@ mod tests {
         a.set_float("level", 1.0);
         a.update(DT);
         assert_eq!(a.state(0).0.name, "high");
+    }
+
+    #[test]
+    fn a_layer_is_taken_up_where_a_recording_has_it() {
+        // A blend under way, as a run begins.
+        let blend = TransitionDef { duration: 0.4, ..to(Target::State(1), Vec::new()) };
+        let mut a = animator(vec![state("rest", vec![blend]), state("Base Layer.Breath", Vec::new())], Vec::new(), Vec::new());
+        a.update(DT);
+        assert!(a.state(0).1.is_some());
+        // The recorder writes the low 24 bits of the hash of the state's
+        // own name, the name without its layer's.
+        let hash = path_hash("Breath") & 0x00ff_ffff;
+        assert_eq!(a.state_by_short_hash(0, hash), Some(1));
+        assert_eq!(a.state_by_short_hash(0, hash ^ 1), None);
+        // Put there outright: no blend left, and the next update plays on
+        // from the figure given.
+        a.start_in(0, 1, 3.7);
+        assert_eq!(a.state(0).0.name, "Base Layer.Breath");
+        assert!(a.state(0).1.is_none());
+        assert_eq!(a.progress(0), (3.7, 0.0));
+        a.update(DT);
+        assert!((a.progress(0).0 - (3.7 + DT)).abs() < 1e-6, "{:?}", a.progress(0));
+        assert!(a.owns_machine(0) && !a.owns_machine(1));
+        assert_eq!(a.layer_count(), 1);
     }
 }

@@ -1,6 +1,0 @@
-<Project>
-  <!-- Keep every build product out of the source tree, under the ignored local folder. -->
-  <PropertyGroup>
-    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)..\..\local\oracle\obj\</BaseIntermediateOutputPath>
-  </PropertyGroup>
-</Project>

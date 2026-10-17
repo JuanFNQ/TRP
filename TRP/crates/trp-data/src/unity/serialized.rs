@@ -40,6 +40,26 @@ pub struct SerializedFile {
 
 impl SerializedFile {
     pub fn parse(data: &[u8]) -> Result<Self> {
+        Self::parse_head(data, data.len())
+    }
+
+    /// Where a file's objects begin, from its first 48 bytes: what of it
+    /// `parse_head` needs.
+    pub fn head_size(first: &[u8]) -> Result<usize> {
+        let mut r = Reader::big_endian(first);
+        r.skip(8)?;
+        let version = r.u32()?;
+        let data_offset = r.u32()? as usize;
+        if version < 22 {
+            return Ok(data_offset);
+        }
+        r.skip(4 + 4 + 8)?;
+        Ok(r.i64()? as usize)
+    }
+
+    /// A file's table read from its head alone (`head_size` bytes of it),
+    /// the file being so long: its objects read later by their ranges.
+    pub fn parse_head(data: &[u8], file_len: usize) -> Result<Self> {
         let mut r = Reader::big_endian(data);
         let _metadata_size = r.u32()?;
         let _file_size = r.u32()?;
@@ -104,7 +124,7 @@ impl SerializedFile {
                 r.skip(1)?;
             }
             let offset = data_offset + start;
-            if offset + size > data.len() {
+            if offset + size > file_len {
                 bail!("object {path_id} runs past the end of the file");
             }
             objects.push(ObjectInfo { path_id, offset, size, type_index, class_id });

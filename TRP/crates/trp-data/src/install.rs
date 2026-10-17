@@ -108,6 +108,31 @@ impl Install {
 
     /// One page of the game's settings as SPT keeps it (`Game.ini`,
     /// `Control.ini`, `Graphics.ini`): JSON, whatever the name says.
+    /// The skills' levels of the newest profile in the install
+    /// (`SPT_Runtime/user/profiles`, its PMC's `Skills.Common`), by the
+    /// game's names: progress over 100, at most 51 (`BaseSkill.Level`).
+    /// Read, never written; none where there is no profile.
+    pub fn profile_skill_levels(&self) -> Option<std::collections::HashMap<String, u32>> {
+        let dir = self.root.join("SPT_Runtime").join("user").join("profiles");
+        let newest = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+            .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())?;
+        let text = std::fs::read_to_string(newest.path()).ok()?;
+        let profile: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+        let skills = profile["characters"]["pmc"]["Skills"]["Common"].as_array()?;
+        Some(
+            skills
+                .iter()
+                .filter_map(|skill| {
+                    let progress = skill["Progress"].as_f64()?.clamp(0.0, 5100.0);
+                    Some((skill["Id"].as_str()?.to_owned(), (progress / 100.0) as u32))
+                })
+                .collect(),
+        )
+    }
+
     fn settings_page(&self, name: &str) -> Option<serde_json::Value> {
         let text = std::fs::read_to_string(self.settings_dir().join(name)).ok()?;
         serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
@@ -219,7 +244,16 @@ impl Install {
             vsync: page.get("VSync").and_then(|v| v.as_bool()),
             mode: display.and_then(|display| display.get("FullScreenMode")?.as_i64()),
             resolution: side("Width").zip(side("Height")).map(|(width, height)| [width, height]),
+            texture_quality: page.get("TextureQuality").and_then(|v| v.as_u64()).map(|v| v.min(2) as u8),
+            mip_streaming: page.get("MipStreaming").and_then(|v| v.as_bool()),
+            shadows_quality: page.get("ShadowsQuality").and_then(|v| v.as_u64()).map(|v| v.min(3) as u8),
         }
+    }
+
+    /// One of the game's sound settings by its name (`Sound.ini`:
+    /// `OverallVolume`, `InterfaceVolume`), as a number.
+    pub fn sound_setting(&self, name: &str) -> Option<f32> {
+        self.settings_page("Sound.ini")?.get(name)?.as_f64().map(|v| v as f32)
     }
 
     /// One of the game's own settings by its name, as text
@@ -304,6 +338,12 @@ pub struct DisplaySettings {
     pub vsync: Option<bool>,
     pub mode: Option<i64>,
     pub resolution: Option<[u32; 2]>,
+    /// The pictures' quality, 0 (low) to 2 (high), and whether they are
+    /// streamed by their levels of detail (`TextureQuality`, `MipStreaming`).
+    pub texture_quality: Option<u8>,
+    pub mip_streaming: Option<bool>,
+    /// The shadows' quality, 0 (low) to 3 (ultra) (`ShadowsQuality`).
+    pub shadows_quality: Option<u8>,
 }
 
 /// One variant of a binding as the install keeps it (`InputSource`): the

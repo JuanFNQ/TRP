@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use bevy::prelude::*;
 use trp_sim::math::{delta_angle, quat_axis, quat_lerp, quat_mul, quat_rotate};
 use trp_sim::{
-    AimPoint, ArmPose, CameraPose, FireMode, FirearmEvent, HandsInput, Input as SimInput, Movement, Pacer, PointOfView, State,
+    AimPoint, ArmPose, CameraPose, FireMode, FirearmEvent, HandsInput, Input as SimInput, MedsEvent, Movement, Pacer, PointOfView, State,
 };
 
 use crate::range::Range;
@@ -26,6 +26,9 @@ use crate::{convert, Options, View};
 
 
 const NO_TURN: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+/// The kit's rattle the sights brought up or down ask for
+/// (`FirearmController.SetAim`: `PlayGearSound(0.2f)`).
+const AIM_KIT: f32 = 0.2;
 
 /// What is drawn of the simulation now.
 #[derive(Clone, Copy)]
@@ -171,7 +174,7 @@ impl Sprung {
 }
 
 /// Input that arrives between frames of the simulation.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Pending {
     look: Vec2,
     /// What the mouse gave the head's free look, in degrees across and
@@ -196,6 +199,9 @@ struct Pending {
     force_auto: bool,
     check_fire_mode: bool,
     examine: bool,
+    /// An item in use asked to stop (`MedsInputTranslator`): the shoot
+    /// key, the aim key or the scope's key pressed.
+    use_cancel: bool,
     /// The walk key given, and taken back where it is bound to be held.
     walk_toggle: bool,
     walk_end: bool,
@@ -231,9 +237,13 @@ pub struct Paced {
     pub blend: f32,
 }
 
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub struct Controller {
     pub movement: Movement,
+    /// The character's health (`docs/spec/health.md`), with the options'
+    /// `HEALTH SYSTEM` on: stepped after the movement each frame, which it
+    /// tells what it allows.
+    pub health: Option<trp_sim::health::Health>,
     /// What the last drawn frame ran of the simulation.
     pub paced: Paced,
     pending: Pending,
@@ -282,6 +292,18 @@ pub struct Controller {
     /// What the thing in the hands said of itself since it was last asked:
     /// that it has appeared, that it has been put away.
     hands_events: Vec<FirearmEvent>,
+    /// The `Sound` marks the animator of what is in the hands passed since
+    /// they were last played (`hands_sound`), each the mark's string.
+    pub hands_sounds: Vec<String>,
+    /// What the weapon asked of its sound player since it was last heard
+    /// (`shot_sound`): its shots and its trigger let go, in order.
+    pub shot_calls: Vec<crate::shot_sound::ShotCall>,
+    /// How often the aim's call has brought the sights up since the
+    /// weapon's aiming sound was last played (`hands_sound`).
+    pub aims_up: u32,
+    /// What health said of the items it was given to use since the
+    /// inventory last asked: what one holds now, one used up.
+    pub items_said: Vec<trp_sim::health::Event>,
     /// How many rounds the character has within reach for the weapon in
     /// hand, as the inventory last counted them: what a tube is filled
     /// from. And how many the weapon has taken since the inventory last
@@ -305,12 +327,27 @@ pub struct Controller {
     pub magazine_asked: Option<trp_sim::inventory::Id>,
     pub swaps: Vec<(Option<u32>, bool)>,
     pub magazines_hidden: u32,
+    /// Whether the weapon in hand draws its magazine, as its reload last
+    /// said, if it has said so since this was last taken: not from the
+    /// old one's leaving the hand (`OnMagPuttedToRig`, where the game
+    /// takes it off the weapon) until the next appears (`OnMagAppeared`).
+    pub magazine_drawn: Option<bool>,
     /// A menu is shown for what is looked at: the wheel is the menu's and
     /// does not set the walking speed (`ActionPanel.TranslateCommand`).
     /// And the notches it has turned since the menu last took them, up
     /// the list counted as positive.
     pub menu_shown: bool,
     pub menu_notches: i32,
+    /// The weapon's magazine has been checked in the hands, seen with the
+    /// character's own eyes (`FirearmController.CheckAmmo`:
+    /// `StrictCheckMagazine` in first person), until the inventory takes it.
+    pub magazine_checked: bool,
+    /// What of health raises the game's health panel in a raid
+    /// (`BattleUIScreen`), counted: damage taken (`ApplyDamageEvent`) or an
+    /// effect started that calls for the panel (`IEffectTriggersUIPanel`:
+    /// chronic fatigue, encumbered, overencumbered of the app's), and an
+    /// effect taken off (`EffectRemovedEvent`).
+    pub health_pulls: [u32; 2],
 }
 
 impl Controller {
@@ -320,6 +357,7 @@ impl Controller {
         let stepped = VecDeque::from([Stepped::of(&movement)]);
         let mut controller = Self {
             movement,
+            health: None,
             paced: Paced::default(),
             pending: Pending::default(),
             pacer,
@@ -339,6 +377,10 @@ impl Controller {
             armed: false,
             rig_pose: RigPose::default(),
             hands_events: Vec::new(),
+            hands_sounds: Vec::new(),
+            shot_calls: Vec::new(),
+            aims_up: 0,
+            items_said: Vec::new(),
             rounds_in_reach: 0,
             rounds_taken: 0,
             rounds_ejected: 0,
@@ -347,6 +389,9 @@ impl Controller {
             magazine_asked: None,
             swaps: Vec::new(),
             magazines_hidden: 0,
+            magazine_drawn: None,
+            magazine_checked: false,
+            health_pulls: [0, 0],
             menu_shown: false,
             menu_notches: 0,
         };
@@ -577,6 +622,9 @@ pub fn gather_input(
     pending.force_auto |= bindings.fired("ForceAutoWeaponMode");
     pending.check_fire_mode |= bindings.fired("CheckFireMode");
     pending.examine |= bindings.fired("ExamineWeapon");
+    // An item in use stops for the shoot key, the aim key or the scope's
+    // (`ToggleShooting`, `ToggleAlternativeShooting`, `ChangeScope`).
+    pending.use_cancel |= bindings.fired("Shoot") || bindings.fired("Aim") || bindings.fired("ChangeAimScope");
     pending.walk_toggle |= bindings.fired("Walk");
     pending.walk_end |= bindings.ended("Walk");
     pending.breath |= bindings.fired("Breath");
@@ -629,6 +677,14 @@ pub fn step(
     features: Res<crate::options_view::Features>,
 ) {
     let controller = &mut *controller;
+    // Dead, the character is left as it stood: the game switches its
+    // animators and its controller off with its life (`Player.OnDead`;
+    // health spec, "Death"), and what moves after is the corpse's
+    // (`death`).
+    if controller.health.as_ref().is_some_and(|health| !health.alive) {
+        controller.paced = Paced::default();
+        return;
+    }
     let inventory_open = controller.inventory_open;
     // Whose eyes the character is seen with: its own while the picture is
     // its own, and anyone else's from a camera outside it, as the game has
@@ -849,9 +905,38 @@ pub fn step(
                 (None, None) => 0,
             },
         };
+        // Dead, no key is heard (the game takes the character's input away
+        // with its life; health spec, "Death").
+        let input = if controller.health.as_ref().is_some_and(|health| !health.alive) { SimInput::default() } else { input };
         // The pacer's frames are the game's drawn frames: the player's
         // own whole-millisecond clock runs on them.
         controller.movement.frame(frame.dt, &input, &*range);
+        // Then health, which takes what the movement did and tells it what
+        // the character may do, on the player's whole-millisecond clock as
+        // the game's is (health spec, "Compared with what").
+        if let Some(health) = controller.health.as_mut() {
+            let player_dt = controller.movement.player_dt();
+            health.follow(player_dt, &mut controller.movement);
+            // What it did goes to an item at work in the hands (a part
+            // done: the next, or finished), and what an item holds now, or
+            // that it is used up, to the inventory.
+            for event in health.take_events() {
+                if let Some(meds) = hands.as_deref_mut().and_then(|hands| hands.meds.as_mut()) {
+                    meds.on_health(health, &event);
+                }
+                {
+                    use trp_sim::health::{Event, Kind};
+                    match event {
+                        Event::Damaged(..) | Event::Started(Kind::ChronicFatigue | Kind::Encumbered | Kind::OverEncumbered, _) => controller.health_pulls[0] = controller.health_pulls[0].wrapping_add(1),
+                        Event::Removed(..) => controller.health_pulls[1] = controller.health_pulls[1].wrapping_add(1),
+                        _ => {}
+                    }
+                }
+                if matches!(event, trp_sim::health::Event::Resource(..) | trp_sim::health::Event::UsedUp(..)) {
+                    controller.items_said.push(event);
+                }
+            }
+        }
         // The doors, containers and trunk move after the character, as the
         // game runs their routines after its update.
         range.step_things(frame.dt);
@@ -869,8 +954,10 @@ pub fn step(
             // first-person weapon (the roll lying down does).
             hands.hands.weapon_flip_speed = controller.movement.settings.weapon_flip_speed;
             // The weapon's motion and its recoil as the options' switches
-            // have them (the rig in hand may be new).
+            // have them (the rig in hand may be new), and what health does
+            // to it.
             hands.hands.set_systems(&controller.movement.systems);
+            hands.hands.set_health(controller.movement.conditions);
             // The weapon's motion is told whose eyes see it; the rig in
             // the hands may have been changed for another since.
             if hands.hands.point_of_view() != point_of_view {
@@ -974,6 +1061,7 @@ pub fn step(
                 }
                 if armed && handled && (pending.check_magazine || script_pressed("check_magazine")) {
                     firearm.check_magazine();
+                    controller.magazine_checked |= !outside;
                 }
                 if armed && handled && pending.check_chamber {
                     firearm.check_chamber();
@@ -997,7 +1085,10 @@ pub fn step(
                 firearm.set_aim_angle(controller.movement.pitch);
                 // How its animations are drawn: the options' switch.
                 firearm.set_drawn_smooth(features.smooth_animations);
-                for event in firearm.step(frame.dt) {
+                // Its operations on the player's clock, its animator on the
+                // engine's (`Firearm::step_on_clock`).
+                let player_dt = controller.movement.player_dt();
+                for event in firearm.step_on_clock(frame.dt, player_dt) {
                     match event {
                         FirearmEvent::Shot { strength } => hands.hands.shoot(strength),
                         FirearmEvent::AutoFire(on) => hands.hands.set_auto_fire(on),
@@ -1016,7 +1107,11 @@ pub fn step(
                         // of the hand: the inventory makes the one and
                         // lets the magazine fall at the other.
                         FirearmEvent::MagazineSwap { left, quick } => controller.swaps.push((left, quick)),
-                        FirearmEvent::MagazineHidden => controller.magazines_hidden += 1,
+                        FirearmEvent::MagazineHidden => {
+                            controller.magazines_hidden += 1;
+                            controller.magazine_drawn = Some(false);
+                        }
+                        FirearmEvent::MagazineShown | FirearmEvent::MagazineIn => controller.magazine_drawn = Some(true),
                         // The stock folded or unfolded: the recoil and
                         // the hold go by the build as it now stands, and
                         // the body's animator by its new width.
@@ -1025,7 +1120,26 @@ pub fn step(
                             let width = if folded { hands.folded_width.unwrap_or(hands.width) } else { hands.width };
                             controller.movement.body.set_weapon_width(width);
                         }
-                        // Sound, shells and the magazine's model are not in yet.
+                        // A mark of a sound: its rig's sound player plays it.
+                        FirearmEvent::Sound(name) => controller.hands_sounds.push(name),
+                        // A shot's sound, and the trigger let go, which
+                        // ends an automatic weapon's loop.
+                        FirearmEvent::FireSound { trigger, doublet } => controller.shot_calls.push(crate::shot_sound::ShotCall::Fire { trigger, doublet }),
+                        FirearmEvent::TriggerReleased => controller.shot_calls.push(crate::shot_sound::ShotCall::Release),
+                        // The sights brought up or down by the aim's call:
+                        // the kit rattles at 0.2, alive (`SetAim`,
+                        // `PlayGearSound`), and coming up the weapon's
+                        // aiming sound plays.
+                        FirearmEvent::Aimed(up) => {
+                            if controller.health.as_ref().is_none_or(|health| health.alive) {
+                                let overweight = controller.movement.stamina.settings.overweight;
+                                controller.movement.sounds.kit(AIM_KIT, overweight);
+                            }
+                            if up {
+                                controller.aims_up += 1;
+                            }
+                        }
+                        // Shells and the magazine's model are not in yet.
                         _ => {}
                     }
                 }
@@ -1035,11 +1149,28 @@ pub fn step(
                 empty.set_drawn_smooth(features.smooth_animations);
                 let said = empty.step(frame.dt, controller.movement.pitch);
                 for event in &said {
-                    if let FirearmEvent::BodyAction(action) = event {
-                        controller.movement.body.set_weapon_action(*action);
+                    match event {
+                        FirearmEvent::BodyAction(action) => controller.movement.body.set_weapon_action(*action),
+                        FirearmEvent::Sound(name) => controller.hands_sounds.push(name.clone()),
+                        _ => {}
                     }
                 }
                 controller.hands_events.extend(said.into_iter().filter(|event| matches!(event, FirearmEvent::Appeared | FirearmEvent::Hidden)));
+            }
+            // So has an item used, its work done by health.
+            if let (Some(meds), Some(health)) = (&mut hands.meds, controller.health.as_mut()) {
+                meds.set_drawn_smooth(features.smooth_animations);
+                if pending.use_cancel {
+                    meds.cancel();
+                }
+                for event in meds.step(health, frame.dt, controller.movement.pitch) {
+                    match event {
+                        MedsEvent::BodyAction(action) => controller.movement.body.set_weapon_action(action),
+                        MedsEvent::Appeared => controller.hands_events.push(FirearmEvent::Appeared),
+                        MedsEvent::Hidden => controller.hands_events.push(FirearmEvent::Hidden),
+                        MedsEvent::Sound(name) => controller.hands_sounds.push(name),
+                    }
+                }
             }
             // The rig as its animator has it now, which is what the rest
             // of the frame goes by, as the game's late update does.

@@ -1,1 +1,0 @@
-{"duration":10.5,"press":[{"key":"prone","at":0.5},{"key":"prone","at":8.5}],"hold":[{"key":"w","from":2.5,"to":6.5}],"turn":[{"from":3.5,"to":4.0,"yaw":200,"pitch":0},{"from":4.5,"to":5.0,"yaw":-200,"pitch":0},{"from":5.5,"to":5.55,"yaw":6000,"pitch":0},{"from":7.0,"to":7.05,"yaw":-6000,"pitch":0}]}

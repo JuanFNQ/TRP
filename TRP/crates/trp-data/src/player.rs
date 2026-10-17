@@ -123,6 +123,12 @@ pub struct BreathData {
     pub base_hip_amplitudes: [f32; 2],
     pub random_between: [f32; 2],
     pub shot_hardness: f32,
+    /// The hands' tremor, from pain or a broken arm (`TremorXRandom`,
+    /// `TremorYRandom`, `TremorZRandom`).
+    pub tremor: [SmoothRandomData; 3],
+    /// The highest a broken arm lets the hands' level count
+    /// (`EnergyFractureLimit`).
+    pub fracture_limit: f32,
 }
 
 /// One component of a turn-away pose: a curve of the effector's value
@@ -207,6 +213,9 @@ pub struct HandsData {
     /// Walk intensity at speed 0 and at speed 1.
     pub walk_intensity_range: [f32; 2],
     pub walk_normal: Vec<WalkEntry>,
+    /// The walk's bob on a damaged leg (`WalkEffector.Presets`' second,
+    /// `EWalkPreset.lame`).
+    pub walk_lame: Vec<WalkEntry>,
 
     pub camera_smooth_time: f32,
     pub camera_smooth_out: f32,
@@ -265,20 +274,26 @@ impl HandsData {
 
         let motion = pwa.req("MotionReact")?;
         let walk = pwa.req("Walk")?;
-        let normal_preset = walk
-            .req("Presets")?
-            .as_array()
-            .and_then(|a| a.first())
-            .context("walk effector has no presets")?;
-        let preset = referenced(assets, normal_preset)?;
-        let mut walk_normal = Vec::new();
-        for entry in preset.req("Curves")?.as_array().unwrap_or(&[]) {
-            walk_normal.push(WalkEntry {
-                curve: curve(entry.req("Curve")?)?,
-                time_shift: float(entry, "TimeShift")?,
-                vals: vals(entry.req("Vals")?)?,
-            });
-        }
+        let presets = walk.req("Presets")?.as_array().context("walk effector has no presets")?;
+        let preset_curves = |preset: &Value| -> Result<Vec<WalkEntry>> {
+            let preset = referenced(assets, preset)?;
+            let mut entries = Vec::new();
+            for entry in preset.req("Curves")?.as_array().unwrap_or(&[]) {
+                entries.push(WalkEntry {
+                    curve: curve(entry.req("Curve")?)?,
+                    time_shift: float(entry, "TimeShift")?,
+                    vals: vals(entry.req("Vals")?)?,
+                });
+            }
+            Ok(entries)
+        };
+        let walk_normal = preset_curves(presets.first().context("walk effector has no presets")?)?;
+        // The lame one, if the prefab has one (`EWalkPreset.lame`, the
+        // second); else the normal one.
+        let walk_lame = match presets.get(1) {
+            Some(preset) => preset_curves(preset)?,
+            None => walk_normal.clone(),
+        };
         let ranges = walk.req("IntensityMinMax")?.as_array().unwrap_or(&[]);
         let range = ranges.first().context("walk effector has no intensity range")?;
 
@@ -318,6 +333,8 @@ impl HandsData {
             base_hip_amplitudes: vec2(breath.req("_baseHipRandomAmplitudes")?)?,
             random_between: vec2(breath.req("_randomBetween")?)?,
             shot_hardness: float(breath, "_shotHardness")?,
+            tremor: [random("TremorXRandom")?, random("TremorYRandom")?, random("TremorZRandom")?],
+            fracture_limit: float(breath, "EnergyFractureLimit")?,
         };
 
         let custom = pwa.req("CustomEffector")?;
@@ -383,6 +400,7 @@ impl HandsData {
             walk_step_frequency: float(walk, "StepFrequency")?,
             walk_intensity_range: [float(range, "x")?, float(range, "y")?],
             walk_normal,
+            walk_lame,
             camera_smooth_time: float(&pwa, "CameraSmoothTime")?,
             camera_smooth_out: float(&pwa, "CameraSmoothOut")?,
             camera_smooth_steady: float(&pwa, "CameraSmoothSteady")?,

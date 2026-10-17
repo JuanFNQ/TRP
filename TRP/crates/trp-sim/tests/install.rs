@@ -1097,6 +1097,11 @@ fn a_sprint_runs_the_legs_dry_and_ends() {
 fn the_legs_dry_scenario_runs_the_legs_dry() {
     use trp_sim::script::{Clock, Scenario};
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hosts/spt-oracle/scenarios/61-legs-dry.json");
+    // The recorder's scenarios are not in the public copy (`docs/manual.md`, "Publishing").
+    if !path.exists() {
+        eprintln!("skipped: no recorder's scenarios here");
+        return;
+    }
     let scenario = Scenario::load(&path).expect("the scenario");
     assert_eq!(scenario.gates.len(), 3);
     let frame = 1.0 / 120.0;
@@ -1611,6 +1616,38 @@ fn a_walk_off_a_ledge_falls_and_lands() {
     assert!(capped < cap_before - 0.05, "{capped} against {cap_before}");
     assert!((m.clamped_speed() - cap_before).abs() < 1e-3);
     assert!(m.grounded && m.freefall_time == 0.0 && !m.long_fall());
+}
+
+/// A sprint off the range's ledge, 6 m up, held on after the landing: the
+/// landing caps the speed to nought for a while, and the sprint's own limit
+/// under it is the game's `Mathf.Clamp` with its bounds crossed (0.1, the
+/// lower, wins), which Rust's clamp would stop the program on (it did, in
+/// the app, 2026-10-15).
+#[test]
+fn a_sprint_off_a_high_ledge_lands_and_goes_on() {
+    let Some(mut m) = movement(0.0) else { return };
+    let ledge = Ledge { edge: 12.0, height: 6.0 };
+    let frame = 1.0 / 120.0;
+    // A walk first: a sprint pressed before moving is ignored.
+    let walking = walk([0.0, 1.0]);
+    for _ in 0..(0.5 / frame) as usize {
+        m.step(frame, &walking, &ledge);
+    }
+    let sprinting = Input { move_dir: [0.0, 1.0], sprint: true, ..Input::default() };
+    let (mut lowest, mut landed, mut sprinted_on) = (f32::MAX, None, 0);
+    for _ in 0..(8.0 / frame) as usize {
+        m.step(frame, &sprinting, &ledge);
+        if landed.is_none() && m.grounded && m.position[1] < -5.9 {
+            landed = Some(m.state);
+        }
+        if landed.is_some() {
+            lowest = lowest.min(m.speed_limit());
+            sprinted_on += (m.state == State::Sprint) as usize;
+        }
+    }
+    println!("landed in {landed:?}; the speed allowed after it at least {lowest:.3}; {sprinted_on} frames of sprint after it; now {:?} at {:.2} m/s", m.state, m.ground_speed());
+    assert_eq!(landed, Some(State::Sprint));
+    assert!(lowest < 0.1, "{lowest}");
 }
 
 /// The legs as the body's animator poses them, for a host that draws the

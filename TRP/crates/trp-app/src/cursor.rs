@@ -24,18 +24,18 @@
 //! any key pressed with Alt held, the walk's among them).
 
 use bevy::prelude::*;
-use bevy::window::{CursorGrabMode, PrimaryWindow};
+use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::controller::Controller;
 use crate::{Options, View};
 
 /// Holds the pointer as the play stands. A run nobody is at the keys of
 /// leaves it alone.
-pub fn hold(options: Res<Options>, view: Res<View>, controller: Res<Controller>, mut window: Query<&mut Window, With<PrimaryWindow>>) {
+pub fn hold(options: Res<Options>, view: Res<View>, controller: Res<Controller>, mut window: Query<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>) {
     if options.unattended() {
         return;
     }
-    let Ok(mut window) = window.single_mut() else { return };
+    let Ok((mut window, mut cursor)) = window.single_mut() else { return };
     let (grab, visible) = if !window.focused || controller.inventory_open {
         (CursorGrabMode::None, true)
     } else if view.played() {
@@ -45,7 +45,7 @@ pub fn hold(options: Res<Options>, view: Res<View>, controller: Res<Controller>,
     };
     // Written only when it differs: the window is otherwise seen as
     // changed on every frame.
-    if window.cursor_options.grab_mode != grab {
+    if cursor.grab_mode != grab {
         // The pointer is held where it is, so it is first put in the
         // middle of the window: one that was outside it (the window come
         // to the front by the keyboard) would be held out there, in sight.
@@ -53,17 +53,17 @@ pub fn hold(options: Res<Options>, view: Res<View>, controller: Res<Controller>,
             let middle = Vec2::new(window.width(), window.height()) / 2.0;
             window.set_cursor_position(Some(middle));
         }
-        window.cursor_options.grab_mode = grab;
+        cursor.grab_mode = grab;
     }
-    if window.cursor_options.visible != visible {
-        window.cursor_options.visible = visible;
+    if cursor.visible != visible {
+        cursor.visible = visible;
     }
 }
 
 /// Keeps the window from taking a key pressed with Alt for its own menu,
 /// once, when the window is first the one in front. On the main thread,
 /// which is the window's own.
-pub fn keep_alt(options: Res<Options>, window: Query<&Window, With<PrimaryWindow>>, _main: NonSend<bevy::winit::WinitWindows>, mut kept: Local<bool>) {
+pub fn keep_alt(options: Res<Options>, window: Query<&Window, With<PrimaryWindow>>, _main: bevy::ecs::system::NonSendMarker, mut kept: Local<bool>) {
     if *kept || options.alt_menu || options.unattended() || !window.single().is_ok_and(|window| window.focused) {
         return;
     }

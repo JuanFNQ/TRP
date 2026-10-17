@@ -2,7 +2,7 @@
 
 A Rust rewrite, on Bevy, of the first-person character controller of the game Single Player Tushonka (SPT) runs on. It reads everything it shows from your own SPT install each time it starts: no files of any game are in this repository.
 
-**The code, how to build and run it, what works, and what was learned and how: [`TRP/README.md`](TRP/README.md).**
+**The code, what works, and what was learned and how: [`TRP/README.md`](TRP/README.md). What changed in each release: [`PATCH_NOTES.md`](PATCH_NOTES.md).**
 
 ## Requirements
 
@@ -11,16 +11,14 @@ A Rust rewrite, on Bevy, of the first-person character controller of the game Si
 - **The Forge (Single Player Tushonka)** *(required)*: [Download installer](https://sp-mod.com/installer)
 - **S.T.A.L.K.E.R. Anomaly / GAMMA** *(optional)*
 
-Quick start:
+## Install and play
 
-```
-git clone https://github.com/JuanFNQ/TRP.git
-cd TRP\TRP
-cargo run -p trp-app
-```
+1. Download TRP: on GitHub, **Code > Download ZIP** (or the latest release's source code), and unzip it. Or `git clone https://github.com/JuanFNQ/TRP.git`.
+2. Double-click **`Install.bat`**, once. It checks for the C++ build tools and Rust and offers to install what is missing, builds TRP (several minutes the first time; about 10 GB on disk in all), and asks where your SPT folder is.
+3. Double-click **`Play.bat`** to play. After an update it rebuilds by itself first.
 
-The first start asks in the console where your SPT folder is, and, if you have them, S.T.A.L.K.E.R. Anomaly's and GAMMA's.
+On the range, the crate straight ahead holds a rifle, a vest and a backpack; the tables along the low wall hold every weapon of the install. `F1` shows the keys.
 
-`AGENTS.md` is the working brief of the AI sessions this was written with: its rules, the user's decisions and the state of the work.
+The working brief of the AI sessions this was written with (`AGENTS.md`), the day-by-day log and the recording plugin stay in the private repository; the public one holds what building and running the app needs, and its documentation.
 
 An unofficial fan project, not affiliated with or endorsed by Battlestate Games, GSC Game World, or the teams of Single Player Tushonka, Anomaly or GAMMA.

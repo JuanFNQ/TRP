@@ -137,7 +137,7 @@ Read from the game's code on 2026-10-12 (evening), after two recordings made by 
 
 A door unlocked is shut, at once, when it is told (`Unlock`): it is then opened like any other.
 
-No recording has a lock opened with a key: this path is as read. (The approach itself is on record in the two kicks.)
+**The clock.** The state times itself by the real clock (`Time.realtimeSinceStartup` from when it was entered), as the pick-up's does, which runs with the player's whole-millisecond frame time and not the engine's: the simulation hands both states the player's (`Movement::act`). Its 1.6 s count from the frame after it is entered. Recorded once (course 6, below): the lock opened and the door shut on the game's frame.
 
 ## A thing's own part (`WorldInteractiveObject`, `Door`, `LootableContainer`, `Trunk`)
 
@@ -277,4 +277,16 @@ Seen in the layer itself (`gesture_layer.sh`): a door's and the pick-up's gestur
 
 The body's figures are the simulation's own run with the recorded doors' places and the recorded character's Strength, on even ground; the two differ by up to 8 mm in the failed kick and by 1 mm at rest. **Not compared frame by frame:** the body's place through the kick (no script replays a recording made by hand), and the menu, which no recording shows.
 
-**Not recorded yet:** a lock opened with a key; a container walked away from as it is searched; the leaf's own collider, for the push.
+**Course 6 of the user's courses, the world** (recorder 0.8.0, `local\traces\courses1\6-*`, made 2026-10-15, read 2026-10-16; `byhand`, the traces copied to `local\byhand_c_s86\6-*` as `free-*.jsonl`). The weapon's animator is the game's on every frame of all seven recordings. **Every thing worked is the game's on every frame, its angle to 0.000 degrees and its state** (7,232 frames):
+
+| What was done | Recorded | The model |
+|---|---|---|
+| a container searched and walked away from | the wait over with the character 1.24 m further off than at the key: no screen, the lid shut again | told to shut; the lid on the game's 798 frames |
+| a door's menu: opened, shut | gestures 20 and 21 | the same, from the door's geometry and the player's place |
+| a kick from the side the door swings away from | the door held | by the code's rule it opens: so this door cannot be breached at all (`CanBeBreached`, not on record; taken from the recording). The player 0.0 mm from the kick's place; the kick lands 0.453 of the way through the state |
+| a kick at the same door from the other side | held | held, by the rule; 0.0 mm; 0.450 |
+| a kick at a second door from the side it swings away from | thrown open | thrown open, by the rule; 0.0 mm; on the game's 916 frames |
+| a locked door unlocked with its key | the door shut and unlocked 2.06 s after the key | the same frame, with the state on the player's frame time (a frame late on the engine's) |
+| a weapon as found | taken from a container searched | the container's lid on the game's 1,221 frames |
+
+**Not compared:** the menu's own list and its scrolling (not on record), the body's place through the kicks frame by frame, the leaf's own collider for the push.

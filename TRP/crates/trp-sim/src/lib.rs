@@ -13,10 +13,14 @@ pub mod collision;
 pub mod empty_hands;
 pub mod firearm;
 pub mod hands;
+pub mod health;
+pub mod health_replay;
 pub mod head_look;
 pub mod interactions;
 pub mod inventory;
+pub mod item_menu;
 pub mod marks;
+pub mod meds_hands;
 pub mod math;
 pub mod movement;
 pub mod pacing;
@@ -25,6 +29,7 @@ pub mod rig;
 pub mod script;
 pub mod settings;
 pub mod stamina;
+pub mod steps;
 pub mod systems;
 pub mod things;
 pub mod vaulting;
@@ -36,6 +41,7 @@ pub use empty_hands::EmptyHands;
 pub use firearm::{Event as FirearmEvent, FireMode, Firearm, FirearmSettings};
 pub use hands::{AimPoint, CameraPose, Carried, Hands, HandsInput, HandsSettings, Held, SightLine};
 pub use interactions::Interaction;
+pub use meds_hands::{MedsEvent, MedsHands};
 pub use movement::{Acted, Flat, Input, Movement, State, Stopwatch, World, WorldInteraction};
 pub use pacing::{Pacer, REFERENCE_FRAME_RATE};
 pub use settings::MovementSettings;
@@ -99,7 +105,11 @@ pub fn load_movement_settings(
     weight: f32,
 ) -> Result<MovementSettings> {
     let table = RootMotionTable::load(assets)?;
-    MovementSettings::new(table, hard, &db.config, weight, engine.gravity[1])
+    let mut settings = MovementSettings::new(table, hard, &db.config, weight, engine.gravity[1])?;
+    // The kinds of moving's multipliers for its sounds are the client's
+    // settings', not the globals' (`steps.rs`).
+    settings.steps.read_client(&db.client);
+    Ok(settings)
 }
 
 fn number(v: &Json, name: &str) -> Result<f32> {
@@ -148,6 +158,7 @@ pub fn hands_settings(
         // The first of each pair is for sound arms and no overweight.
         sway_frequency: hard.vec2("SWAY_FREQ_NORMAL_DAMAGED")?[0],
         sway_damping: hard.vec2("SWAY_DAMPING_NORMAL_DAMAGED")?[0],
+        sway_damaged: [hard.vec2("SWAY_FREQ_NORMAL_DAMAGED")?[1], hard.vec2("SWAY_DAMPING_NORMAL_DAMAGED")?[1]],
         sway_strength_per_kg: hard.curve("SWAY_STRENGTH_PER_KG")?.clone(),
         displacement_strength_per_kg: hard.curve("DISPLACEMENT_STRENGTH_PER_KG")?.clone(),
         aiming: hands::AimingConfig {
@@ -215,6 +226,7 @@ pub fn empty_hands_settings(
         fixed_timestep: engine.fixed_timestep,
         sway_frequency: hard.vec2("SWAY_FREQ_NORMAL_DAMAGED")?[0],
         sway_damping: hard.vec2("SWAY_DAMPING_NORMAL_DAMAGED")?[0],
+        sway_damaged: [hard.vec2("SWAY_FREQ_NORMAL_DAMAGED")?[1], hard.vec2("SWAY_DAMPING_NORMAL_DAMAGED")?[1]],
         sway_strength_per_kg: hard.curve("SWAY_STRENGTH_PER_KG")?.clone(),
         displacement_strength_per_kg: hard.curve("DISPLACEMENT_STRENGTH_PER_KG")?.clone(),
         aiming: hands::AimingConfig {

@@ -102,7 +102,20 @@ In the recorder (0.7.0, built, not run): a key (`\`, the setting `PointOfViewKey
 
 ## Compared with what
 
-**With the game: nothing yet.** No recording has a character seen from outside. Everything above is the game's code and the install's data as read, tried in `crates/trp-sim/tests/third_person.rs` against the install's own controller and prefab:
+**With the game: course 7 of the user's courses** (recorder 0.8.0, made 2026-10-15 with the game's switch thrown, `point_of_view: ThirdPerson`; read 2026-10-16; kept as `local\traces\outside1`, `main` for six scenarios of the main set and `hands` for the six of `scenarios-hands`, and in the regression as `ro` and `roh`). The replay takes a trace's point of view from its header (`replay --traces local\traces\outside1\main`): the body and the hands are told it, the weapon's motion runs `ThirdPersonStrategy`, the camera is left where it stands (and what the replay says of the camera, the eye and the field of view is left out), nothing is squeezed along the view, the body is told the weapon's `ThirdAction` marks, and it reaches for the vest as the left hand's marker nears the weapon's marker for it. Each of the body animator's layers is started where the recording has it (below). On every frame of all twelve:
+
+- **the body animator's state and the weapon animator's state and time are the game's**;
+- **the body's own weapon bone** (`Weapon_root_3rd_anim`): the game's to 0.000 degrees standing, aiming and firing, within 0.06 in the walk, within 0.26 through a reload (0.08 to 0.12 rms);
+- **the arms** (the whole chain, from the simulation's own weapon): within 0.1 to 0.2 degrees in a walk and a sprint (0.005 to 0.016 rms), 0.5 aiming and firing (0.03 to 0.09 rms), 0.8 to 1.4 through a reload or a fire-mode switch (0.1 to 0.26 rms); the palms within 2 to 7 mm where the ground is the replay's;
+- **the weapon's moved bone and its share of the body's** (`Weapon_3rd`): the share the game's on every frame, the bone within 0.14 degrees and 3 mm standing, 0.35 degrees through a reload;
+- **the weapon's springs** under `ThirdPersonStrategy` (`hands_pos`, `hands_rot`): within 2 mm and 0.12 degrees, the largest on the first frame;
+- **the reach for the vest's weight**: within 0.013 of the game's (0.002 rms), as the reload's clip takes the left hand to the vest and back.
+
+Before the layers were started from the recording the arms were 1 to 1.7 degrees off (rms) all through: the breath's additive clip, which only a character seen from outside plays, was out of step with the game's, which began 0.89 of the way through its cycle where the replay's began at nothing. Set beside the first-person arms instead, as the replay did before it read the header, they were 14 to 80 degrees apart.
+
+**What does not compare.** The walk and the sprint (01, 06) and the crawl (26) were made on ground that is not the replay's flat ground (the crawl's tilts by up to 3.5 degrees in patches, and the whole lying body with it: 8 degrees at most, the bones together); the folder has no `ground.txt`. The camera, which the game leaves where it stood. The turn-away's second figures (nothing was in the way) and the aim pose's tip as the sights move (within the 0.14 degrees above). A bot's mask.
+
+Before the recording, everything above was the game's code and the install's data as read, tried in `crates/trp-sim/tests/third_person.rs` against the install's own controller and prefab:
 
 - at rest and in a walk the body's weapon bone has the weapon whole (authority 1.000) where its own eyes see the rig's; both hands stay the weapon's, both shoulders the body's;
 - standing still for four seconds the right upper arm travels 47 mm (the breath), and none for its own eyes; the body's lean into a walk is on, and gone again for its own eyes with the arm back where it rested to 0.00 mm;
@@ -118,7 +131,7 @@ The first-person results are untouched: the regression over the sixteen kept rec
 ## Not built, and open
 
 - **A second character.** The app has one character and shows it from outside. Two at once (a bot, another player) needs the app's rig, body and controller to be made per character; the simulation's types already are.
-- **The replay for a third-person trace**: the header's `point_of_view` is not read.
+- **The replay for a third-person trace** reads the header's `point_of_view` since 2026-10-16; the ground under course 7's walk, sprint and crawl is not given to it.
 - The grenade's and the blades' states of layer 1; the left-stance layer; a stationary weapon's and a mounted weapon's branches.
 - The feet's solver, every level of detail and all culling by distance.
 - The weapon's own switch (`Firearms.SetPointOfView`: muzzle effects, tactical devices) and the sounds' (a character seen from outside is heard in the world; its own steps and voice are not placed).

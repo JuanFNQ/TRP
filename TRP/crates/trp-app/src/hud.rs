@@ -5,12 +5,15 @@
 //! legs and the arms are. The drawing is plain bars; the game's art for
 //! it is not read.
 //!
-//! And, at the top left, two panels of the app's own in the inventory
-//! screen's colours (the user, 2026-10-13): **the debug figures** (what
-//! the movement and the thing in hand are doing just now), and under them
-//! with a small gap **the guide to the keys**, read off the bindings as
-//! they stand. `F1` hides the guide and shows it; it stands back while the
-//! inventory screen is open.
+//! And, at the top right, a panel of the app's own in the inventory
+//! screen's colours (the user, 2026-10-16: "Let's move the debug corner to
+//! the top right of the display, combine all information into an
+//! organized pop-up. (Debug/FPS information included only show when f1 is
+//! pressed, hidden when closed)"): **the frame rate**, **the debug
+//! figures** (what the movement and the thing in hand are doing just now)
+//! and **the guide to the keys**, read off the bindings as they stand.
+//! `F1` shows it and hides it; hidden as a run begins (`--fps on` starts
+//! with it shown), and while the inventory screen is open.
 
 use bevy::prelude::*;
 
@@ -53,7 +56,7 @@ struct Notch(usize);
 #[derive(Component)]
 struct StanceWord;
 
-/// The frame-rate readout at the bottom right.
+/// The frame-rate readout, in the panel at the top right.
 #[derive(Component)]
 struct FrameRateText;
 
@@ -88,48 +91,81 @@ pub struct DebugValue(usize);
 #[derive(Component)]
 pub struct DebugCell(usize);
 
-/// The guide to the keys, and whether the player wants it shown.
+/// The panel at the top right, the guide to the keys in it, and whether
+/// the player wants it shown.
 #[derive(Component)]
-struct GuidePanel;
+struct DebugPopup;
+/// The small tag at the top right that says how to open it, while it is
+/// shut (the user, 2026-10-16: "Add "Press f1 for debug menu" a small tag
+/// on the top right").
+#[derive(Component)]
+struct DebugTag;
+#[derive(Component)]
+struct GuideBody;
 #[derive(Resource)]
-struct GuideShown(bool);
+pub struct GuideShown(bool);
 
 pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FrameTimes>()
-            .insert_resource(GuideShown(true))
             .add_systems(Startup, (spawn, spawn_top))
             // The guide after a capture's own presses are in, which come
             // before the weapon's clips: a key pressed by hand is in sooner.
-            .add_systems(Update, (show, frame_rate, guide.after(crate::animation::play_clips)));
+            .add_systems(Update, (show, frame_rate, guide.after(crate::animation::play_clips), hide_over_screen));
     }
 }
 
-/// A panel of the top left, laid out as told: the inventory screen's
+/// A panel of the app's own, laid out as told: the inventory screen's
 /// dark ground and its line about it.
 fn panel(layout: Node) -> impl Bundle {
     let node = Node { border: UiRect::all(Val::Px(1.0)), padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)), ..layout };
-    (node, BackgroundColor(BACK), BorderColor(LINE))
+    (node, BackgroundColor(BACK), BorderColor::all(LINE))
 }
 
-fn spawn_top(mut commands: Commands) {
-    let column = Node {
+/// A section's name in the panel, over a line.
+fn section(parent: &mut ChildSpawnerCommands, name: &str) {
+    let head = Node { margin: UiRect::top(Val::Px(4.0)), padding: UiRect::bottom(Val::Px(2.0)), border: UiRect::bottom(Val::Px(1.0)), ..default() };
+    parent.spawn((head, BorderColor::all(LINE))).with_children(|head| {
+        head.spawn(words(name, 10.0, FAINT));
+    });
+}
+
+/// The panel at the top right: its head, then the frame rate, the debug
+/// figures (each name over its figure, in rows) and the guide to the keys,
+/// each under its section's name.
+fn spawn_top(mut commands: Commands, options: Res<Options>) {
+    commands.insert_resource(GuideShown(options.show_fps));
+    let tag = Node {
         position_type: PositionType::Absolute,
-        left: Val::Px(16.0),
+        right: Val::Px(16.0),
         top: Val::Px(12.0),
-        flex_direction: FlexDirection::Column,
-        // Both as wide as the wider of the two.
-        align_items: AlignItems::Stretch,
-        // The small gap between the two.
-        row_gap: Val::Px(6.0),
+        padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+        display: if options.show_fps { Display::None } else { Display::Flex },
         ..default()
     };
-    commands.spawn(column).with_children(|top| {
-        // The debug figures: a row of names, each over its figure. Drawn
-        // over the inventory screen, in the band above its tabs.
-        top.spawn((panel(Node { column_gap: Val::Px(16.0), ..default() }), GlobalZIndex(11))).with_children(|row| {
+    commands.spawn((DebugTag, tag, BackgroundColor(BACK.with_alpha(0.6)), GlobalZIndex(11))).with_children(|tag| {
+        tag.spawn((words("PRESS F1 FOR DEBUG MENU", 10.0, FAINT), TextLayout::new_with_no_wrap()));
+    });
+    let popup = Node {
+        position_type: PositionType::Absolute,
+        right: Val::Px(16.0),
+        top: Val::Px(12.0),
+        flex_direction: FlexDirection::Column,
+        row_gap: Val::Px(4.0),
+        display: if options.show_fps { Display::Flex } else { Display::None },
+        ..default()
+    };
+    commands.spawn((DebugPopup, panel(popup), GlobalZIndex(11))).with_children(|popup| {
+        popup.spawn(Node { justify_content: JustifyContent::SpaceBetween, column_gap: Val::Px(24.0), ..default() }).with_children(|head| {
+            head.spawn(words("DEBUG", 11.0, WORDS));
+            head.spawn(words("F1 CLOSES THIS", 10.0, FAINT));
+        });
+        section(popup, "PERFORMANCE");
+        popup.spawn((FrameRateText, words("", 12.0, WORDS), TextLayout::new_with_no_wrap()));
+        section(popup, "CHARACTER");
+        popup.spawn(Node { column_gap: Val::Px(16.0), row_gap: Val::Px(6.0), flex_wrap: FlexWrap::Wrap, max_width: Val::Px(760.0), ..default() }).with_children(|row| {
             for (index, (name, room)) in DEBUG.into_iter().enumerate() {
                 let cell = Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(1.0), min_width: Val::Px(room), ..default() };
                 row.spawn((DebugCell(index), cell)).with_children(|cell| {
@@ -138,12 +174,42 @@ fn spawn_top(mut commands: Commands) {
                 });
             }
         });
-        // The guide: drawn afresh when the bindings or the view change.
-        top.spawn((GuidePanel, panel(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), ..default() })));
+        section(popup, "CONTROLS");
+        // Drawn afresh when the bindings or the view change.
+        popup.spawn((GuideBody, Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), ..default() }));
     });
 }
 
+/// What of the HUD the game's screen hides while it is open: the meters of
+/// the stance, speed and stamina.
+#[derive(Component)]
+struct ScreenHides;
+
+/// The meters of the stance, speed and stamina, which the game's own
+/// stance panel takes the place of with `TARKOV UI` (`battle_view`).
+#[derive(Component)]
+struct PlainMeters;
+
+/// With `TARKOV UI` the inventory screen is the game's, which shows
+/// nothing of the app's under its left side: the meters are hidden while
+/// it is open, and not drawn at all where the game's stance panel is.
+fn hide_over_screen(
+    controller: Res<Controller>,
+    features: Res<crate::options_view::Features>,
+    look: Res<crate::health_view::HealthLook>,
+    mut row: Query<(&mut Node, Has<PlainMeters>), With<ScreenHides>>,
+) {
+    let battle = look.tarkov_ui && look.battle.is_some();
+    for (mut node, meters) in &mut row {
+        let display = if (controller.inventory_open && features.tarkov_ui) || (meters && battle) { Display::None } else { Display::Flex };
+        if node.display != display {
+            node.display = display;
+        }
+    }
+}
+
 /// The debug panel's figures as they stand.
+#[allow(clippy::too_many_arguments)]
 pub fn debug(
     player: Res<ClipPlayer>,
     controller: Res<Controller>,
@@ -151,7 +217,15 @@ pub fn debug(
     hands: Option<Res<HandsRig>>,
     mut figures: Query<(&DebugValue, &mut Text)>,
     mut cells: Query<(&DebugCell, &mut Node)>,
+    shown: Option<Res<GuideShown>>,
+    keys: Res<ButtonInput<KeyCode>>,
 ) {
+    // Written while the panel is shown, or as `F1` shows it (`guide` is
+    // not ordered before this): a text written is measured and laid out
+    // afresh whether it is seen or not.
+    if !shown.is_some_and(|shown| shown.0) && !keys.just_pressed(KeyCode::F1) {
+        return;
+    }
     let m = &controller.movement;
     // With nothing in hand there is no weapon to speak of.
     let weapon = match hands.as_deref().and_then(|h| h.firearm.as_ref()).filter(|_| controller.armed) {
@@ -210,8 +284,13 @@ pub fn debug(
 }
 
 /// The app's own keys, which are not bindings.
-const APP_KEYS: [(&str, &str); 4] =
-    [("F1", "This guide"), ("F3", "Frame rate"), ("F4", "Free camera"), ("F5", "Watched from outside, or back")];
+const APP_KEYS: [(&str, &str); 5] = [
+    ("F1", "This panel"),
+    ("F4", "Free camera"),
+    ("F5", "Watched from outside, or back"),
+    ("F7", "Hurt the next part (a bullet)"),
+    ("F8", "Die (a bullet through the head)"),
+];
 /// The free camera's, shown in place of the character's while it flies.
 const CAMERA_KEYS: [(&str, &str); 6] = [
     ("RMB (hold)", "Look"),
@@ -222,9 +301,10 @@ const CAMERA_KEYS: [(&str, &str); 6] = [
     ("F5", "Play, watched from here"),
 ];
 
-/// Keeps the guide to the keys: `F1` hides it and shows it, it stands back
-/// while the inventory screen is open, and it is drawn afresh when the
-/// bindings have been changed or the view has.
+/// Keeps the panel at the top right: `F1` shows it and hides it, it stands
+/// back while the inventory screen is open, and its guide to the keys is
+/// drawn afresh when the bindings have been changed or the view has.
+#[allow(clippy::too_many_arguments)]
 fn guide(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
@@ -232,17 +312,51 @@ fn guide(
     view: Res<View>,
     controller: Res<Controller>,
     mut shown: ResMut<GuideShown>,
-    mut panel: Query<(Entity, &mut Node), With<GuidePanel>>,
+    mut popup: Query<&mut Node, (With<DebugPopup>, Without<DebugTag>)>,
+    body: Query<Entity, With<GuideBody>>,
     mut drawn: Local<Option<(u32, View)>>,
+    (look, window, mut tag): (Res<crate::health_view::HealthLook>, Query<&Window, With<bevy::window::PrimaryWindow>>, Query<&mut Node, With<DebugTag>>),
 ) {
     let _clock = crate::render_timing::Clock::new("hud guide");
-    let Ok((panel, mut node)) = panel.single_mut() else { return };
+    let (Ok(mut node), Ok(panel)) = (popup.single_mut(), body.single()) else { return };
     if keys.just_pressed(KeyCode::F1) {
         shown.0 = !shown.0;
     }
     let display = if shown.0 && !controller.inventory_open { Display::Flex } else { Display::None };
     if node.display != display {
         node.display = display;
+    }
+    // Under the game's quick bar where it is drawn (`TARKOV UI`), 8 units
+    // clear of it.
+    let top = match (look.battle_quick.as_ref().filter(|_| look.tarkov_ui), window.single()) {
+        (Some(quick), Ok(window)) => {
+            let s = window.height() / 1080.0;
+            let [_, y, _, h] = quick.quick_in([window.width() / s.max(1e-3), 1080.0]);
+            Val::Px((y + h + 8.0) * s)
+        }
+        _ => Val::Px(12.0),
+    };
+    if node.top != top {
+        node.top = top;
+    }
+    // The tag where the panel would be, while the panel is shut.
+    for mut tag in &mut tag {
+        let display = if !shown.0 && !controller.inventory_open { Display::Flex } else { Display::None };
+        if tag.display != display {
+            tag.display = display;
+        }
+        if tag.top != top {
+            tag.top = top;
+        }
+    }
+    // Hidden, the guide is not kept: Bevy lays out every node there is,
+    // shown or not, each frame (`findings.md`). It is drawn afresh as the
+    // panel shows.
+    if display == Display::None {
+        if drawn.take().is_some() {
+            commands.entity(panel).despawn_related::<Children>();
+        }
+        return;
     }
     if *drawn == Some((bindings.version, *view)) {
         return;
@@ -265,10 +379,6 @@ fn guide(
         longest as f32 * 6.7 + 14.0
     };
     commands.entity(panel).despawn_related::<Children>().with_children(|guide| {
-        guide.spawn(Node { justify_content: JustifyContent::SpaceBetween, column_gap: Val::Px(24.0), ..default() }).with_children(|head| {
-            head.spawn(words("CONTROLS", 11.0, WORDS));
-            head.spawn(words("F1 HIDES AND SHOWS THIS", 10.0, FAINT));
-        });
         guide.spawn(Node { column_gap: Val::Px(18.0), align_items: AlignItems::FlexStart, ..default() }).with_children(|body| {
             for sections in &columns {
                 let keys_wide = width(sections);
@@ -301,32 +411,20 @@ fn spawn(mut commands: Commands, options: Res<crate::Options>) {
     let track = |width: f32, height: f32| {
         (Node { width: Val::Px(width), height: Val::Px(height), ..default() }, BackgroundColor(TRACK))
     };
-    // The frame-rate readout, bottom right, clear of the top line however
-    // long that runs; F3 hides and shows it.
-    commands.spawn((
-        FrameRateText,
-        Text::default(),
-        TextFont { font_size: 13.0, ..default() },
-        TextColor(SET),
-        Node {
-            position_type: PositionType::Absolute,
-            right: Val::Px(8.0),
-            bottom: Val::Px(8.0),
-            padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
-            ..default()
-        },
-        BackgroundColor(TRACK),
-        if options.show_fps { Visibility::Inherited } else { Visibility::Hidden },
-    ));
+    let _ = &options;
     commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(16.0),
-            bottom: Val::Px(16.0),
-            column_gap: Val::Px(10.0),
-            align_items: AlignItems::FlexEnd,
-            ..default()
-        })
+        .spawn((
+            ScreenHides,
+            PlainMeters,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(16.0),
+                bottom: Val::Px(16.0),
+                column_gap: Val::Px(10.0),
+                align_items: AlignItems::FlexEnd,
+                ..default()
+            },
+        ))
         .with_children(|panel| {
             // How high the character stands: a column that fills from the
             // bottom, empty lying down.
@@ -393,14 +491,25 @@ fn show(
         match fill {
             Fill::Legs | Fill::Arms => {
                 let (pool, full) = if matches!(fill, Fill::Legs) { (&stamina.legs, LEGS) } else { (&stamina.arms, ARMS) };
-                node.width = Val::Percent(pool.level().clamp(0.0, 1.0) * 100.0);
+                // (Written only when it changes: a node written is laid
+                // out afresh, `findings.md`.)
+                let width = Val::Percent(pool.level().clamp(0.0, 1.0) * 100.0);
+                if node.width != width {
+                    node.width = width;
+                }
                 // The game's bars take another look under the threshold.
-                colour.0 = if pool.exhausted() { SPENT } else { full };
+                let look = if pool.exhausted() { SPENT } else { full };
+                if colour.0 != look {
+                    colour.0 = look;
+                }
             }
             Fill::Stance => {
                 let level = if m.prone { 0.0 } else { m.smoothed_pose_level.clamp(0.0, 1.0) };
                 // Fully crouched still shows a foot of column.
-                node.height = Val::Percent(if m.prone { 0.0 } else { 12.0 + 88.0 * level });
+                let height = Val::Percent(if m.prone { 0.0 } else { 12.0 + 88.0 * level });
+                if node.height != height {
+                    node.height = height;
+                }
             }
         }
     }
@@ -412,13 +521,16 @@ fn show(
     let allowed = m.speed_limit() / top;
     for (notch, mut colour) in &mut notches {
         let at = if notch.0 + 1 == NOTCHES { 1.0 } else { notch.0 as f32 * 0.05 };
-        colour.0 = if at <= set + 1e-3 {
+        let look = if at <= set + 1e-3 {
             SET
         } else if (at - allowed).round_to(2) <= 0.0 {
             ALLOWED
         } else {
             REFUSED
         };
+        if colour.0 != look {
+            colour.0 = look;
+        }
     }
     if let Ok(mut text) = word.single_mut() {
         let stance = match (m.prone, m.smoothed_pose_level) {
@@ -437,18 +549,18 @@ fn show(
 /// takes, both over the last second of drawn frames, the longest frame in
 /// that second, and what the simulation cost a drawn frame. The times are
 /// the engine's own (`Time<Real>`), which is what `--log-pacing` writes as
-/// `dt_ms`. F3 hides it or shows it.
+/// `dt_ms`. Written while the panel at the top right is shown.
 fn frame_rate(
-    keys: Res<ButtonInput<KeyCode>>,
     real: Res<Time<Real>>,
     controller: Res<Controller>,
+    guide: Option<Res<GuideShown>>,
     mut times: ResMut<FrameTimes>,
-    mut readout: Query<(&mut Text, &mut Visibility), With<FrameRateText>>,
+    mut readout: Query<&mut Text, With<FrameRateText>>,
 ) {
     let _clock = crate::render_timing::Clock::new("hud frame_rate");
-    let Ok((mut text, mut shown)) = readout.single_mut() else { return };
-    if keys.just_pressed(KeyCode::F3) {
-        *shown = if *shown == Visibility::Hidden { Visibility::Inherited } else { Visibility::Hidden };
+    let Ok(mut text) = readout.single_mut() else { return };
+    let shown = guide.as_ref().is_some_and(|guide| guide.0);
+    if guide.as_ref().is_some_and(|guide| guide.is_changed()) {
         // Shown again, it is written at once.
         times.since = FRAME_REFRESH;
     }
@@ -463,7 +575,7 @@ fn frame_rate(
         total -= times.frames.pop_front().map_or(0.0, |(took, _)| took);
     }
     times.since += took;
-    if times.since < FRAME_REFRESH || *shown == Visibility::Hidden {
+    if times.since < FRAME_REFRESH || !shown {
         return;
     }
     times.since = 0.0;

@@ -12,10 +12,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use bevy::prelude::*;
-use bevy::render::camera::{Exposure, RenderTarget, ScalingMode};
+use bevy::camera::{Exposure, RenderTarget, ScalingMode};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
-use bevy::render::view::RenderLayers;
+use bevy::camera::visibility::RenderLayers;
 use bevy::tasks::{block_on, futures_lite::future::poll_once, AsyncComputeTaskPool, Task};
 use trp_data::icon::{Pose, Studio};
 use trp_data::unity::assets::ObjRef;
@@ -82,17 +82,30 @@ pub struct PreparedIcon {
 /// edge; and the other game's own pictures are drawings, not models.)
 const LAID_FACE_UP: Pose = Pose { rotation: [0.0, std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2, 0.0], position: [0.0; 3], has_offset: false, bounds_scale: 1.0 };
 
+/// An item's model as the game makes it for its picture and for the world
+/// (`ObjectsFactory`): its tree, what each node draws, whether its first
+/// node keeps its own place and turn, and the pose its prefab gives its
+/// picture.
+pub(crate) struct Model {
+    pub hierarchy: Hierarchy,
+    pub keeps_own: bool,
+    pub looks: PreparedLooks,
+    pub parts: Vec<Vec<(usize, usize)>>,
+    pub extra: Vec<(usize, usize, usize)>,
+    pub pose: Option<Pose>,
+}
+
 /// The icon thread's own reader of the install and its database, and of
 /// the other game's folders.
-struct Worker {
-    unity: trp_data::unity::Assets,
+pub(crate) struct Worker {
+    pub unity: trp_data::unity::Assets,
     db: trp_data::Database,
     stalker: trp_data::xray::Stalker,
     studio: Option<Studio>,
 }
 
 impl Worker {
-    fn new(install: &trp_data::Install) -> anyhow::Result<Self> {
+    pub(crate) fn new(install: &trp_data::Install) -> anyhow::Result<Self> {
         let studio = Studio::read(install).unwrap_or_else(|e| {
             warn!("the game's icon camera could not be read ({e:#}): it is taken as it was read on 2026-10-14");
             Studio::as_read()
@@ -103,12 +116,18 @@ impl Worker {
 
     /// An item's model, posed for its picture of `cells`.
     fn prepare(&mut self, template: &str, cells: [u32; 2]) -> anyhow::Result<PreparedIcon> {
+        let Model { hierarchy, keeps_own, looks, parts, extra, pose } = self.model(template)?;
+        self.framed(template, cells, hierarchy, keeps_own, looks, parts, extra, pose)
+    }
+
+    /// An item's model, read.
+    pub(crate) fn model(&mut self, template: &str) -> anyhow::Result<Model> {
         // An outfit of the other game's has that game's model of it, where
         // its file names one and it can be read; else its donor's.
         if let Some(world) = self.db.outfits.get(template).and_then(|outfit| outfit.world_visual.clone()) {
-            match self.prepare_stalker(template, cells, &world) {
-                Ok(prepared) => return Ok(prepared),
-                Err(e) => warn!("the picture of {template} is its donor's: its own model {world} could not be drawn: {e:#}"),
+            match self.stalker_model(template, &world) {
+                Ok(model) => return Ok(model),
+                Err(e) => warn!("the model of {template} is its donor's: its own model {world} could not be read: {e:#}"),
             }
         }
         let item = self.db.item(template)?;
@@ -157,14 +176,14 @@ impl Worker {
                 }
             }
         }
-        self.framed(template, cells, hierarchy, weapon, looks, parts, extra, pose)
+        Ok(Model { hierarchy, keeps_own: weapon, looks, parts, extra, pose })
     }
 
     /// An outfit of the other game's, by its own model of the item as it
     /// lies in the world (`docs/spec/icons.md`, "an item of the other
     /// game's"): its meshes with their pictures, read loose or from the
     /// game's packed archives, hung from one node of no turn.
-    fn prepare_stalker(&mut self, template: &str, cells: [u32; 2], world: &str) -> anyhow::Result<PreparedIcon> {
+    fn stalker_model(&mut self, template: &str, world: &str) -> anyhow::Result<Model> {
         let (bytes, _) = self.stalker.read(&format!("meshes/{world}"))?;
         let model = trp_data::xray::read(&bytes)?;
         let mut looks = PreparedLooks::default();
@@ -195,9 +214,10 @@ impl Worker {
             grip: None,
             placer: None,
             transform: ObjRef { file: usize::MAX, path_id: 0 },
+            colliders: Vec::new(),
         };
         let hierarchy = Hierarchy { nodes: vec![node] };
-        self.framed(template, cells, hierarchy, false, looks, Vec::new(), extra, Some(LAID_FACE_UP))
+        Ok(Model { hierarchy, keeps_own: false, looks, parts: Vec::new(), extra, pose: Some(LAID_FACE_UP) })
     }
 
     /// A model posed and framed for its picture of `cells`: each node in
@@ -222,14 +242,14 @@ impl Worker {
         for (index, node) in hierarchy.nodes.iter().enumerate() {
             let own = if index == 0 && !keeps_own { Transform::from_scale(Vec3::from(node.scale)) } else { convert::transform(node.translation, node.rotation, node.scale) };
             let above = node.parent.map_or(Mat4::from_quat(turn), |parent| world[parent]);
-            world.push(above * own.compute_matrix());
+            world.push(above * own.to_matrix());
         }
         // The bounds: every drawn mesh's own box, its corners in the
         // studio, but for lenses and the muzzle's flash
         // (`WeaponPreview.GetBounds`).
         let (mut low, mut high) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         let mut take = |mesh: usize, matrix: Mat4| {
-            let Some(bevy::render::mesh::VertexAttributeValues::Float32x3(points)) = looks.meshes[mesh].attribute(Mesh::ATTRIBUTE_POSITION) else { return };
+            let Some(bevy::mesh::VertexAttributeValues::Float32x3(points)) = looks.meshes[mesh].attribute(Mesh::ATTRIBUTE_POSITION) else { return };
             let (mut from, mut to) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
             for p in points {
                 (from, to) = (from.min(Vec3::from(*p)), to.max(Vec3::from(*p)));
@@ -376,11 +396,14 @@ impl Icons {
 
 /// The words for the cache of the items whose models are not the
 /// install's: an outfit of the other game's by its model of the item (a
-/// checksum of its path; `donor` where it has none and has its donor's).
+/// checksum of its path; `donor` where it has none and has its donor's),
+/// and a weapon whose stock preset the app put a magazine into
+/// (`magazine`; 0.9.1 drew the RPK-16 without one).
 pub fn signatures(db: &trp_data::Database) -> HashMap<String, String> {
     db.outfits
         .iter()
         .map(|(id, outfit)| (id.clone(), outfit.world_visual.as_deref().map_or("donor".to_owned(), |world| format!("{:08x}", trp_data::xray_archive::crc32(world.as_bytes())))))
+        .chain(db.given_magazines.iter().map(|id| (id.clone(), "magazine".to_owned())))
         .collect()
 }
 
@@ -589,7 +612,7 @@ fn draw_icons(
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut cameras: Query<(&mut Camera, &mut Projection)>,
+    mut cameras: Query<(&mut Camera, &mut Projection, &mut RenderTarget)>,
     waiting: Res<crate::PipelinesWaiting>,
     mut carried: ResMut<Carried>,
     mut ready: ResMut<crate::inventory_view::PicturesArrived>,
@@ -621,7 +644,7 @@ fn draw_icons(
             .spawn((
                 Name::new("Icon camera"),
                 Camera3d::default(),
-                Camera { is_active: false, order: -5, hdr: false, clear_color: ClearColorConfig::Custom(Color::NONE), ..default() },
+                Camera { is_active: false, order: -5, clear_color: ClearColorConfig::Custom(Color::NONE), ..default() },
                 Projection::Orthographic(OrthographicProjection { near: 0.0, far: 40.0, ..OrthographicProjection::default_3d() }),
                 Transform { translation: place, rotation: convert::rotation(studio.rotation), ..default() },
                 Msaa::Sample4,
@@ -685,7 +708,7 @@ fn draw_icons(
             } else {
                 warn!("the picture of {} was not read back three times: not made", drawing.template);
                 give_up(&mut commands, icons, &mut images, carried.bypass_change_detection(), &mut ready);
-                if let Ok((mut camera, _)) = cameras.get_mut(camera) {
+                if let Ok((mut camera, ..)) = cameras.get_mut(camera) {
                     camera.is_active = false;
                 }
             }
@@ -694,6 +717,7 @@ fn draw_icons(
     }
     let Some(prepared) = icons.ready.pop_front() else { return };
     let PreparedIcon { template, size, hierarchy, keeps_own, looks, parts, extra, turn, place, half_height, picture_bytes, .. } = prepared;
+    // (Its pictures whole, as the game draws an item for its picture.)
     let (mesh_handles, material_handles, pictures) = looks.add_with_pictures(&mut meshes, &mut images, &mut materials);
     let layer = RenderLayers::layer(LAYER);
     let model = commands.spawn((Name::new(format!("Icon of {template}")), Transform { translation: place, rotation: turn, ..default() }, Visibility::Inherited)).id();
@@ -724,8 +748,8 @@ fn draw_icons(
     let mut target = Image::new_uninit(Extent3d { width, height, depth_or_array_layers: 1 }, TextureDimension::D2, TextureFormat::Rgba8UnormSrgb, bevy::asset::RenderAssetUsages::default());
     target.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
     let target = images.add(target);
-    if let Ok((mut aim, mut projection)) = cameras.get_mut(camera) {
-        aim.target = RenderTarget::Image(target.clone().into());
+    if let Ok((mut aim, mut projection, mut render_target)) = cameras.get_mut(camera) {
+        *render_target = RenderTarget::Image(target.clone().into());
         aim.is_active = true;
         if let Projection::Orthographic(ortho) = &mut *projection {
             ortho.scaling_mode = ScalingMode::Fixed { width: 2.0 * half_height * size[0] as f32 / size[1] as f32, height: 2.0 * half_height };
@@ -748,7 +772,7 @@ fn give_up(commands: &mut Commands, icons: &mut Icons, images: &mut Assets<Image
 /// The picture read back: finished as the game finishes it, put on the
 /// screen, written to the cache; the model goes.
 fn icon_captured(
-    trigger: Trigger<ScreenshotCaptured>,
+    trigger: On<ScreenshotCaptured>,
     mut commands: Commands,
     mut icons: ResMut<Icons>,
     mut carried: ResMut<Carried>,
@@ -759,8 +783,8 @@ fn icon_captured(
     let icons = &mut *icons;
     // (An answer to a reading back asked before, and asked again since, is
     // not this picture's.)
-    let Some(drawing) = icons.drawing.as_mut().filter(|drawing| drawing.asked == Some(trigger.target())) else { return };
-    let captured = &trigger.event().0;
+    let Some(drawing) = icons.drawing.as_mut().filter(|drawing| drawing.asked == Some(trigger.event().entity)) else { return };
+    let captured = &trigger.event().image;
     let Some(data) = captured.data.as_ref() else { return };
     let [width, height] = drawing.size;
     // Nothing drawn yet (a picture of the model's not yet on the card):

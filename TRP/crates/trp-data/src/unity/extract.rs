@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use super::assets::{Assets, ObjRef};
+use super::assets::{Assets, ObjRef, ResourcePlace};
 use super::class;
 use super::value::Value;
 
@@ -247,6 +247,7 @@ mod tests {
             grip: None,
             placer: None,
             transform: ObjRef { file: 0, path_id: 0 },
+            colliders: Vec::new(),
         }
     }
 
@@ -289,23 +290,52 @@ pub struct TextureData {
     pub srgb: bool,
     /// All mip levels, largest first, rows bottom to top.
     pub data: Vec<u8>,
+    /// Whether the engine streams it by its levels (`m_StreamingMipmaps`,
+    /// set as it was imported): with streaming on, one that is not is
+    /// drawn whole.
+    pub streaming_mipmaps: bool,
+    /// Whether it is sampled at its nearest pixel (`m_TextureSettings.
+    /// m_FilterMode`, point), not blended between its pixels.
+    pub point: bool,
+    /// Whether it is clamped at its edges across and up
+    /// (`m_TextureSettings.m_WrapU`, `m_WrapV`: `TextureWrapMode.Clamp`,
+    /// 1), not repeated: sampled at an edge it gives its own edge, not the
+    /// far side's.
+    pub clamp: [bool; 2],
+}
+
+/// A texture's wrap modes across and up as clamped or not
+/// (`TextureWrapMode`: 0 repeat, 1 clamp, 2 mirror, 3 mirror once; an
+/// older file's one `m_WrapMode` for both).
+fn clamps(v: &Value) -> [bool; 2] {
+    let settings = v.get("m_TextureSettings");
+    let mode = |name: &str| settings.and_then(|s| s.get(name)).and_then(|m| m.as_i64());
+    let both = mode("m_WrapMode");
+    [mode("m_WrapU").or(both) == Some(1), mode("m_WrapV").or(both) == Some(1)]
 }
 
 pub fn read_texture(assets: &Assets, obj: ObjRef) -> Result<TextureData> {
+    Ok(read_texture_shared(assets, obj)?.0)
+}
+
+/// A texture, and where its levels are in their bundle's file when they are
+/// kept beside its serialized file (`m_StreamData`), to be read again from
+/// there (none where they are in the serialized file itself).
+pub fn read_texture_shared(assets: &Assets, obj: ObjRef) -> Result<(TextureData, Option<ResourcePlace>)> {
     let v = assets.read(obj)?;
     let inline = v.req("image data")?.as_bytes().unwrap_or(&[]);
-    let data = if !inline.is_empty() {
-        inline.to_vec()
+    let (data, place) = if !inline.is_empty() {
+        (inline.to_vec(), None)
     } else {
         let stream = v.req("m_StreamData")?;
-        assets
-            .resource(
-                stream.req("path")?.as_str().unwrap_or(""),
-                stream.req("offset")?.as_usize().unwrap_or(0),
-                stream.req("size")?.as_usize().unwrap_or(0),
-            )?
-            .to_vec()
+        let (path, offset, size) = (stream.req("path")?.as_str().unwrap_or(""), stream.req("offset")?.as_usize().unwrap_or(0), stream.req("size")?.as_usize().unwrap_or(0));
+        (assets.resource(path, offset, size)?.to_vec(), assets.resource_place(path, offset, size).ok())
     };
+    Ok((TextureData { data, ..texture_header(&v)? }, place))
+}
+
+/// A texture's own fields but its levels, which are left empty.
+pub fn texture_header(v: &Value) -> Result<TextureData> {
     Ok(TextureData {
         name: v.req("m_Name")?.as_str().unwrap_or("").to_owned(),
         width: v.req("m_Width")?.as_u32().unwrap_or(0),
@@ -313,7 +343,10 @@ pub fn read_texture(assets: &Assets, obj: ObjRef) -> Result<TextureData> {
         format: v.req("m_TextureFormat")?.as_i64().unwrap_or(0) as i32,
         mip_count: v.req("m_MipCount")?.as_u32().unwrap_or(1).max(1),
         srgb: v.req("m_ColorSpace")?.as_i64().unwrap_or(0) == 1,
-        data,
+        data: Vec::new(),
+        streaming_mipmaps: v.get("m_StreamingMipmaps").and_then(|streamed| streamed.as_bool()).unwrap_or(false),
+        point: v.get("m_TextureSettings").and_then(|settings| settings.get("m_FilterMode")).and_then(|mode| mode.as_i64()) == Some(0),
+        clamp: clamps(v),
     })
 }
 
@@ -385,6 +418,90 @@ pub struct Node {
     /// Set on a part that says for itself where it goes on its bone.
     pub placer: Option<Placer>,
     pub transform: ObjRef,
+    /// The colliders on this object, in its own axes.
+    pub colliders: Vec<NodeCollider>,
+}
+
+/// A collider on an object of a model (`BoxCollider` and the rest): its
+/// shape in the object's own axes, whether it is a trigger or switched
+/// off, its object's layer, and its material where it names one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeCollider {
+    pub shape: ColliderShape,
+    pub trigger: bool,
+    pub enabled: bool,
+    pub layer: u32,
+    pub material: Option<PhysicMaterial>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColliderShape {
+    Box { centre: [f32; 3], size: [f32; 3] },
+    Sphere { centre: [f32; 3], radius: f32 },
+    /// Along x, y or z (0, 1, 2), its height end to end with the caps.
+    Capsule { centre: [f32; 3], radius: f32, height: f32, direction: u32 },
+    /// A mesh, convex or not, and the mesh it names (in a file loaded with
+    /// the model).
+    Mesh { convex: bool, mesh: Option<ObjRef> },
+}
+
+/// A material for the physics (`PhysicMaterial`): frictions, bounce, and
+/// how each is combined (0 average, 1 minimum, 2 multiply, 3 maximum).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicMaterial {
+    pub dynamic_friction: f32,
+    pub static_friction: f32,
+    pub bounciness: f32,
+    pub friction_combine: u32,
+    pub bounce_combine: u32,
+}
+
+const BOX_COLLIDER: i32 = 65;
+const MESH_COLLIDER: i32 = 64;
+const SPHERE_COLLIDER: i32 = 135;
+const CAPSULE_COLLIDER: i32 = 136;
+
+/// A collider component as a `NodeCollider`, if it is one.
+fn node_collider(assets: &Assets, comp: ObjRef, class_id: i32, layer: u32) -> Result<Option<NodeCollider>> {
+    let c = assets.read(comp)?;
+    let vec3 = |name: &str| -> Result<[f32; 3]> { c.req(name)?.as_vec3().with_context(|| format!("{name} is not a vector")) };
+    let float = |name: &str| -> Result<f32> { c.req(name)?.as_f32().with_context(|| format!("{name} is not a number")) };
+    let shape = match class_id {
+        BOX_COLLIDER => ColliderShape::Box { centre: vec3("m_Center")?, size: vec3("m_Size")? },
+        SPHERE_COLLIDER => ColliderShape::Sphere { centre: vec3("m_Center")?, radius: float("m_Radius")? },
+        CAPSULE_COLLIDER => ColliderShape::Capsule {
+            centre: vec3("m_Center")?,
+            radius: float("m_Radius")?,
+            height: float("m_Height")?,
+            direction: c.get("m_Direction").and_then(Value::as_i64).unwrap_or(1) as u32,
+        },
+        MESH_COLLIDER => ColliderShape::Mesh {
+            convex: c.get("m_Convex").and_then(Value::as_bool).unwrap_or(false),
+            mesh: c.get("m_Mesh").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(comp.file, p)),
+        },
+        _ => return Ok(None),
+    };
+    let material = c
+        .get("m_Material")
+        .and_then(Value::as_pptr)
+        .and_then(|p| assets.resolve_loaded(comp.file, p))
+        .and_then(|m| assets.read(m).ok())
+        .and_then(|m| {
+            Some(PhysicMaterial {
+                dynamic_friction: m.get("dynamicFriction")?.as_f32()?,
+                static_friction: m.get("staticFriction")?.as_f32()?,
+                bounciness: m.get("bounciness")?.as_f32()?,
+                friction_combine: m.get("frictionCombine").and_then(Value::as_i64).unwrap_or(0) as u32,
+                bounce_combine: m.get("bounceCombine").and_then(Value::as_i64).unwrap_or(0) as u32,
+            })
+        });
+    Ok(Some(NodeCollider {
+        shape,
+        trigger: c.get("m_IsTrigger").and_then(Value::as_bool).unwrap_or(false),
+        enabled: c.get("m_Enabled").and_then(Value::as_bool).unwrap_or(true),
+        layer,
+        material,
+    }))
 }
 
 /// Where a part goes on the bone it is put on, when that is not the
@@ -516,8 +633,13 @@ pub fn read_hierarchy(assets: &Assets, game_object: ObjRef) -> Result<Hierarchy>
         let mut scripts = Vec::new();
         let mut grip = None;
         let mut placer = None;
+        let mut colliders = Vec::new();
+        let layer = go.get("m_Layer").and_then(Value::as_i64).unwrap_or(0) as u32;
         for comp in components(assets, go_ref, &go) {
             match assets.class_id(comp) {
+                Some(class_id @ (BOX_COLLIDER | MESH_COLLIDER | SPHERE_COLLIDER | CAPSULE_COLLIDER)) => {
+                    colliders.extend(node_collider(assets, comp, class_id, layer)?);
+                }
                 Some(class::MESH_FILTER) => {
                     let c = assets.read(comp)?;
                     mesh = c.req("m_Mesh")?.as_pptr().and_then(|p| assets.resolve_loaded(comp.file, p));
@@ -609,6 +731,7 @@ pub fn read_hierarchy(assets: &Assets, game_object: ObjRef) -> Result<Hierarchy>
             grip,
             placer,
             transform,
+            colliders,
         });
         // Reversed so that children come off the stack in file order.
         for child in t.req("m_Children")?.as_array().unwrap_or(&[]).iter().rev() {

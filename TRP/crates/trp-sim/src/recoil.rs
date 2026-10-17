@@ -11,6 +11,8 @@
 use trp_data::curve::Curve;
 use trp_data::player::{RecoilProcessData, RecoilShotVal};
 
+use crate::math::unity_clamp;
+
 /// The game draws from one global random source. This one is seeded, so a
 /// run can be repeated.
 #[derive(Debug, Clone)]
@@ -34,18 +36,6 @@ impl Rng {
     /// `Random.Range` for floats. The ends may come in either order.
     pub fn range(&mut self, a: f32, b: f32) -> f32 {
         a + (b - a) * self.unit()
-    }
-}
-
-/// `Mathf.Clamp`, which unlike Rust's accepts a lower bound above the upper
-/// one. The game relies on what it returns then.
-fn unity_clamp(value: f32, min: f32, max: f32) -> f32 {
-    if value < min {
-        min
-    } else if value > max {
-        max
-    } else {
-        value
     }
 }
 

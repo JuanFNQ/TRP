@@ -68,6 +68,17 @@ pub struct Graphics {
     pub field_of_view: f32,
     pub mode: Mode,
     pub resolution: [u32; 2],
+    /// The game's pictures' quality, 0 (low) to 2 (high), and whether they
+    /// are streamed by their levels of detail (`streaming`): each taken at
+    /// the next start.
+    pub texture_quality: u8,
+    pub mip_streaming: bool,
+    /// The game's shadows' quality, 0 (low) to 3 (ultra): how many
+    /// cascades the sun's shadows have and how far they reach (`shadows`),
+    /// taken at the next start.
+    pub shadow_quality: u8,
+    /// The graphics backend (`backend`), taken at the next start.
+    pub renderer: crate::backend::Renderer,
 }
 
 /// The game's limits for its field-of-view setting (`GameSettingsGroup`).
@@ -106,6 +117,15 @@ pub struct Features {
     /// with them. The drawing alone: the simulation is the same either
     /// way.
     pub smooth_animations: bool,
+    /// `GROUNDED FEET` (the user, 2026-10-16: "Can i see the float fix
+    /// first?"; foot IK tried and taken back): the body is drawn down onto
+    /// the ground where the character stands over it within Tarkov's ground
+    /// check (after a short drop it rests up to 15 cm over the ground, as
+    /// the game's capsule does; `feet_down`). Off, the body is drawn where
+    /// the game's capsule holds it, feet and all. The drawing alone: the
+    /// simulation, the eye and the first-person arms are the same either
+    /// way. A departure from Tarkov's look.
+    pub grounded_feet: bool,
     /// `ICON GENERATION` (the user, 2026-10-14): the inventory's pictures
     /// are drawn from the items' models as the game draws them, and kept
     /// (`icons`). Off, none is drawn or read: each box has the plain shape
@@ -126,6 +146,16 @@ pub struct Features {
     /// body's own meshes and pictures (`figure_view`). Off, the app's paper
     /// figure of plain shapes.
     pub character_model: bool,
+    /// `TARKOV UI` (the user, 2026-10-15, at night: "right now, we have a
+    /// mixed ui id like a switch that changes to 1;1 tarkov ui or our own.
+    /// for examjple1 i want our 3d inventory model in our health tab
+    /// instead of a mix of tarkov and ours"): the inventory's screens drawn
+    /// as the game's own wherever they are built so (the HEALTH tab's
+    /// panel, `health_view`), their pictures read from the install. Off,
+    /// the app's own look throughout: the HEALTH tab has the character's
+    /// model as the gear tab has it, and its boxes in the app's style at
+    /// the game's places.
+    pub tarkov_ui: bool,
     /// The systems of the list that are built (the user, 2026-10-14:
     /// "make the switches work for mechanics that are fully done. For
     /// now, when set to off, lets make it just stop"): those of the
@@ -146,6 +176,35 @@ pub struct Features {
     pub first_person_body: bool,
     pub inventory: bool,
     pub world_interactions: bool,
+    /// `HEALTH SYSTEM` (2026-10-14, night: the user, "we are ready to
+    /// start the health system"): the body's parts and what harms and
+    /// heals them (`docs/spec/health.md`). Off, nothing of it is made: the
+    /// character cannot be hurt, and is taken as fed and watered.
+    pub health: bool,
+    /// `ITEM PHYSICS` (2026-10-15: the user, "Notice weapons when doing a
+    /// quick reload drop the magazine, and it is affected by gravity. So
+    /// are dropped items, projected from the player... We need 1:1 physics
+    /// parity"): things put down, dropped and let fall are thrown and fall
+    /// in the game's engine, each with its own model (`loose`). Off,
+    /// nothing of it is made: a thing lies as a plain box where it is put.
+    pub item_physics: bool,
+    /// `MOVEMENT SOUNDS` (2026-10-16: the user, "Lets add the sounds for
+    /// moving in the world"): the footsteps by the surface underfoot, the
+    /// sprint's, the stop, the jump, the landing, the crawl, the turn and
+    /// the kit, as the game plays them for the player (`step_sound`). Off,
+    /// the banks are not read and nothing plays.
+    pub movement_sounds: bool,
+    /// `HANDS SOUNDS` (2026-10-16: the user, "Let's do the sounds"): what
+    /// a weapon, an item used or the empty hands sound as their animation
+    /// marks it (drawn, put away, a magazine out and in, the bolt, an AI-2
+    /// opened and injected), from each one's own sound player
+    /// (`hands_sound`). Off, the players are not read and nothing plays.
+    pub hands_sounds: bool,
+    /// `SHOT SOUNDS` (2026-10-16: the plan's next step, the shots' sounds):
+    /// a weapon's shots from its own banks, an automatic weapon's fire as
+    /// the game's loop ended on a beat by its tail (`shot_sound`). Off, the
+    /// banks are not read and the shots are silent.
+    pub shot_sounds: bool,
 }
 
 impl Default for Features {
@@ -153,9 +212,11 @@ impl Default for Features {
         Self {
             custom_hands: true,
             smooth_animations: true,
+            grounded_feet: true,
             icon_generation: true,
             compatible_highlight: true,
             character_model: true,
+            tarkov_ui: false,
             movement: true,
             vaulting: true,
             stamina: true,
@@ -167,6 +228,11 @@ impl Default for Features {
             first_person_body: true,
             inventory: true,
             world_interactions: true,
+            health: true,
+            item_physics: true,
+            movement_sounds: true,
+            hands_sounds: true,
+            shot_sounds: true,
         }
     }
 }
@@ -282,6 +348,22 @@ pub struct OptionsState {
     apply_at_start: bool,
     /// What the install's own game has for them.
     install_graphics: Graphics,
+    /// The settings of the game's own GAME tab the battle screen's panels
+    /// go by (`battle_view::BattleModes`), as they stand and as the
+    /// install has them.
+    pub game: crate::battle_view::BattleModes,
+    install_game: crate::battle_view::BattleModes,
+    /// The game's volumes of its sound settings the app's sounds go by
+    /// (`ui_sound::Levels`), as they stand and as the install has them.
+    pub sound: crate::ui_sound::Levels,
+    install_sound: crate::ui_sound::Levels,
+    /// The pictures' quality and streaming as this run began, which it
+    /// holds.
+    pub textures_started: (u8, bool),
+    /// The shadows' quality as this run began, which it holds.
+    pub shadows_started: u8,
+    /// The backend as this run began, which it holds.
+    pub renderer_started: crate::backend::Renderer,
     /// The page is to be drawn afresh.
     dirty: bool,
     /// Where what is changed is kept; none in a run nobody is at the
@@ -317,7 +399,7 @@ fn source_of_json(value: &serde_json::Value) -> Source {
     Source { keys, wheel: value.get("wheel").and_then(|up| up.as_bool()) }
 }
 
-fn save(path: &std::path::Path, controls: &Controls, graphics: &Graphics, mouse: &Mouse, features: &Features) -> std::io::Result<()> {
+fn save(path: &std::path::Path, controls: &Controls, graphics: &Graphics, mouse: &Mouse, features: &Features, game: &crate::battle_view::BattleModes, sound: &crate::ui_sound::Levels) -> std::io::Result<()> {
     let keys: Vec<serde_json::Value> = controls
         .keys
         .iter()
@@ -336,8 +418,10 @@ fn save(path: &std::path::Path, controls: &Controls, graphics: &Graphics, mouse:
     let all = serde_json::json!({
         "controls": { "double_click": controls.double_click, "keys": keys, "axes": axes },
         "mouse": { "sensitivity": mouse.sensitivity, "aiming_sensitivity": mouse.aiming, "optic_sensitivity": mouse.optic, "inverted_x": mouse.invert[0], "inverted_y": mouse.invert[1] },
-        "graphics": { "vsync": graphics.vsync, "field_of_view": graphics.field_of_view, "mode": mode, "resolution": graphics.resolution },
+        "graphics": { "vsync": graphics.vsync, "field_of_view": graphics.field_of_view, "mode": mode, "resolution": graphics.resolution, "texture_quality": graphics.texture_quality, "mip_streaming": graphics.mip_streaming, "shadow_quality": graphics.shadow_quality, "renderer": graphics.renderer.key() },
         "features": FeatureSwitch::ALL.iter().map(|switch| (switch.key().to_owned(), serde_json::Value::Bool(switch.get(features)))).collect::<serde_json::Map<_, _>>(),
+        "game": { "quick_slots": game.quick.name(), "stamina": game.stamina.name(), "health": game.health.name(), "health_color": game.color_name() },
+        "sound": { "overall": sound.overall, "interface": sound.interface },
     });
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder)?;
@@ -350,8 +434,22 @@ fn save(path: &std::path::Path, controls: &Controls, graphics: &Graphics, mouse:
 /// axis the file names takes the file's keys, and the rest stay the
 /// install's; a switch of the features' list the file has is as the file
 /// has it. Says which of the first two parts the file had.
-fn load(path: &std::path::Path, controls: &mut Controls, graphics: &mut Graphics, mouse: &mut Mouse, features: &mut Features) -> [bool; 2] {
+fn load(path: &std::path::Path, controls: &mut Controls, graphics: &mut Graphics, mouse: &mut Mouse, features: &mut Features, game: &mut crate::battle_view::BattleModes, sound: &mut crate::ui_sound::Levels) -> [bool; 2] {
     let Some(all) = std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()) else { return [false; 2] };
+    if let Some(kept) = all.get("sound") {
+        let level = |name: &str, now: u8| kept.get(name).and_then(|v| v.as_u64()).map_or(now, |v| v.min(10) as u8);
+        (sound.overall, sound.interface) = (level("overall", sound.overall), level("interface", sound.interface));
+    }
+    if let Some(kept) = all.get("game") {
+        use crate::battle_view::Shows;
+        let shows = |name: &str, now: Shows| kept.get(name).and_then(|v| Shows::of(v.as_str()?)).unwrap_or(now);
+        game.quick = shows("quick_slots", game.quick);
+        game.stamina = shows("stamina", game.stamina);
+        game.health = shows("health", game.health);
+        if let Some(scheme) = kept.get("health_color").and_then(|v| v.as_str()) {
+            game.green_to_red = scheme == "GreenToRed";
+        }
+    }
     let switch = |name: &str| all.get("features").and_then(|kept| kept.get(name)?.as_bool());
     for kept in FeatureSwitch::ALL {
         if let Some(on) = switch(kept.key()) {
@@ -392,6 +490,10 @@ fn load(path: &std::path::Path, controls: &mut Controls, graphics: &mut Graphics
         Some("windowed") => Mode::Windowed,
         _ => graphics.mode,
     };
+    graphics.texture_quality = display.get("texture_quality").and_then(|quality| quality.as_u64()).map_or(graphics.texture_quality, |quality| quality.min(2) as u8);
+    graphics.mip_streaming = display.get("mip_streaming").and_then(|on| on.as_bool()).unwrap_or(graphics.mip_streaming);
+    graphics.shadow_quality = display.get("shadow_quality").and_then(|quality| quality.as_u64()).map_or(graphics.shadow_quality, |quality| quality.min(3) as u8);
+    graphics.renderer = display.get("renderer").and_then(|key| crate::backend::Renderer::from_key(key.as_str()?)).unwrap_or(graphics.renderer);
     let side = |at: usize| display.get("resolution")?.get(at)?.as_u64().map(|side| side as u32);
     if let (Some(width), Some(height)) = (side(0), side(1)) {
         graphics.resolution = [width.max(640), height.max(360)];
@@ -406,13 +508,30 @@ impl OptionsState {
     /// has over that and over the install's bindings. The field of view
     /// given on the command line stays.
     pub fn new(options: &mut Options, install: &trp_data::Install, bindings: &mut Bindings, size: [u32; 2]) -> Self {
-        let mut graphics = Graphics { vsync: options.present == "vsync", field_of_view: options.field_of_view, mode: Mode::Windowed, resolution: size };
         let read = install.display_settings();
+        // The pictures as the install's own game has their quality, and
+        // streamed (the user, 2026-10-15: "can we enable mip streaming?";
+        // the install's own has it off).
+        let mut graphics = Graphics {
+            vsync: options.present == "vsync",
+            field_of_view: options.field_of_view,
+            mode: Mode::Windowed,
+            resolution: size,
+            texture_quality: read.texture_quality.unwrap_or(2),
+            mip_streaming: true,
+            shadow_quality: read.shadows_quality.unwrap_or(crate::shadows::DEFAULT_QUALITY),
+            renderer: crate::backend::Renderer::DEFAULT,
+        };
         let install_graphics = Graphics {
             vsync: read.vsync.unwrap_or(false),
             field_of_view: install.player_settings().field_of_view.unwrap_or(FOV[0]).clamp(FOV[0], FOV[1]),
             mode: read.mode.map_or(Mode::Borderless, Mode::of_game),
             resolution: read.resolution.unwrap_or(size),
+            texture_quality: read.texture_quality.unwrap_or(2),
+            mip_streaming: read.mip_streaming.unwrap_or(false),
+            shadow_quality: read.shadows_quality.unwrap_or(crate::shadows::DEFAULT_QUALITY),
+            // (The game draws through Direct3D 11, which is neither.)
+            renderer: crate::backend::Renderer::DEFAULT,
         };
         // The mouse as the run begins with it: the install's, or what the
         // command line said; and what the install's own game has.
@@ -432,10 +551,16 @@ impl OptionsState {
         let file = (!options.unattended()).then(options_file);
         let mut apply_at_start = false;
         let mut features = Features::default();
+        // The battle screen's panels as the install's own game has them,
+        // unless kept otherwise here.
+        let install_game = crate::battle_view::BattleModes::read(install);
+        let mut game = install_game;
+        let install_sound = crate::ui_sound::Levels::read(install);
+        let mut sound = install_sound;
         if let Some(path) = &file {
             let asked = graphics.field_of_view;
             let asked_mouse = mouse.clone();
-            let [controls, display] = load(path, &mut bindings.controls, &mut graphics, &mut mouse, &mut features);
+            let [controls, display] = load(path, &mut bindings.controls, &mut graphics, &mut mouse, &mut features, &mut game, &mut sound);
             if controls {
                 bindings.changed();
             }
@@ -463,6 +588,11 @@ impl OptionsState {
             eprintln!("the game's words for its bindings could not be read: {e:#}");
             HashMap::new()
         });
+        // The command line has the last word on the battle screen's panels
+        // for this run (`--hud`), as on a switch.
+        if let Some(shows) = options.hud {
+            (game.quick, game.stamina, game.health) = (shows, shows, shows);
+        }
         // The command line has the last word on a switch, as on the rest.
         if let Some(on) = options.custom_hands {
             features.custom_hands = on;
@@ -480,7 +610,10 @@ impl OptionsState {
             }
         }
         let started = features.clone();
-        Self { sub: 0, listening: None, asking: None, note: String::new(), scroll: 0.0, graphics, features, started, mouse, install_mouse, apply_at_start, install_graphics, dirty: true, file, names, sliding: None }
+        let textures_started = (graphics.texture_quality, graphics.mip_streaming);
+        let shadows_started = graphics.shadow_quality;
+        let renderer_started = graphics.renderer;
+        Self { sub: 0, listening: None, asking: None, note: String::new(), scroll: 0.0, graphics, features, started, mouse, install_mouse, apply_at_start, install_graphics, game, install_game, sound, install_sound, textures_started, shadows_started, renderer_started, dirty: true, file, names, sliding: None }
     }
 
     /// Whether Escape is the tab's own just now: a key is being chosen,
@@ -545,7 +678,7 @@ impl OptionsState {
 
     fn keep(&mut self, controls: &Controls) {
         if let Some(path) = &self.file {
-            if let Err(e) = save(path, controls, &self.graphics, &self.mouse, &self.features) {
+            if let Err(e) = save(path, controls, &self.graphics, &self.mouse, &self.features, &self.game, &self.sound) {
                 self.note = format!("not kept: {} could not be written ({e})", path.display());
             }
         }
@@ -559,7 +692,18 @@ const AXIS_WORDS: [(&str, [&str; 2]); 3] =
 /// What the game's controls tab says besides its bindings, each by the
 /// name the install's texts have it under, with the app's words for an
 /// install that has none.
-const SAID: [(&str, &str); 10] = [
+const SAID: [(&str, &str); 21] = [
+    ("Settings/Sound/OverallVolume", "OVERALL VOLUME:"),
+    ("Settings/Sound/InterfaceVolume", "INTERFACE VOLUME:"),
+    ("Ui/Settings/QuickSlotsVisibility", "QUICK SLOTS"),
+    ("Ui/Settings/StanimaVisibility", "STAMINA AND STANCE"),
+    ("Ui/Settings/HeathVisibility", "HEALTH CONDITION"),
+    ("Ui/Settings/HealthColorScheme", "HEALTH COLOR SCHEME"),
+    ("Ui/Settings/Visibility/Autohide", "AUTOHIDE"),
+    ("Ui/Settings/Visibility/Always", "ALWAYS SHOWN"),
+    ("Ui/Settings/Visibility/Never", "ALWAYS HIDDEN"),
+    ("Ui/Settings/ColorScheme/WhiteToRed", "MONOCHROME"),
+    ("Ui/Settings/ColorScheme/GreenToRed", "POLYCHROME"),
     ("EPressType/Release", "RELEASE"),
     ("EPressType/Continuous", "CONTINUOUS"),
     ("EPressType/Press", "PRESS"),
@@ -576,17 +720,16 @@ const SAID: [(&str, &str); 10] = [
 /// that are not switched yet: a name, where it stands here, and what it
 /// is. **A list only** (the user, 2026-10-12). Those that are built are
 /// switches since 2026-10-14 (`FeatureSwitch`, shown over this list).
-const FEATURES: [(&str, &str, &str); 11] = [
+const FEATURES: [(&str, &str, &str); 10] = [
     ("AIMING", "in part", "The eye on the iron sights' line and the aimed field of view are built; optics are not."),
     ("THIRD-PERSON BODY", "in part", "The character as others see it: its own pose, weapon and breath (F5, or the free camera). Built for the player's own; a second character is not."),
     ("LOOTING SYSTEM", "in part", "Containers searched and things taken up are built; a search item by item is not."),
     ("ADVANCED ATTACHMENT SYSTEM", "not built", "Parts put on a weapon and taken off it, and what each does to its handling. Weapons are their stock presets."),
-    ("HEALTH", "not built", "The body's parts and what harms them."),
-    ("ADVANCED HEALING SYSTEM", "not built", "Bleeding, fractures and their treatment, medicine used from the bar."),
-    ("HUNGER AND THIRST", "a constant", "Both move stamina by a few percent. Taken as full; a host may set them (radiation likewise, from STALKER)."),
+    ("ADVANCED HEALING SYSTEM", "in part", "What medicine, food and drink do once at work, and using them by a quick-use key with each item's own hands, are built (HEALTH SYSTEM), and so are a double click on one (\"Use\", with the window that asks how much of food or drink) and a drop on a part of the HEALTH tab, and the menu of a right click with its \"Use\" and \"Use All\" (in a raid it has no \"Heal All\")."),
+    ("HUNGER AND THIRST", "in health", "Energy and hydration fall a step a minute, move stamina, and hurt at empty: part of HEALTH SYSTEM. A host may still set them (radiation likewise, from STALKER)."),
     ("SKILLS", "options", "Endurance, Strength, the weapon skills and mastering are options of a run, not a system that trains."),
     ("BALLISTICS AND DAMAGE", "not built", "Where a shot goes and what it does; malfunctions and overheating."),
-    ("SOUND", "not built", "Steps, shots, the weapon's handling."),
+    ("SOUND", "in part", "The inventory's sounds and the sounds of moving are built (MOVEMENT SOUNDS); shots, the weapon's handling and the world's own are not."),
     ("CO-OP", "not built", "Other players. Kept in mind, not begun."),
 ];
 
@@ -606,6 +749,30 @@ struct InstallKeys;
 struct InstallDisplay;
 #[derive(Component)]
 struct VsyncChoice(bool);
+#[derive(Component)]
+struct TextureChoice(u8);
+#[derive(Component)]
+struct StreamingChoice(bool);
+#[derive(Component)]
+struct ShadowChoice(u8);
+#[derive(Component)]
+struct RendererChoice(crate::backend::Renderer);
+/// A choice of the GAME page: which setting (0 the quick bar, 1 the stamina
+/// and stance, 2 the health condition) and when it shows; or the health's
+/// colours (green to red or not).
+#[derive(Component)]
+enum GameChoice {
+    Shows(u8, crate::battle_view::Shows),
+    Colors(bool),
+}
+#[derive(Component)]
+struct InstallGame;
+/// A choice of the SOUND page: which volume (0 the overall, 1 the
+/// interface's) and its step, 0 to 10.
+#[derive(Component)]
+struct SoundChoice(u8, u8);
+#[derive(Component)]
+struct InstallSound;
 #[derive(Component)]
 struct ModeChoice(Mode);
 #[derive(Component)]
@@ -634,16 +801,23 @@ enum FeatureSwitch {
     FirstPersonBody,
     Inventory,
     WorldInteractions,
+    Health,
+    ItemPhysics,
+    MovementSounds,
+    HandsSounds,
+    ShotSounds,
     CustomHands,
     SmoothAnimations,
+    GroundedFeet,
     IconGeneration,
     CompatibleHighlight,
     CharacterModel,
+    TarkovUi,
 }
 
 impl FeatureSwitch {
-    /// The built systems of the list in its order, then the app's five.
-    const ALL: [Self; 16] = [
+    /// The built systems of the list in its order, then the app's seven.
+    const ALL: [Self; 23] = [
         Self::Movement,
         Self::Vaulting,
         Self::Stamina,
@@ -655,11 +829,18 @@ impl FeatureSwitch {
         Self::FirstPersonBody,
         Self::Inventory,
         Self::WorldInteractions,
+        Self::Health,
+        Self::ItemPhysics,
+        Self::MovementSounds,
+        Self::HandsSounds,
+        Self::ShotSounds,
         Self::CustomHands,
         Self::SmoothAnimations,
+        Self::GroundedFeet,
         Self::IconGeneration,
         Self::CompatibleHighlight,
         Self::CharacterModel,
+        Self::TarkovUi,
     ];
 
     /// Its name in the options file.
@@ -676,11 +857,18 @@ impl FeatureSwitch {
             Self::FirstPersonBody => "first_person_body",
             Self::Inventory => "inventory",
             Self::WorldInteractions => "world_interactions",
+            Self::Health => "health",
+            Self::ItemPhysics => "item_physics",
+            Self::MovementSounds => "movement_sounds",
+            Self::HandsSounds => "hands_sounds",
+            Self::ShotSounds => "shot_sounds",
             Self::CustomHands => "custom_first_person_hands",
             Self::SmoothAnimations => "smooth_first_person_animations",
+            Self::GroundedFeet => "grounded_feet",
             Self::IconGeneration => "icon_generation",
             Self::CompatibleHighlight => "compatible_items_highlight",
             Self::CharacterModel => "character_model",
+            Self::TarkovUi => "tarkov_ui",
         }
     }
 
@@ -697,11 +885,18 @@ impl FeatureSwitch {
             Self::FirstPersonBody => &mut features.first_person_body,
             Self::Inventory => &mut features.inventory,
             Self::WorldInteractions => &mut features.world_interactions,
+            Self::Health => &mut features.health,
+            Self::ItemPhysics => &mut features.item_physics,
+            Self::MovementSounds => &mut features.movement_sounds,
+            Self::HandsSounds => &mut features.hands_sounds,
+            Self::ShotSounds => &mut features.shot_sounds,
             Self::CustomHands => &mut features.custom_hands,
             Self::SmoothAnimations => &mut features.smooth_animations,
+            Self::GroundedFeet => &mut features.grounded_feet,
             Self::IconGeneration => &mut features.icon_generation,
             Self::CompatibleHighlight => &mut features.compatible_highlight,
             Self::CharacterModel => &mut features.character_model,
+            Self::TarkovUi => &mut features.tarkov_ui,
         }
     }
 
@@ -734,6 +929,26 @@ impl FeatureSwitch {
                 "The equipment's slots, containers and their grids, moving things, the quick-use bar. Off, the screen opens on these options alone, and nothing is taken up, bound or moved.",
             ),
             Self::WorldInteractions => ("WORLD INTERACTIONS", "Doors, containers, a trunk, a kick, a lock and its key, things on the ground. Off, nothing is looked at to be worked."),
+            Self::Health => (
+                "HEALTH SYSTEM",
+                "The body's seven parts and their hit points; bleeding, fractures, pain and tremor; hunger and thirst; falls, barbed wire and death; and what each does to moving, stamina and the weapon. Off, the character cannot be hurt and is taken as fed and watered.",
+            ),
+            Self::ItemPhysics => (
+                "ITEM PHYSICS",
+                "Things put down from the inventory and backpacks dropped are thrown as Tarkov throws them, and a quick reload's magazine falls from the weapon, each with its own model and colliders in Tarkov's own physics engine (PhysX, set up as the game's). Off, a thing lies as a plain box where it is put.",
+            ),
+            Self::MovementSounds => (
+                "MOVEMENT SOUNDS",
+                "Footsteps by what is underfoot (twenty surfaces, from Tarkov's own banks: a walking and a running clip blended by speed), the sprint's steps, the stop, the jump, the landing, the crawl, a turn on the spot and the kit's rattle, when and as loud as Tarkov plays them for the player. Off, they are not read and nothing plays.",
+            ),
+            Self::HandsSounds => (
+                "HANDS SOUNDS",
+                "What is in the hands sounds as its animation marks it, from its own sounds in Tarkov's files: a weapon drawn and put away, a magazine out and in, the bolt, the selector, a hand on the weapon; an AI-2 opened, its syringe taken, injected and thrown away. Off, they are not read and nothing plays.",
+            ),
+            Self::ShotSounds => (
+                "SHOT SOUNDS",
+                "A weapon's shots from its own banks in Tarkov's files, as Tarkov plays them: an automatic weapon's fire as one recorded loop at its rate, ended on the next beat by its tail when the trigger is let go; a bolt action's, a shotgun's or a pistol's each shot whole; the silenced banks with a silencer on; both barrels' own sound when they fire together. Off, they are not read and the shots are silent.",
+            ),
             Self::CustomHands => (
                 "CUSTOM FIRST PERSON HANDS",
                 "An outfit that changes the body brings its own arms into first person. Off, the hands do not change with what is worn: they are Tarkov's default arms. Whatever an outfit has not got is Tarkov's default either way.",
@@ -741,6 +956,10 @@ impl FeatureSwitch {
             Self::SmoothAnimations => (
                 "SMOOTH FIRST PERSON ANIMATIONS",
                 "Every animation of what is in hand, weapons and empty hands, drawn on curves through its clips' samples, where Tarkov's engine joins them by straight lines (the stutter in a look over a weapon). Off, all are drawn as the engine has them, and each pose is worked out once a step instead of twice. Only the drawing changes.",
+            ),
+            Self::GroundedFeet => (
+                "GROUNDED FEET",
+                "After a short drop Tarkov's character can come to rest up to 15 cm over the ground, as its capsule does, and its feet with it. On, the body is drawn down onto the ground there; the view and the hands are where Tarkov has them either way. Off, the feet float as in Tarkov. Only the drawing changes.",
             ),
             Self::IconGeneration => (
                 "ICON GENERATION",
@@ -753,6 +972,10 @@ impl FeatureSwitch {
             Self::CharacterModel => (
                 "CHARACTER MODEL",
                 "The gear page has the character's own model behind its slots, in what it wears, standing as Tarkov's pre-raid screen stands it, hands at its sides, and still. It is drawn from the body already loaded, nothing read twice, and drawn again only when what is worn changes. Off, a paper figure of plain shapes.",
+            ),
+            Self::TarkovUi => (
+                "TARKOV UI",
+                "The screens drawn 1:1 as Tarkov's own, from the game's own layout, pictures, fonts and animations read from the install: the inventory (its bar of tabs, the GEAR and HEALTH tabs, the containers, the things, the quick-use panel, the blur behind it) and, in a raid, the stance panel (stance, speed, stamina, noise) and the health silhouette with its effects, fading in and out as your game's own settings say. Off, the app's own look: the character model on the HEALTH tab, the plain meters in play. The figures are the same either way.",
             ),
         }
     }
@@ -792,7 +1015,7 @@ const GROUP_GAP: f32 = 8.0;
 /// The shares of the list's width the game's four columns have: what the
 /// binding does, its two keys, and how it is pressed.
 const COLUMNS: [f32; 4] = [40.0, 20.0, 20.0, 20.0];
-const SUBS: [&str; 3] = ["CONTROLS", "GRAPHICS", "FEATURES"];
+const SUBS: [&str; 5] = ["GAME", "CONTROLS", "GRAPHICS", "SOUND", "FEATURES"];
 
 pub struct OptionsPlugin;
 
@@ -801,7 +1024,7 @@ impl Plugin for OptionsPlugin {
         // With the inventory's own systems: after the simulation's frames.
         app.add_systems(
             Update,
-            (clicks, listen, slide, scroll_list, apply, rebuild)
+            (clicks, listen, slide, scroll_list, apply, rebuild, describe_features)
                 .chain()
                 .run_if(crate::running)
                 .after(crate::controller::step)
@@ -868,7 +1091,7 @@ fn controls_part(page: &mut ChildSpawnerCommands, state: &OptionsState, bindings
             min_height: Val::Px(0.0),
             ..default()
         };
-        (node, BackgroundColor(BACK), BorderColor(LINE))
+        (node, BackgroundColor(BACK), BorderColor::all(LINE))
     };
     let line = || Node { column_gap: Val::Px(3.0), height: Val::Px(ROW), width: Val::Percent(100.0), flex_shrink: 0.0, ..default() };
     let listened = state.listening.as_ref();
@@ -907,7 +1130,7 @@ fn controls_part(page: &mut ChildSpawnerCommands, state: &OptionsState, bindings
             }
         });
         let area = Node { flex_direction: FlexDirection::Column, flex_grow: 1.0, flex_basis: Val::Px(0.0), min_height: Val::Px(0.0), width: Val::Percent(100.0), overflow: Overflow::scroll_y(), ..default() };
-        panel.spawn((ListArea { whole }, area, ScrollPosition { offset_x: 0.0, offset_y: state.scroll.max(0.0) }, RelativeCursorPosition::default())).with_children(|list| {
+        panel.spawn((ListArea { whole }, area, ScrollPosition(Vec2::new(0.0, state.scroll.max(0.0))), RelativeCursorPosition::default())).with_children(|list| {
             // How many rows the group in hand has so far: its first is of
             // the darker shade.
             let mut in_group = 0;
@@ -992,7 +1215,7 @@ fn controls_part(page: &mut ChildSpawnerCommands, state: &OptionsState, bindings
                 let node = Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)), ..default() };
                 switches.spawn((InvertChoice(axis), Button, node, BackgroundColor(BACK))).with_children(|switch| {
                     let tick = Node { width: Val::Px(18.0), height: Val::Px(18.0), border: UiRect::all(Val::Px(1.0)), justify_content: JustifyContent::Center, align_items: AlignItems::Center, ..default() };
-                    switch.spawn((tick, BorderColor(LINE), BackgroundColor(if on { FAINT } else { PANEL }))).with_children(|mark| {
+                    switch.spawn((tick, BorderColor::all(LINE), BackgroundColor(if on { FAINT } else { PANEL }))).with_children(|mark| {
                         mark.spawn(words(if on { "X" } else { "" }, 12.0, WORDS));
                     });
                     switch.spawn(words(state.said(name), 12.0, WORDS));
@@ -1003,6 +1226,78 @@ fn controls_part(page: &mut ChildSpawnerCommands, state: &OptionsState, bindings
 }
 
 /// The display: the four of the game's settings the user named.
+/// The game's own GAME tab, of it what the app has (the user, 2026-10-16:
+/// "We need to add a setting for auto-hiding, always showing, or never
+/// showing the in-raid HUD (HP doll, Stance doll, Quick slots) like tarkov
+/// does. We may need a "Game" cateogry in options just like tarkov has
+/// it"): when the battle screen's quick bar, stance panel and health panel
+/// show (`QuickSlotsVisibility`, `StaminaVisibility`, `HealthVisibility`),
+/// and the health's colours (`HealthColor`), in the game's words, laid out
+/// as the app's other pages are (the user: "We dont need to copy tarkov
+/// 1:1 exactly here").
+fn game_part(page: &mut ChildSpawnerCommands, state: &OptionsState) {
+    use crate::battle_view::Shows;
+    let game = &state.game;
+    let line = |page: &mut ChildSpawnerCommands, caption: &str, inside: &mut dyn FnMut(&mut ChildSpawnerCommands)| {
+        page.spawn(Node { column_gap: Val::Px(6.0), align_items: AlignItems::Center, flex_wrap: FlexWrap::Wrap, row_gap: Val::Px(4.0), ..default() }).with_children(|row| {
+            row.spawn(Node { width: Val::Px(240.0), flex_shrink: 0.0, ..default() }).with_children(|name| {
+                name.spawn(words(caption, 12.0, FAINT));
+            });
+            inside(row);
+        });
+    };
+    for (which, (key, now)) in [("Ui/Settings/QuickSlotsVisibility", game.quick), ("Ui/Settings/StanimaVisibility", game.stamina), ("Ui/Settings/HeathVisibility", game.health)].into_iter().enumerate() {
+        line(page, &state.said(key), &mut |row| {
+            for shows in Shows::ALL {
+                button(row, GameChoice::Shows(which as u8, shows), &state.said(&format!("Ui/Settings/Visibility/{}", shows.name())), now == shows, Val::Px(150.0));
+            }
+        });
+    }
+    line(page, &state.said("Ui/Settings/HealthColorScheme"), &mut |row| {
+        for green in [false, true] {
+            let name = if green { "GreenToRed" } else { "WhiteToRed" };
+            button(row, GameChoice::Colors(green), &state.said(&format!("Ui/Settings/ColorScheme/{name}")), game.green_to_red == green, Val::Px(150.0));
+        }
+    });
+    page.spawn(words("The panels of the screen in a raid with TARKOV UI on: the quick slots at the top, the stance and stamina at the lower left, the health at the upper left. Each change is taken when the inventory is shut, as the game's panels take theirs when the screen is next shown.", 11.0, FAINT));
+    let theirs = &state.install_game;
+    page.spawn(Node { column_gap: Val::Px(12.0), align_items: AlignItems::Center, margin: UiRect::top(Val::Px(10.0)), ..default() }).with_children(|row| {
+        button(row, InstallGame, "AS THE INSTALL HAS THEM", false, Val::Auto);
+        let said = format!(
+            "the install's own game: quick slots {}, stamina and stance {}, health {}, {}",
+            state.said(&format!("Ui/Settings/Visibility/{}", theirs.quick.name())).to_lowercase(),
+            state.said(&format!("Ui/Settings/Visibility/{}", theirs.stamina.name())).to_lowercase(),
+            state.said(&format!("Ui/Settings/Visibility/{}", theirs.health.name())).to_lowercase(),
+            state.said(&format!("Ui/Settings/ColorScheme/{}", theirs.color_name())).to_lowercase(),
+        );
+        row.spawn(words(said, 11.0, FAINT));
+    });
+}
+
+/// The game's own SOUND tab, of it what the app's sounds go by: the
+/// overall volume and the interface's, in the game's eleven steps
+/// (`SoundSettingsGroup`: 0 to 10, -80 to 0 decibels), as the install has
+/// them until changed, each taken at once (`ui_sound`).
+fn sound_part(page: &mut ChildSpawnerCommands, state: &OptionsState) {
+    for (which, (key, now)) in [("Settings/Sound/OverallVolume", state.sound.overall), ("Settings/Sound/InterfaceVolume", state.sound.interface)].into_iter().enumerate() {
+        page.spawn(Node { column_gap: Val::Px(6.0), align_items: AlignItems::Center, flex_wrap: FlexWrap::Wrap, row_gap: Val::Px(4.0), ..default() }).with_children(|row| {
+            row.spawn(Node { width: Val::Px(240.0), flex_shrink: 0.0, ..default() }).with_children(|name| {
+                name.spawn(words(state.said(key).trim_end_matches(':').to_owned(), 12.0, FAINT));
+            });
+            for step in 0..=10u8 {
+                button(row, SoundChoice(which as u8, step), &step.to_string(), now == step, Val::Px(44.0));
+            }
+            row.spawn(words(format!("{:.0} dB", crate::ui_sound::Levels::DECIBELS[now.min(10) as usize]), 11.0, FAINT));
+        });
+    }
+    page.spawn(words("The interface's sounds play at both volumes; a thing's (taken, put down, put on) at the overall volume and at 0.15 of it in a raid, as the game's. Each change is heard at once.", 11.0, FAINT));
+    let theirs = &state.install_sound;
+    page.spawn(Node { column_gap: Val::Px(12.0), align_items: AlignItems::Center, margin: UiRect::top(Val::Px(10.0)), ..default() }).with_children(|row| {
+        button(row, InstallSound, "AS THE INSTALL HAS THEM", false, Val::Auto);
+        row.spawn(words(format!("the install's own game: overall {}, interface {}", theirs.overall, theirs.interface), 11.0, FAINT));
+    });
+}
+
 fn graphics_part(page: &mut ChildSpawnerCommands, state: &OptionsState, resolutions: &[[u32; 2]]) {
     let graphics = &state.graphics;
     let line = |page: &mut ChildSpawnerCommands, caption: &str, inside: &mut dyn FnMut(&mut ChildSpawnerCommands)| {
@@ -1031,6 +1326,32 @@ fn graphics_part(page: &mut ChildSpawnerCommands, state: &OptionsState, resoluti
             button(row, ResolutionChoice(*size), &format!("{} x {}", size[0], size[1]), graphics.resolution == *size, Val::Px(130.0));
         }
     });
+    // The pictures', taken at the next start (`streaming`).
+    let textures_changed = graphics.texture_quality != state.textures_started.0 || graphics.mip_streaming != state.textures_started.1;
+    line(page, "TEXTURE QUALITY", &mut |row| {
+        for (quality, word) in [(0, "LOW"), (1, "MEDIUM"), (2, "HIGH")] {
+            button(row, TextureChoice(quality), word, graphics.texture_quality == quality, Val::Px(110.0));
+        }
+    });
+    line(page, "MIP STREAMING", &mut |row| {
+        button(row, StreamingChoice(true), "ON", graphics.mip_streaming, Val::Px(110.0));
+        button(row, StreamingChoice(false), "OFF", !graphics.mip_streaming, Val::Px(110.0));
+        row.spawn(words("RESTART REQUIRED", 10.0, if textures_changed { WORDS } else { FAINT }));
+    });
+    // The sun's, taken at the next start (`shadows`).
+    line(page, "SHADOW QUALITY", &mut |row| {
+        for (quality, word) in crate::shadows::NAMES.iter().enumerate() {
+            button(row, ShadowChoice(quality as u8), word, graphics.shadow_quality == quality as u8, Val::Px(110.0));
+        }
+        row.spawn(words("RESTART REQUIRED", 10.0, if graphics.shadow_quality != state.shadows_started { WORDS } else { FAINT }));
+    });
+    // The backend, taken at the next start (`backend`).
+    line(page, "RENDERER", &mut |row| {
+        for renderer in [crate::backend::Renderer::Vulkan, crate::backend::Renderer::Dx12] {
+            button(row, RendererChoice(renderer), renderer.word(), graphics.renderer == renderer, Val::Px(110.0));
+        }
+        row.spawn(words("RESTART REQUIRED", 10.0, if graphics.renderer != state.renderer_started { WORDS } else { FAINT }));
+    });
     page.spawn(words(
         "Each is put on the window as it is chosen. A borderless window is as large as the screen whatever the resolution says; the screen taken over is put into the nearest mode it has.",
         11.0,
@@ -1040,78 +1361,160 @@ fn graphics_part(page: &mut ChildSpawnerCommands, state: &OptionsState, resoluti
     page.spawn(Node { column_gap: Val::Px(12.0), align_items: AlignItems::Center, margin: UiRect::top(Val::Px(10.0)), ..default() }).with_children(|row| {
         button(row, InstallDisplay, "AS THE INSTALL HAS THEM", false, Val::Auto);
         let said = format!(
-            "the install's own game: vsync {}, field of view {:.0}, {}, {} x {}",
+            "the install's own game: vsync {}, field of view {:.0}, {}, {} x {}, textures {}, mip streaming {}, shadows {}",
             if theirs.vsync { "on" } else { "off" },
             theirs.field_of_view,
             theirs.mode.word().to_lowercase(),
             theirs.resolution[0],
-            theirs.resolution[1]
+            theirs.resolution[1],
+            ["low", "medium", "high"][theirs.texture_quality.min(2) as usize],
+            if theirs.mip_streaming { "on" } else { "off" },
+            crate::shadows::NAMES[theirs.shadow_quality.min(3) as usize].to_lowercase()
         );
         row.spawn(words(said, 11.0, FAINT));
     });
     page.spawn(words(state.note.clone(), 12.0, WORDS));
 }
 
+/// The switches by section (the user, 2026-10-16: "Re-Organize the
+/// Mechanics menu. It's getting cramped with descriptions. Have different
+/// sections like: Gameplay and Visuals. The explainations should appear on
+/// hover"): what the character does and what happens to it, and what is
+/// drawn and how.
+const GAMEPLAY: [FeatureSwitch; 15] = [
+    FeatureSwitch::Movement,
+    FeatureSwitch::Vaulting,
+    FeatureSwitch::Stamina,
+    FeatureSwitch::Weight,
+    FeatureSwitch::Exhaustion,
+    FeatureSwitch::WeaponMotion,
+    FeatureSwitch::Recoil,
+    FeatureSwitch::WeaponHandling,
+    FeatureSwitch::Inventory,
+    FeatureSwitch::WorldInteractions,
+    FeatureSwitch::Health,
+    FeatureSwitch::ItemPhysics,
+    FeatureSwitch::MovementSounds,
+    FeatureSwitch::HandsSounds,
+    FeatureSwitch::ShotSounds,
+];
+const VISUALS: [FeatureSwitch; 8] = [
+    FeatureSwitch::FirstPersonBody,
+    FeatureSwitch::CustomHands,
+    FeatureSwitch::SmoothAnimations,
+    FeatureSwitch::GroundedFeet,
+    FeatureSwitch::IconGeneration,
+    FeatureSwitch::CompatibleHighlight,
+    FeatureSwitch::CharacterModel,
+    FeatureSwitch::TarkovUi,
+];
+
+/// A row of the features: what the panel beside them says with the mouse
+/// on it (its name, what it does, and its state's note).
+#[derive(Component)]
+struct FeatureRow {
+    name: &'static str,
+    what: &'static str,
+    note: String,
+}
+/// The panel that says what the row under the mouse does.
+#[derive(Component)]
+struct FeatureAbout(u8);
+
+/// A row lit with the mouse on it.
+const ROW_LIT: Color = Color::srgba(1.0, 1.0, 1.0, 0.08);
+
 fn features_part(page: &mut ChildSpawnerCommands, state: &OptionsState) {
-    // Rows close together, so that the switches and the list fit a
-    // window of 900 pixels.
-    page.spawn(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() }).with_children(|page| features_rows(page, state));
+    page.spawn(Node { column_gap: Val::Px(28.0), margin: UiRect::top(Val::Px(8.0)), ..default() }).with_children(|columns| {
+        columns.spawn(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), width: Val::Px(330.0), flex_shrink: 0.0, ..default() }).with_children(|column| {
+            section(column, "GAMEPLAY");
+            for switch in GAMEPLAY {
+                switch_row(column, state, switch);
+            }
+        });
+        columns.spawn(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), width: Val::Px(360.0), flex_shrink: 0.0, ..default() }).with_children(|column| {
+            section(column, "VISUALS");
+            for switch in VISUALS {
+                switch_row(column, state, switch);
+            }
+            column.spawn(Node { height: Val::Px(14.0), ..default() });
+            section(column, "NOT BUILT YET");
+            for (name, stands, what) in FEATURES {
+                let row = Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)), ..default() };
+                let note = format!("Not a switch yet: {stands}. The systems a host could switch off, or feed from its own game, while it runs.");
+                column.spawn((FeatureRow { name, what, note }, RelativeCursorPosition::default(), row, BackgroundColor(Color::NONE))).with_children(|row| {
+                    row.spawn((Node { width: Val::Px(46.0), padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)), border: UiRect::all(Val::Px(1.0)), justify_content: JustifyContent::Center, flex_shrink: 0.0, ..default() }, BorderColor::all(LINE))).with_children(|switch| {
+                        switch.spawn(words(if stands == "not built" { "-" } else { "ON" }, 11.0, FAINT));
+                    });
+                    row.spawn(words(name, 12.0, FAINT));
+                });
+            }
+        });
+        // What the row under the mouse does.
+        let panel = Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(8.0), width: Val::Px(440.0), min_height: Val::Px(160.0), padding: UiRect::all(Val::Px(12.0)), border: UiRect::all(Val::Px(1.0)), flex_shrink: 0.0, align_self: AlignSelf::FlexStart, ..default() };
+        columns.spawn((panel, BorderColor::all(LINE), BackgroundColor(PANEL))).with_children(|about| {
+            about.spawn((FeatureAbout(0), words("", 14.0, WORDS)));
+            about.spawn((FeatureAbout(1), Node { max_width: Val::Px(414.0), ..default() }, words("Point at a switch to read what it does. Each takes effect when the app is next started.", 12.0, FAINT)));
+            about.spawn((FeatureAbout(2), words("", 11.0, WORDS)));
+        });
+    });
 }
 
-/// The column of the column width the two notes of a row take: the
-/// switch's being restart required, and how far a system of the list
-/// stands.
-const NOTE_WIDTH: f32 = 125.0;
+/// A section's header over its rows.
+fn section(column: &mut ChildSpawnerCommands, name: &str) {
+    column.spawn((Node { padding: UiRect::axes(Val::Px(4.0), Val::Px(3.0)), margin: UiRect::bottom(Val::Px(4.0)), border: UiRect::bottom(Val::Px(1.0)), ..default() }, BorderColor::all(LINE))).with_children(|header| {
+        header.spawn(words(name, 13.0, WORDS));
+    });
+}
 
-fn features_rows(page: &mut ChildSpawnerCommands, state: &OptionsState) {
-    // What is switched: rows as the list's rows are, each with a switch
-    // that is one.
-    page.spawn(words("Switched here, each taking effect when the app is next started:", 12.0, WORDS));
-    for switch in FeatureSwitch::ALL {
-        let (name, what) = switch.words();
-        page.spawn(Node { column_gap: Val::Px(10.0), align_items: AlignItems::Center, ..default() }).with_children(|row| {
-            let on = switch.get(&state.features);
-            let node = Node { width: Val::Px(46.0), padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)), border: UiRect::all(Val::Px(1.0)), justify_content: JustifyContent::Center, flex_shrink: 0.0, ..default() };
-            row.spawn((switch, Button, node, BorderColor(if on { WORDS } else { LINE }), BackgroundColor(if on { LINE } else { PANEL }))).with_children(|inside| {
-                inside.spawn(words(if on { "ON" } else { "OFF" }, 11.0, WORDS));
-            });
-            row.spawn(Node { width: Val::Px(290.0), flex_shrink: 0.0, ..default() }).with_children(|cell| {
-                cell.spawn(words(name, 13.0, WORDS));
-            });
-            // Restart required: faint as a standing note; bright, and the
-            // state the run holds said, once thrown away from it.
-            let pending = on != switch.get(&state.started);
-            row.spawn(Node { width: Val::Px(NOTE_WIDTH), flex_shrink: 0.0, flex_direction: FlexDirection::Column, ..default() }).with_children(|cell| {
-                cell.spawn(words("RESTART REQUIRED", 10.0, if pending { WORDS } else { FAINT }));
-                if pending {
-                    cell.spawn(words(if on { "off until then" } else { "on until then" }, 10.0, FAINT));
-                }
-            });
-            row.spawn(words(what, 11.0, FAINT));
+/// A switch's row: its switch and its name, and, once it is thrown away
+/// from what the run holds, the note that it takes effect at the next
+/// start ("restart required").
+fn switch_row(column: &mut ChildSpawnerCommands, state: &OptionsState, switch: FeatureSwitch) {
+    let (name, what) = switch.words();
+    let on = switch.get(&state.features);
+    let pending = on != switch.get(&state.started);
+    let note = if pending { format!("RESTART REQUIRED: {} until the app is started again.", if on { "off" } else { "on" }) } else { "RESTART REQUIRED to take effect.".to_owned() };
+    let row = Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)), ..default() };
+    column.spawn((FeatureRow { name, what, note }, RelativeCursorPosition::default(), row, BackgroundColor(Color::NONE))).with_children(|row| {
+        let node = Node { width: Val::Px(46.0), padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)), border: UiRect::all(Val::Px(1.0)), justify_content: JustifyContent::Center, flex_shrink: 0.0, ..default() };
+        row.spawn((switch, Button, node, BorderColor::all(if on { WORDS } else { LINE }), BackgroundColor(if on { LINE } else { PANEL }))).with_children(|inside| {
+            inside.spawn(words(if on { "ON" } else { "OFF" }, 11.0, WORDS));
         });
+        row.spawn(words(name, 12.0, WORDS));
+        if pending {
+            row.spawn(words("RESTART", 10.0, WORDS));
+        }
+    });
+}
+
+/// The row under the mouse lit, and what it does said in the panel beside.
+fn describe_features(mut rows: Query<(&FeatureRow, &RelativeCursorPosition, &mut BackgroundColor)>, mut about: Query<(&FeatureAbout, &mut Text)>, mut said: Local<Option<&'static str>>) {
+    let mut over = None;
+    for (row, at, mut ground) in &mut rows {
+        let lit = at.cursor_over();
+        let want = if lit { ROW_LIT } else { Color::NONE };
+        if ground.0 != want {
+            ground.0 = want;
+        }
+        if lit {
+            over = Some(row);
+        }
     }
-    page.spawn((
-        Node { margin: UiRect::top(Val::Px(10.0)), ..default() },
-        words(
-            "Nothing below is switched yet. This is the list to be settled: the systems a host could switch off, or feed from its own game, while it runs.",
-            12.0,
-            WORDS,
-        ),
-    ));
-    for (name, stands, what) in FEATURES {
-        page.spawn(Node { column_gap: Val::Px(10.0), align_items: AlignItems::Center, ..default() }).with_children(|row| {
-            // A switch as it will be, not yet one.
-            row.spawn((Node { width: Val::Px(46.0), padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)), border: UiRect::all(Val::Px(1.0)), flex_shrink: 0.0, ..default() }, BorderColor(LINE))).with_children(|switch| {
-                switch.spawn(words(if stands == "not built" { "-" } else { "ON" }, 11.0, FAINT));
-            });
-            row.spawn(Node { width: Val::Px(290.0), flex_shrink: 0.0, ..default() }).with_children(|cell| {
-                cell.spawn(words(name, 13.0, WORDS));
-            });
-            row.spawn(Node { width: Val::Px(NOTE_WIDTH), flex_shrink: 0.0, ..default() }).with_children(|cell| {
-                cell.spawn(words(stands, 11.0, FAINT));
-            });
-            row.spawn(words(what, 11.0, FAINT));
-        });
+    let Some(row) = over else { return };
+    if *said == Some(row.name) && about.iter().any(|(part, text)| part.0 == 2 && text.0 == row.note) {
+        return;
+    }
+    *said = Some(row.name);
+    for (part, mut text) in &mut about {
+        let now = match part.0 {
+            0 => row.name,
+            1 => row.what,
+            _ => row.note.as_str(),
+        };
+        if text.0 != now {
+            text.0 = now.to_owned();
+        }
     }
 }
 
@@ -1166,8 +1569,10 @@ fn rebuild(
                 button(row, ExitButton, "QUIT", false, Val::Px(150.0));
             });
             match state.sub {
-                0 => controls_part(page, state, &bindings),
-                1 => graphics_part(page, state, &sizes),
+                0 => game_part(page, state),
+                1 => controls_part(page, state, &bindings),
+                2 => graphics_part(page, state, &sizes),
+                3 => sound_part(page, state),
                 _ => features_part(page, state),
             }
         });
@@ -1193,8 +1598,22 @@ fn clicks(
         Query<(&Interaction, &FeatureSwitch), Changed<Interaction>>,
     ),
     inverts: Query<(&Interaction, &InvertChoice), Changed<Interaction>>,
+    (textures, streamings, shadow_choices, renderers): (
+        Query<(&Interaction, &TextureChoice), Changed<Interaction>>,
+        Query<(&Interaction, &StreamingChoice), Changed<Interaction>>,
+        Query<(&Interaction, &ShadowChoice), Changed<Interaction>>,
+        Query<(&Interaction, &RendererChoice), Changed<Interaction>>,
+    ),
     exit: Query<&Interaction, (With<ExitButton>, Changed<Interaction>)>,
-    mut quit: EventWriter<AppExit>,
+    mut quit: MessageWriter<AppExit>,
+    (game_choices, install_game, mut battle_modes, sound_choices, install_sound, mut levels): (
+        Query<(&Interaction, &GameChoice), Changed<Interaction>>,
+        Query<&Interaction, (With<InstallGame>, Changed<Interaction>)>,
+        ResMut<crate::battle_view::BattleModes>,
+        Query<(&Interaction, &SoundChoice), Changed<Interaction>>,
+        Query<&Interaction, (With<InstallSound>, Changed<Interaction>)>,
+        ResMut<crate::ui_sound::Levels>,
+    ),
 ) {
     let pressed = |interaction: &Interaction| *interaction == Interaction::Pressed;
     // The screen shut: a key being chosen is dropped with it.
@@ -1231,6 +1650,43 @@ fn clicks(
     }
     if let Some((_, tab)) = subs.iter().find(|(interaction, _)| pressed(interaction)) {
         (state.sub, state.note, state.dirty) = (tab.0, String::new(), true);
+        return;
+    }
+    // A setting of the GAME page: kept, and handed to the battle screen,
+    // which takes it as it is next shown.
+    let game_before = state.game;
+    if let Some((_, choice)) = game_choices.iter().find(|(interaction, _)| pressed(interaction)) {
+        match *choice {
+            GameChoice::Shows(0, shows) => state.game.quick = shows,
+            GameChoice::Shows(1, shows) => state.game.stamina = shows,
+            GameChoice::Shows(_, shows) => state.game.health = shows,
+            GameChoice::Colors(green) => state.game.green_to_red = green,
+        }
+    }
+    if install_game.iter().any(pressed) {
+        state.game = state.install_game;
+    }
+    if state.game != game_before {
+        *battle_modes = state.game;
+        state.keep(&bindings.controls);
+        state.dirty = true;
+        return;
+    }
+    // A volume of the SOUND page: kept, and heard at once.
+    let sound_before = state.sound;
+    if let Some((_, choice)) = sound_choices.iter().find(|(interaction, _)| pressed(interaction)) {
+        match choice.0 {
+            0 => state.sound.overall = choice.1,
+            _ => state.sound.interface = choice.1,
+        }
+    }
+    if install_sound.iter().any(pressed) {
+        state.sound = state.install_sound;
+    }
+    if state.sound != sound_before {
+        *levels = state.sound;
+        state.keep(&bindings.controls);
+        state.dirty = true;
         return;
     }
     // A switch of the features' list: thrown and kept for the next run.
@@ -1278,8 +1734,21 @@ fn clicks(
     if let Some((_, choice)) = sizes.iter().find(|(interaction, _)| pressed(interaction)) {
         state.graphics.resolution = choice.0;
     }
+    if let Some((_, choice)) = textures.iter().find(|(interaction, _)| pressed(interaction)) {
+        state.graphics.texture_quality = choice.0;
+    }
+    if let Some((_, choice)) = streamings.iter().find(|(interaction, _)| pressed(interaction)) {
+        state.graphics.mip_streaming = choice.0;
+    }
+    if let Some((_, choice)) = shadow_choices.iter().find(|(interaction, _)| pressed(interaction)) {
+        state.graphics.shadow_quality = choice.0;
+    }
+    if let Some((_, choice)) = renderers.iter().find(|(interaction, _)| pressed(interaction)) {
+        state.graphics.renderer = choice.0;
+    }
     if install_display.iter().any(pressed) {
-        state.graphics = state.install_graphics.clone();
+        // (The backend stays: the game has none of the two.)
+        state.graphics = Graphics { renderer: state.graphics.renderer, ..state.install_graphics.clone() };
     }
     if state.graphics != before {
         state.note.clear();
@@ -1381,7 +1850,7 @@ fn slide(
     }
     let state = &mut *state;
     if buttons.just_pressed(MouseButton::Left) && state.listening.is_none() {
-        state.sliding = bars.iter().find(|(_, over)| over.mouse_over()).map(|(bar, _)| bar.0);
+        state.sliding = bars.iter().find(|(_, over)| over.cursor_over()).map(|(bar, _)| bar.0);
     }
     let Some(kind) = state.sliding else { return };
     if !buttons.pressed(MouseButton::Left) {
@@ -1392,7 +1861,7 @@ fn slide(
         state.keep(&bindings.controls);
         return;
     }
-    let Some(at) = bars.iter().find(|(bar, _)| bar.0 == kind).and_then(|(_, over)| over.normalized) else { return };
+    let Some(at) = bars.iter().find(|(bar, _)| bar.0 == kind).and_then(|(_, over)| crate::inventory_view::share_of(over)) else { return };
     let ([low, high], step) = (kind.range(), kind.step());
     let value = (((low + at.x.clamp(0.0, 1.0) * (high - low)) / step).round() * step).clamp(low, high);
     if value == state.slider(kind, &bindings.controls) {
@@ -1433,15 +1902,15 @@ fn scroll_list(
         return;
     }
     let mut to = state.scroll - scripted as f32 * ROW * 3.0;
-    if state.listening.is_none() && over.mouse_over() && wheel.delta.y != 0.0 {
+    if state.listening.is_none() && over.cursor_over() && wheel.delta.y != 0.0 {
         to -= wheel.delta.y.signum() * ROW * 3.0;
     }
     let to = to.clamp(0.0, (sizes.whole - shown).max(0.0));
     if to != state.scroll {
         state.bypass_change_detection().scroll = to;
     }
-    if position.offset_y != to {
-        position.offset_y = to;
+    if position.y != to {
+        position.y = to;
     }
 }
 
@@ -1469,7 +1938,7 @@ fn apply(
     // As the run begins there is nothing to do, unless the app's file
     // said how the display is to be.
     let was = applied.replace(now.clone());
-    let Some(was) = was.or_else(|| state.apply_at_start.then(|| Graphics { vsync: !now.vsync, field_of_view: f32::NAN, mode: Mode::Windowed, resolution: [0, 0] })) else { return };
+    let Some(was) = was.or_else(|| state.apply_at_start.then(|| Graphics { vsync: !now.vsync, field_of_view: f32::NAN, mode: Mode::Windowed, resolution: [0, 0], ..now.clone() })) else { return };
     let Ok(mut window) = window.single_mut() else { return };
     if now.vsync != was.vsync {
         window.present_mode = if now.vsync { PresentMode::AutoVsync } else { PresentMode::AutoNoVsync };
@@ -1524,29 +1993,43 @@ mod tests {
         changed.keys[2].variants[1] = source(&["Z"], Some(false));
         changed.axes[0].pairs[1] = [source(&["RightArrow"], None), source(&["LeftArrow"], None)];
         changed.double_click = 0.45;
-        let graphics = Graphics { vsync: false, field_of_view: 68.0, mode: Mode::Borderless, resolution: [2560, 1440] };
+        let graphics = Graphics { vsync: false, field_of_view: 68.0, mode: Mode::Borderless, resolution: [2560, 1440], texture_quality: 0, mip_streaming: false, shadow_quality: 3, renderer: crate::backend::Renderer::Dx12 };
         let mouse = Mouse { sensitivity: 0.42, aiming: 0.31, optic: 2.5, invert: [false, true] };
         let path = std::env::temp_dir().join(format!("trp-options-test-{}.json", std::process::id()));
-        let kept = Features { custom_hands: false, smooth_animations: false, icon_generation: false, compatible_highlight: false, character_model: false, stamina: false, world_interactions: false, ..Features::default() };
-        save(&path, &changed, &graphics, &mouse, &kept).unwrap();
+        let kept = Features { custom_hands: false, smooth_animations: false, icon_generation: false, compatible_highlight: false, character_model: false, tarkov_ui: true, stamina: false, world_interactions: false, ..Features::default() };
+        use crate::battle_view::{BattleModes, Shows};
+        let game = BattleModes { quick: Shows::Never, stamina: Shows::Always, health: Shows::Autohide, green_to_red: true };
+        use crate::ui_sound::Levels;
+        let sound = Levels { overall: 7, interface: 4 };
+        save(&path, &changed, &graphics, &mouse, &kept, &game, &sound).unwrap();
         // Read over an install that has since gained a binding: the new
         // one stays, the rest are as kept.
         let mut read = install.clone();
         read.keys.push(group("Jump", PressType::Release, &["Space"]));
-        let mut display = Graphics { vsync: true, field_of_view: 50.0, mode: Mode::Windowed, resolution: [1600, 900] };
+        let mut display = Graphics { vsync: true, field_of_view: 50.0, mode: Mode::Windowed, resolution: [1600, 900], texture_quality: 2, mip_streaming: true, shadow_quality: 1, renderer: crate::backend::Renderer::Vulkan };
         let mut pointer = Mouse { sensitivity: 0.7, aiming: 0.5, optic: 1.0, invert: [false; 2] };
         // A switch of the features' list is on until a file says it is not.
         let mut switched = Features::default();
         assert!(switched.custom_hands);
-        assert_eq!(load(&path, &mut read, &mut display, &mut pointer, &mut switched), [true, true]);
+        // The GAME page's settings over the install's.
+        let mut hud = BattleModes { quick: Shows::Always, stamina: Shows::Autohide, health: Shows::Never, green_to_red: false };
+        let mut volumes = Levels { overall: 1, interface: 1 };
+        assert_eq!(load(&path, &mut read, &mut display, &mut pointer, &mut switched, &mut hud, &mut volumes), [true, true]);
+        assert_eq!(hud, game, "the battle screen's settings are kept");
+        assert_eq!(volumes, sound, "the SOUND page's volumes are kept");
         assert!(!switched.custom_hands && !switched.smooth_animations && !switched.icon_generation && !switched.compatible_highlight && !switched.character_model);
+        assert!(switched.tarkov_ui, "the one switch that starts off is kept on");
         assert_eq!(switched, kept, "every switch is kept, the systems' among them");
         // A file kept before there was such a switch leaves it as it is.
         let older = path.with_extension("older.json");
         std::fs::write(&older, r#"{ "graphics": { "vsync": true } }"#).unwrap();
         let mut untold = Features::default();
-        assert_eq!(load(&older, &mut read.clone(), &mut display.clone(), &mut pointer.clone(), &mut untold), [false, true]);
+        let mut install_hud = BattleModes::default();
+        let mut install_volumes = Levels { overall: 1, interface: 1 };
+        assert_eq!(load(&older, &mut read.clone(), &mut display.clone(), &mut pointer.clone(), &mut untold, &mut install_hud, &mut install_volumes), [false, true]);
+        assert_eq!(install_volumes, Levels { overall: 1, interface: 1 }, "a file without them leaves the install's volumes");
         assert_eq!(untold, Features::default());
+        assert_eq!(install_hud, BattleModes::default(), "a file without them leaves the install's");
         let _ = std::fs::remove_file(&older);
         let _ = std::fs::remove_file(&path);
         assert_eq!(read.keys[..3], changed.keys[..]);
@@ -1556,7 +2039,7 @@ mod tests {
         assert_eq!(display, graphics);
         assert_eq!(pointer, mouse);
         // No file: nothing read, nothing changed.
-        assert_eq!(load(&path, &mut read, &mut display, &mut pointer, &mut switched), [false, false]);
+        assert_eq!(load(&path, &mut read, &mut display, &mut pointer, &mut switched, &mut hud, &mut volumes), [false, false]);
         assert_eq!(pointer, mouse);
         assert!(!switched.custom_hands);
     }

@@ -181,7 +181,7 @@ Not root motion. On entering:
 
 - `v0` = the horizontal velocity before the jump: per axis, whichever is larger in magnitude of the last pre-limit input velocity and (if coming from the move state) the normalized movement direction.
 - `initialMagnitude = |v0|`; direction is `v0` normalized, or the body's forward if the magnitude is at most 0.1.
-- `lift = LIFT_VELOCITY_BY_SPEED(initialMagnitude) * weightFactor`, upward, where `weightFactor = lerp(1, 0.66, Overweight)` (0.66 with a damaged leg and no painkillers). Strength adds a multiplier.
+- `lift = LIFT_VELOCITY_BY_SPEED(initialMagnitude) * weightFactor`, upward, where `weightFactor = lerp(1, 0.66, Overweight)` (0.66 with a damaged leg and no painkillers). Strength adds a multiplier. (The weight factor was left out of the simulation until 0.10.0, when health brought the damaged leg's: no recording was overweight, and the regression did not move.)
 - `liftDelay = JUMP_DELAY_BY_SPEED(initialMagnitude)`.
 
 Each frame, with `t` the time in the state:

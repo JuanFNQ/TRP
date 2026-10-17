@@ -27,6 +27,1050 @@ fn main() -> Result<()> {
     let mut assets = Assets::new(install)?;
 
     match (arg(0), arg(1)) {
+        // One of the build's own serialized files (`sharedassets44.assets`):
+        // its engine version, whether it keeps its classes' type trees, and
+        // how many objects of each class it holds.
+        (Some("file"), Some(file)) => {
+            let data = std::fs::read(assets.install.root.join("EscapeFromTarkov_Data").join(file))?;
+            let meta = trp_data::unity::SerializedFile::parse(&data)?;
+            println!("{file}: format {}, engine {}, type trees {}", meta.version, meta.unity_version, meta.has_type_trees);
+            let mut classes: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+            for object in &meta.objects {
+                *classes.entry(object.class_id).or_default() += 1;
+            }
+            for (class, count) in classes {
+                println!("  class {class}: {count}");
+            }
+        }
+        // The inventory screen's health panel as the app reads it, on a
+        // screen 1920 by 1080 (or so wide: `healthpanel 2560`): the left
+        // panel's size, then each object with its rectangle in it, whether
+        // it shows, its sprite (with its texture's size and format) and
+        // its text.
+        // The game's window that shows a thing (`infowindow [width]`): each
+        // of its objects as the prefab has it, placed in a screen that wide
+        // and 1080 high by its own anchors, with its picture and its words.
+        (Some("infowindow"), width) => {
+            let window = trp_data::screen::info_window(&assets.install)?;
+            let screen = [width.and_then(|w| w.parse().ok()).unwrap_or(1920.0), 1080.0];
+            println!("{} ({} objects)", window.file, window.nodes.len());
+            for (index, node) in window.nodes.iter().enumerate() {
+                let [x, y, w, h] = window.placed_in(index, screen).rect;
+                let mut line = format!("{:70} {}  ({x:.1}, {y:.1}) {w:.1} x {h:.1}", node.path, if window.shown(index) { "on " } else { "off" });
+                if let Some(image) = &node.image {
+                    line += &format!("  image {:?} kind {} sprite {:?}", image.color, image.kind, image.sprite);
+                }
+                if let Some(text) = &node.text {
+                    line += &format!("  text {:?} size {} {:?} colour {:?} style {} align {}/{}", text.text, text.size, text.auto_size, text.color, text.style, text.horizontal, text.vertical);
+                }
+                let scripts: Vec<&str> = node.scripts.iter().map(|(name, _)| name.as_str()).collect();
+                if !scripts.is_empty() {
+                    line += &format!("  [{}]", scripts.join(", "));
+                }
+                println!("{line}");
+            }
+        }
+        // Each font asset the GEAR tab's panels and the things' views draw
+        // in (`fontscale`): its sampling size and scale, its lines, and the
+        // width of a few words at 48 by its glyphs (TextMeshPro's measure)
+        // beside the same words by its font file's own advances at an em of
+        // 48 (the app's drawing measure), and their ratio.
+        (Some("fontscale"), _) => {
+            let gear = trp_data::screen::GearPanel::load(&assets.install)?;
+            let health = trp_data::screen::HealthPanel::load(&assets.install, &gear.file)?;
+            let items = trp_data::screen::ItemViews::load(&assets.install)?;
+            let mut seen = std::collections::BTreeSet::new();
+            let panels: Vec<&trp_data::screen::ScenePanel> = [health.gear_panel.as_ref(), items.slot.as_ref(), items.grid.as_ref()].into_iter().flatten().collect();
+            for panel in panels {
+                for node in &panel.nodes {
+                    let Some(text) = &node.text else { continue };
+                    let Some(file) = panel.file_of(text.font.0) else { continue };
+                    if std::env::var("FONTSCALE_TEXTS").is_ok() {
+                        println!("text {:70} size {} style {} spacing {} kerning {} margin {:?} font {} material {:?}", node.path, text.size, text.style, text.spacing, text.kerning, text.margin, text.font.1, text.material);
+                        continue;
+                    }
+                    if !seen.insert((file.clone(), text.font.1)) {
+                        continue;
+                    }
+                    let tmp = trp_data::screen::TmpFont::read(&assets.install, &file, text.font.1)?;
+                    let fonts = trp_data::screen::build_fonts(&assets.install, &file)?;
+                    let name = trp_data::screen::script_name(&assets.install, &file, text.font.1).unwrap_or_default();
+                    let ttf = trp_data::screen::font_for(&name, &fonts).or_else(|| trp_data::screen::font_by_face(&tmp.family, &tmp.style, &fonts));
+                    println!("{name} ({file} {}): {} {}, sampled at {}, scale {}, ascent {} descent {}", text.font.1, tmp.family, tmp.style, tmp.point_size, tmp.scale, tmp.ascent, tmp.descent);
+                    println!("  bold typeface {:?}, normal spacing {}, bold spacing {}", tmp.bold, tmp.normal_spacing, tmp.bold_spacing);
+                    println!("  atlases {:?}, glyphs {}, M: {:?}", tmp.atlases, tmp.glyph_table.len(), tmp.glyph_of('M'));
+                    let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+                    for (atlas_file, atlas_id) in &tmp.atlases {
+                        match pictures.texture(atlas_file, *atlas_id) {
+                            Ok(t) => {
+                                println!("  atlas {} {}x{} format {} mips {} bytes {}", t.name, t.width, t.height, t.format, t.mip_count, t.data.len());
+                                if let Some((g, _)) = tmp.glyph_of('M') {
+                                    let row = (g.rect[1] + g.rect[3] / 2) as usize;
+                                    let line: Vec<String> = (g.rect[0] - 12..g.rect[0] + 12).map(|x| format!("{}", t.data[row * t.width as usize + x as usize])).collect();
+                                    println!("  M's middle row from 12 left of its rectangle: {}", line.join(" "));
+                                }
+                            }
+                            Err(e) => println!("  atlas {atlas_file} {atlas_id}: {e:#}"),
+                        }
+                    }
+                    if let Ok((material_file, material)) = trp_data::screen::font_material(&assets.install, &file, text.font.1) {
+                        if let Ok(props) = trp_data::screen::material_properties(&assets.install, &material_file, material) {
+                            let mut floats: Vec<_> = props.floats.iter().filter(|(k, _)| ["_WeightNormal", "_WeightBold", "_FaceDilate", "_ScaleRatioA", "_ScaleRatioB", "_ScaleRatioC", "_GradientScale", "_OutlineWidth", "_OutlineSoftness", "_UnderlayDilate", "_UnderlaySoftness", "_UnderlayOffsetX", "_UnderlayOffsetY", "_Sharpness", "_TextureWidth", "_PerspectiveFilter"].contains(&k.as_str())).collect();
+                            floats.sort_by(|a, b| a.0.cmp(b.0));
+                            println!("  material {:?} keywords {:?}: {:?}", props.name, props.keywords, floats);
+                            println!("  shader {:?}", trp_data::screen::material_shader(&assets.install, &material_file, material).map_err(|e| e.to_string()));
+                        }
+                    }
+                    let Some((ttf_name, bytes)) = ttf else { println!("  no font file"); continue };
+                    let face = ttf_parser::Face::parse(bytes, 0)?;
+                    println!("  file {ttf_name}: {} units to the em, ascender {} descender {} line gap {}", face.units_per_em(), face.ascender(), face.descender(), face.line_gap());
+                    for words in ["M", "ARMBAND", "ON SLING", "TACTICAL RIG", "AKM", "30"] {
+                        let one = tmp.width(words, 48.0, 0.0, false) - tmp.normal_spacing * 48.0 / 100.0 * (words.chars().count().saturating_sub(1)) as f32;
+                        let file_width = trp_data::screen::text_width(bytes, words, 48.0, false).unwrap_or(0.0);
+                        println!("  {words:14} asset {one:8.2}  file {file_width:8.2}  ratio {:.4}", one / file_width.max(1e-3));
+                    }
+                }
+            }
+        }
+        // Words drawn as the game draws them (`tmptext <words> <size>
+        // <bold 0|1> <spacing> <kerning 0|1> <asset id> <pixels to a unit>
+        // <out.png> [ground r,g,b]`): from the asset of that number in
+        // resources.assets and its own material, laid on a plain ground, as
+        // a PNG, with the box the words are aligned by.
+        (Some("tmptext"), Some(words)) => {
+            let num = |k: usize| arg(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+            let (size, bold, spacing, kerning, id, s) = (num(2), num(3) != 0.0, num(4), num(5) != 0.0, num(6) as i64, num(7));
+            let out = arg(8).unwrap_or("local/tmptext.png");
+            let ground: Vec<f32> = arg(9).unwrap_or("15,15,15").split(',').map(|v| v.parse::<f32>().unwrap_or(0.0) / 255.0).collect();
+            let file = "resources.assets";
+            let face_of = |id: i64| -> anyhow::Result<trp_data::tmp_text::TmpFace> {
+                let font = trp_data::screen::TmpFont::read(&assets.install, file, id)?;
+                let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+                let (atlas_file, atlas_id) = font.atlases.first().cloned().ok_or_else(|| anyhow::anyhow!("no atlas"))?;
+                let atlas = pictures.texture(&atlas_file, atlas_id)?;
+                let fonts = trp_data::screen::build_fonts(&assets.install, file)?;
+                let name = trp_data::screen::script_name(&assets.install, file, id).unwrap_or_default();
+                let ttf = trp_data::screen::font_for(&name, &fonts).or_else(|| trp_data::screen::font_by_face(&font.family, &font.style, &fonts)).map(|(_, bytes)| bytes.clone());
+                Ok(trp_data::tmp_text::TmpFace::new(font, &atlas, ttf.as_deref()))
+            };
+            let mut face = face_of(id)?;
+            if let Some((_, bold_id)) = face.font.bold.clone() {
+                face.bold = Some(std::sync::Arc::new(face_of(bold_id)?));
+            }
+            let (material_file, material) = trp_data::screen::font_material(&assets.install, file, id)?;
+            let material = trp_data::tmp_text::TmpMaterial::of(&trp_data::screen::material_properties(&assets.install, &material_file, material)?);
+            let color = [0xb6 as f32 / 255.0, 0xc1 as f32 / 255.0, 0xc7 as f32 / 255.0, 1.0];
+            let runs = [trp_data::tmp_text::TmpRun { text: words.to_owned(), size: size * s, color, bold }];
+            let image = trp_data::tmp_text::draw(&face, &material, &runs, &trp_data::tmp_text::TmpLayout { em: size * s, spacing, kerning, wrap: None, align: 1 });
+            println!("{}x{} px, the words' box at {:?}; material {material:?}", image.width, image.height, image.layout);
+            // Laid on the ground (the screen's numbers, blended as they are).
+            let (w, h) = (image.width + 8, image.height + 8);
+            let mut rgb = vec![0u8; w * h * 3];
+            for y in 0..h {
+                for x in 0..w {
+                    let (ix, iy) = (x as isize - 4, y as isize - 4);
+                    let px = if ix >= 0 && iy >= 0 && (ix as usize) < image.width && (iy as usize) < image.height { &image.rgba[(iy as usize * image.width + ix as usize) * 4..][..4] } else { &[0, 0, 0, 0][..] };
+                    let a = px[3] as f32 / 255.0;
+                    for c in 0..3 {
+                        rgb[(y * w + x) * 3 + c] = ((px[c] as f32 / 255.0 * a + ground[c] * (1.0 - a)) * 255.0 + 0.5) as u8;
+                    }
+                }
+            }
+            let mut encoder = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(out)?), w as u32, h as u32);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header()?.write_image_data(&rgb)?;
+            println!("written {out}");
+        }
+        (Some("healthpanel"), width) => {
+            let gear = trp_data::screen::GearPanel::load(&assets.install)?;
+            let health = trp_data::screen::HealthPanel::load(&assets.install, &gear.file)?;
+            let screen = [width.and_then(|w| w.parse().ok()).unwrap_or(1920.0), 1080.0];
+            let left = health.left_panel(screen);
+            println!("{}: left panel {left:?}, the equipment panel at {:?}, spacing {}", gear.file, health.gear_in(left), health.spacing);
+            let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+            for (index, node) in health.panel.nodes.iter().enumerate() {
+                let placed = health.panel.placed(index, left);
+                let [x, y, w, h] = placed.rect;
+                let flip = match placed.flip { [false, false] => "", [true, false] => " mirrored", [false, true] => " upside down", [true, true] => " turned" };
+                let mut line = format!("{:60} {}  ({x:.1}, {y:.1}) {w:.1} x {h:.1}{flip}", node.path, if health.panel.shown(index) { "on " } else { "off" });
+                if let Some(image) = &node.image {
+                    line += &format!("  image {:?} kind {} fill {}/{}/{}", image.color, image.kind, image.fill_method, image.fill_origin, image.fill_amount);
+                    if let Some((file, id)) = image.sprite {
+                        let name = if file == 0 { gear.file.clone() } else { health.panel.externals.get(file as usize - 1).cloned().unwrap_or_default() };
+                        match pictures.sprite(&name, id) {
+                            Ok(cut) => {
+                                let texture = pictures.texture(&cut.texture.0, cut.texture.1).map(|t| format!("{}x{} format {}", t.width, t.height, t.format)).unwrap_or_else(|e| format!("{e:#}"));
+                                line += &format!("  sprite {:?} {:?} border {:?} ppu {} covers {:?}{} of {texture}", cut.name, cut.rect, cut.border, cut.pixels_per_unit, cut.covers(), if cut.turned { " (turned in its atlas)" } else { "" });
+                            }
+                            Err(e) => line += &format!("  sprite {name} {id}: {e:#}"),
+                        }
+                    }
+                }
+                if let Some(text) = &node.text {
+                    line += &format!("  text {:?} size {} {:?} colour {:?} style {} align {}/{}", text.text, text.size, text.auto_size, text.color, text.style, text.horizontal, text.vertical);
+                }
+                println!("{line}");
+            }
+            let path = |index: Option<usize>| index.map_or("-".to_owned(), |index| health.panel.nodes[index].path.clone());
+            let views = &health.views;
+            println!("\nsilhouette {}, legend {}", path(views.silhouette), path(views.legend));
+            for part in &views.parts {
+                println!("view {}: value {}, bar {}, border {}, shape {}, broken {}, effects {}", path(Some(part.view)), path(part.value), path(part.bar), path(part.border), path(part.shape), path(part.broken), path(part.effects));
+            }
+            if let Some(gear) = &health.gear_panel {
+                println!("\nthe equipment panel's slot views:");
+                let at = |index: Option<usize>| index.map_or("-".to_owned(), |index| gear.nodes[index].path.clone());
+                for (slot, parts) in &health.slot_views {
+                    println!(
+                        "{slot}: {} full {}, back {}, fill {}, empty {}, chosen {} {}, words {}, header {}",
+                        at(Some(parts.view)), at(parts.full_border), at(parts.back_image), at(parts.background), at(parts.empty_border), at(parts.selected_border), at(parts.selected_corner), at(parts.header_text), at(parts.header)
+                    );
+                }
+            }
+            if let Some(strip) = &health.strip {
+                println!("\nthe GEAR tab's strip of figures, in the left panel:");
+                for (index, node) in strip.nodes.iter().enumerate() {
+                    let [x, y, w, h] = strip.placed_in(index, left).rect;
+                    let text = node.text.as_ref().map_or(String::new(), |text| format!("  text {:?} size {}", text.text, text.size));
+                    println!("{:50} {}  ({x:.1}, {y:.1}) {w:.1} x {h:.1}{text}", node.path, if strip.shown(index) { "on " } else { "off" });
+                }
+                for (name, figure) in &health.strip_figures {
+                    if let Some(f) = figure {
+                        let at = |index: Option<usize>| index.map_or("-".to_owned(), |index| strip.nodes[index].path.clone());
+                        println!("{name}: {} current {}, max {}, ok glow {}, glow {}, icon {}, warning {:?}, alternative {:?}", at(Some(f.panel)), at(f.current), at(f.max), at(f.ok_glow), at(f.glow), at(f.icon), f.warning, f.alternative);
+                    }
+                }
+            }
+            for (name, figure) in &views.parameters {
+                match figure {
+                    Some(f) => println!(
+                        "{name}: {} current {}, max {}, ok glow {}, glow {}, icon {}, warning {:?}, alternative {:?}, digits {} noughts {:?}, rate {} {} {}",
+                        path(Some(f.panel)), path(f.current), path(f.max), path(f.ok_glow), path(f.glow), path(f.icon), f.warning, f.alternative, f.least_digits, f.noughts, path(f.up), path(f.down), path(f.rate)
+                    ),
+                    None => println!("{name}: none"),
+                }
+            }
+        }
+        // The animation clips of one of the build's own files, read by the
+        // tree of a clip in a bundle of the install's (`sceneclips
+        // sharedassets44.assets assets/content/weapons/animations/simple_animations.bundle
+        // [part of a name]`): each curve that drives a property of a
+        // component, with its values at the clip's start and end, the
+        // object's path and the property named where they are among the
+        // health panel's objects and the screen's usual properties.
+        (Some("sceneclips"), Some(file)) => {
+            let donor = arg(2).ok_or_else(|| anyhow::anyhow!("a bundle that has a clip"))?;
+            let wanted = arg(3).unwrap_or("").to_lowercase();
+            let tree = trp_data::screen::tree_of(&assets.install, donor, trp_data::unity::class::ANIMATION_CLIP)?;
+            let mut files = trp_data::screen::ScenePictures::new(&assets.install)?;
+            // The names the clips' numbers may be for: every object's path
+            // below a view of the health panel, and below the panel.
+            let mut paths: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+            if let Ok(gear) = trp_data::screen::GearPanel::load(&assets.install) {
+                if let Ok(health) = trp_data::screen::HealthPanel::load(&assets.install, &gear.file) {
+                    for node in &health.panel.nodes {
+                        let mut path = node.path.as_str();
+                        loop {
+                            paths.insert(trp_data::unity::anim::path_hash(path), path.to_owned());
+                            match path.split_once('/') {
+                                Some((_, rest)) => path = rest,
+                                None => break,
+                            }
+                        }
+                    }
+                }
+            }
+            paths.insert(trp_data::unity::anim::path_hash(""), "(the root)".to_owned());
+            let properties: std::collections::HashMap<u32, &str> = ["m_Color.r", "m_Color.g", "m_Color.b", "m_Color.a", "m_IsActive", "m_Enabled", "m_FillAmount", "m_LocalScale.x", "m_LocalScale.y", "m_AnchoredPosition.x", "m_AnchoredPosition.y", "m_SizeDelta.x", "m_SizeDelta.y", "m_Alpha", "m_fontColor.a"]
+                .iter()
+                .map(|name| (trp_data::unity::anim::path_hash(name), *name))
+                .collect();
+            for id in files.objects(file, trp_data::unity::class::ANIMATION_CLIP)? {
+                let clip = match files.read_by(file, id, trp_data::unity::class::ANIMATION_CLIP, &tree).and_then(|v| trp_data::unity::anim::Clip::of(&v)) {
+                    Ok(clip) => clip,
+                    Err(e) => {
+                        println!("clip {id}: {e:#}");
+                        continue;
+                    }
+                };
+                if !clip.name.to_lowercase().contains(&wanted) {
+                    continue;
+                }
+                // Its values at nine times from its start to its end.
+                let samples: Vec<Vec<f32>> = (0..9)
+                    .map(|n| {
+                        let mut values = Vec::new();
+                        clip.sample(clip.duration() * n as f32 / 8.0, &mut values);
+                        values
+                    })
+                    .collect();
+                println!("clip {id} {:?}: {:.3} s{}", clip.name, clip.duration(), if clip.looping { ", looping" } else { "" });
+                for b in &clip.others {
+                    let path = paths.get(&b.path).cloned().unwrap_or_else(|| format!("#{:08x}", b.path));
+                    let property = properties.get(&b.attribute).map_or_else(|| format!("#{:08x}", b.attribute), |name| name.to_string());
+                    let values: Vec<String> = samples.iter().map(|values| format!("{:.3}", values.get(b.curve).copied().unwrap_or(f32::NAN))).collect();
+                    println!("  {path} (class {}) {property}: {}", b.class, values.join(" "));
+                }
+            }
+        }
+        // The smallest bundles of the install's that keep a class with its
+        // tree (`classfind 74`), smallest first, ten of them: where to
+        // borrow the tree to read the build's own files by.
+        (Some("classfind"), Some(class)) => {
+            let class: i32 = class.parse()?;
+            let mut keys: Vec<(u64, String)> = assets
+                .manifest
+                .entries
+                .keys()
+                .filter_map(|key| Some((std::fs::metadata(assets.install.bundle_path(key)).ok()?.len(), key.clone())))
+                .collect();
+            keys.sort();
+            let mut found = 0;
+            for (size, key) in keys {
+                let Ok(bundle) = trp_data::unity::Bundle::open(&assets.install.bundle_path(&key)) else { continue };
+                let has = bundle.nodes.iter().filter(|node| node.is_serialized_file()).any(|node| {
+                    trp_data::unity::SerializedFile::parse(bundle.file(node)).is_ok_and(|meta| meta.types.iter().any(|ty| ty.class_id == class && !ty.tree.is_empty()))
+                });
+                if has {
+                    println!("{size:>10}  {key}");
+                    found += 1;
+                    if found == 10 {
+                        break;
+                    }
+                }
+            }
+        }
+        // Any object of a scene and all under it, as the app reads a panel
+        // (`scenepanel level44 "Left Panel/Gear Panel" 494 650`): each
+        // object's rectangle in the top's of that size (its own size where
+        // none is given), whether it is on, its scripts, its picture and
+        // its text.
+        (Some("scenepanel"), Some(file)) => {
+            let scene = trp_data::screen::Scene::load(&assets.install, file, true)?;
+            let end = arg(2).unwrap_or("");
+            let top = (0..scene.nodes.len()).find(|&index| scene.path(index).ends_with(end)).ok_or_else(|| anyhow::anyhow!("no object's path ends with {end:?}"))?;
+            let panel = trp_data::screen::ScenePanel::of(&scene, top);
+            let own = panel.nodes[0].layout.size_delta;
+            let size = [arg(3).and_then(|w| w.parse().ok()).unwrap_or(own[0]), arg(4).and_then(|h| h.parse().ok()).unwrap_or(own[1])];
+            println!("{}: {size:?}", scene.path(top));
+            let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+            for (index, node) in panel.nodes.iter().enumerate() {
+                let placed = panel.placed(index, size);
+                let [x, y, w, h] = placed.rect;
+                let classes: Vec<&str> = node.scripts.iter().map(|(class, _)| class.as_str()).collect();
+                let mut line = format!("{:55} {} ({x:.1}, {y:.1}) {w:.1} x {h:.1} [{}]", node.path, if node.active { "on " } else { "off" }, classes.join(", "));
+                if node.layout.turn.abs() > 1e-3 {
+                    line += &format!("  turned {:.1}", node.layout.turn);
+                }
+                if let Some(text) = node.text.as_ref().filter(|text| text.margin.iter().any(|&m| m != 0.0)) {
+                    line += &format!("  margin {:?}", text.margin);
+                }
+                if let Some(group) = node.group {
+                    line += &format!("  row {group:?}");
+                }
+                if let Some(element) = node.element {
+                    line += &format!("  asks {element:?}");
+                }
+                if let Some(image) = &node.image {
+                    line += &format!("  image {:?} kind {}", image.color, image.kind);
+                    if let Some((outside, id)) = image.sprite {
+                        let name = if outside == 0 { file.to_owned() } else { panel.externals.get(outside as usize - 1).map(|n| n.rsplit('/').next().unwrap_or(n).to_owned()).unwrap_or_default() };
+                        match pictures.sprite(&name, id) {
+                            Ok(cut) => {
+                                line += &format!(" sprite {:?} {:?} border {:?}", cut.name, cut.rect, cut.border);
+                                // `PROBE_SPRITES=<folder>`: each sprite
+                                // written there as it is, its top up.
+                                if let Ok(folder) = std::env::var("PROBE_SPRITES") {
+                                    let texture = pictures.texture(&cut.texture.0, cut.texture.1)?;
+                                    let levels = trp_data::unity::texture::mips(&texture)?;
+                                    let pixels = trp_data::unity::texture::decode_rgba(&texture, *levels.first().ok_or_else(|| anyhow::anyhow!("no levels"))?)?;
+                                    let [x, y, w, h] = cut.rect.map(|v| v.round().max(0.0) as usize);
+                                    let width = texture.width as usize;
+                                    // `PROBE_MARGIN=<texels>`: that much of the
+                                    // texture around it too, and the alpha
+                                    // just outside its left and right edges
+                                    // on its middle row.
+                                    let margin: usize = std::env::var("PROBE_MARGIN").ok().and_then(|m| m.parse().ok()).unwrap_or(0);
+                                    let row_mid = y + h / 2;
+                                    let alpha = |column: Option<usize>| column.filter(|&c| c < width).map_or("-".to_owned(), |c| pixels[(row_mid * width + c) * 4 + 3].to_string());
+                                    if margin > 0 {
+                                        line += &format!(" (alpha outside: left {}, right {}; inside: {} .. {})", alpha(x.checked_sub(1)), alpha(Some(x + w)), alpha(Some(x)), alpha(Some(x + w - 1)));
+                                    }
+                                    let (x, y) = (x.saturating_sub(margin), y.saturating_sub(margin));
+                                    let (w, h) = ((w + 2 * margin).min(width - x), (h + 2 * margin).min(texture.height as usize - y));
+                                    let mut out = Vec::with_capacity(w * h * 4);
+                                    for row in (y..y + h).rev() {
+                                        out.extend_from_slice(&pixels[(row * width + x) * 4..(row * width + x + w) * 4]);
+                                    }
+                                    line += &format!(" (texture {} by {}, {} levels, format {}, srgb {})", texture.width, texture.height, levels.len(), texture.format, texture.srgb);
+                                    let path = std::path::Path::new(&folder).join(format!("{}.png", cut.name));
+                                    let mut encoder = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(&path)?), w as u32, h as u32);
+                                    encoder.set_color(png::ColorType::Rgba);
+                                    encoder.set_depth(png::BitDepth::Eight);
+                                    encoder.write_header()?.write_image_data(&out)?;
+                                }
+                            }
+                            Err(e) => line += &format!(" sprite {name} {id}: {e:#}"),
+                        }
+                    }
+                }
+                if let Some(text) = &node.text {
+                    line += &format!("  text {:?} size {} colour {:?} align {}/{} style {} font {:?}", text.text, text.size, text.color, text.horizontal, text.vertical, text.style, text.font);
+                }
+                println!("{line}");
+            }
+        }
+        // A prefab of the build's own Resources by its path
+        // (`prefab prefabs/ugui/layouts/slot_layout 125 125`), as
+        // `scenepanel` prints a part of a scene.
+        // The inventory's quick-use panel as the app reads it, its views on
+        // as its script shows them: each view's binding, what it names and
+        // where it lies on a screen 1920 by 1080.
+        (Some("battle"), _) => {
+            let gear = trp_data::screen::GearPanel::load(&assets.install)?;
+            let views = trp_data::screen::BattleViews::load(&assets.install, &gear.file)?;
+            let stance = |index: Option<usize>| index.map_or("-".to_owned(), |index| views.stance.nodes[index].path.clone());
+            let health = |index: Option<usize>| index.map_or("-".to_owned(), |index| views.health.nodes[index].path.clone());
+            for (object, factor) in &views.figures {
+                println!("figure {} at {factor}", stance(Some(*object)));
+            }
+            println!("noise {} sprites {:?}", stance(views.noise), views.noise_sprites);
+            println!("notch {} final {} row {} colours {:?}", stance(views.notch_template), stance(views.final_notch), stance(views.notches_place), views.notch_colors);
+            for slider in [views.stance_slider, views.speed_slider].into_iter().flatten() {
+                println!("slider {} handle {} area {} direction {} from {} to {} at {}", stance(Some(slider.object)), stance(slider.handle), stance(slider.area), slider.direction, slider.min, slider.max, slider.value);
+                let size = views.stance.nodes[0].layout.size_delta;
+                println!("  scene {:?}, at 0 {:?}, at 1 {:?}, at the scene's value {:?}", slider.handle.map(|handle| views.stance.rect(handle, size)), slider.handle_at(&views.stance, size, 0.0), slider.handle_at(&views.stance, size, 1.0), slider.handle_at(&views.stance, size, trp_data::screen::SliderParts::share(slider.value, slider.min, slider.max)));
+            }
+            println!("fills {} {} sprites {:?}", stance(views.legs_fill), stance(views.arms_fill), views.fill_sprites);
+            println!("ground {}", health(views.background));
+            for (part, image) in &views.parts {
+                println!("part {part}: {}", health(Some(*image)));
+            }
+            println!("effects {} grid {:?} icon {} count {}", health(views.effects), views.effects_grid, health(views.effect_template), health(views.stack_count));
+            let quick = trp_data::screen::QuickViews::load_battle(&assets.install, &gear.file)?;
+            let rect = quick.quick_in([1920.0, 1080.0]);
+            println!("quick bar {rect:?}");
+            let at = |index: Option<usize>| index.map_or("-".to_owned(), |index| quick.panel.nodes[index].path.clone());
+            for slot in &quick.slots {
+                println!("  {} {}: {:?} install {:?}, key {}, caption {}, border {}, ground {}, arrow {}", slot.key, at(Some(slot.object)), quick.panel.rect(slot.object, [rect[2], rect[3]]), slot.install.map(|i| quick.panel.rect(i, [rect[2], rect[3]])), at(slot.hot_key), at(slot.caption), at(slot.border), at(slot.background), at(slot.arrow));
+            }
+            for (index, node) in views.stance.nodes.iter().enumerate().filter(|(_, node)| node.path.contains("Handle")) {
+                println!("{} image {:?}", node.path, node.image.map(|image| image.sprite));
+                let _ = index;
+            }
+        }
+        (Some("quick"), _) => {
+            let gear = trp_data::screen::GearPanel::load(&assets.install)?;
+            let mut quick = trp_data::screen::QuickViews::load(&assets.install, &gear.file)?;
+            for slot in quick.slots.clone() {
+                quick.panel.nodes[slot.object].active = true;
+            }
+            let rect = quick.quick_in([1920.0, 1080.0]);
+            println!("the panel {rect:?}");
+            let at = |index: Option<usize>| index.map_or("-".to_owned(), |index| quick.panel.nodes[index].path.clone());
+            for slot in &quick.slots {
+                println!("{} {}: {:?}  install {}, key {}, caption {}, border {}", slot.key, at(Some(slot.object)), quick.panel.rect(slot.object, [rect[2], rect[3]]), at(slot.install), at(slot.hot_key), at(slot.caption), at(slot.border));
+            }
+            for name in ["Header", "Header/Text", "Quick Slots"] {
+                if let Some(index) = quick.panel.find(name) {
+                    println!("{name}: {:?}", quick.panel.rect(index, [rect[2], rect[3]]));
+                }
+            }
+        }
+        // The inventory's panel for a container opened, as the app reads it:
+        // what its script names, its filters' tabs and its scrolling.
+        (Some("stash"), _) => {
+            let gear = trp_data::screen::GearPanel::load(&assets.install)?;
+            let stash = trp_data::screen::StashViews::load(&assets.install, &gear.file)?;
+            let at = |index: Option<usize>| index.map_or("-".to_owned(), |index| stash.panel.nodes[index].path.clone());
+            println!("simple {}, header {}, grid name {}, filters {}, money {}, name panel {}, name {}", at(Some(stash.simple)), at(stash.header), at(stash.grid_name), at(stash.filters), at(stash.money), at(stash.name_panel), at(stash.name));
+            println!("lobby only {:?}", stash.lobby_only.iter().map(|&index| at(Some(index))).collect::<Vec<_>>());
+            println!("sort {}, sorting table {}, search {}, scroll {}, external {}, pin {}, lock {}, priority {}, grids {}", at(stash.sort), at(stash.sorting_table), at(stash.search), at(stash.scroll), at(stash.external), at(stash.pin), at(stash.lock), at(stash.priority), at(stash.grids));
+            println!("scrolling {:?}", stash.scrolling);
+            for tab in &stash.filter_tabs {
+                println!("  filter {}: normal {}, selected {}, target {}, icon {}", at(Some(tab.object)), at(tab.normal), at(tab.selected), at(tab.target), at(tab.icon));
+            }
+            let size = stash.panel.nodes[0].layout.size_delta;
+            for (index, node) in stash.panel.nodes.iter().enumerate().filter(|(_, node)| node.path.contains("Filter Panel/") && node.path.matches('/').count() == 3) {
+                println!("  {} {:?}", node.path, stash.panel.rect(index, size));
+            }
+        }
+        // Where a script's pointers lead in its panel (`points level44
+        // "InventoryScreen/Items Panel/Stash Panel/Simple Panel"
+        // SimpleStashPanel`): each place in its fields that names an
+        // object of the panel, a script on one, or one's place.
+        (Some("points"), Some(file)) => {
+            let wanted = arg(2).ok_or_else(|| anyhow::anyhow!("which object?"))?;
+            let class = arg(3).ok_or_else(|| anyhow::anyhow!("which script?"))?;
+            let scene = trp_data::screen::Scene::load(&assets.install, file, true)?;
+            let top = (0..scene.nodes.len()).find(|&node| scene.path(node).ends_with(wanted)).ok_or_else(|| anyhow::anyhow!("no {wanted}"))?;
+            let panel = trp_data::screen::ScenePanel::of(&scene, top);
+            let fields = panel.script(0, class).ok_or_else(|| anyhow::anyhow!("no {class} on it"))?;
+            println!("{wanted} {class}: {} bytes of fields", fields.len());
+            for at in (0..fields.len().saturating_sub(11)).step_by(4) {
+                let object = panel.pointer_at(fields, at).map(|index| ("object or script", index));
+                let place = panel.transform_at(fields, at).map(|index| ("place", index));
+                if let Some((what, index)) = object.or(place) {
+                    println!("  {at:5}: {what} {}", panel.nodes[index].path);
+                }
+            }
+        }
+        // One object of a build's file by its number, its bytes as words
+        // from a place on (`raw sharedassets0.assets 1234 0 64`), each
+        // as a number, a float and its letters.
+        // A TextMeshPro font asset's material and its floats and colours
+        // (`fontmaterial resources.assets 34143`).
+        // Each object whose path ends so, and those under it, with its
+        // parts' engine classes (223 a canvas: then its fields, which say
+        // whether it sorts on its own and by what order).
+        (Some("parts"), Some(file)) => {
+            let scene = trp_data::screen::Scene::load(&assets.install, file, true)?;
+            let end = arg(2).unwrap_or("");
+            let top = (0..scene.nodes.len()).find(|&index| scene.path(index).ends_with(end)).ok_or_else(|| anyhow::anyhow!("no object's path ends with {end:?}"))?;
+            let top_path = scene.path(top);
+            for index in (0..scene.nodes.len()).filter(|&index| scene.path(index).starts_with(&top_path)) {
+                let parts = scene.parts_of(index);
+                let classes: Vec<String> = parts.iter().map(|(_, class)| class.to_string()).collect();
+                println!("{} [{}]", scene.path(index).trim_start_matches(&top_path), classes.join(" "));
+                for (id, class) in parts.iter().filter(|(_, class)| *class == 223) {
+                    let (_, bytes) = trp_data::screen::object_bytes(&assets.install, file, *id)?;
+                    let words: Vec<String> = bytes.chunks(4).map(|w| format!("{:?}", w)).collect();
+                    println!("    canvas {class} {id}: {}", words.join(" "));
+                }
+            }
+        }
+        // The interface's sounds (`Resources/Audio/UISoundsWrapper`): each
+        // sound's kind and its clip's name, length and how it is kept.
+        (Some("uisounds"), _) => {
+            let paths = trp_data::screen::resource_paths(&assets.install)?;
+            let (_, file, id) = paths.iter().find(|(path, ..)| path == "audio/uisoundswrapper").ok_or_else(|| anyhow::anyhow!("no audio/uisoundswrapper"))?;
+            let (class, bytes) = trp_data::screen::object_bytes(&assets.install, file, *id)?;
+            println!("{file} {id}: class {class}, {} bytes", bytes.len());
+            let tree = trp_data::screen::tree_of(&assets.install, "assets/content/audio/itemsounds/itemsounds.bundle", 83)?;
+            let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+            // After the object, its switch, its script and its name: the
+            // list of kinds and clips.
+            let mut at = 12 + 4 + 12;
+            let name_len = u32::from_le_bytes(bytes[at..at + 4].try_into()?) as usize;
+            at += 4 + name_len;
+            at = (at + 3) & !3;
+            let count = u32::from_le_bytes(bytes[at..at + 4].try_into()?) as usize;
+            at += 4;
+            for n in 0..count {
+                let kind = i32::from_le_bytes(bytes[at + 16 * n..at + 16 * n + 4].try_into()?);
+                let clip_file = i32::from_le_bytes(bytes[at + 16 * n + 4..at + 16 * n + 8].try_into()?);
+                let clip_id = i64::from_le_bytes(bytes[at + 16 * n + 8..at + 16 * n + 16].try_into()?);
+                let said = if clip_file == 0 { pictures.read_by(file, clip_id, 83, &tree).map(|v| format!("{:?} {:?}s format {:?} {:?}", v.get("m_Name").and_then(|n| n.as_str()).unwrap_or(""), v.get("m_Length").and_then(|l| l.as_f32()), v.get("m_CompressionFormat").and_then(|f| f.as_i64()), v.get("m_Resource").and_then(|r| r.get("m_Source")).and_then(|s| s.as_str()))).unwrap_or_else(|e| format!("{e:#}")) } else { format!("in file {clip_file}") };
+                println!("  kind {kind}: {said}");
+            }
+        }
+        // The sounds of moving (`sound::movement_sounds`): each surface's
+        // banks with their figures and how many clips each list has; with
+        // `read`, every clip decoded too and a count of those not read; with
+        // a folder after `read`, the clips of the surfaces given (by number,
+        // `stepsounds read local\x 0 2`) written there as WAVE files.
+        (Some("stepsounds"), read) => {
+            let read = read.as_deref() == Some("read");
+            let only: Vec<u8> = (3..16).filter_map(|n| arg(n).and_then(|s| s.parse().ok())).collect();
+            let sounds = trp_data::sound::movement_sounds(&assets.install, (!only.is_empty()).then_some(only.as_slice()), read)?;
+            let say = |bank: &trp_data::sound::Bank| {
+                format!(
+                    "{:28} volume {:.2} -{:.2}, pitch {:.2} +-{:.2}, rolloff {:5.1}, blend {:?}, clips {:?}",
+                    bank.name,
+                    bank.base_volume,
+                    bank.delta_volume,
+                    bank.base_pitch,
+                    bank.delta_pitch,
+                    bank.rolloff,
+                    bank.blend,
+                    bank.lists.iter().map(Vec::len).collect::<Vec<_>>()
+                )
+            };
+            for set in &sounds.surfaces {
+                println!("{} ({})", trp_data::sound::SURFACES.get(set.surface as usize).unwrap_or(&"?"), set.surface);
+                for (name, bank) in trp_data::sound::SURFACE_BANKS.iter().zip(&set.banks) {
+                    println!("  {name:20} {}", bank.map_or("none".to_owned(), |bank| say(&sounds.banks[bank])));
+                }
+            }
+            for (name, bank) in trp_data::sound::GEAR_BANKS.iter().zip(&sounds.gear) {
+                println!("{name:22} {}", bank.map_or("none".to_owned(), |bank| say(&sounds.banks[bank])));
+            }
+            let mut kinds: std::collections::BTreeMap<(u16, u32), (usize, f32)> = std::collections::BTreeMap::new();
+            for clip in sounds.clips.iter().filter_map(|(_, clip)| clip.as_ref()) {
+                let entry = kinds.entry((clip.channels, clip.frequency)).or_default();
+                entry.0 += 1;
+                entry.1 = entry.1.max(clip.samples.len() as f32 / clip.channels.max(1) as f32 / clip.frequency.max(1) as f32);
+            }
+            for ((channels, rate), (count, longest)) in &kinds {
+                println!("  {count} clips of {channels} channels at {rate} Hz, the longest {longest:.2} s");
+            }
+            let decoded = sounds.clips.iter().filter(|(_, clip)| clip.is_some()).count();
+            let frames: usize = sounds.clips.iter().filter_map(|(_, clip)| clip.as_ref()).map(|clip| clip.samples.len()).sum();
+            println!("{} clips named, {decoded} read ({:.1} MB of 16-bit samples)", sounds.clips.len(), frames as f64 * 2.0 / 1e6);
+            if let Some(folder) = arg(2).filter(|_| read) {
+                let folder = std::path::Path::new(folder);
+                std::fs::create_dir_all(folder)?;
+                for (name, clip) in &sounds.clips {
+                    if let Some(clip) = clip {
+                        std::fs::write(folder.join(format!("{name}.wav")), clip.wav())?;
+                    }
+                }
+            }
+        }
+        // The sounds as read (`sound`): the interface's of the kinds given
+        // and the things' of a group, each written as a WAVE file to the
+        // folder given (to listen to), with its length.
+        // A hands rig's sound player (`BaseSoundPlayer`): each of its
+        // events with its rolloff, volume and clips. An item that has
+        // hands of its own by its template (its `UsePrefab`), else a weapon.
+        (Some("handsounds"), Some(what)) => {
+            let db = trp_data::Database::load(&assets.install)?;
+            let key = db.items.get(what).and_then(|item| item.props["UsePrefab"]["path"].as_str().filter(|path| !path.is_empty()).map(str::to_owned)).unwrap_or_else(|| what.to_owned());
+            let weapon = trp_data::weapon::assemble_named(&mut assets, &db, &key)?;
+            let mut setups = trp_data::sound::VorbisSetups::new(&assets.install);
+            match trp_data::sound::hands_sounds(&assets, &weapon, &mut setups, true)? {
+                Some(sounds) => {
+                    println!("{key}: {}", sounds.player);
+                    for (list, elements) in [("main", &sounds.main), ("additional", &sounds.additional)] {
+                        for element in elements {
+                            let clips: Vec<String> = element.clips.iter().map(|clip| format!("{} ({:.2} s, x{})", clip.name, clip.samples.len() as f32 / clip.channels.max(1) as f32 / clip.frequency.max(1) as f32, clip.channels)).collect();
+                            println!("  {list} {}: rolloff {}, volume {}, {}", element.event, element.rolloff, element.volume, clips.join(", "));
+                        }
+                    }
+                    // Its shots (`WeaponSoundPlayer`): each bank's figures
+                    // and its three lists by distance.
+                    if let Some(shots) = &sounds.shots {
+                        println!("  shots: {}", if shots.non_auto { "each whole (Non_auto)" } else { "automatic: a loop and a tail" });
+                        for (name, bank) in trp_data::sound::SHOT_BANKS.iter().zip(&shots.banks) {
+                            let Some(bank) = bank else {
+                                println!("  {name}: none");
+                                continue;
+                            };
+                            println!("  {name} = {}: volume {}, rolloff {}, length {:.4} s, blend {:?}", bank.name, bank.base_volume, bank.rolloff, bank.clip_length, bank.blend);
+                            for (n, list) in bank.lists.iter().enumerate() {
+                                let clips: Vec<String> = list
+                                    .iter()
+                                    .map(|&at| match &shots.clips[at] {
+                                        (name, Some(clip)) => format!("{name} ({:.4} s, x{}, {} Hz)", clip.samples.len() as f32 / clip.channels.max(1) as f32 / clip.frequency.max(1) as f32, clip.channels, clip.frequency),
+                                        (name, None) => format!("{name} (not read)"),
+                                    })
+                                    .collect();
+                                println!("    distance {n}: {}", clips.join(", "));
+                            }
+                        }
+                        let bytes: usize = shots.clips.iter().filter_map(|(_, clip)| clip.as_ref()).map(|clip| clip.samples.len() * 2).sum();
+                        println!("  {} clips, {:.1} MB decoded", shots.clips.len(), bytes as f32 / 1e6);
+                        // With a folder (`handsounds <weapon> <folder>`), each
+                        // clip written there as a WAVE file, with its peak.
+                        if let Some(folder) = arg(2) {
+                            let folder = std::path::Path::new(folder);
+                            std::fs::create_dir_all(folder)?;
+                            for clip in shots.clips.iter().filter_map(|(_, clip)| clip.as_ref()) {
+                                let peak = clip.samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+                                let rms = (clip.samples.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / clip.samples.len().max(1) as f64).sqrt();
+                                println!("  {}: peak {peak}, rms {rms:.0}", clip.name);
+                                std::fs::write(folder.join(format!("{}.wav", clip.name)), clip.wav())?;
+                            }
+                        }
+                    }
+                }
+                None => println!("{key}: no sound player"),
+            }
+        }
+        // The things' sounds kept as Vorbis: each sample's channels,
+        // frequency, frames, packets and the CRC32 of its setup header,
+        // and whether that header was found in the game's engine.
+        (Some("vorbis"), _) => {
+            let clips = trp_data::sound::item_vorbis(&assets.install)?;
+            let wanted: Vec<u32> = clips.iter().map(|(_, sample)| sample.setup_crc).collect();
+            let headers = trp_data::sound::vorbis_setup_headers(&assets.install, &wanted)?;
+            // With a folder, each decoded and written there as a WAVE file.
+            let folder = arg(1).map(std::path::PathBuf::from);
+            for (name, sample) in &clips {
+                let found = headers.get(&sample.setup_crc).map_or("not found".to_owned(), |header| format!("found, {} bytes", header.len()));
+                println!("{name}: {} Hz x{}, {} frames, {} packets ({} bytes), setup header {:08x} {found}", sample.frequency, sample.channels, sample.frames, sample.packets.len(), sample.packets.iter().map(Vec::len).sum::<usize>(), sample.setup_crc);
+                let (Some(folder), Some(setup)) = (&folder, headers.get(&sample.setup_crc)) else { continue };
+                match trp_data::sound::decode_vorbis(sample, setup) {
+                    Ok(samples) => {
+                        let ch = sample.channels.max(1) as usize;
+                        let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+                        let level: f64 = samples.iter().map(|s| (*s as f64).abs()).sum::<f64>() / samples.len().max(1) as f64;
+                        let jumps: f64 = samples.windows(ch + 1).map(|w| (w[ch] as f64 - w[0] as f64).abs()).sum::<f64>() / samples.len().max(1) as f64;
+                        println!("  decoded: {} frames of {}, peak {peak}, roughness {:.2}", samples.len() / ch, sample.frames, jumps / level.max(1.0));
+                        std::fs::create_dir_all(folder)?;
+                        let clip = trp_data::sound::Clip { name: name.clone(), channels: sample.channels, frequency: sample.frequency, samples };
+                        std::fs::write(folder.join(format!("{name}.wav")), clip.wav())?;
+                    }
+                    Err(e) => println!("  not decoded: {e:#}"),
+                }
+            }
+        }
+        (Some("sounds"), Some(folder)) => {
+            let folder = std::path::Path::new(folder);
+            std::fs::create_dir_all(folder)?;
+            let ui = trp_data::sound::ui_sounds(&assets.install, &(0..64).collect::<Vec<i32>>())?;
+            let items = trp_data::sound::item_sounds(&assets.install)?;
+            let group = arg(2).unwrap_or("weap_ar");
+            let mut all: Vec<(String, &trp_data::sound::Clip)> = ui.iter().map(|(kind, clip)| (format!("ui{kind}"), clip)).collect();
+            all.extend(items.iter().filter(|(name, _)| name.starts_with(group)).map(|(name, clip)| (name.clone(), clip)));
+            for (name, clip) in &all {
+                std::fs::write(folder.join(format!("{name}_{}.wav", clip.name)), clip.wav())?;
+                let ch = clip.channels as usize;
+                let level: f64 = clip.samples.iter().map(|s| (*s as f64).abs()).sum::<f64>() / clip.samples.len().max(1) as f64;
+                let jumps: f64 = clip.samples.windows(ch + 1).map(|w| (w[ch] as f64 - w[0] as f64).abs()).sum::<f64>() / clip.samples.len().max(1) as f64;
+                println!("{name}: {} {} Hz x{}, {:.3} s, peak {}, roughness {:.2}", clip.name, clip.frequency, clip.channels, clip.samples.len() as f32 / clip.channels as f32 / clip.frequency as f32, clip.samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0), jumps / level.max(1.0));
+            }
+            println!("the things' sounds: {} clips", items.len());
+        }
+        // The pointers of a scene object's script into other files, each
+        // with the script it points to (`scriptptrs level49 UIContext ItemUiContext`).
+        (Some("scriptptrs"), Some(file)) => {
+            let scene = trp_data::screen::Scene::load(&assets.install, file, true)?;
+            let end = arg(2).unwrap_or("");
+            let class = arg(3).unwrap_or("");
+            let top = (0..scene.nodes.len()).find(|&index| scene.path(index).ends_with(end)).ok_or_else(|| anyhow::anyhow!("no object's path ends with {end:?}"))?;
+            let panel = trp_data::screen::ScenePanel::of(&scene, top);
+            let fields = panel.script(0, class).ok_or_else(|| anyhow::anyhow!("no {class} there"))?;
+            for start in (0..fields.len().saturating_sub(11)).step_by(4) {
+                let to_file = i32::from_le_bytes(fields[start..start + 4].try_into()?);
+                let to = i64::from_le_bytes(fields[start + 4..start + 12].try_into()?);
+                if (1..64).contains(&to_file) && to > 0 && to < 1 << 40 {
+                    let name = panel.file_of(to_file).unwrap_or_default();
+                    let script = trp_data::screen::script_name(&assets.install, &name, to).unwrap_or_default();
+                    println!("  at {start}: {name} {to} {script}");
+                }
+            }
+        }
+        // Each text of the views of a thing and of the inventory's panels:
+        // its font asset's own material, and the material it is drawn
+        // with, where that is another.
+        (Some("textmats"), _) => {
+            let gear = trp_data::screen::GearPanel::load(&assets.install)?;
+            let items = trp_data::screen::ItemViews::load(&assets.install)?;
+            let health = trp_data::screen::HealthPanel::load(&assets.install, &gear.file)?;
+            let quick = trp_data::screen::QuickViews::load(&assets.install, &gear.file)?;
+            let panels: Vec<(&str, &trp_data::screen::ScenePanel)> = [("slot view", items.slot.as_ref()), ("grid view", items.grid.as_ref()), ("health", Some(&health.panel)), ("quick", Some(&quick.panel))].into_iter().filter_map(|(name, panel)| Some((name, panel?))).collect();
+            for (name, panel) in panels {
+                for node in &panel.nodes {
+                    let Some(text) = &node.text else { continue };
+                    let Some(font_file) = panel.file_of(text.font.0) else { continue };
+                    let own = trp_data::screen::font_material(&assets.install, &font_file, text.font.1).ok();
+                    let used = text.material.and_then(|(outside, id)| Some((panel.file_of(outside)?, id)));
+                    let say = |which: &Option<(String, i64)>| which.as_ref().and_then(|(file, id)| trp_data::screen::material_properties(&assets.install, file, *id).ok()).map_or("-".to_owned(), |props| format!("{} {:?} outline {:?} underlay {:?}", props.name, props.keywords, props.floats.get("_OutlineWidth"), props.floats.get("_UnderlayDilate")));
+                    println!("{name}: {} {:?} size {} font {} {}\n    font's {}\n    drawn {}{}", node.path, text.text, text.size, font_file, text.font.1, say(&own), say(&used), if used == own { "  (the same)" } else { "" });
+                }
+            }
+        }
+        (Some("fontmaterial"), Some(file)) => {
+            let id: i64 = arg(2).ok_or_else(|| anyhow::anyhow!("which font asset?"))?.parse()?;
+            let (material_file, material) = trp_data::screen::font_material(&assets.install, file, id)?;
+            let props = trp_data::screen::material_properties(&assets.install, &material_file, material)?;
+            println!("{} ({material_file} {material})", props.name);
+            let mut floats: Vec<_> = props.floats.iter().collect();
+            floats.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in floats {
+                println!("  {key} = {value}");
+            }
+            let mut colors: Vec<_> = props.colors.iter().collect();
+            colors.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in colors {
+                println!("  {key} = {value:?}");
+            }
+        }
+        // The files a build's file points into, by their numbers in its
+        // pointers (`externals resources.assets`: 1 is the first).
+        (Some("externals"), Some(file)) => {
+            let path = assets.install.root.join("EscapeFromTarkov_Data").join(file);
+            let data = std::fs::read(&path)?;
+            let meta = trp_data::unity::serialized::SerializedFile::parse(&data)?;
+            for (at, name) in meta.externals.iter().enumerate() {
+                println!("{} {name}", at + 1);
+            }
+        }
+        // An object's bytes from one place on, LZ4 blocks unpacked, as
+        // words (`unpack globalgamemanagers.assets 284 3024 710 1464`: a
+        // shader's compiled programs).
+        (Some("unpack"), Some(file)) => {
+            let number = |at: usize| -> Result<usize> { Ok(arg(at).ok_or_else(|| anyhow::anyhow!("unpack takes an object, an offset and two lengths"))?.parse()?) };
+            let (id, from, packed, unpacked) = (number(2)? as i64, number(3)?, number(4)?, number(5)?);
+            let (_, bytes) = trp_data::screen::object_bytes(&assets.install, file, id)?;
+            let out = lz4_flex::block::decompress(&bytes[from..from + packed], unpacked)?;
+            if let Some(path) = arg(6) {
+                std::fs::write(path, &out)?;
+            }
+            for at in (0..out.len()).step_by(4) {
+                let Some(word) = out.get(at..at + 4) else { break };
+                let word: [u8; 4] = word.try_into()?;
+                let letters: String = word.iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '.' }).collect();
+                println!("  {at:6}: {:08x} {:11} {:14} {letters}", u32::from_le_bytes(word), i32::from_le_bytes(word), f32::from_le_bytes(word));
+            }
+        }
+        (Some("raw"), Some(file)) => {
+            let id: i64 = arg(2).ok_or_else(|| anyhow::anyhow!("which object?"))?.parse()?;
+            let from: usize = arg(3).and_then(|n| n.parse().ok()).unwrap_or(0);
+            let count: usize = arg(4).and_then(|n| n.parse().ok()).unwrap_or(64);
+            let (class, bytes) = trp_data::screen::object_bytes(&assets.install, file, id)?;
+            println!("{file} {id}: class {class}, {} bytes", bytes.len());
+            for at in (from..bytes.len().min(from + 4 * count)).step_by(4) {
+                let Some(word) = bytes.get(at..at + 4) else { break };
+                let word: [u8; 4] = word.try_into()?;
+                let letters: String = word.iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '.' }).collect();
+                println!("  {at:6}: {:11} {:14} {letters}", i32::from_le_bytes(word), f32::from_le_bytes(word));
+            }
+        }
+        // Every text of a scene sized to its words (`ContentSizeFitter`),
+        // its saved width beside the width its font's advances give it
+        // (`textwidths level44`): how TMP's preferred width goes.
+        (Some("textwidths"), Some(file)) => {
+            let mut tmp: std::collections::HashMap<(String, i64), Option<trp_data::screen::TmpFont>> = std::collections::HashMap::new();
+            let install = assets.install.clone();
+            let tmp_width = |tmp: &mut std::collections::HashMap<(String, i64), Option<trp_data::screen::TmpFont>>, file: &str, id: i64, shown: &str, text: &trp_data::screen::TextLook| -> Option<f32> {
+                let mut font = |file: &str, id: i64| tmp.entry((file.to_owned(), id)).or_insert_with(|| trp_data::screen::TmpFont::read(&install, file, id).ok()).clone();
+                let regular = font(file, id)?;
+                let bold = text.style & 1 != 0;
+                Some(match regular.bold.clone().filter(|_| bold).and_then(|(file, id)| font(&file, id)) {
+                    Some(alternative) => alternative.width(shown, text.size, text.spacing, false),
+                    None => regular.width(shown, text.size, text.spacing, bold),
+                } + text.margin[0] + text.margin[2])
+            };
+            let scene = trp_data::screen::Scene::load(&assets.install, file, true)?;
+            let roots: Vec<usize> = (0..scene.nodes.len()).filter(|&index| scene.nodes[index].layout.is_some() && scene.nodes[index].parent.is_none_or(|parent| scene.nodes[parent].layout.is_none())).collect();
+            let mut fonts: std::collections::HashMap<String, Vec<(String, Vec<u8>)>> = std::collections::HashMap::new();
+            let mut names: std::collections::HashMap<(String, i64), String> = std::collections::HashMap::new();
+            for root in roots {
+            let mut panel = trp_data::screen::ScenePanel::of(&scene, root);
+            panel.file = file.to_owned();
+            for node in &panel.nodes {
+                let Some(text) = &node.text else { continue };
+                if !node.scripts.iter().any(|(class, _)| class == "ContentSizeFitter") || text.text.is_empty() || text.text.contains('\n') || text.text.contains('<') || text.auto_size.is_some() {
+                    continue;
+                }
+                let Some(font_file) = panel.file_of(text.font.0).or_else(|| (text.font.0 == 0).then(|| file.to_owned())) else { continue };
+                if !fonts.contains_key(&font_file) {
+                    fonts.insert(font_file.clone(), trp_data::screen::build_fonts(&assets.install, &font_file).unwrap_or_default());
+                }
+                let asset = names.entry((font_file.clone(), text.font.1)).or_insert_with(|| trp_data::screen::script_name(&assets.install, &font_file, text.font.1).unwrap_or_default()).clone();
+                let shown = if text.style & 16 != 0 { text.text.to_uppercase() } else if text.style & 8 != 0 { text.text.to_lowercase() } else { text.text.clone() };
+                let Some(width) = tmp_width(&mut tmp, &font_file, text.font.1, &shown, text) else { continue };
+                let _ = trp_data::screen::font_for(&asset, &fonts[&font_file]);
+                let saved = node.layout.size_delta[0];
+                let fit = node.scripts.iter().find(|(class, _)| class == "ContentSizeFitter").and_then(|(_, fields)| fields.get(0..4)).map_or(-1, |word| i32::from_le_bytes(word.try_into().unwrap_or_default()));
+                if fit != 2 {
+                    continue;
+                }
+                println!("{:?} {:7.2} saved {:7.2} measured {:7.2} size {:5.1} style {:2} spacing {:4.1} {:?} {asset:?} {}", text.margin, saved - width, saved, width, text.size, text.style, text.spacing, shown, node.path);
+            }
+            }
+        }
+        // The inventory screen's bar of tabs as the app reads it: each tab
+        // with what its scripts name, its words in the install's English
+        // and how wide they are in their font.
+        (Some("tabs"), _) => {
+            let gear = trp_data::screen::GearPanel::load(&assets.install)?;
+            let bar = trp_data::screen::TabBar::load(&assets.install, &gear.file)?;
+            let at = |index: Option<usize>| index.map_or("-".to_owned(), |index| bar.panel.nodes[index].path.clone());
+            println!("row {}, gap {}", at(bar.row), bar.gap);
+            let keys: Vec<&str> = bar.tabs.iter().map(|tab| tab.key.as_str()).collect();
+            let words = trp_data::inventory::texts(&assets.install, "en", &keys).unwrap_or_default();
+            let mut fonts: std::collections::HashMap<String, Vec<(String, Vec<u8>)>> = std::collections::HashMap::new();
+            for tab in &bar.tabs {
+                let said = words.get(&tab.key.to_lowercase()).cloned().unwrap_or_else(|| tab.key.clone());
+                println!(
+                    "{} order {} key {:?} ({said:?}) case {} adjust {} definers {:?} normal {} selected {} hover {} idle {} group {} target {}",
+                    at(Some(tab.object)),
+                    tab.order,
+                    tab.key,
+                    tab.case,
+                    tab.width_adjustment,
+                    tab.size_definers.iter().map(|&d| at(Some(d))).collect::<Vec<_>>(),
+                    at(tab.normal),
+                    at(tab.selected),
+                    at(tab.hover),
+                    at(tab.idle),
+                    at(tab.canvas_group),
+                    at(tab.target)
+                );
+                for &label in &tab.labels {
+                    let Some(text) = &bar.panel.nodes[label].text else { continue };
+                    let Some(file) = bar.panel.file_of(text.font.0) else { continue };
+                    if !fonts.contains_key(&file) {
+                        fonts.insert(file.clone(), trp_data::screen::build_fonts(&assets.install, &file).unwrap_or_default());
+                    }
+                    let asset = trp_data::screen::script_name(&assets.install, &file, text.font.1).unwrap_or_default();
+                    println!("    font asset {asset:?}: {file} {}", text.font.1);
+                    if let Ok(face) = trp_data::screen::TmpFont::read(&assets.install, &file, text.font.1) {
+                        println!("      face {:?} {:?}, bold typeface {:?}", face.family, face.style, face.bold);
+                        if let Some((bold_file, bold_id)) = &face.bold {
+                            let bold_name = trp_data::screen::script_name(&assets.install, bold_file, *bold_id).unwrap_or_default();
+                            match trp_data::screen::TmpFont::read(&assets.install, bold_file, *bold_id) {
+                                Ok(bold) => println!("      bold {bold_name:?}: face {:?} {:?}", bold.family, bold.style),
+                                Err(e) => println!("      bold {bold_name:?}: {e:#}"),
+                            }
+                        }
+                    }
+                    let font = trp_data::screen::font_for(&asset, &fonts[&file]);
+                    let width = font.and_then(|(_, bytes)| trp_data::screen::text_width(bytes, &said, text.size, text.kerning));
+                    let shown_said = if text.style & 16 != 0 { said.to_uppercase() } else { said.clone() };
+                    let tmp = trp_data::screen::TmpFont::read(&assets.install, &file, text.font.1).ok();
+                    let bold = text.style & 1 != 0;
+                    let tmp_width = tmp.as_ref().map(|regular| match regular.bold.clone().filter(|_| bold).and_then(|(file, id)| trp_data::screen::TmpFont::read(&assets.install, &file, id).ok()) {
+                        Some(alternative) => alternative.width(&shown_said, text.size, text.spacing, false),
+                        None => regular.width(&shown_said, text.size, text.spacing, bold),
+                    } + text.margin[0] + text.margin[2]);
+                    println!("    as the game lays it out: {shown_said:?} {tmp_width:?}");
+                    let shown = if text.style & 16 != 0 { text.text.to_uppercase() } else { text.text.clone() };
+                    let saved = font.and_then(|(_, bytes)| trp_data::screen::text_width(bytes, &shown, text.size, text.kerning));
+                    println!("    label {} font {asset:?} ({:?}) size {} style {} spacing {}: {said:?} {width:?}; the scene's {:?} {saved:?}, laid {:?}", at(Some(label)), font.map(|(name, _)| name), text.size, text.style, text.spacing, text.text, bar.panel.nodes[label].layout.size_delta);
+                }
+            }
+        }
+        // A sprite of one of the build's files by its number (`sprite
+        // resources.assets 4222`): its cut, and its texture's pixels where
+        // it is small (16 by 16 at most), each row from the lowest.
+        (Some("sprite"), Some(file)) => {
+            let id: i64 = arg(2).ok_or_else(|| anyhow::anyhow!("which sprite?"))?.parse()?;
+            let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+            let cut = pictures.sprite(file, id)?;
+            println!("{cut:?}");
+            let texture = pictures.texture(&cut.texture.0, cut.texture.1)?;
+            println!("texture {}x{} format {} srgb {}", texture.width, texture.height, texture.format, texture.srgb);
+            if texture.width <= 16 && texture.height <= 16 {
+                let levels = trp_data::unity::texture::mips(&texture)?;
+                let pixels = trp_data::unity::texture::decode_rgba(&texture, *levels.first().ok_or_else(|| anyhow::anyhow!("no levels"))?)?;
+                for row in pixels.chunks(texture.width as usize * 4) {
+                    println!("  {:?}", row.chunks(4).collect::<Vec<_>>());
+                }
+            }
+        }
+        (Some("prefab"), Some(wanted)) => {
+            // Or a script's prefab by its file and number
+            // (`prefab sharedassets44.assets:9060`).
+            let (file, id, scene) = match wanted.split_once(':') {
+                Some((file, id)) => {
+                    let id: i64 = id.parse()?;
+                    (file.to_owned(), id, trp_data::screen::Scene::load_prefab_of_script(&assets.install, file, id)?)
+                }
+                None => {
+                    let found = trp_data::screen::resource_paths(&assets.install)?.into_iter().find(|(path, ..)| path == wanted).ok_or_else(|| anyhow::anyhow!("no resource is at {wanted:?}"))?;
+                    let (_, file, id) = found;
+                    let scene = trp_data::screen::Scene::load_prefab(&assets.install, &file, id)?;
+                    (file, id, scene)
+                }
+            };
+            let panel = trp_data::screen::ScenePanel::of(&scene, 0);
+            let own = panel.nodes[0].layout.size_delta;
+            let size = [arg(2).and_then(|w| w.parse().ok()).unwrap_or(own[0]), arg(3).and_then(|h| h.parse().ok()).unwrap_or(own[1])];
+            println!("{wanted} ({file} {id}): {} objects, {size:?}", panel.nodes.len());
+            if let Some(group) = panel.nodes[0].group {
+                println!("  its row: {group:?}");
+            }
+            // The pointers of its own scripts into other files.
+            for (class, fields) in &panel.nodes[0].scripts {
+                for start in (0..fields.len().saturating_sub(11)).step_by(4) {
+                    let mut r = trp_data::unity::reader::Reader::new(&fields[start..]);
+                    if let (Ok(to_file), Ok(to)) = (r.i32(), r.i64()) {
+                        if (0..64).contains(&to_file) && to > 0 && to < 1 << 40 {
+                            println!("  {class} at {start}: file {to_file} ({}) object {to}", panel.file_of(to_file).unwrap_or_default());
+                        }
+                    }
+                }
+            }
+            let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+            for (index, node) in panel.nodes.iter().enumerate() {
+                let [x, y, w, h] = panel.placed(index, size).rect;
+                let classes: Vec<&str> = node.scripts.iter().map(|(class, _)| class.as_str()).collect();
+                let mut line = format!("{:55} {} ({x:.1}, {y:.1}) {w:.1} x {h:.1} [{}]", node.path, if node.active { "on " } else { "off" }, classes.join(", "));
+                if let Some(image) = &node.image {
+                    line += &format!("  image {:?} kind {}", image.color, image.kind);
+                    if let Some((outside, sprite)) = image.sprite {
+                        let name = if outside == 0 { file.clone() } else { panel.externals.get(outside as usize - 1).map(|n| n.rsplit('/').next().unwrap_or(n).to_owned()).unwrap_or_default() };
+                        match pictures.sprite(&name, sprite) {
+                            Ok(cut) => {
+                                let texture = pictures
+                                    .texture(&cut.texture.0, cut.texture.1)
+                                    .map(|t| {
+                                        // Its first level's pixels: the least, most and mean of each channel.
+                                        let pixels = trp_data::unity::texture::mips(&t).ok().and_then(|levels| trp_data::unity::texture::decode_rgba(&t, *levels.first()?).ok()).unwrap_or_default();
+                                        let stats: Vec<String> = (0..4)
+                                            .map(|c| {
+                                                let values: Vec<u32> = pixels.iter().skip(c).step_by(4).map(|&v| v as u32).collect();
+                                                let mean = values.iter().sum::<u32>() as f32 / values.len().max(1) as f32;
+                                                format!("{}..{} ~{mean:.0}", values.iter().min().unwrap_or(&0), values.iter().max().unwrap_or(&0))
+                                            })
+                                            .collect();
+                                        format!("{}x{} format {} srgb {} mips {} rgba {}", t.width, t.height, t.format, t.srgb, t.mip_count, stats.join(" "))
+                                    })
+                                    .unwrap_or_else(|e| format!("{e:#}"));
+                                line += &format!(" sprite {:?} {:?} border {:?} of {texture}", cut.name, cut.rect, cut.border)
+                            }
+                            Err(e) => line += &format!(" sprite {name} {sprite}: {e:#}"),
+                        }
+                    }
+                }
+                if let Some(text) = &node.text {
+                    line += &format!("  text {:?} size {} colour {:?} align {}/{} style {} font {:?}", text.text, text.size, text.color, text.horizontal, text.vertical, text.style, text.font);
+                }
+                println!("{line}");
+            }
+        }
+        // The containers' column as the app reads it, and a container's
+        // own layout of its grids (`containers [layout name]`).
+        (Some("containers"), layout) => {
+            let gear = trp_data::screen::GearPanel::load(&assets.install)?;
+            let views = trp_data::screen::ContainerViews::load(&assets.install, &gear.file)?;
+            let at = |index: Option<usize>| index.map_or("-".to_owned(), |index| views.panel.nodes[index].path.clone());
+            println!("template {}, header {}, slot panel {}", at(Some(views.template)), at(views.header), at(views.slot_panel));
+            println!("column {:?}\ngrids' row {:?}", views.column, views.grids_row);
+            if let Some(scrolling) = views.scrolling {
+                println!("scrolling {scrolling:?}: view {}, content {}", at(scrolling.view), at(scrolling.content));
+                if let Some(bar) = scrolling.bar {
+                    println!("  its bar {}, sliding {}, handle {}, tinted {}", at(Some(bar.object)), at(bar.sliding), at(bar.handle), at(bar.tinted));
+                }
+            }
+            if let Some(grid) = &views.grid {
+                for (index, node) in grid.nodes.iter().enumerate() {
+                    println!("  grid view: {} {:?} image {:?}", node.path, grid.rect(index, [64.0, 64.0]), node.image.map(|image| image.kind));
+                }
+            }
+            for slot in ["TacticalVest", "Backpack", "SecuredContainer", "Pockets"] {
+                println!("  slots/equipment/{slot}: {:?}", trp_data::screen::resource_sprite(&assets.install, &format!("Slots/Equipment/{slot}")));
+            }
+            if let Some(name) = layout {
+                let (panel, grids) = trp_data::screen::rig_layout(&assets.install, name)?;
+                let size = panel.nodes[0].layout.size_delta;
+                for (n, view) in grids.iter().enumerate() {
+                    println!("  grid {n}: {} {:?}", panel.nodes[*view].path, panel.rect(*view, size));
+                }
+            }
+        }
+        // The build's own Resources whose paths have a part (`resources
+        // ugui/layouts`): each path with its file and object.
+        (Some("resources-paths"), filter) => {
+            let wanted = filter.unwrap_or("").to_lowercase();
+            for (path, file, id) in trp_data::screen::resource_paths(&assets.install)?.iter().filter(|(path, ..)| path.contains(&wanted)) {
+                println!("{path}  {file} {id}");
+            }
+        }
+        // The fonts the build keeps whole (`fonts resources.assets`), and
+        // the font assets the health panel's texts are drawn with.
+        (Some("fonts"), Some(file)) => {
+            for (name, font) in trp_data::screen::build_fonts(&assets.install, file)? {
+                println!("{name:30} {} bytes, {:?}", font.len(), String::from_utf8_lossy(&font[..4]));
+            }
+            if let Ok(gear) = trp_data::screen::GearPanel::load(&assets.install) {
+                if let Ok(health) = trp_data::screen::HealthPanel::load(&assets.install, &gear.file) {
+                    let mut seen = std::collections::BTreeSet::new();
+                    for node in health.panel.nodes.iter().chain(health.strip.iter().flat_map(|strip| strip.nodes.iter())) {
+                        let Some(text) = &node.text else { continue };
+                        if seen.insert(text.font) {
+                            let outside = health.panel.externals.get(text.font.0 as usize - 1).cloned().unwrap_or_default();
+                            println!("font asset {:?} in {outside}: {:?} (first by {})", text.font, trp_data::screen::script_name(&assets.install, &outside, text.font.1), node.path);
+                        }
+                    }
+                }
+            }
+        }
         // The build's scenes, each with the file it is, and the inventory
         // screen's equipment panel as the install lays it out.
         (Some("scenes"), filter) => {
@@ -115,6 +1159,31 @@ fn main() -> Result<()> {
                 show(&scene, index, 1, depth);
             }
         }
+        // Each script's own fields on the objects of a scene whose path
+        // ends so, word by word as a whole number and as a real number
+        // (`fields level44 "Items Panel/LeftSide"`): how a layout script of
+        // the engine's is set, read by its known order of fields.
+        (Some("fields"), Some(file)) => {
+            let scene = trp_data::screen::Scene::load(&assets.install, file, true)?;
+            let end = arg(2).unwrap_or("");
+            // The files a pointer's first number counts from 1 in.
+            let data = std::fs::read(assets.install.root.join("EscapeFromTarkov_Data").join(file))?;
+            for (n, outside) in trp_data::unity::SerializedFile::parse(&data)?.externals.iter().enumerate() {
+                println!("file {}: {outside}", n + 1);
+            }
+            for index in (0..scene.nodes.len()).filter(|&index| scene.path(index).ends_with(end)) {
+                println!("{}  [{}]", scene.path(index), scene.nodes[index].scripts.join(", "));
+                for behaviour in scene.behaviours.iter().filter(|behaviour| behaviour.node == index) {
+                    let fields = scene.fields(behaviour);
+                    println!("  the script {}: {} bytes of fields", behaviour.id, fields.len());
+                    for (n, word) in fields.chunks(4).take(160).enumerate() {
+                        let mut bytes = [0u8; 4];
+                        bytes[..word.len()].copy_from_slice(word);
+                        println!("    {:3}: {:02x?}  {}  {}", n * 4, bytes, i32::from_le_bytes(bytes), f32::from_le_bytes(bytes));
+                    }
+                }
+            }
+        }
         // What the scripts on the objects of a scene whose path ends so
         // point to among the scene's own scripts: each such pointer in their
         // fields, by where it lies, with the object it points to and that
@@ -136,6 +1205,137 @@ fn main() -> Result<()> {
                 }
             }
         }
+        // Every script of a class on the player prefab: the object it is on,
+        // that object's parent and layer, and the colliders on it
+        // (`player-scripts BodyPartCollider`).
+        (Some("player-scripts"), Some(wanted)) => {
+            use trp_data::unity::{class, Value};
+            let files = assets.load(trp_data::player::PLAYER_BUNDLE)?;
+            let objects: Vec<_> = files.iter().flat_map(|&f| assets.objects_of(f, class::MONO_BEHAVIOUR)).collect();
+            for obj in objects {
+                if trp_data::unity::extract::script_class(&assets, obj).as_deref() != Some(wanted) {
+                    continue;
+                }
+                let v = assets.read(obj)?;
+                let Some(owner) = v.get("m_GameObject").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(obj.file, p)) else { continue };
+                let go = assets.read(owner)?;
+                let name = go.get("m_Name").and_then(Value::as_str).unwrap_or("").to_owned();
+                let layer = go.get("m_Layer").and_then(Value::as_i64).unwrap_or(0);
+                let mut parent = String::new();
+                let mut shapes = Vec::new();
+                for c in go.get("m_Component").and_then(Value::as_array).unwrap_or(&[]) {
+                    let Some(c) = c.get("component").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(owner.file, p)) else { continue };
+                    let class_id = assets.class_id(c);
+                    let value = assets.read(c)?;
+                    if class_id == Some(class::TRANSFORM) {
+                        let father = value.get("m_Father").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(c.file, p));
+                        let pos = value.get("m_LocalPosition").and_then(Value::as_vec3);
+                        parent = father
+                            .and_then(|f| assets.read(f).ok())
+                            .and_then(|t| t.get("m_GameObject").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(c.file, p)))
+                            .and_then(|g| assets.read(g).ok())
+                            .and_then(|g| g.get("m_Name").and_then(Value::as_str).map(str::to_owned))
+                            .unwrap_or_default();
+                        parent = format!("{parent} at {pos:?}");
+                    } else if matches!(class_id, Some(65 | 135 | 136)) {
+                        let get = |n: &str| value.get(n).map(|v| v.as_vec3().map(|x| format!("{x:?}")).or(v.as_f32().map(|f| f.to_string())).unwrap_or_default()).unwrap_or_default();
+                        shapes.push(format!("class {} centre {} size {} radius {} height {} dir {} trigger {}", class_id.unwrap_or(0), get("m_Center"), get("m_Size"), get("m_Radius"), get("m_Height"), get("m_Direction"), get("m_IsTrigger")));
+                    }
+                }
+                let fields: Vec<String> = ["BodyPartType", "BodyPartColliderType"].iter().filter_map(|f| v.get(f).and_then(Value::as_i64).map(|x| format!("{f} {x}"))).collect();
+                println!("{name} (layer {layer}) under {parent} {}: {}", fields.join(" "), shapes.join("; "));
+            }
+        }
+        // The ragdoll a dead character becomes (`trp_data::ragdoll`).
+        // The engine's physics layers: their names (`TagManager`) and which
+        // collide with which (`PhysicsManager.m_LayerCollisionMatrix`, found
+        // as 32 masks after their count that agree with one another), and
+        // the physics settings' first figures (`layers`).
+        (Some("layers"), _) => {
+            let path = assets.install.root.join("EscapeFromTarkov_Data").join("globalgamemanagers");
+            let data = std::fs::read(&path)?;
+            let meta = trp_data::unity::serialized::SerializedFile::parse(&data)?;
+            let object = |class_id: i32| meta.objects.iter().find(|o| o.class_id == class_id).map(|o| &data[o.offset..o.offset + o.size]);
+            let word = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            // The names: the tags' list, then the layers' 32.
+            let mut names: Vec<String> = Vec::new();
+            if let Some(tags) = object(78) {
+                let mut at = 0usize;
+                let list = |at: &mut usize| -> Vec<String> {
+                    let count = word(tags, *at) as usize;
+                    *at += 4;
+                    (0..count)
+                        .map(|_| {
+                            let len = word(tags, *at) as usize;
+                            let text = String::from_utf8_lossy(&tags[*at + 4..*at + 4 + len]).into_owned();
+                            *at = (*at + 4 + len + 3) & !3;
+                            text
+                        })
+                        .collect()
+                };
+                let tag_list = list(&mut at);
+                names = list(&mut at);
+                println!("{} tags; {} layers", tag_list.len(), names.len());
+            }
+            let Some(physics) = object(55) else { anyhow::bail!("no physics settings") };
+            let floats: Vec<String> = physics.chunks_exact(4).take(24).map(|c| {
+                let v = f32::from_le_bytes(c.try_into().unwrap());
+                if v.is_finite() && (v == 0.0 || v.abs() > 1e-6 && v.abs() < 1e6) { format!("{v}") } else { format!("i{}", i32::from_le_bytes(c.try_into().unwrap())) }
+            }).collect();
+            println!("physics settings' first words: {}", floats.join(" "));
+            let rows = (0..physics.len().saturating_sub(4 * 33)).step_by(4).find(|&at| {
+                word(physics, at) == 32 && (0..32).all(|i| (0..32).all(|j| (word(physics, at + 4 + 4 * i) >> j & 1) == (word(physics, at + 4 + 4 * j) >> i & 1)))
+                    && (0..32).any(|i| word(physics, at + 4 + 4 * i) != 0)
+            });
+            let Some(rows) = rows else { anyhow::bail!("no collision matrix found") };
+            println!("the collision matrix at byte {rows}");
+            let after: Vec<String> = physics[rows + 4 * 33..].chunks_exact(4).take(40).map(|c| {
+                let v = f32::from_le_bytes(c.try_into().unwrap());
+                if v.is_finite() && (v == 0.0 || v.abs() > 1e-6 && v.abs() < 1e6) { format!("{v}") } else { format!("i{}", i32::from_le_bytes(c.try_into().unwrap())) }
+            }).collect();
+            println!("after it: {}", after.join(" "));
+            let bytes: Vec<String> = physics[rows + 4 * 33..].iter().take(64).map(|b| format!("{b:02x}")).collect();
+            println!("its bytes: {}", bytes.join(" "));
+            let name = |i: usize| names.get(i).filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| format!("({i})"));
+            for i in 0..32 {
+                let mask = word(physics, rows + 4 + 4 * i);
+                let with: Vec<String> = (0..32).filter(|j| mask >> j & 1 == 1).map(name).collect();
+                if !names.get(i).is_some_and(|n| n.is_empty()) {
+                    println!("{i:2} {}: collides with {}", name(i), with.join(", "));
+                }
+            }
+        }
+        (Some("ragdoll"), _) => {
+            let ragdoll = trp_data::ragdoll::RagdollData::load(&mut assets)?;
+            for body in &ragdoll.bodies {
+                println!("body {}: mass {} drag {} angular drag {}", body.bone, body.mass, body.drag, body.angular_drag);
+                for collider in &body.colliders {
+                    println!("    {} {:?} at {:?}", collider.object, collider.shape, collider.local);
+                }
+            }
+            for joint in &ragdoll.joints {
+                println!(
+                    "joint {} to {}: anchor {:?} axis {:?} swing axis {:?} twist {}..{} swing {} {} springs {:?} {:?} collision {} projection {:?} auto anchor {} connected anchor {:?} preprocessing {}",
+                    joint.bone, joint.connected, joint.anchor, joint.axis, joint.swing_axis, joint.low_twist.limit, joint.high_twist.limit, joint.swing1.limit, joint.swing2.limit, joint.twist_spring, joint.swing_spring, joint.enable_collision, joint.projection, joint.auto_anchor, joint.connected_anchor, joint.preprocessing
+                );
+            }
+        }
+        // One object of the game's own `resources.assets` by its number: its
+        // class and, for most, its name, which comes first in it; and its
+        // first figures (`object 84`).
+        (Some("object"), Some(id)) => {
+            let path = assets.install.root.join("EscapeFromTarkov_Data").join("resources.assets");
+            let data = std::fs::read(&path)?;
+            let meta = trp_data::unity::serialized::SerializedFile::parse(&data)?;
+            let id: i64 = id.parse()?;
+            let object = meta.objects.iter().find(|o| o.path_id == id).ok_or_else(|| anyhow::anyhow!("no object {id}"))?;
+            let bytes = &data[object.offset..object.offset + object.size];
+            let len = u32::from_le_bytes(bytes[0..4].try_into()?) as usize;
+            let name = (len < 200).then(|| String::from_utf8_lossy(&bytes[4..4 + len.min(bytes.len() - 4)]).into_owned()).unwrap_or_default();
+            println!("object {id}: class {}, {} bytes, named {name:?}", object.class_id, bytes.len());
+            let text: String = bytes.iter().take(4096).map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' }).collect();
+            println!("{text}");
+        }
         // Game objects of the game's own `resources.assets` (no type trees)
         // whose name has a word: each component's class and path id; a
         // transform's place and turn; the first figures of anything else,
@@ -145,6 +1345,24 @@ fn main() -> Result<()> {
             let data = std::fs::read(&path)?;
             let meta = trp_data::unity::serialized::SerializedFile::parse(&data)?;
             let bytes_of = |path_id: i64| meta.objects.iter().find(|o| o.path_id == path_id).map(|o| (o.class_id, &data[o.offset..o.offset + o.size]));
+            // A script's class, from the file its pointer names (a script
+            // object begins with its name), as `screen::Scene` finds it.
+            let folder = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+            let mut outside: std::collections::HashMap<i32, (Vec<u8>, trp_data::unity::serialized::SerializedFile)> = std::collections::HashMap::new();
+            let mut script_of = |file: i32, id: i64| -> Option<String> {
+                let listed = meta.externals.get(usize::try_from(file).ok()?.checked_sub(1)?)?;
+                if !outside.contains_key(&file) {
+                    let name = listed.rsplit('/').next().unwrap_or(listed);
+                    let data = std::fs::read(folder.join(name)).ok()?;
+                    let parsed = trp_data::unity::serialized::SerializedFile::parse(&data).ok()?;
+                    outside.insert(file, (data, parsed));
+                }
+                let (data, parsed) = &outside[&file];
+                let found = parsed.objects.iter().find(|o| o.path_id == id)?;
+                let bytes = &data[found.offset..found.offset + found.size];
+                let len = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?) as usize;
+                Some(String::from_utf8_lossy(bytes.get(4..4 + len)?).into_owned())
+            };
             let wanted = wanted.to_lowercase();
             for object in meta.objects.iter().filter(|o| o.class_id == 1) {
                 let mut r = trp_data::unity::reader::Reader::new(&data[object.offset..object.offset + object.size]);
@@ -192,11 +1410,16 @@ fn main() -> Result<()> {
                             println!("  transform: turned {q:?} at {p:?} scale {s:?}, children {names:?}, parent {father}");
                         }
                         _ => {
-                            let floats: Vec<String> = bytes[12..bytes.len().min(12 + 4 * 48)].chunks_exact(4).map(|c| {
+                            let floats: Vec<String> = bytes[12..if arg(2) == Some("all") { bytes.len() } else { bytes.len().min(12 + 4 * 48) }].chunks_exact(4).map(|c| {
                                 let (f, i) = (f32::from_le_bytes([c[0], c[1], c[2], c[3]]), i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
                                 if f.abs() > 1e-6 && f.abs() < 1e6 { format!("{f}") } else { format!("i{i}") }
                             }).collect();
-                            println!("  class {class} ({} bytes, {id}): {}", bytes.len(), floats.join(" "));
+                            // A script's class, where it is one.
+                            let script = (class == 114 && bytes.len() >= 28)
+                                .then(|| script_of(i32::from_le_bytes(bytes[16..20].try_into().unwrap()), i64::from_le_bytes(bytes[20..28].try_into().unwrap())))
+                                .flatten()
+                                .map_or(String::new(), |name| format!(" {name}"));
+                            println!("  class {class}{script} ({} bytes, {id}): {}", bytes.len(), floats.join(" "));
                         }
                     }
                 }
@@ -234,6 +1457,22 @@ fn main() -> Result<()> {
         }
         // An item template of the database, by id or by a part of its
         // name: what it weighs, the cells it takes, its slots and grids.
+        // An item's properties in the install's database, whole or those
+        // named (`props 590c678286f77426c9660122 UsePrefab medUseTime`).
+        (Some("props"), Some(wanted)) => {
+            let db = trp_data::Database::load(&assets.install)?;
+            let item = db.items.get(wanted).ok_or_else(|| anyhow::anyhow!("no item {wanted}"))?;
+            let names: Vec<&str> = (2..16).filter_map(arg).collect();
+            println!("{} {}", item.id, item.name);
+            match (names.is_empty(), item.props.as_object()) {
+                (false, Some(props)) => {
+                    for name in names {
+                        println!("  {name}: {}", props.get(name).map_or("-".to_owned(), |value| value.to_string()));
+                    }
+                }
+                _ => println!("{}", serde_json::to_string_pretty(&item.props)?),
+            }
+        }
         (Some("item"), Some(wanted)) => {
             let db = trp_data::Database::load(&assets.install)?;
             let mut found: Vec<&trp_data::database::ItemTemplate> =
@@ -663,10 +1902,13 @@ fn main() -> Result<()> {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
+                // With its short name's hash as a recording keeps it (24 bits).
+                let own = state.full_name.rsplit('.').next().unwrap_or(&state.full_name);
                 println!(
-                    "[{}] {}  speed {}{}  {clip}{}",
+                    "[{}] {} #{}  speed {}{}  {clip}{}",
                     state.machine,
                     state.full_name,
+                    trp_data::unity::anim::path_hash(own) & 0x00ff_ffff,
                     state.speed,
                     if state.looping { " loop" } else { "" },
                     match &state.blend_parameter {
@@ -1417,6 +2659,108 @@ fn main() -> Result<()> {
                     );
                 }
             }
+        }
+        // An item's model as it lies loose (`ObjectsFactory.CreateLootPrefab`:
+        // a weapon with its parts, any other item its prefab), and every
+        // collider on it: its object, shape, layer, whether a trigger or
+        // switched off, and its material.
+        (Some("colliders"), Some(template)) => {
+            let db = trp_data::Database::load(&assets.install)?;
+            let item = db.item(template)?;
+            let hierarchy = if db.is_a(item, "Weapon") {
+                trp_data::weapon::assemble(&mut assets, &db, template)?.hierarchy
+            } else {
+                let key = item.prefab_key().ok_or_else(|| anyhow::anyhow!("{template} has no model"))?.to_owned();
+                trp_data::icon::model_of(&mut assets, &key)?.0
+            };
+            println!("{} ({}): {} objects", item.name, template, hierarchy.nodes.len());
+            for (index, node) in hierarchy.nodes.iter().enumerate() {
+                for c in &node.colliders {
+                    println!("  {index:>3} {:<28} layer {:>2}{}{} {:?} {:?}", node.name, c.layer, if c.trigger { " trigger" } else { "" }, if c.enabled { "" } else { " off" }, c.shape, c.material);
+                }
+            }
+        }
+        // The game's views of a thing (`itemviews [width] [height]`, units:
+        // a grid's view of one cell unless told): each object of the slot's
+        // and the grid's layout placed in that size, and each text's
+        // alignment and margins (left, top, right, bottom).
+        (Some("itemviews"), _) => {
+            let views = trp_data::screen::ItemViews::load(&assets.install)?;
+            let size = [arg(1).and_then(|w| w.parse().ok()).unwrap_or(63.0), arg(2).and_then(|h| h.parse().ok()).unwrap_or(63.0)];
+            for (name, panel) in [("slot", &views.slot), ("grid", &views.grid)] {
+                let Some(panel) = panel else { continue };
+                println!("== {name}");
+                for (index, node) in panel.nodes.iter().enumerate() {
+                    let [x, y, w, h] = panel.placed(index, size).rect;
+                    let text = node.text.as_ref().map(|t| format!(" text {:?} size {} align {}/{} margin {:?}", t.text, t.size, t.horizontal, t.vertical, t.margin)).unwrap_or_default();
+                    println!("  {:50} {} ({x:.1}, {y:.1}) {w:.1} x {h:.1}{text}", node.path, if node.active { "on " } else { "off" });
+                }
+            }
+        }
+        // The aiming's sounds (`aimsounds`): each kind of weapon's bank,
+        // its volume, rolloff and clips.
+        (Some("aimsounds"), _) => {
+            for (kind, bank) in trp_data::sound::aiming_sounds(&assets.install)? {
+                let clips: Vec<String> = bank.clips.iter().map(|clip| format!("{} ({:.2} s, x{})", clip.name, clip.samples.len() as f32 / clip.channels.max(1) as f32 / clip.frequency.max(1) as f32, clip.channels)).collect();
+                println!("{kind}: {}, volume {}, rolloff {}: {}", bank.name, bank.volume, bank.rolloff, clips.join(", "));
+            }
+        }
+        // An object a bundle's object points to, by the field's name
+        // (`follow <bundle> <path id> <field> [depth] [items]`), dumped.
+        (Some("follow"), Some(key)) => {
+            let path_id: i64 = arg(2).ok_or_else(|| anyhow::anyhow!("path id needed"))?.parse()?;
+            let field = arg(3).ok_or_else(|| anyhow::anyhow!("field needed"))?;
+            let depth = arg(4).map_or(Ok(6), str::parse)?;
+            let items = arg(5).map_or(Ok(12), str::parse)?;
+            for file in assets.load(key)? {
+                let obj = ObjRef { file, path_id };
+                if assets.info(obj).is_none() {
+                    continue;
+                }
+                let value = assets.read(obj)?;
+                let target = value.get(field).and_then(|v| v.as_pptr()).and_then(|p| assets.resolve_loaded(file, p)).ok_or_else(|| anyhow::anyhow!("{field} leads nowhere loaded"))?;
+                println!("{}", assets.read(target)?.pretty(depth, items));
+            }
+        }
+        // Every object of a bundle: its path id, its class and its name, if
+        // it has one (`objects <bundle>`); to find what to `dump`.
+        (Some("objects"), Some(key)) => {
+            for file in assets.load(key)? {
+                let objects: Vec<(i64, i32)> = assets.file(file).meta.objects.iter().map(|o| (o.path_id, o.class_id)).collect();
+                for (path_id, class_id) in objects {
+                    let name = assets.read(ObjRef { file, path_id }).ok().and_then(|v| v.get("m_Name").and_then(|n| n.as_str()).map(str::to_owned)).unwrap_or_default();
+                    println!("{path_id:>22}  class {class_id:>4}  {name}");
+                }
+            }
+        }
+        // The game's audio mixer (`mixer`, the bundle
+        // `assets/content/audio/mastermixer.bundle`): its groups as a tree,
+        // each with its volume in each snapshot (dB, from the snapshot's
+        // values at the group's `volumeIndex`), whether a script may set it
+        // (an exposed parameter), and the kinds of its effects.
+        (Some("mixer"), _) => {
+            let mixer = trp_data::sound::master_mixer(&assets.install)?;
+            println!("start snapshot: {}", mixer.start_snapshot);
+            fn walk(mixer: &trp_data::sound::Mixer, at: usize, depth: usize) {
+                let group = &mixer.groups[at];
+                let effects: Vec<String> = group
+                    .effects
+                    .iter()
+                    .map(|e| if e.parameters.is_empty() { e.kind.to_string() } else { format!("{}[{}]", e.kind, e.parameters.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")) })
+                    .collect();
+                println!("{}{}: {:+.1} dB{} (path {:+.1} dB); effects {}", "  ".repeat(depth), group.name, group.volume_db, if group.exposed { " exposed" } else { "" }, mixer.path_db(at), effects.join(" "));
+                for (child, g) in mixer.groups.iter().enumerate() {
+                    if g.parent == Some(at) {
+                        walk(mixer, child, depth + 1);
+                    }
+                }
+            }
+            for (at, group) in mixer.groups.iter().enumerate() {
+                if group.parent.is_none() {
+                    walk(&mixer, at, 0);
+                }
+            }
+            println!("the master's compressor: {:?}", mixer.master_compressor());
         }
         (Some("tree"), Some(key)) => {
             for file in assets.load(key)? {
