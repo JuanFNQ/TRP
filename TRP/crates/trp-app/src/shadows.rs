@@ -9,6 +9,11 @@ use bevy::light::CascadeShadowConfig;
 /// (`GraphicsSettingsGroup`: `ShadowsQuality` registered with 0).
 pub const DEFAULT_QUALITY: u8 = 0;
 
+/// The quality the app starts at until the options change it: HIGH (the
+/// user, 2026-10-22: "Start at HIGH instead"). The install's own is what
+/// `AS THE INSTALL HAS THEM` takes.
+pub const START_QUALITY: u8 = 2;
+
 /// The qualities' names, 0 to 3, as the game's menu has them.
 pub const NAMES: [&str; 4] = ["LOW", "MEDIUM", "HIGH", "ULTRA"];
 
@@ -38,6 +43,20 @@ pub fn cascades(quality: u8, near: f32) -> CascadeShadowConfig {
     CascadeShadowConfig { bounds: shares(quality).iter().map(|share| share * reach).collect(), overlap_proportion: 0.0, minimum_distance: near }
 }
 
+/// The cascades, with one more out to `reach` where the preset's stop
+/// short of it: the stand-in for the game's baked shadows of what does not
+/// move beyond its realtime ones (the recorded sun's mode `Shadowmask`, the
+/// level's lightmaps `CombinedDirectional`), which the range has none of,
+/// so that the range hall's roof shades all of it from anywhere inside
+/// (`range::baked_reach`). `PROVISIONAL`: the character's own shadow
+/// reaches as far, where the game's baked ones are of the level alone.
+pub fn with_baked_reach(mut config: CascadeShadowConfig, reach: f32) -> CascadeShadowConfig {
+    if config.bounds.last().is_some_and(|last| *last < reach) {
+        config.bounds.push(reach);
+    }
+    config
+}
+
 /// What a quality comes to, for the run's first lines.
 pub fn describe(quality: u8) -> String {
     let quality = quality.min(3);
@@ -58,5 +77,9 @@ mod tests {
         assert_eq!(bounds(3), vec![0.05 * 80.0, 0.14 * 80.0, 0.33 * 80.0, 80.0]);
         assert_eq!(bounds(9), bounds(3));
         assert_eq!(cascades(1, 0.03).minimum_distance, 0.03);
+        // The baked shadows' stand-in adds a cascade only where it reaches
+        // further.
+        assert_eq!(with_baked_reach(cascades(1, 0.03), 50.0).bounds, vec![0.33 * 40.0, 40.0, 50.0]);
+        assert_eq!(with_baked_reach(cascades(2, 0.03), 50.0).bounds, bounds(2));
     }
 }

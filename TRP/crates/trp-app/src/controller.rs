@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use bevy::prelude::*;
 use trp_sim::math::{delta_angle, quat_axis, quat_lerp, quat_mul, quat_rotate};
 use trp_sim::{
-    AimPoint, ArmPose, CameraPose, FireMode, FirearmEvent, HandsInput, Input as SimInput, MedsEvent, Movement, Pacer, PointOfView, State,
+    AimPoint, ArmPose, CameraPose, FireMode, FirearmEvent, GrenadeEvent, HandsInput, Input as SimInput, KnifeEvent, MedsEvent, Movement, Pacer, PointOfView, RangefinderEvent, State,
 };
 
 use crate::range::Range;
@@ -50,6 +50,15 @@ pub struct Shown {
     pub weapon: ([f32; 3], [f32; 4]),
     /// The camera beside the weapon's root, in the game's axes.
     pub camera: CameraPose,
+    /// How far the camera's own object is from the ribcage, in the frame
+    /// the rig hangs in and the game's axes (`Movement::camera_container`):
+    /// nothing but where a clip shifts the ribcage on its spine, as blind
+    /// fire's do. The camera's place is from there.
+    pub camera_apart: [f32; 3],
+    /// How far the rig's origin is from the ribcage, in the same frame and
+    /// axes: nothing but on a mount, which moves the weapon onto its point
+    /// (`Movement::mounted_rig_apart`; mounting spec, "The weapon's place").
+    pub rig_apart: [f32; 3],
     /// Each arm, right then left, as the body's animation has it, with
     /// how much of it that animation claims (a crawl claims both whole),
     /// in the frame the rig hangs in and the game's axes. The arm's
@@ -118,6 +127,13 @@ struct Stepped {
     /// The ribcage from the feet, in the world's frame and the game's
     /// axes, and the view (yaw and pitch) the body's pose was made for.
     ribcage: [f32; 3],
+    /// The camera's own object from the ribcage, in the rig's frame
+    /// (`Shown::camera_apart`).
+    camera_apart: [f32; 3],
+    /// The rig's origin from the ribcage (`Shown::rig_apart`).
+    rig_apart: [f32; 3],
+    /// The mount, while there is one.
+    mount: Option<MountDrawn>,
     posed_for: [f32; 2],
     arms: [ArmPose; 2],
     /// The body's skeleton, where the body is drawn.
@@ -137,10 +153,20 @@ impl Stepped {
         // Drawn where the frames' own time puts it: the game's clock for
         // the player makes a jump's travel uneven from frame to frame.
         let at = m.drawn_position();
+        // The camera's own object beside the ribcage, into the frame the rig
+        // hangs in (turned from the body to the view).
+        let camera_apart = {
+            let (container, ribcage) = (m.camera_container(), m.ribcage());
+            let look = quat_mul(quat_axis(1, m.yaw - m.drawn_body_yaw()), quat_axis(0, m.pitch));
+            quat_rotate([-look[0], -look[1], -look[2], look[3]], std::array::from_fn(|k| container[k] - ribcage[k]))
+        };
         Self {
             // The simulation's forward is +z; Bevy's is -z.
             position: Vec3::new(at[0], at[1], -at[2]),
             ribcage: quat_rotate(quat_axis(1, m.drawn_body_yaw()), m.ribcage()),
+            camera_apart,
+            rig_apart: [0.0; 3],
+            mount: None,
             posed_for: m.posed_for(),
             arms: [m.body.arm_pose(true, in_view), m.body.arm_pose(false, in_view)],
             body: BodyPose::of(m),
@@ -156,6 +182,11 @@ struct Sprung {
     weapon: ([f32; 3], [f32; 4]),
     camera: CameraPose,
     elbows: [[f32; 3]; 2],
+    /// On a mount, how far the camera's place on that frame was moved with
+    /// the rig (`Hands::set_rig_shift`: the mount's camera follows the rig
+    /// across and up at once), so that it can be moved with the rig as
+    /// drawn instead (`Controller::shown`).
+    shift: Option<[f32; 3]>,
 }
 
 impl Sprung {
@@ -169,8 +200,20 @@ impl Sprung {
                 field_of_view: self.camera.field_of_view + (to.camera.field_of_view - self.camera.field_of_view) * t,
             },
             elbows: [lerp(self.elbows[0], to.elbows[0]), lerp(self.elbows[1], to.elbows[1])],
+            shift: self.shift.zip(to.shift).map(|(a, b)| lerp(a, b)),
         }
     }
+}
+
+/// A frame's mount, for drawing the rig onto its point
+/// (`Movement::mounted_rig_apart`): the point in the world's frame and the
+/// game's axes, the pivot in the rig's frame as the hands' animator had it,
+/// and the transition's share.
+#[derive(Clone, Copy)]
+struct MountDrawn {
+    point: [f32; 3],
+    pivot: [f32; 3],
+    progress: f32,
 }
 
 /// Input that arrives between frames of the simulation.
@@ -199,6 +242,17 @@ struct Pending {
     force_auto: bool,
     check_fire_mode: bool,
     examine: bool,
+    /// The sights' two keys (`ChangeAimScope`, `ChangeAimScopeMagnification`)
+    /// and the wheel's turns for a variable scope's zoom since the
+    /// simulation's last frame (optics spec, "The sights a weapon has",
+    /// "Zoom and modes").
+    change_scope: bool,
+    magnification: bool,
+    zoom: f32,
+    /// The zeroing keys (`OpticCalibrationSwitchUp`, `Down`; optics spec,
+    /// "Zeroing").
+    zeroing_up: bool,
+    zeroing_down: bool,
     /// An item in use asked to stop (`MedsInputTranslator`): the shoot
     /// key, the aim key or the scope's key pressed.
     use_cancel: bool,
@@ -217,9 +271,28 @@ struct Pending {
     lean_end: [bool; 2],
     step_toggle: [bool; 2],
     step_end: [bool; 2],
+    /// Blind fire's commands (`docs/spec/blind-fire.md`, "The keys"): the
+    /// side given last (`ToggleBlindAbove` 1, `ToggleBlindRight` -1, 0
+    /// none) and its keys come up (`BlindShootEnd`).
+    blind_toggle: i32,
+    blind_end: bool,
+    /// The mount's key and the bipod's (`WeaponMounting`, `ToggleBipods`;
+    /// mounting spec, "The keys").
+    mount: bool,
+    bipod: bool,
+    /// The left shoulder's key (`LeftStance`, `Mouse4`; left-shoulder spec).
+    left_stance: bool,
     /// The aim's binding, in the order it came: given (true), which puts
     /// the sights the other way, or taken back, which puts them down.
     aim: Vec<bool>,
+    /// For a grenade in hand, the throws' two keys as they went down and
+    /// came up, in order (`HighThrow` and `LowThrow`: the trigger's keys
+    /// and the aim's, held; `TryHighThrow`, `FinishHighThrow` and the
+    /// like): from below or not, and down or up. For a knife, the strokes
+    /// asked for (`ToggleShooting` a slash, `ToggleAlternativeShooting` a
+    /// stab).
+    throw_keys: Vec<(bool, bool)>,
+    strokes: Vec<trp_sim::Stroke>,
 }
 
 /// What the simulation did in the last drawn frame and what that cost, for
@@ -260,6 +333,10 @@ pub struct Controller {
     /// (`Shown::ribcage`).
     looks: VecDeque<(f32, [f32; 2])>,
     ribcage_shown: Vec3,
+    /// The same ribcage from the feet in the world's frame and the game's
+    /// axes, the view it is shown for, and the view shown one of the
+    /// simulation's frames before.
+    ribcage_drawn: ([f32; 3], [f32; 2], [f32; 2]),
     /// Whether the aim key was down when last looked at, in a run that
     /// plays a script.
     aim_key: bool,
@@ -282,6 +359,9 @@ pub struct Controller {
     /// The inventory screen is open: the mouse is the screen's, so the
     /// view does not turn and the mouse's buttons do nothing.
     pub inventory_open: bool,
+    /// The edit build screen is open (`edit_build`): the same, and the
+    /// character is handed nothing, as under any screen.
+    pub edit_build: bool,
     /// Whether there is a weapon in the hands: the one on the sling slot
     /// of the equipment (inventory spec, "The weapon in hand"). With none
     /// the weapon's keys do nothing and its rig is not drawn.
@@ -292,18 +372,47 @@ pub struct Controller {
     /// What the thing in the hands said of itself since it was last asked:
     /// that it has appeared, that it has been put away.
     hands_events: Vec<FirearmEvent>,
+    /// What the weapon in hand said of its malfunctions since they were
+    /// last taken (`crate::wear`): each malfunction, reminder, look,
+    /// repair, the round a repair threw out, the heat's stray shot.
+    pub wear_events: Vec<FirearmEvent>,
     /// The `Sound` marks the animator of what is in the hands passed since
     /// they were last played (`hands_sound`), each the mark's string.
     pub hands_sounds: Vec<String>,
     /// What the weapon asked of its sound player since it was last heard
     /// (`shot_sound`): its shots and its trigger let go, in order.
     pub shot_calls: Vec<crate::shot_sound::ShotCall>,
+    /// What a spent case is to do (`cases`): a round to the shell port at a
+    /// shot, thrown at the `ShellEject` mark; for a weapon of one chamber.
+    pub case_calls: Vec<crate::cases::CaseCall>,
+    /// Each shot's call for its bullets (`bullets`): whether it was fired
+    /// by automatic fire (the game's firing operation in the player's
+    /// update, before the frame's bullets move on) or by the animation's
+    /// event (after it).
+    pub bullet_calls: Vec<bool>,
     /// How often the aim's call has brought the sights up since the
     /// weapon's aiming sound was last played (`hands_sound`).
     pub aims_up: u32,
+    /// The weapon's mount sound: how many are due to play (`hands_sound`),
+    /// and the time left until the next (`WeaponSoundPlayer.
+    /// EnterMountedStateHandler`'s timer, the approach's length, stopped by
+    /// an exit; by the engine's clock).
+    pub mount_sounds: u32,
+    mount_sound_in: Option<f32>,
+    /// How many mount searches have found nothing or been refused
+    /// (`OnNothingFound`: the stance panel's mount icon flashes red,
+    /// `battle_view`).
+    pub mount_refusals: u32,
     /// What health said of the items it was given to use since the
     /// inventory last asked: what one holds now, one used up.
     pub items_said: Vec<trp_sim::health::Event>,
+    /// The bleedings' damage since the screen last asked: the part, and
+    /// whether heavy (`ApplyDamageEvent` of a bleeding kind: blood on the
+    /// screen, `blood_view`).
+    pub bled: Vec<(trp_sim::health::Part, bool)>,
+    /// What health did since the voice last asked (`voice_sound`), kept
+    /// once the voice runs.
+    pub voice_heard: Option<Vec<trp_sim::health::Event>>,
     /// How many rounds the character has within reach for the weapon in
     /// hand, as the inventory last counted them: what a tube is filled
     /// from. And how many the weapon has taken since the inventory last
@@ -323,10 +432,29 @@ pub struct Controller {
     /// rounds left in the old one, and whether it was the quick way), and
     /// how many times an old one has left the hand (firing spec, "The
     /// quick reload").
-    pub next_magazine: Option<(trp_sim::inventory::Id, u32)>,
+    pub next_magazine: Option<(trp_sim::inventory::Id, u32, i32)>,
     pub magazine_asked: Option<trp_sim::inventory::Id>,
     pub swaps: Vec<(Option<u32>, bool)>,
     pub magazines_hidden: u32,
+    /// A magazine's move from the inventory the weapon's hands have done
+    /// (`FirearmEvent::MagazineMoved`), counted.
+    pub magazines_moved: u32,
+    /// Folds the key has begun in the weapon's hands, counted: the item in
+    /// hand folds with each as it begins (`FoldOperation`), which the
+    /// inventory sees to.
+    pub folds_begun: u32,
+    /// Shots the weapon in hand has made, counted: the inventory sets its
+    /// magazine beside them (`UncheckOnShot`).
+    pub shots_made: u32,
+    /// Every shot since the run began, never taken (the muzzle's flash
+    /// counts its own from it: `muzzle_view`).
+    pub shots_fired: u32,
+    /// The hands gave up putting a round into the chamber (put away
+    /// meanwhile): the inventory undoes the move.
+    pub chamber_given_up: bool,
+    /// The switches on the head's sounds to play, by their places in
+    /// `trp_data::sound::TOGGLE_SOUNDS` (`step_sound`).
+    pub toggle_sounds: Vec<usize>,
     /// Whether the weapon in hand draws its magazine, as its reload last
     /// said, if it has said so since this was last taken: not from the
     /// old one's leaving the hand (`OnMagPuttedToRig`, where the game
@@ -338,10 +466,25 @@ pub struct Controller {
     /// the list counted as positive.
     pub menu_shown: bool,
     pub menu_notches: i32,
+    /// Notches of the wheel a run nobody is at the keys of turned with the
+    /// scope zoom's keys held (`--zoom`), up counted as positive, not yet
+    /// taken by the simulation.
+    pub zoom_notches: i32,
     /// The weapon's magazine has been checked in the hands, seen with the
     /// character's own eyes (`FirearmController.CheckAmmo`:
     /// `StrictCheckMagazine` in first person), until the inventory takes it.
     pub magazine_checked: bool,
+    /// What the hands tell the battle screen's panels at the lower right
+    /// since they last heard (`sight_panels`).
+    pub panel_calls: Vec<crate::sight_panels::PanelCall>,
+    /// A grenade in hand has been let go of in a throw since the inventory
+    /// last heard: it is gone from what is carried. And the throws to be
+    /// made in the world (`grenade`): from below or not.
+    pub grenade_thrown: bool,
+    pub throws: Vec<bool>,
+    /// Medical items that have started their work (`MedEffect` started),
+    /// counted: what stops a magazine's loading (inventory spec).
+    pub meds_started: u32,
     /// What of health raises the game's health panel in a raid
     /// (`BattleUIScreen`), counted: damage taken (`ApplyDamageEvent`) or an
     /// effect started that calls for the panel (`IEffectTriggersUIPanel`:
@@ -353,7 +496,7 @@ pub struct Controller {
 impl Controller {
     pub fn new(movement: Movement, pacer: Pacer) -> Self {
         let camera = CameraPose { position: [0.0; 3], rotation: NO_TURN, field_of_view: 50.0 };
-        let sprung = Sprung { weapon: ([0.0; 3], NO_TURN), camera, elbows: [[0.0; 3]; 2] };
+        let sprung = Sprung { weapon: ([0.0; 3], NO_TURN), camera, elbows: [[0.0; 3]; 2], shift: None };
         let stepped = VecDeque::from([Stepped::of(&movement)]);
         let mut controller = Self {
             movement,
@@ -366,6 +509,7 @@ impl Controller {
             stepped,
             looks: VecDeque::new(),
             ribcage_shown: Vec3::ZERO,
+            ribcage_drawn: ([0.0; 3], [0.0; 2], [0.0; 2]),
             aim_key: false,
             trigger: false,
             vault_key: false,
@@ -374,13 +518,22 @@ impl Controller {
             overlap: 0.0,
             camera_box: None,
             inventory_open: false,
+            edit_build: false,
             armed: false,
             rig_pose: RigPose::default(),
             hands_events: Vec::new(),
+            wear_events: Vec::new(),
             hands_sounds: Vec::new(),
             shot_calls: Vec::new(),
+            case_calls: Vec::new(),
+            bullet_calls: Vec::new(),
             aims_up: 0,
+            mount_sounds: 0,
+            mount_refusals: 0,
+            mount_sound_in: None,
             items_said: Vec::new(),
+            bled: Vec::new(),
+            voice_heard: None,
             rounds_in_reach: 0,
             rounds_taken: 0,
             rounds_ejected: 0,
@@ -391,9 +544,20 @@ impl Controller {
             magazines_hidden: 0,
             magazine_drawn: None,
             magazine_checked: false,
+            panel_calls: Vec::new(),
+            grenade_thrown: false,
+            meds_started: 0,
+            magazines_moved: 0,
+            folds_begun: 0,
+            shots_made: 0,
+            shots_fired: 0,
+            chamber_given_up: false,
+            toggle_sounds: Vec::new(),
+            throws: Vec::new(),
             health_pulls: [0, 0],
             menu_shown: false,
             menu_notches: 0,
+            zoom_notches: 0,
         };
         controller.settle_shown();
         controller
@@ -456,6 +620,31 @@ impl Controller {
         // forward is +z, Bevy's -z.
         let seen = quat_rotate(quat_axis(1, -look[0]), ribcage);
         self.ribcage_shown = Vec3::new(seen[0], seen[1], -seen[2]);
+        self.ribcage_drawn = (ribcage, look, trailing);
+    }
+
+    /// The rig's origin from the ribcage for the frame drawn, on a mount:
+    /// worked out again (`Movement::mounted_rig_apart`) for the view and
+    /// the ribcage as drawn, which are a little ahead of the simulation's
+    /// last frames while the view turns; the pivot turned by the view one
+    /// of the simulation's frames before, as the simulation turns it by the
+    /// frame before's. Taken between those frames' own
+    /// figures, the pivot came off its point by the view's turn since them
+    /// (some 7 mm a degree at half a metre), and the camera, which the
+    /// mount's way moves with the rig on frames with a physics step, came
+    /// off the weapon by as much on the frames between: the weapon shook
+    /// against the view as it turned. Only the drawing: the simulation's
+    /// figures are its own.
+    fn rig_apart_drawn(&self, older: &Stepped, newer: &Stepped, t: f32, position: Vec3) -> Option<[f32; 3]> {
+        let (a, b) = (older.mount.or(newer.mount)?, newer.mount?);
+        let lerp = |x: [f32; 3], y: [f32; 3]| -> [f32; 3] { std::array::from_fn(|i| x[i] + (y[i] - x[i]) * t) };
+        let (pivot, progress) = (lerp(a.pivot, b.pivot), a.progress + (b.progress - a.progress) * t);
+        let (ribcage, [yaw, pitch], [yaw_before, pitch_before]) = self.ribcage_drawn;
+        // The simulation's forward is +z; Bevy's is -z.
+        let origin = [position.x + ribcage[0], position.y + ribcage[1], -position.z + ribcage[2]];
+        let turn = quat_mul(quat_axis(1, yaw), quat_axis(0, pitch));
+        let before = quat_mul(quat_axis(1, yaw_before), quat_axis(0, pitch_before));
+        Some(trp_sim::movement::mounted_apart(b.point, origin, turn, before, pivot, progress))
     }
 
     /// The two frames of the simulation either side of the moment drawn,
@@ -472,11 +661,24 @@ impl Controller {
     pub fn shown(&self) -> Shown {
         let sprung = self.before.blend(self.now, self.pacer.blend());
         let (older, newer, t) = self.around_drawn();
+        let position = older.position.lerp(newer.position, t);
+        let camera_apart: [f32; 3] = std::array::from_fn(|k| older.camera_apart[k] + (newer.camera_apart[k] - older.camera_apart[k]) * t);
+        let rig_apart = self
+            .rig_apart_drawn(older, newer, t, position)
+            .unwrap_or_else(|| std::array::from_fn(|k| older.rig_apart[k] + (newer.rig_apart[k] - older.rig_apart[k]) * t));
+        // The mount's camera goes with the rig as drawn, not as it stood on
+        // the frames it was worked out on.
+        let mut camera = sprung.camera;
+        if let Some(shift) = sprung.shift {
+            camera.position = std::array::from_fn(|k| camera.position[k] - shift[k] + rig_apart[k] - camera_apart[k]);
+        }
         Shown {
-            position: older.position.lerp(newer.position, t),
+            position,
             ribcage: self.ribcage_shown,
             weapon: sprung.weapon,
-            camera: sprung.camera,
+            camera,
+            camera_apart,
+            rig_apart,
             arms: [blend_arm(older.arms[0], newer.arms[0], t), blend_arm(older.arms[1], newer.arms[1], t)],
             elbows: sprung.elbows,
         }
@@ -506,6 +708,27 @@ impl Controller {
     /// What is in the hands has been changed for something else: its rig
     /// is drawn from this pose on, and the simulation's next frame reads
     /// this of it.
+    /// What the simulation takes from the rig in the hands, as its animator
+    /// left it on the last frame.
+    pub fn rig_pose(&self) -> &RigPose {
+        &self.rig_pose
+    }
+
+    /// The rig in the hands changed for the same weapon built anew while
+    /// its animation goes on (`Firearm::carry_on_from`): the frames already
+    /// stepped and still to be drawn keep their poses, each bone taken
+    /// from the old rig's same bone (`map`, by its path; none where the old
+    /// rig has none, which takes `pose`'s), so that the drawing goes on
+    /// without a stop or a jump.
+    pub fn rig_carried_over(&mut self, map: &[Option<usize>], pose: Vec<([f32; 3], [f32; 4])>, read: RigPose) {
+        let now = std::sync::Arc::new(pose);
+        for stepped in &mut self.stepped {
+            let remapped = stepped.rig.as_ref().map(|old| std::sync::Arc::new(map.iter().zip(now.iter()).map(|(from, own)| from.and_then(|i| old.get(i).copied()).unwrap_or(*own)).collect::<Vec<_>>()));
+            stepped.rig = Some(remapped.unwrap_or_else(|| now.clone()));
+        }
+        self.rig_pose = read;
+    }
+
     pub fn rig_changed(&mut self, pose: Vec<([f32; 3], [f32; 4])>, read: RigPose) {
         let pose = std::sync::Arc::new(pose);
         for stepped in &mut self.stepped {
@@ -517,6 +740,12 @@ impl Controller {
     /// What the thing in the hands has said of itself since last asked.
     pub fn take_hands_events(&mut self) -> Vec<FirearmEvent> {
         std::mem::take(&mut self.hands_events)
+    }
+
+    /// The raid's clock (`GameHelper.PastTime`): the simulation's own
+    /// seconds since the run began, by which a weapon's heat cools.
+    pub fn raid_clock(&self) -> f64 {
+        f64::from(self.pacer.simulated())
     }
 
     /// The moment drawn now, in the simulation's own seconds.
@@ -544,6 +773,11 @@ pub fn gather_input(
     bindings: Res<crate::keys::Bindings>,
     mut controller: ResMut<Controller>,
 ) {
+    // A capture's turns of the wheel with the zoom's keys held (`--zoom`),
+    // as `GetZoomInput` takes them (the turn times `OpticSensitivity`),
+    // whatever else it holds.
+    let scripted_zoom = std::mem::take(&mut controller.zoom_notches) as f32 * options.optic_sensitivity;
+    controller.pending.zoom += scripted_zoom;
     // An unattended capture must not pick up the mouse happening to move
     // over its window. It can turn the view at a steady rate instead
     // (`--turn`), from a second in: what a mouse moved evenly would add in
@@ -564,7 +798,10 @@ pub fn gather_input(
     // How the trigger, the vault key and the movement keys stand is kept
     // whatever has the keys, as a key's own state is: let go under an
     // open screen, they are let go.
-    if bindings.fired("Shoot") {
+    // (Not a press under the edit build screen, whose left button turns
+    // the preview and clicks its buttons: the screen is the mouse's until
+    // the button that shut it is let go, `edit_build::release`.)
+    if bindings.fired("Shoot") && !controller.edit_build {
         controller.trigger = !controller.trigger;
     }
     if bindings.ended("Shoot") {
@@ -579,7 +816,7 @@ pub fn gather_input(
     // (`R` turns what the mouse holds): nothing is gathered, and a key
     // pressed meanwhile is lost, as in the game (inventory spec, "What an
     // open screen does to the keys").
-    if !view.played() || controller.inventory_open {
+    if !view.played() || controller.inventory_open || controller.edit_build {
         return;
     }
     let (delta_level, delta_speed) = {
@@ -589,7 +826,7 @@ pub fn gather_input(
     // While aiming, the weapon's factor and the aiming setting replace the
     // ordinary sensitivity.
     let sensitivity = match hands.as_deref() {
-        Some(rig) if rig.aiming => rig.aim_sensitivity * options.aiming_sensitivity,
+        Some(rig) if rig.aiming => rig.hands.aim_sensitivity(rig.aim_sensitivity) * options.aiming_sensitivity,
         _ => options.sensitivity,
     };
     let menu_shown = controller.menu_shown;
@@ -622,6 +859,11 @@ pub fn gather_input(
     pending.force_auto |= bindings.fired("ForceAutoWeaponMode");
     pending.check_fire_mode |= bindings.fired("CheckFireMode");
     pending.examine |= bindings.fired("ExamineWeapon");
+    pending.change_scope |= bindings.fired("ChangeAimScope");
+    pending.magnification |= bindings.fired("ChangeAimScopeMagnification");
+    pending.zoom += bindings.zoom();
+    pending.zeroing_up |= bindings.fired("OpticCalibrationSwitchUp");
+    pending.zeroing_down |= bindings.fired("OpticCalibrationSwitchDown");
     // An item in use stops for the shoot key, the aim key or the scope's
     // (`ToggleShooting`, `ToggleAlternativeShooting`, `ChangeScope`).
     pending.use_cancel |= bindings.fired("Shoot") || bindings.fired("Aim") || bindings.fired("ChangeAimScope");
@@ -640,11 +882,31 @@ pub fn gather_input(
         pending.step_toggle[side] |= bindings.fired(step);
         pending.step_end[side] |= bindings.ended(step);
     }
+    // Blind fire's two bindings, each held: given, its side; coming up,
+    // the end (`ToggleBlindAbove`, `ToggleBlindRight`, `BlindShootEnd`).
+    for (binding, side) in [("BlindShootAbove", 1), ("BlindShootRight", -1)] {
+        if bindings.fired(binding) {
+            pending.blind_toggle = side;
+        }
+        pending.blind_end |= bindings.ended(binding);
+    }
+    pending.mount |= bindings.fired("WeaponMounting");
+    pending.left_stance |= bindings.fired("LeftStance");
+    pending.bipod |= bindings.fired("ToggleBipods");
     if bindings.fired("Aim") {
         pending.aim.push(true);
     }
     if bindings.ended("Aim") {
         pending.aim.push(false);
+    }
+    for (binding, low, stroke) in [("Shoot", false, trp_sim::Stroke::Slash), ("Aim", true, trp_sim::Stroke::Stab)] {
+        if bindings.fired(binding) {
+            pending.throw_keys.push((low, true));
+            pending.strokes.push(stroke);
+        }
+        if bindings.ended(binding) {
+            pending.throw_keys.push((low, false));
+        }
     }
     // The wheel's two bindings set the speed, and with the stance's key
     // held the stance's two set that. While a menu is shown for what is
@@ -709,7 +971,7 @@ pub fn step(
         let at = options.scenario_at;
         let [yaw, pitch] = scenario.turned(host_before - at, controller.pacer.host_time() - at);
         let sensitivity = match hands.as_deref() {
-            Some(rig) if rig.aiming => rig.aim_sensitivity * options.aiming_sensitivity,
+            Some(rig) if rig.aiming => rig.hands.aim_sensitivity(rig.aim_sensitivity) * options.aiming_sensitivity,
             _ => options.sensitivity,
         };
         controller.pending.look += Vec2::new(yaw, pitch) * sensitivity;
@@ -761,7 +1023,7 @@ pub fn step(
             (None, None) => false,
         };
         // Presses go to the first frame that comes.
-        let pending = std::mem::take(&mut controller.pending);
+        let mut pending = std::mem::take(&mut controller.pending);
 
         // The aim key asks; the weapon's logic and the movement state decide.
         // The same goes for a press of the trigger: a sprint and a crawl
@@ -782,6 +1044,48 @@ pub fn step(
             (None, Some(_)) => has("aim") && since(0.5),
             (None, None) => false,
         };
+        // The weapon in hand's mount figures, and its bipod, for the
+        // movement's mount (`Movement::set_mount_weapon`).
+        match hands.as_deref() {
+            Some(rig) => controller.movement.set_mount_weapon(rig.firearm.as_ref().map(|_| rig.hands.settings.mount), rig.firearm.as_ref().and_then(|f| f.bipod()).unwrap_or(false)),
+            None => controller.movement.set_mount_weapon(None, false),
+        }
+        // The bipod's key (`FirearmController.ToggleBipod`), with its
+        // switch on: taken, the body's gesture is asked and the weapon's
+        // motion and the movement are told at once (`ToggleBipodOperation.
+        // Start`).
+        if let Some(rig) = hands.as_deref_mut() {
+            let asked = pending.bipod || script_pressed("cmd:ToggleBipods");
+            if let Some(firearm) = rig.firearm.as_mut().filter(|_| asked && armed && handled && features.mounting) {
+                let m = &controller.movement;
+                if firearm.toggle_bipod(m.mounted(), m.sprinting, m.gesture_free()) {
+                    if let (Some(out), Some(forward)) = (firearm.bipod(), firearm.settings.bipod) {
+                        controller.movement.bipod_gesture(out, forward);
+                        rig.hands.set_bipod(out);
+                        controller.movement.set_mount_weapon(Some(rig.hands.settings.mount), out);
+                    }
+                }
+            }
+        }
+        // The handheld rangefinder's aim, by the same key and the same rule
+        // (`UsableItemInputTranslator`: `ToggleAim`, and let go where held;
+        // rangefinder spec), whatever is armed.
+        if let Some(rangefinder) = hands.as_deref_mut().and_then(|h| h.rangefinder.as_mut()) {
+            if played {
+                for given in pending.aim.iter().filter(|_| heard) {
+                    rangefinder.set_aim(*given && !rangefinder.aiming(), can_aim);
+                }
+            } else {
+                let wanted = match (scenario, scripted) {
+                    (Some(_), _) => script_held("aim"),
+                    (None, Some(_)) => has("aim") && since(0.5),
+                    (None, None) => false,
+                };
+                if std::mem::replace(&mut controller.aim_key, wanted) != wanted && heard {
+                    rangefinder.set_aim(wanted, can_aim);
+                }
+            }
+        }
         if let Some(firearm) = hands.as_deref_mut().and_then(|h| h.firearm.as_mut()) {
             if played {
                 // The aim's binding given puts the sights the other way
@@ -799,7 +1103,11 @@ pub fn step(
             // in, or three with `prone`, when the character is down.
             let at = if has("prone") { 3.0 } else { 2.0 };
             let plain = pending.reload || (has("reload") && passing(at)) || script_pressed("reload");
-            let quick = pending.quick_reload && !plain;
+            // Stunned, a reload is the quick one (`ShouldForceQuickReload`:
+            // a stun on the head; grenade spec, "A flash").
+            let stunned = controller.health.as_ref().is_some_and(|health| health.active(trp_sim::health::Kind::Stun, Some(trp_sim::health::Part::Head)).is_some());
+            let quick = (pending.quick_reload && !plain) || (plain && stunned);
+            let plain = plain && !stunned;
             if armed && handled && (plain || quick) {
                 if firearm.settings.internal_magazine {
                     // A tube is filled from the rounds within reach, and
@@ -812,11 +1120,13 @@ pub fn step(
                     // A recorded scenario changes the magazine for a full
                     // one, as its recording does.
                     firearm.reload();
-                } else if let Some((magazine, rounds)) = controller.next_magazine {
+                } else if let Some((magazine, rounds, variant)) = controller.next_magazine {
                     // The fullest magazine within reach goes in; with
                     // none, nothing is done (`ReloadMagNotFound`). The
                     // inventory makes the exchange as the reload begins.
+                    // Its clips are its own (`magAnimationIndex`).
                     controller.magazine_asked = Some(magazine);
+                    firearm.next_magazine_variant(variant);
                     if quick {
                         firearm.quick_reload_with(rounds);
                     } else {
@@ -826,7 +1136,10 @@ pub fn step(
             }
         }
         let firearm = hands.as_deref().and_then(|h| h.firearm.as_ref());
-        let (aiming, reloading) = (firearm.is_some_and(|f| f.aiming()), firearm.is_some_and(|f| f.reloading()));
+        // The rangefinder aimed slows the walk as the sights do
+        // (`SetAimingSlowdown(IsAiming, 0.33)`) and costs the arms.
+        let aiming_rangefinder = hands.as_deref().and_then(|h| h.rangefinder.as_ref()).is_some_and(|r| r.aiming());
+        let (aiming, reloading) = (firearm.is_some_and(|f| f.aiming()) || aiming_rangefinder, firearm.is_some_and(|f| f.reloading()));
         let empty_hands = hands.as_deref().and_then(|h| h.empty.as_ref());
         let hands_busy = firearm.is_some_and(|f| f.hands_busy()) || empty_hands.is_some_and(|empty| empty.hands_busy());
         // Whether the animator of the thing in hand is at rest, which a
@@ -836,6 +1149,23 @@ pub fn step(
         let hands_idle = firearm.is_some_and(|f| f.animator_idling()) || empty_hands.is_some_and(|empty| empty.animator_idling());
         let hands_in_inventory = firearm.is_some_and(|f| f.in_inventory());
         let weapon_occupied = firearm.is_some_and(|f| f.occupied());
+        // Medicine or food in hand, or a grenade's throw held: a vault only
+        // under the move's height without hands.
+        let hands_limit_vault = hands.as_deref().is_some_and(|h| {
+            h.meds.as_ref().is_some_and(|meds| meds.in_hand()) || h.grenade.as_ref().is_some_and(|grenade| grenade.holds_throw())
+        });
+        // Blind fire's commands, a played run's from its bindings and a
+        // scripted run's as the recorder gives them (`cmd:`), and what the
+        // thing in hand says to its gate.
+        let blind_toggle = if script_pressed("cmd:ToggleBlindAbove") {
+            1
+        } else if script_pressed("cmd:ToggleBlindRight") {
+            -1
+        } else {
+            pending.blind_toggle
+        };
+        let blind_end = pending.blind_end || script_pressed("cmd:BlindShootEnd");
+        let (blind_firearm, blind_may_start) = (firearm.is_some(), firearm.is_some_and(|f| f.can_set_blind_fire()));
         let notch = |up: &str, down: &str| axis(script_pressed(up), script_pressed(down));
         // What a played run's keys push the movement axes to; none while
         // the keys fly the camera.
@@ -848,10 +1178,11 @@ pub fn step(
             hands_idle,
             hands_in_inventory,
             weapon_occupied,
+            hands_limit_vault,
             free_look: false,
             // The inventory screen has the keys while it is open: the
             // character is handed no movement, no turn and no key.
-            screen: inventory_open,
+            screen: inventory_open || controller.edit_build,
             inventory: inventory_open,
             // The head's free look: its share of the mouse's travel, its
             // key come up, and how far down the camera last pointed.
@@ -904,6 +1235,20 @@ pub fn step(
                 }
                 (None, None) => 0,
             },
+            blind_toggle,
+            blind_end,
+            blind_firearm,
+            blind_may_start,
+            // The mount's key, a played run's binding or a script's command,
+            // what the thing in hand says of it, and how deep the weapon last
+            // stuck into something.
+            mount: pending.mount || script_pressed("cmd:WeaponMounting"),
+            mount_may: firearm.is_some_and(|f| f.may_mount()),
+            overlap_depth: controller.overlap,
+            // The left shoulder's key, and whether the operation in hand
+            // passes it on.
+            left_stance: pending.left_stance || script_pressed("cmd:LeftStanceToggle"),
+            left_stance_may: firearm.is_some_and(|f| f.may_toggle_left_stance()),
         };
         // Dead, no key is heard (the game takes the character's input away
         // with its life; health spec, "Death").
@@ -911,6 +1256,52 @@ pub fn step(
         // The pacer's frames are the game's drawn frames: the player's
         // own whole-millisecond clock runs on them.
         controller.movement.frame(frame.dt, &input, &*range);
+        // What blind fire's gate took goes to the weapon and its motion, on
+        // this frame (`trp_sim::blind_fire::tell`).
+        match hands.as_deref_mut() {
+            Some(rig) => trp_sim::blind_fire::tell(&mut controller.movement, rig.firearm.as_mut(), Some(&mut rig.hands)),
+            None => _ = controller.movement.take_blind_fire(),
+        }
+        // The weapon's mount sound comes on the first frame its timer has run
+        // out on, the frame of the mount not counted (`WaitForSeconds`, from
+        // the mount's frame: recorded 0.4584 s after a mount of 0.4506 s).
+        if let Some(left) = controller.mount_sound_in.as_mut() {
+            *left -= frame.dt;
+            if *left <= 0.0 {
+                controller.mount_sound_in = None;
+                controller.mount_sounds += 1;
+            }
+        }
+        // What the mount did goes to the weapon and its motion
+        // (`trp_sim::mounting::tell`), and sounds: the kit's medium rattle at
+        // the mount, the exit's start and its end; the weapon's mount sound
+        // the approach's length after the mount, unless an exit comes first.
+        let mounted = match hands.as_deref_mut() {
+            Some(rig) => trp_sim::mounting::tell(&mut controller.movement, rig.firearm.as_mut(), Some(&mut rig.hands), rig.mount_ergonomics),
+            None => trp_sim::mounting::tell(&mut controller.movement, None, None, [0.0; 2]),
+        };
+        for event in mounted {
+            use trp_sim::mounting::MountEvent;
+            info!("the mount: {event:?} (the search's root {:?}, the feet {:?})", controller.movement.grid_root(), controller.movement.position);
+            let alive = controller.health.as_ref().is_none_or(|health| health.alive);
+            match event {
+                MountEvent::Entered { approach, .. } => {
+                    if alive {
+                        let overweight = controller.movement.stamina.settings.overweight;
+                        controller.movement.sounds.kit_medium(overweight);
+                    }
+                    controller.mount_sound_in = Some(approach);
+                }
+                MountEvent::Leaving { .. } | MountEvent::Left { .. } => {
+                    if alive {
+                        let overweight = controller.movement.stamina.settings.overweight;
+                        controller.movement.sounds.kit_medium(overweight);
+                    }
+                    controller.mount_sound_in = None;
+                }
+                MountEvent::Refused => controller.mount_refusals = controller.mount_refusals.wrapping_add(1),
+            }
+        }
         // Then health, which takes what the movement did and tells it what
         // the character may do, on the player's whole-millisecond clock as
         // the game's is (health spec, "Compared with what").
@@ -924,13 +1315,20 @@ pub fn step(
                 if let Some(meds) = hands.as_deref_mut().and_then(|hands| hands.meds.as_mut()) {
                     meds.on_health(health, &event);
                 }
+                if let Some(heard) = controller.voice_heard.as_mut() {
+                    heard.push(event.clone());
+                }
                 {
                     use trp_sim::health::{Event, Kind};
                     match event {
                         Event::Damaged(..) | Event::Started(Kind::ChronicFatigue | Kind::Encumbered | Kind::OverEncumbered, _) => controller.health_pulls[0] = controller.health_pulls[0].wrapping_add(1),
                         Event::Removed(..) => controller.health_pulls[1] = controller.health_pulls[1].wrapping_add(1),
+                        Event::Started(Kind::MedEffect, _) => controller.meds_started = controller.meds_started.wrapping_add(1),
                         _ => {}
                     }
+                }
+                if let trp_sim::health::Event::Damaged(part, _, kind @ (trp_sim::health::DamageKind::LightBleeding | trp_sim::health::DamageKind::HeavyBleeding)) = event {
+                    controller.bled.push((part, kind == trp_sim::health::DamageKind::HeavyBleeding));
                 }
                 if matches!(event, trp_sim::health::Event::Resource(..) | trp_sim::health::Event::UsedUp(..)) {
                     controller.items_said.push(event);
@@ -944,6 +1342,8 @@ pub fn step(
         let (mut weapon, mut camera) = (controller.now.weapon, controller.now.camera);
         let mut elbows = controller.now.elbows;
         let mut rig_now = None;
+        let mut rig_apart = [0.0f32; 3];
+        let (mut mount_drawn, mut shift) = (None, None);
         if let Some(hands) = hands.as_deref_mut() {
             // The sprint switching on puts the sights down and lets go of
             // the trigger; so does entering a state that does not allow
@@ -988,8 +1388,25 @@ pub fn step(
             // view gives way while the mouse has the head.
             let head = &controller.movement.head_look;
             hands.hands.set_head_rotation(head.rotation(), head.control(), aiming);
-            let aiming = hands.firearm.as_ref().is_some_and(|f| f.aiming());
+            // The rangefinder's aim let go as a weapon's sights are put down:
+            // a sprint begun, a state that cannot aim, a long fall, a vault
+            // (`OnAimingDisabled`).
+            if let Some(rangefinder) = &mut hands.rangefinder {
+                let can = controller.movement.can_aim();
+                if rangefinder.aiming() && (sprint_started || aim_lowered || !can || controller.movement.long_fall() || controller.movement.take_aim_taken()) {
+                    rangefinder.set_aim(false, can);
+                }
+            }
+            let aiming = hands.firearm.as_ref().is_some_and(|f| f.aiming()) || hands.rangefinder.as_ref().is_some_and(|r| r.aiming());
             hands.aiming = aiming;
+            // Its optic live while its controller has it on.
+            let forced = hands.rangefinder.as_ref().filter(|r| r.optic_on()).map(|_| 0);
+            if let Some(sights) = hands.hands.settings.sights.as_mut().filter(|_| hands.rangefinder.is_some()) {
+                sights.force_optic(forced);
+            }
+            // The weapon's motion takes the aim on this frame, whether a
+            // physics step comes in it or not (`Hands::aim_changed`).
+            hands.hands.aim_changed(aiming);
             // The bone the weapon's moved bone hangs from, as its animator
             // left it on the frame before: the springs run ahead of the
             // frame's own update of the animator.
@@ -1011,7 +1428,9 @@ pub fn step(
                         sprinting: m.state == State::Sprint,
                         idle: m.state == State::Idle,
                         footstep,
-                        tilt: m.smoothed_tilt,
+                        // Mounted, the weapon's motion reads the mount's lean
+                        // (`ProceduralWeaponAnimation.SmoothedTilt`).
+                        tilt: if m.mounted() { m.weapon_tilt() } else { m.smoothed_tilt },
                         tilt_target: m.tilt,
                         pose_level: m.pose_level,
                         smoothed_pose_level: m.smoothed_pose_level,
@@ -1049,7 +1468,7 @@ pub fn step(
                         }
                         has("fire") && (!has("auto") || since(2.0))
                     }
-                    (None, None) => view.played() && controller.trigger,
+                    (None, None) => view.played() && controller.trigger && !controller.edit_build,
                 };
                 if handled {
                     firearm.set_trigger(trigger && armed, can_fire);
@@ -1059,8 +1478,10 @@ pub fn step(
                 if armed && handled && pending.fire_mode {
                     firearm.next_fire_mode();
                 }
-                if armed && handled && (pending.check_magazine || script_pressed("check_magazine")) {
-                    firearm.check_magazine();
+                // The magazine is known, and its count named in the
+                // ammunition's panel, only where the look began and in first
+                // person (`Idling.CheckAmmo`).
+                if armed && handled && (pending.check_magazine || script_pressed("check_magazine")) && firearm.check_magazine() {
                     controller.magazine_checked |= !outside;
                 }
                 if armed && handled && pending.check_chamber {
@@ -1077,10 +1498,32 @@ pub fn step(
                 if armed && handled && pending.examine {
                     firearm.examine();
                 }
+                // The sights' keys: the next sight, and the next mode of
+                // the scope aimed by, which the hands' animator is told of
+                // (`ChangeScope`, `ChangeScopeMagnification`). Blind fire
+                // holds back the first (`ChangeAimingMode`); the left hand's
+                // items and mounting, which do too, are not built.
+                if armed && handled && pending.change_scope && !firearm.blind_fire() {
+                    hands.hands.change_aim_scope(controller.movement.mounted());
+                }
+                if armed && handled && pending.magnification && hands.hands.change_magnification() {
+                    firearm.mod_switch();
+                }
+                // The zeroing keys, while aiming (an under-barrel launcher's
+                // range instead: none of the app's has one).
+                if armed && handled && pending.zeroing_up {
+                    hands.hands.step_zeroing(true);
+                }
+                if armed && handled && pending.zeroing_down {
+                    hands.hands.step_zeroing(false);
+                }
+                // A variable scope's zoom, once a frame by the frame's time
+                // (`ScopeZoomHandler`), with the wheel's turns since the last.
+                hands.hands.zoom_frame(if handled { pending.zoom } else { 0.0 }, frame.dt);
                 // A scripted run with `fold` folds the stock a second and a
                 // half in.
-                if armed && handled && (pending.fold_stock || (has("fold") && passing(1.5))) {
-                    firearm.fold_stock();
+                if armed && handled && (pending.fold_stock || (has("fold") && passing(1.5))) && firearm.fold_stock() {
+                    controller.folds_begun += 1;
                 }
                 firearm.set_aim_angle(controller.movement.pitch);
                 // How its animations are drawn: the options' switch.
@@ -1088,14 +1531,35 @@ pub fn step(
                 // Its operations on the player's clock, its animator on the
                 // engine's (`Firearm::step_on_clock`).
                 let player_dt = controller.movement.player_dt();
+                // (A cylinder's or barrels' cases stay in the weapon: not
+                // built.)
+                let one_chamber = firearm.settings.cylinder.is_none() && firearm.settings.barrels == 0;
+                let automatic = matches!(firearm.mode(), FireMode::FullAuto | FireMode::Burst);
+                // Its heat by the raid's clock, this frame's.
+                firearm.set_wear_clock(f64::from(now));
                 for event in firearm.step_on_clock(frame.dt, player_dt) {
                     match event {
-                        FirearmEvent::Shot { strength } => hands.hands.shoot(strength),
+                        FirearmEvent::Shot { strength } => {
+                            hands.hands.shoot(strength);
+                            controller.shots_made += 1;
+                            controller.shots_fired = controller.shots_fired.wrapping_add(1);
+                            controller.bullet_calls.push(automatic);
+                            if one_chamber {
+                                controller.case_calls.push(crate::cases::CaseCall::Shot);
+                            }
+                        }
+                        FirearmEvent::ShellEject if one_chamber => controller.case_calls.push(crate::cases::CaseCall::Eject),
                         FirearmEvent::AutoFire(on) => hands.hands.set_auto_fire(on),
                         FirearmEvent::Appeared | FirearmEvent::Hidden => controller.hands_events.push(event),
                         // The body's own part in a weapon drawn or put
                         // away: its animator is told whoever is looking.
                         FirearmEvent::BodyAction(action) => controller.movement.body.set_weapon_action(action),
+                        // An operation that ends blind fire has begun.
+                        FirearmEvent::BlindFireEnded => trp_sim::blind_fire::ended(&mut controller.movement, Some(&mut hands.hands)),
+                        // And one that ends a mount (mounting spec, "What ends it").
+                        FirearmEvent::LeaveMount { at_once } => controller.movement.leave_mount(at_once),
+                        // And what the left shoulder is told of the hands.
+                        FirearmEvent::LeftStance(call) => controller.movement.left_stance_call(call),
                         // The rounds a tube took: the inventory takes
                         // them out of the pockets and the vest.
                         FirearmEvent::RoundsTaken(count) => controller.rounds_taken += count,
@@ -1112,6 +1576,24 @@ pub fn step(
                             controller.magazine_drawn = Some(false);
                         }
                         FirearmEvent::MagazineShown | FirearmEvent::MagazineIn => controller.magazine_drawn = Some(true),
+                        FirearmEvent::MagazineMoved => controller.magazines_moved += 1,
+                        FirearmEvent::ChamberGivenUp => controller.chamber_given_up = true,
+                        // Its malfunctions, for the item, the words on the
+                        // screen and the round thrown out (`crate::wear`).
+                        FirearmEvent::Malfunctioned(_)
+                        | FirearmEvent::MalfunctionReminder { .. }
+                        | FirearmEvent::MalfunctionExamined { .. }
+                        | FirearmEvent::MalfunctionRepairBegun(_)
+                        | FirearmEvent::MalfunctionRepaired(_)
+                        | FirearmEvent::MalfunctionCleared(_)
+                        | FirearmEvent::FedRoundThrown
+                        | FirearmEvent::MisfiredRoundThrown
+                        | FirearmEvent::Autoshot => controller.wear_events.push(event),
+                        // A way of firing named in the ammunition's panel,
+                        // to the character's own eyes (`ShowFireMode`).
+                        FirearmEvent::FireModeShown(mode) if !outside => controller.panel_calls.push(crate::sight_panels::PanelCall::FireMode(mode)),
+                        // And a look at the magazine's count (`ShowAmmoDetails`).
+                        FirearmEvent::MagazineChecked if !outside => controller.panel_calls.push(crate::sight_panels::PanelCall::Magazine),
                         // The stock folded or unfolded: the recoil and
                         // the hold go by the build as it now stands, and
                         // the body's animator by its new width.
@@ -1172,6 +1654,76 @@ pub fn step(
                     }
                 }
             }
+            // A grenade (grenades-and-knife spec, "The grenade's hands"):
+            // its keys, then its animator; let go of, it is thrown
+            // (`grenade::throw_out`) and gone from the inventory.
+            if let Some(grenade) = &mut hands.grenade {
+                grenade.set_drawn_smooth(features.smooth_animations);
+                for (low, down) in pending.throw_keys.drain(..).filter(|_| heard) {
+                    if down {
+                        grenade.press(low);
+                    } else {
+                        grenade.release(low);
+                    }
+                }
+                for event in grenade.step(frame.dt) {
+                    match event {
+                        GrenadeEvent::Appeared => controller.hands_events.push(FirearmEvent::Appeared),
+                        GrenadeEvent::Hidden => controller.hands_events.push(FirearmEvent::Hidden),
+                        GrenadeEvent::Thrown { low } => {
+                            controller.grenade_thrown = true;
+                            controller.throws.push(low);
+                        }
+                        GrenadeEvent::Used => {}
+                        // The fuse's sound is the thrown grenade's, played
+                        // where it leaves the hand (`PROVISIONAL`: the game
+                        // plays it at the grenade, 0.05 s on).
+                        GrenadeEvent::Sound(name) | GrenadeEvent::SoundAtPoint(name) => controller.hands_sounds.push(name),
+                        GrenadeEvent::BodyAction(action) => controller.movement.body.set_weapon_action(action),
+                    }
+                }
+            }
+            // A knife (grenades-and-knife spec, "The knife's hands"): its
+            // strokes, with the stamina for them; its blade's sweep is
+            // `knife::sweep`'s.
+            // The rangefinder (rangefinder spec): the examine key's look
+            // over it, its animator and its readout's clock moved on.
+            if let Some(rangefinder) = &mut hands.rangefinder {
+                rangefinder.set_drawn_smooth(features.smooth_animations);
+                if pending.examine && heard {
+                    rangefinder.look();
+                }
+                for event in rangefinder.step(frame.dt) {
+                    match event {
+                        RangefinderEvent::Appeared => controller.hands_events.push(FirearmEvent::Appeared),
+                        RangefinderEvent::Hidden => controller.hands_events.push(FirearmEvent::Hidden),
+                        RangefinderEvent::Sound(name) => controller.hands_sounds.push(name),
+                        RangefinderEvent::BodyAction(action) => controller.movement.body.set_weapon_action(action),
+                    }
+                }
+            }
+            if let Some(knife) = &mut hands.knife {
+                knife.set_drawn_smooth(features.smooth_animations);
+                for stroke in pending.strokes.drain(..).filter(|_| heard) {
+                    let (can, speed) = (controller.movement.stamina.can_melee(), controller.movement.stamina.melee_speed());
+                    if !knife.strike(stroke, can, speed) && knife.idling() {
+                        info!("a stroke: too tired for it");
+                    }
+                }
+                for event in knife.step(frame.dt) {
+                    match event {
+                        KnifeEvent::Appeared => controller.hands_events.push(FirearmEvent::Appeared),
+                        KnifeEvent::Hidden => controller.hands_events.push(FirearmEvent::Hidden),
+                        KnifeEvent::Live { cost, .. } => {
+                            let now = controller.movement.frame_clock();
+                            controller.movement.stamina.melee(cost, now);
+                        }
+                        KnifeEvent::Dead | KnifeEvent::Used => {}
+                        KnifeEvent::Sound(name) => controller.hands_sounds.push(name),
+                        KnifeEvent::BodyAction(action) => controller.movement.body.set_weapon_action(action),
+                    }
+                }
+            }
             // The rig as its animator has it now, which is what the rest
             // of the frame goes by, as the game's late update does.
             // What is drawn of it is the animator's pose for drawing,
@@ -1180,6 +1732,10 @@ pub fn step(
             // The simulation reads the pose itself.
             let posed = hands.animator().map(|animator| (animator.pose().to_vec(), animator.drawn_pose()));
             if let Some((posed, drawn)) = posed {
+                // At the sight now aimed by.
+                if let Some(nodes) = hands.hands.sight_nodes() {
+                    hands.frame.set_sights(nodes);
+                }
                 controller.rig_pose = hands.frame.read(&posed);
                 rig_now = Some(std::sync::Arc::new(drawn));
             }
@@ -1200,18 +1756,30 @@ pub fn step(
             let m = &controller.movement;
             // The iron sights' line and the muzzle as the rig has them now.
             hands.hands.note_sights(pose.sight_line, pose.muzzle);
-            hands.hands.blend_poses(frame.dt);
+            // On the player's clock, as the game's weapon motion runs.
+            let arms_dt = m.player_dt();
+            hands.hands.blend_poses(arms_dt);
             // What is drawn of the body's hold takes the body as drawn.
             let in_view = m.drawn_body_in_view();
-            weapon = hands.hands.weapon_transform_carried(
-                pose.parent,
-                m.body.carried(in_view),
-                m.body.held(in_view),
-                pose.marker,
-            );
+            // With the left shoulder's part (`PlayerBones.ShiftWeaponRoot`),
+            // for the character's own eyes; seen from outside, the body's
+            // weapon bone by its authority alone.
+            let left = trp_sim::hands::LeftShoulder {
+                curve: if outside { 0.0 } else { m.body.left_stance_curve() },
+                sprinting: m.state == trp_sim::State::Sprint,
+                anim_value: m.left_stance().last_anim,
+                aiming: hands.hands.is_aiming(),
+                forward: m.forward_input(),
+                dt: arms_dt,
+                ribcage_local: m.body.ribcage_local(),
+            };
+            weapon = hands.hands.weapon_transform_shifted(pose.parent, m.body.weapon_root_third(in_view), m.body.held(in_view), pose.marker, left).held;
             // The camera takes the sight's place off the weapon where the
             // procedural motion put it, before the body takes the weapon.
-            let placed = hands.hands.weapon_transform();
+            // With the left shoulder's curve up the camera's pass comes late
+            // in the frame (`LateTransformations`), after the shoulder has
+            // moved the weapon, and takes the sight from there.
+            let placed = if hands.hands.left_shoulder_curve() > 0.0 { weapon } else { hands.hands.weapon_transform() };
             let aim = pose.aim_bone.map(|bone| {
                 let hanging = quat_rotate(pose.parent.1, placed.0);
                 let origin: [f32; 3] = std::array::from_fn(|i| pose.parent.0[i] + hanging[i]);
@@ -1222,14 +1790,36 @@ pub fn step(
                     origin,
                     // The barrel runs along the moved bone's -y.
                     barrel: quat_rotate(turn, [0.0, -1.0, 0.0]),
+                    line: quat_rotate(turn, pose.aim_line),
                 }
             });
             hands.hands.body_camera = Some(m.body.camera_bone());
+            // On a mount the rig is moved onto the point (`MountingRotationFunction`,
+            // the pivot as the weapon's `Weapon_root` holds it), and the mount's
+            // camera follows it from the camera's own object.
+            let mount_pivot = m.mount_view().map(|view| {
+                let pivot = hands.hands.settings.mount.pivot_for(view.side != trp_sim::mounting::Side::Forward, view.on_bipod);
+                let turned = quat_rotate(pose.parent.1, pivot);
+                std::array::from_fn::<f32, 3, _>(|k| pose.parent.0[k] + turned[k])
+            });
+            rig_apart = mount_pivot.map_or([0.0; 3], |pivot| m.mounted_rig_apart(pivot));
+            let camera_apart = {
+                let (container, ribcage) = (m.camera_container(), m.ribcage());
+                let look = quat_mul(quat_axis(1, m.yaw - m.drawn_body_yaw()), quat_axis(0, m.pitch));
+                quat_rotate([-look[0], -look[1], -look[2], look[3]], std::array::from_fn(|k| container[k] - ribcage[k]))
+            };
+            let rig_shift: [f32; 3] = std::array::from_fn(|k| rig_apart[k] - camera_apart[k]);
+            hands.hands.set_rig_shift(rig_shift);
+            if let (Some(view), Some(pivot)) = (m.mount_view(), mount_pivot) {
+                // The pivot in the rig's frame, as `mounted_rig_apart` takes it.
+                mount_drawn = Some(MountDrawn { point: view.point, pivot, progress: view.progress });
+                shift = Some(rig_shift);
+            }
             // The camera is moved for the character's own eyes only: seen
             // from outside it is left where it last stood
             // (`ThirdPersonStrategy.ApplyCameraTransformations`).
             if !outside {
-                camera = hands.hands.frame(frame.dt, pose.animated, aim);
+                camera = hands.hands.frame_on_clock(frame.dt, arms_dt, pose.animated, aim);
                 // The camera's box is pushed out of whatever it has got into,
                 // and the camera with it: the next frame's easing starts there.
                 if let Some(shape) = &controller.camera_box {
@@ -1237,14 +1827,20 @@ pub fn step(
                     camera.position = hands.hands.push_camera(push);
                 }
             } else {
-                hands.hands.frame_outside();
+                hands.hands.frame_outside(frame.dt);
             }
             elbows = [hands.hands.elbow_shift(true), hands.hands.elbow_shift(false)];
 
             // Last in the frame, as in the game: how deep the weapon would
-            // stick into something. The next physics steps turn it away by
-            // that, and past a limit the sights come down until it is clear.
-            let depth = m.weapon_overlap(&*range, hands.hands.weapon_line());
+            // stick into something (in blind fire from its end point first:
+            // `Hands::measure_overlap`). The next physics steps turn it away
+            // by that, and past a limit the sights come down until it is
+            // clear.
+            // With the left shoulder wanted, from where it puts the weapon;
+            // and its way back's line, 0.2 m further left, tried as well.
+            let left_wanted = m.left_stance().wanted;
+            let (depth, measured) = hands.hands.measure_overlap_shoulder(left_wanted, |line| m.weapon_overlap(&*range, line));
+            let clear_left = !left_wanted || m.weapon_overlap(&*range, hands.hands.shoulder_line(0.2)) <= 0.0;
             hands.hands.set_overlap(depth);
             let run_down = hands.hands.turn_away_value();
             if let Some(firearm) = &mut hands.firearm {
@@ -1255,15 +1851,16 @@ pub fn step(
                 hands.hands.aim_changed_after_frame(aiming, frame.dt);
             }
             controller.overlap = depth;
+            controller.movement.left_stance_overlap(depth, measured, || clear_left, frame.dt);
         }
 
         // What the springs moved is drawn from the frames with a physics
         // step; what the movement and the body moved, from every frame.
         if frame.physics_steps > 0 {
             controller.before = controller.now;
-            controller.now = Sprung { weapon, camera, elbows };
+            controller.now = Sprung { weapon, camera, elbows, shift };
         }
-        controller.stepped.push_back(Stepped { rig: rig_now, ..Stepped::of(&controller.movement) });
+        controller.stepped.push_back(Stepped { rig: rig_now, rig_apart, mount: mount_drawn, ..Stepped::of(&controller.movement) });
         let kept = (controller.pacer.physics_step() / controller.pacer.frame_length()).ceil() as usize + 2;
         while controller.stepped.len() > kept {
             controller.stepped.pop_front();

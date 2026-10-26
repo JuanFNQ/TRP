@@ -11,6 +11,10 @@ use crate::math::{inverse_lerp, lerp};
 /// a start threshold starts (`Stamina.EXHAUSTED_THRESHOLD`; the sprint's
 /// and the jump's `StartThreshold` are the same figure).
 pub const EXHAUSTED: f32 = 15.0;
+/// The melee consumption's start threshold and its pause on the refill
+/// (`Physical`: `Consumptions[Melee]`, `StartThreshold` 10, `Downtime` 0.5).
+const MELEE_START: f32 = 10.0;
+const MELEE_DOWNTIME: f32 = 0.5;
 
 /// A factor by how much the character has eaten or drunk
 /// (`StaminaPolygonalGraph`): 1 on a plateau, sloping away either side.
@@ -68,7 +72,16 @@ pub struct StaminaSettings {
     pub oxygen_restoration: f32,
     pub sprint_drain: f32,
     pub jump_cost: f32,
+    /// What a fast weapon switch costs the arms (`WeaponFastSwitchConsumption`:
+    /// 15 in the install; stamina spec, "A drain").
+    pub fast_switch_cost: f32,
+    /// A melee stroke's speed with the hands exhausted
+    /// (`ExhaustedMeleeSpeed`; 1 otherwise).
+    pub exhausted_melee_speed: f32,
     pub aim_drain: f32,
+    /// The aim's rate with the handheld rangefinder in hand, in place of
+    /// `aim_drain` (`AimRangeFinderDrainRate`; rangefinder spec).
+    pub aim_rangefinder_drain: f32,
     /// By stance class: lying, fully crouched, anything higher.
     pub aim_by_pose: [f32; 3],
     pub restoration_by_pose: [f32; 3],
@@ -112,6 +125,18 @@ pub struct StaminaSettings {
     pub endurance_jump: f32,
     pub endurance_breath: f32,
     pub strength_aim: f32,
+    /// Endurance's two elites: the arms' capacity raised by it
+    /// (`EnduranceHands`, 0.5), and the breath's capacity no longer falling
+    /// with the energy (`EnduranceBreathElite`). 0 and off untrained.
+    pub endurance_hands: f32,
+    pub endurance_breath_elite: bool,
+    /// What stimulators' buffs at work add: to the legs' and the arms'
+    /// capacity (`MaxStamina`, `Physical.CapacityBuff`), and a refill of
+    /// their own a second, the legs and the breath that much and the arms
+    /// half (`StaminaRate`, `RestoreRateBuff`, `Stamina.BuffRestoration`;
+    /// health spec, "Buffs"). Nothing without.
+    pub buff_capacity: f32,
+    pub buff_restoration: f32,
     /// The skills' buffs at level 50, in that order, for `set_skills`.
     skill_buffs: [f32; 5],
 
@@ -136,6 +161,12 @@ pub struct StaminaSettings {
 impl StaminaSettings {
     /// `config` is the `config` section of `globals.json`.
     pub fn new(config: &Json, weight: f32, delta_level: f32) -> Result<Self> {
+        Self::new_carrying(config, weight, delta_level, 1.0)
+    }
+
+    /// As `new`, with the overweight limits times `carry`, the carrying
+    /// factor Strength gives (`settings::WeightLimits`; 1 untrained).
+    pub fn new_carrying(config: &Json, weight: f32, delta_level: f32, carry: f32) -> Result<Self> {
         let s = config.get("Stamina").ok_or_else(|| anyhow!("globals have no Stamina"))?;
         let number = |name: &str| -> Result<f32> {
             s.get(name).and_then(Json::as_f64).map(|f| f as f32).ok_or_else(|| anyhow!("Stamina has no {name}"))
@@ -146,7 +177,7 @@ impl StaminaSettings {
             Ok([part("x")?, part("y")?, part("z")?])
         };
         let range = |name: &str| -> Result<[f32; 2]> { parts(name).map(|v| [v[0], v[1]]) };
-        let within = |name: &str| -> Result<f32> { range(name).map(|r| inverse_lerp(r[0], r[1], weight)) };
+        let within = |name: &str| -> Result<f32> { range(name).map(|r| inverse_lerp(r[0] * carry, r[1] * carry, weight)) };
         Ok(Self {
             capacity: number("Capacity")?,
             restoration: number("BaseRestorationRate")?,
@@ -156,7 +187,10 @@ impl StaminaSettings {
             oxygen_restoration: number("OxygenRestoration")?,
             sprint_drain: number("SprintDrainRate")?,
             jump_cost: number("JumpConsumption")?,
+            fast_switch_cost: number("WeaponFastSwitchConsumption")?,
+            exhausted_melee_speed: number("ExhaustedMeleeSpeed")?,
             aim_drain: number("AimDrainRate")?,
+            aim_rangefinder_drain: number("AimRangeFinderDrainRate")?,
             aim_by_pose: parts("AimConsumptionByPose")?,
             restoration_by_pose: parts("RestorationMultiplierByPose")?,
             overweight_by_pose: parts("OverweightConsumptionByPose")?,
@@ -182,6 +216,10 @@ impl StaminaSettings {
             endurance_jump: 0.0,
             endurance_breath: 0.0,
             strength_aim: 0.0,
+            endurance_hands: 0.0,
+            endurance_breath_elite: false,
+            buff_capacity: 0.0,
+            buff_restoration: 0.0,
             // The buffs' full values are written in the game's code
             // (`SkillManager`), not in the install's data: stamina spec,
             // "Capacity and refill".
@@ -206,6 +244,19 @@ impl StaminaSettings {
         self.endurance_jump = jump * share(endurance);
         self.endurance_breath = breath * share(endurance);
         self.strength_aim = aim * share(strength);
+    }
+
+    /// Sets what the Endurance and Strength skills do to stamina from the
+    /// skills' buffs (`skills::Buffs`), elites and all: the host's way (the
+    /// replay's is `set_skills`, by the levels a recording shows).
+    pub fn set_skill_buffs(&mut self, buffs: &crate::skills::Buffs) {
+        self.endurance_capacity = buffs.endurance_capacity;
+        self.endurance_restoration = buffs.endurance_restoration;
+        self.endurance_jump = buffs.endurance_jump;
+        self.endurance_breath = buffs.endurance_breath;
+        self.strength_aim = buffs.strength_aim;
+        self.endurance_hands = buffs.endurance_hands;
+        self.endurance_breath_elite = buffs.endurance_breath_elite;
     }
 
     /// The Endurance level at which the legs hold `capacity`.
@@ -260,15 +311,16 @@ impl StaminaSettings {
     }
 
     pub fn legs_capacity(&self) -> f32 {
-        (self.capacity * (1.0 + self.endurance_capacity)).max(1.0)
+        (self.capacity * (1.0 + self.endurance_capacity) + self.buff_capacity).max(1.0)
     }
 
     pub fn arms_capacity(&self) -> f32 {
-        self.hands_capacity.max(1.0)
+        (self.hands_capacity * (1.0 + self.endurance_hands) + self.buff_capacity).max(1.0)
     }
 
     pub fn oxygen_capacity(&self) -> f32 {
-        self.oxygen_capacity * (0.5 + 0.5 * self.energy.clamp(0.0, 1.0) * (2.0 * self.endurance_breath + self.health))
+        let energy = if self.endurance_breath_elite { 1.0 } else { self.energy.clamp(0.0, 1.0) };
+        self.oxygen_capacity * (0.5 + 0.5 * energy * (2.0 * self.endurance_breath + self.health))
     }
 }
 
@@ -374,7 +426,7 @@ impl Pool {
 
     /// One frame: the running drains come off, then the refill goes on if
     /// its pause is over. Says whether the pool ran dry.
-    fn work(&mut self, costs: &[(Drain, f32)], refill: f32, dt: f32, now: f32) -> bool {
+    fn work(&mut self, costs: &[(Drain, f32)], refill: f32, buff: f32, dt: f32, now: f32) -> bool {
         let mut total = 0.0;
         let mut pause: Option<f32> = None;
         for (drain, cost) in costs.iter().filter(|(drain, _)| self.runs(*drain)) {
@@ -390,6 +442,11 @@ impl Pool {
         if total > 0.0 {
             self.current = (self.current - total * dt).max(0.0);
             dry = self.current.abs() < 1e-6;
+        }
+        // A stimulator's refill comes first, whether the pool's own is held
+        // off or not (`Stamina.Update`).
+        if self.current < self.capacity && buff != 0.0 {
+            self.current += buff * dt;
         }
         if self.current < self.capacity && now > self.no_refill_until {
             self.current = (self.current + refill * dt).min(self.capacity);
@@ -427,6 +484,13 @@ pub struct Stamina {
     /// keeps").
     aim_cost: Option<f32>,
     aim_taken: (bool, f32),
+    /// The aiming arms' drain multiplier on a mount (`Physical`: 0.85 at a
+    /// side, 0.6 forward, 0.2 forward on the bipod; 1 off a mount), set by
+    /// the movement (`set_aim_drain_by`).
+    aim_drain_by: f32,
+    /// The handheld rangefinder is in hand: the aim at its own rate
+    /// (`Physical`: `HandsController is PortableRangeFinderController`).
+    rangefinder: bool,
     /// The two systems of the features' list this is (`crate::Systems`):
     /// with `drains` off nothing is paid and the pools stay full; with
     /// `holds_back` off (exhaustion) a spent pool holds nothing back.
@@ -457,6 +521,8 @@ impl Stamina {
             spam_until: f32::NEG_INFINITY,
             aim_cost: None,
             aim_taken: (false, 0.0),
+            aim_drain_by: 1.0,
+            rangefinder: false,
             drains: true,
             holds_back: true,
             health_lets_sprint: true,
@@ -482,6 +548,25 @@ impl Stamina {
         }
         // A skill's new level has the cost of aiming worked out again.
         self.aim_cost = None;
+    }
+
+    /// What stimulators' buffs at work add to the legs' and the arms'
+    /// capacity and to the refills (`StaminaSettings::buff_capacity`,
+    /// `buff_restoration`), told every frame; the capacities worked out
+    /// again where they change, as each buff's start and end does in the
+    /// game (`Skills.Endurance.OnLevelUp`).
+    pub fn set_buffs(&mut self, capacity: f32, restoration: f32) {
+        self.settings.buff_restoration = restoration;
+        if capacity != self.settings.buff_capacity {
+            self.settings.buff_capacity = capacity;
+            // The pools keep what they hold, down to a smaller capacity
+            // (`Stamina.Update`): a larger one is filled by refilling.
+            let capacities = [self.settings.legs_capacity(), self.settings.arms_capacity()];
+            for (pool, capacity) in [&mut self.legs, &mut self.arms].into_iter().zip(capacities) {
+                pool.capacity = capacity;
+                pool.current = pool.current.min(capacity);
+            }
+        }
     }
 
     /// Energy, hydration and health as health has them, each a share of its
@@ -634,7 +719,8 @@ impl Stamina {
             },
             // The figure kept, or a fresh one where none is.
             Drain::Aim => self.aim_cost.unwrap_or_else(|| {
-                self.aim_mass.max(0.0).sqrt() * s.aim_drain * s.arms_aim * s.aim_by_pose[self.pose] * (1.0 - s.strength_aim) * s.drain_factor()
+                let rate = if self.rangefinder { s.aim_rangefinder_drain } else { s.aim_drain };
+                self.aim_mass.max(0.0).sqrt() * rate * s.arms_aim * s.aim_by_pose[self.pose] * (1.0 - s.strength_aim) * s.drain_factor() * self.aim_drain_by
             }),
             Drain::OverweightIdle => s.restoration * s.refill_factor(self.pose) + s.overweight_by_pose[self.pose],
             Drain::Crawl => s.prone_cost,
@@ -687,6 +773,76 @@ impl Stamina {
             self.legs.run(Drain::Aim);
             self.oxygen.run(Drain::Aim);
         }
+    }
+
+    /// Whether a melee stroke may start (`Physical.CanMeleeHit`): the melee
+    /// consumption's start threshold, 10, in the legs or else in the hands
+    /// (`Stamina.CanAdd`: more than it).
+    pub fn can_melee(&self) -> bool {
+        !self.holds_back || self.legs.current > MELEE_START || self.arms.current > MELEE_START
+    }
+
+    /// A melee stroke's swing speed (`PhysicalBase.MeleeSpeed`): the stamina
+    /// settings' figure with the hands exhausted, else 1.
+    pub fn melee_speed(&self) -> f32 {
+        if self.arms.exhausted() { self.settings.exhausted_melee_speed } else { 1.0 }
+    }
+
+    /// A melee stroke's cost (`ConsumeAsMelee`, its consumption's charge):
+    /// the knife's expense times one and the overweight, off the hands, the
+    /// legs paying it again whole where the hands could not, and off the
+    /// oxygen; each held from refilling half a second.
+    pub fn melee(&mut self, expense: f32, now: f32) {
+        if expense <= 0.0 {
+            return;
+        }
+        let cost = expense * (1.0 + self.settings.overweight);
+        let (unpaid, spent) = self.arms.charge(cost, Some(MELEE_DOWNTIME), now);
+        let dry = unpaid > 0.0 && self.legs.charge(cost, Some(MELEE_DOWNTIME), now).1;
+        self.oxygen.charge(cost, Some(MELEE_DOWNTIME), now);
+        if spent {
+            self.arms_ran_dry();
+        }
+        if dry {
+            self.legs_ran_dry();
+        }
+    }
+
+    /// A hit by a weapon (`Physical.BulletHit`, the `Wound` consumption):
+    /// `burn` (the round's figure a point times the damage) off the legs at
+    /// once, the refill not paused (`AllowsRestoration`). Stamina spec, "A
+    /// drain". Nothing with the stamina switched off.
+    pub fn wound(&mut self, burn: f32, now: f32) {
+        if !self.drains {
+            return;
+        }
+        if self.legs.charge(burn, None, now).1 {
+            self.legs_ran_dry();
+        }
+    }
+
+    /// A fast weapon switch (`Physical.OnWeaponSwitchFast`, the
+    /// `FastWeaponSwitch` consumption): `fast_switch_cost` over (the
+    /// weapon's class skill level / 50, whole, + 1) off the arms; if the
+    /// arms could not pay it all, the legs pay it all as well; each pool's
+    /// refill paused as a cost that does not let it refill (no downtime of
+    /// its own). Returns what the arms lacked (`FastWeaponSwitchStaminaLack`),
+    /// which the draw's hand shake goes by. PROVISIONAL (with `wound`): read
+    /// from code, no recording has a quick draw or a hit the player lives.
+    pub fn fast_switch(&mut self, level: u32, now: f32) -> f32 {
+        if !self.drains {
+            return 0.0;
+        }
+        let cost = self.settings.fast_switch_cost / (level / 50 + 1) as f32;
+        let lack = (cost - self.arms.current).max(0.0);
+        let (unpaid, spent) = self.arms.charge(cost, Some(0.0), now);
+        if spent {
+            self.arms_ran_dry();
+        }
+        if unpaid > 0.0 && self.legs.charge(cost, Some(0.0), now).1 {
+            self.legs_ran_dry();
+        }
+        lack
     }
 
     /// A jump begun (`Physical.OnJump`).
@@ -799,6 +955,25 @@ impl Stamina {
         if self.settings.legs_deepen_breath { self.oxygen.level().min(self.legs.level()) } else { self.oxygen.level() }
     }
 
+    /// A mount's multiplier on the aiming arms' drain (mounting spec, "The
+    /// weapon's motion while mounted"). The game works the cost out again as
+    /// a mount is entered and left (`RecalculateErgonomic`, `Physical.Aim`).
+    pub fn set_aim_drain_by(&mut self, by: f32) {
+        if self.aim_drain_by != by {
+            self.aim_drain_by = by;
+            self.aim_cost = None;
+        }
+    }
+
+    /// The handheld rangefinder in hand or not: the aim's rate its own
+    /// (`AimRangeFinderDrainRate`) while it is.
+    pub fn set_rangefinder(&mut self, on: bool) {
+        if self.rangefinder != on {
+            self.rangefinder = on;
+            self.aim_cost = None;
+        }
+    }
+
     /// The sights up or down (`Physical.Aim`). The game calls this when
     /// the sights change and when the weapon is taken stock of again; a
     /// host may call it every frame, and only those two changes have the
@@ -840,13 +1015,14 @@ impl Stamina {
             s.hands_restoration * s.refill_factor(self.pose),
             s.oxygen_restoration * (1.0 + s.endurance_restoration),
         ];
-        if self.legs.work(&costs, refills[0], dt, now) {
+        let buff = s.buff_restoration;
+        if self.legs.work(&costs, refills[0], buff, dt, now) {
             self.legs_ran_dry();
         }
-        if self.arms.work(&costs, refills[1], dt, now) {
+        if self.arms.work(&costs, refills[1], buff / 2.0, dt, now) {
             self.arms_ran_dry();
         }
-        if self.oxygen.work(&costs, refills[2], dt, now) && self.holds_back {
+        if self.oxygen.work(&costs, refills[2], buff, dt, now) && self.holds_back {
             // Out of oxygen, the breath is let go.
             self.oxygen.stop(Drain::HoldBreath);
         }
@@ -882,7 +1058,10 @@ mod tests {
             oxygen_restoration: 4.0,
             sprint_drain: 4.0,
             jump_cost: 14.0,
+            fast_switch_cost: 15.0,
+            exhausted_melee_speed: 0.65,
             aim_drain: 1.0,
+            aim_rangefinder_drain: 1.0,
             aim_by_pose: [0.15, 0.75, 1.0],
             restoration_by_pose: [1.45, 1.25, 1.0],
             overweight_by_pose: [-3.0, -2.0, 0.0],
@@ -908,6 +1087,10 @@ mod tests {
             endurance_jump: 0.0,
             endurance_breath: 0.0,
             strength_aim: 0.0,
+            endurance_hands: 0.0,
+            endurance_breath_elite: false,
+            buff_capacity: 0.0,
+            buff_restoration: 0.0,
             skill_buffs: [0.5, 0.5, 0.3, 1.0, 0.2],
             energy: 1.0,
             hydration: 1.0,
@@ -926,6 +1109,34 @@ mod tests {
             *now += DT;
             stamina.update(DT, *now);
         }
+    }
+
+    #[test]
+    fn a_wound_burns_the_legs_and_lets_them_refill() {
+        let mut stamina = Stamina::new(settings());
+        let mut now = 10.0;
+        stamina.wound(30.0, now);
+        assert!((stamina.legs.current - 70.0).abs() < 1e-4, "{}", stamina.legs.current);
+        // No pause: the refill goes on at once, 4.5 a second.
+        run(&mut stamina, &mut now, 1.0);
+        assert!((stamina.legs.current - 74.5).abs() < 0.05, "{}", stamina.legs.current);
+        assert_eq!(stamina.arms.current, 80.0, "the arms pay nothing");
+    }
+
+    #[test]
+    fn a_fast_switch_costs_the_arms_and_the_legs_what_the_arms_lack() {
+        let mut stamina = Stamina::new(settings());
+        let now = 10.0;
+        assert_eq!(stamina.fast_switch(0, now), 0.0);
+        assert!((stamina.arms.current - 65.0).abs() < 1e-4 && stamina.legs.current == 100.0);
+        // At the class skill's level 50, half.
+        stamina.fast_switch(50, now);
+        assert!((stamina.arms.current - 57.5).abs() < 1e-4);
+        // Arms with less than the cost: what they lack, and the legs pay it all.
+        stamina.arms.current = 5.0;
+        let lack = stamina.fast_switch(0, now);
+        assert!((lack - 10.0).abs() < 1e-4 && stamina.arms.current == 0.0, "{lack}");
+        assert!((stamina.legs.current - 85.0).abs() < 1e-4, "{}", stamina.legs.current);
     }
 
     #[test]
@@ -1044,6 +1255,25 @@ mod tests {
         let legs = stamina.legs.current;
         run(&mut stamina, &mut now, 3.0);
         assert!(stamina.legs.current > legs && stamina.arms.current > 0.0);
+    }
+
+    #[test]
+    fn the_rangefinder_aims_at_its_own_rate() {
+        let mut settings = settings();
+        settings.aim_rangefinder_drain = 0.55;
+        let mut stamina = Stamina::new(settings);
+        // Its aim weighs 1 (`Physical.Aim(1)`), at its own rate.
+        stamina.aim_mass = 1.0;
+        stamina.set_rangefinder(true);
+        let mut now = 10.0;
+        stamina.aim(true);
+        run(&mut stamina, &mut now, 10.0);
+        assert!((stamina.arms.current - 74.5).abs() < 0.05, "0.55 a second standing, from 80: {}", stamina.arms.current);
+        // Put away, the rate is the weapons' again, taken afresh.
+        stamina.set_rangefinder(false);
+        let before = stamina.arms.current;
+        run(&mut stamina, &mut now, 1.0);
+        assert!((before - stamina.arms.current - 1.0).abs() < 1e-3, "1 a second: {}", before - stamina.arms.current);
     }
 
     #[test]

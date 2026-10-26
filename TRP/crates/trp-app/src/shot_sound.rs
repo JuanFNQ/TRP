@@ -25,8 +25,8 @@
 //!   outside from the character's place 1.4 m up, after the sound's travel
 //!   (340.29 m/s), falling as one over the distance past 1 m and panned as
 //!   the hands' sounds (`PROVISIONAL`, as theirs); at the bank's volume and
-//!   the overall volume, the `Gunshots` group adding nothing
-//!   (`PROVISIONAL`: not read).
+//!   the overall volume, through the `Gunshots` group, read at 0.40.0: under
+//!   `Guns`, `World`, `InGame` and `Master`, all 0 dB (`gunshots_gain`).
 //!
 //! Not built: the supersonic crack heard from outside (`FireSonicSound`),
 //! occlusion, the indoor clips (the range has no indoors), the burst of
@@ -287,7 +287,7 @@ impl Player {
             } else {
                 Voice::placed(clip, [heard.gains[0] * gain, heard.gains[1] * gain], queue.pitch.clone())
             };
-            mixer.0.add(voice.at_frame(starts, looping, cut.clone()));
+            mixer.0.add_to(crate::ui_sound::Group::Guns, voice.at_frame(starts, looping, cut.clone()));
         }
         queue.cuts.push(cut);
         log.push(format!("from {start:.4} s, {}, share {:.3}", if looping { "looping".to_owned() } else { format!("{seconds:.4} s") }, self.balance));

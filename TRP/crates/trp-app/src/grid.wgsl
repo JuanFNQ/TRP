@@ -13,6 +13,7 @@
     forward_io::{VertexOutput, FragmentOutput},
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
+    decal::clustered::apply_decals,
 }
 
 struct GridLines {
@@ -70,6 +71,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let base = pbr_input.material.base_color;
     pbr_input.material.base_color = vec4<f32>(mix(base.rgb, grid.tone.rgb, lined), base.a);
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
+
+    // The decals over what the surface is (the game's deferred decals over
+    // its G-buffer: `decal_view`), as Bevy's own fragment has them.
+    apply_decals(&pbr_input);
 
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);

@@ -22,6 +22,13 @@ use crate::settings::MovementSettings;
 use crate::stamina::Stamina;
 use crate::vaulting::{Move, Obstacle, Standing, Vaulting};
 
+mod left_stance;
+mod mount;
+pub use mount::mounted_apart;
+pub mod pom;
+mod room;
+pub mod slope;
+
 const MAX_TILT: f32 = 5.0;
 /// Lean units per second at a step multiplier of 1.
 const TILT_STEP: f32 = 25.0;
@@ -83,6 +90,8 @@ const PITCH_LIMIT_SPEED: f32 = 5.0;
 /// (0.0001 rad); below it the angle comes back as nearly a full turn.
 const ENGINE_ANGLE_ALLOWANCE: f32 = 0.005_729_578;
 
+// ==== The movement states and the input ====
+
 /// The movement states. Which one is current follows the body's animator:
 /// each of its states names one of these, and entering that animator state
 /// enters this one.
@@ -122,10 +131,15 @@ pub enum State {
     Approach,
     /// Kicking a door (the game's `BreachDoor`).
     Breach,
+    /// Blind fire, over the top or to the right, on the way in, held, or
+    /// on the way out (`docs/spec/blind-fire.md`): a standing state for
+    /// all its frames' work.
+    BlindFire,
 }
 
 impl State {
-    const ALL: [State; 18] = [
+    const ALL: [State; 19] = [
+        State::BlindFire,
         State::Approach,
         State::Breach,
         State::Sidestep,
@@ -167,6 +181,7 @@ impl State {
             State::VaultLanding => movement_state::VAULTING_LANDING,
             State::Approach => movement_state::APPROACH,
             State::Breach => movement_state::BREACH_DOOR,
+            State::BlindFire => movement_state::BLIND_FIRE,
         }
     }
 
@@ -175,13 +190,29 @@ impl State {
     }
 
     /// The states the game builds on its standing state: they take
-    /// movement keys and sprint commands as standing does.
+    /// movement keys and sprint commands as standing does. (Blind fire's
+    /// is one: the keys never reach it while its figure is set.)
     fn stands(self) -> bool {
         matches!(
             self,
-            State::Idle | State::ToProne | State::ProneIdle | State::FromProne | State::Sidestep | State::Roll
+            State::Idle | State::ToProne | State::ProneIdle | State::FromProne | State::Sidestep | State::Roll | State::BlindFire
         )
     }
+
+    /// The states that pass blind fire's side on to the gate
+    /// (`IdlePlayerState.BlindFire`): standing, blind fire's own, the step
+    /// aside, going down and getting up. Lying still and rolled over have
+    /// their own, which passes 0 (`PronePlayerState`).
+    fn takes_blind_fire(self) -> bool {
+        matches!(self, State::Idle | State::BlindFire | State::Sidestep | State::ToProne | State::FromProne)
+    }
+}
+
+/// Blind fire's side by the side its animator state names (`Entered::
+/// side`, 1 for the game's `Right`): -1 to the right, 1 over the top
+/// (`BlindeFireState`: anything but `Right` is 1).
+fn blind_side(named: f32) -> f32 {
+    if named > 0.0 { -1.0 } else { 1.0 }
 }
 
 /// The two lean keys as an input has them, the left and the right.
@@ -278,6 +309,12 @@ pub struct Input {
     /// at the weapon (`Firearm::occupied`). Only an obstacle low enough to
     /// leave the hands on the weapon is then vaulted or climbed.
     pub weapon_occupied: bool,
+    /// Medicine or food in hand, or a grenade's throw held or under way
+    /// (`CheckMedsAndFoodOperation`, `CheckGrenadeOperation`): only an
+    /// obstacle low enough to leave the hands free is then vaulted or
+    /// climbed, and nothing with no move measured yet (vaulting spec,
+    /// "What a try does").
+    pub hands_limit_vault: bool,
     /// Take `look_delta` as it is, without the movement state's own
     /// slowing and limit on the view's turning: for a host that follows a
     /// view recorded from the game, which has been through them already.
@@ -304,7 +341,39 @@ pub struct Input {
     /// sprinting character whose camera is far down looks no further
     /// down. A host with no camera leaves it at nothing.
     pub camera_pitch: f32,
+    /// Blind fire's commands (`docs/spec/blind-fire.md`, "The keys"):
+    /// `ToggleBlindAbove` (1) or `ToggleBlindRight` (-1) given this frame,
+    /// 0 neither; and `BlindShootEnd`, its keys come up. Each is carried
+    /// out once, before the movement keys.
+    pub blind_toggle: i32,
+    pub blind_end: bool,
+    /// What the thing in hand says of blind fire (`MovementContext.
+    /// SetBlindFire`): whether it is a firearm (anything else puts blind
+    /// fire to 0), and whether that firearm may start it now
+    /// (`Firearm::can_set_blind_fire`).
+    pub blind_firearm: bool,
+    pub blind_may_start: bool,
+    /// The mount's command (`ECommand.WeaponMounting`, `V`) given this
+    /// frame, and whether the thing in hand may mount (`Player.TryMountWeapon`'s
+    /// part of the weapon's: a firearm whose template is mountable, no
+    /// stationary weapon, no reload, draw, gesture or put-away under way;
+    /// `Firearm::may_mount`). Mounting spec, "Who may ask".
+    pub mount: bool,
+    pub mount_may: bool,
+    /// How deep the weapon sticks into something just now, in metres
+    /// (`MovementContext.OverlapDepth`): a forward mount's lower pitch limit
+    /// goes by it.
+    pub overlap_depth: f32,
+    /// The left shoulder's command (`ECommand.LeftStanceToggle`, `Mouse4`)
+    /// given this frame, and whether the firearm in hand's operation takes
+    /// it now (`FirearmController.ChangeLeftStance`, the operation's
+    /// `ToggleLeftStance`: at rest or in a look; `Firearm::may_toggle_left_stance`).
+    /// Left-shoulder spec, "The key".
+    pub left_stance: bool,
+    pub left_stance_may: bool,
 }
+
+// ==== The capsule, the world trait, the stopwatch, flat ground ====
 
 /// The upright space the character's collision takes up over its feet, in
 /// metres: from `underside` to `top`. Standing, crouched and lying the
@@ -342,6 +411,27 @@ pub trait World {
     /// otherwise; a lying body is laid to it.
     fn ground_normal(&self, _x: f32, _z: f32) -> [f32; 3] {
         [0.0, 1.0, 0.0]
+    }
+
+    /// Of the ways out of the ground that the character's capsule, its feet
+    /// at `at`, was last pushed along, the one that points most upward, of
+    /// those within 85 degrees of straight up
+    /// (`SimpleCharacterController.surfaceNormalAccordingToCapsule`):
+    /// straight up if the capsule was in nothing, nothing at all (all
+    /// three zero) if it was in walls alone. The slope's rules take it
+    /// where the ray under the axis finds no ground, or ground too steep
+    /// to stand on (movement spec, "Slopes and sliding"). Left alone: the
+    /// ground's normal under the axis where the feet are on the ground,
+    /// straight up where they are not.
+    fn contact_normal(&self, at: [f32; 3], capsule: Capsule) -> [f32; 3] {
+        /// Within this of the ground the feet are on it: rounding only,
+        /// the simulation puts the feet on the ground exactly.
+        const ON: f32 = 1e-4;
+        if at[1] + capsule.underside - self.footing(at) <= ON {
+            self.ground_normal(at[0], at[2])
+        } else {
+            [0.0, 1.0, 0.0]
+        }
     }
 
     /// How far along the line from `from` to `to` the first solid thing
@@ -436,6 +526,76 @@ pub trait World {
         false
     }
 
+    /// What a ray from `from` along `direction` (a unit vector) meets first
+    /// within `length`, on the world's `layer` (`Physics.Raycast`): the
+    /// mount's search and its target place (`crate::mounting`). A ray that
+    /// starts inside something does not meet it. Left alone, only the
+    /// ground: where `line` first goes under it, with its normal there.
+    fn ray(&self, from: [f32; 3], direction: [f32; 3], length: f32, _layer: crate::mounting::Layer) -> Option<crate::mounting::Hit> {
+        let to: [f32; 3] = std::array::from_fn(|k| from[k] + direction[k] * length);
+        let distance = self.line(from, to)?;
+        let point: [f32; 3] = std::array::from_fn(|k| from[k] + direction[k] * distance);
+        Some(crate::mounting::Hit { distance, point, normal: self.ground_normal(point[0], point[2]) })
+    }
+
+    /// Whether a sphere is clear of everything on `layer`
+    /// (`Physics.CheckSphere`): the prone mount's room ahead. Left alone,
+    /// only the ground under its middle counts.
+    fn sphere_clear(&self, centre: [f32; 3], radius: f32, _layer: crate::mounting::Layer) -> bool {
+        centre[1] - radius >= self.ground_height(centre[0], centre[2])
+    }
+
+    /// Whether a box swept from `from` along `direction` (a unit vector)
+    /// for `length` meets anything on `layer` (`Physics.BoxCast`): `half` its
+    /// half-width, half-height and half-depth, turned to `yaw` about the
+    /// upright. The mount's way to its target place. Left alone nothing
+    /// is met: the box rides above the step height, over the ground.
+    fn box_sweep(&self, _from: [f32; 3], _half: [f32; 3], _yaw: f32, _direction: [f32; 3], _length: f32, _layer: crate::mounting::Layer) -> bool {
+        false
+    }
+
+    /// Whether a box reaches into anything solid (`Physics.CheckBox`,
+    /// `OverlapBox`): `centre` its middle, `half` its half-width,
+    /// half-height and half-depth along its own axes, `turn` how those
+    /// axes are turned. The refusals of a step aside, a roll, lying down
+    /// and standing up ask it (movement spec, "Room to move"); the game's
+    /// water and other characters count where a host has them. Left alone,
+    /// only the ground: a corner of the box under it.
+    fn box_overlaps(&self, centre: [f32; 3], half: [f32; 3], turn: [f32; 4]) -> bool {
+        (0..8).any(|corner| {
+            let reach = quat_rotate(turn, std::array::from_fn(|k| if corner >> k & 1 == 0 { half[k] } else { -half[k] }));
+            let at: [f32; 3] = std::array::from_fn(|k| centre[k] + reach[k]);
+            at[1] < self.ground_height(at[0], at[2])
+        })
+    }
+
+    /// How far a sphere of `radius` swept from `from` along `direction` (a
+    /// unit vector) goes before it meets something solid, within `length`
+    /// (`Physics.SphereCast`); what it starts inside is not met. Lying
+    /// down asks it for room ahead and behind. Left alone, only the ground
+    /// under its middle, felt every centimetre.
+    fn sphere_cast(&self, from: [f32; 3], radius: f32, direction: [f32; 3], length: f32) -> Option<f32> {
+        /// How finely the way is felt, in metres.
+        const STEP: f32 = 0.01;
+        let touches = |along: f32| {
+            let at: [f32; 3] = std::array::from_fn(|k| from[k] + direction[k] * along);
+            at[1] - radius < self.ground_height(at[0], at[2])
+        };
+        if touches(0.0) {
+            return None;
+        }
+        let steps = (length / STEP).ceil().max(1.0) as usize;
+        (1..=steps).map(|step| length * step as f32 / steps as f32).find(|along| touches(*along))
+    }
+
+    /// Whether the character's capsule, its feet at `at` moved by `shift`
+    /// and turned by `turn` degrees about its axis, would collide
+    /// (`MovementContext.RotationOverlapPrediction`): a mounted turn outward
+    /// is refused then. Left alone nothing is in the way.
+    fn turn_blocked(&self, _at: [f32; 3], _shift: [f32; 3], _turn: f32, _capsule: Capsule) -> bool {
+        false
+    }
+
     /// How far a box has to move to be clear of everything solid: for each
     /// thing it is in, the shortest move that takes it out of that thing,
     /// lengthened by `margin`, all added up. This is the game's push of
@@ -445,6 +605,28 @@ pub trait World {
     /// gives its own. Left alone, only the ground counts: the box is
     /// lifted along the ground's normal by as far as its lowest corner is
     /// under it.
+    /// How far a capsule (the two ends of its middle line, and its radius)
+    /// has to move to be clear of everything solid: for each thing it is
+    /// in, the shortest move that takes it out, lengthened by a millimetre
+    /// (`pom::MARGIN`), all added up (`ColliderExtrusion.
+    /// CalculateDepenetration`). The head's push out of walls asks it (movement
+    /// spec, "The head's push out of walls"); the low-poly world, doors, the
+    /// terrain and other characters count. Left alone, only the ground:
+    /// along its normal by as far as the capsule's lowest point is under it.
+    fn capsule_push(&self, ends: [[f32; 3]; 2], radius: f32) -> [f32; 3] {
+        let deepest = ends
+            .iter()
+            .map(|end| {
+                let normal = self.ground_normal(end[0], end[2]);
+                ((self.ground_height(end[0], end[2]) - end[1]) * normal[1] + radius, normal)
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        match deepest {
+            Some((under, normal)) if under > 0.0 => normal.map(|n| n * (under + pom::MARGIN)),
+            _ => [0.0; 3],
+        }
+    }
+
     fn push_out(&self, centre: [f32; 3], half: [f32; 3], turn: [f32; 4], margin: f32) -> [f32; 3] {
         let mut deepest: Option<(f32, [f32; 3])> = None;
         for corner in 0..8 {
@@ -506,6 +688,8 @@ fn sign(v: f32) -> f32 {
 fn is_zero(v: [f32; 2]) -> bool {
     v[0] == 0.0 && v[1] == 0.0
 }
+
+// ==== The data read from the install: move, jump, step, vault ====
 
 #[derive(Clone, Default)]
 struct MoveData {
@@ -633,6 +817,8 @@ struct VaultData {
     capsule: [f32; 2],
 }
 
+// ==== Movement: the simulation's state ====
+
 #[derive(Clone)]
 pub struct Movement {
     pub settings: MovementSettings,
@@ -669,11 +855,18 @@ pub struct Movement {
     /// to the character"), as a host's health system sets it
     /// (`set_conditions`): nothing is held back unless one does.
     pub conditions: crate::health::Conditions,
-    /// The speed limits health and barbed wire put on the character
-    /// (`ESpeedLimit.HealthCondition`, `ESpeedLimit.BarbedWire`), and the
-    /// same as the frame's upkeep has worked them in.
-    held_limits: [Option<f32>; 2],
-    held_limits_in_effect: [Option<f32>; 2],
+    /// The speed limits health, barbed wire and the armour worn put on the
+    /// character (`ESpeedLimit.HealthCondition`, `BarbedWire`, `Armor`), and
+    /// the same as the frame's upkeep has worked them in.
+    held_limits: [Option<f32>; 3],
+    held_limits_in_effect: [Option<f32>; 3],
+    /// The cap a hit by a weapon leaves on the selected speed, and the time
+    /// on the frame clock it ends (`ESpeedLimit.Shot`); the same as worked
+    /// in; and the stamina burnt by the frame's hits so far, with the
+    /// frame it was (movement spec, "Speed limits").
+    shot_limit: Option<(f32, f32)>,
+    shot_limit_in_effect: Option<f32>,
+    hits_burnt: (u64, f32),
     /// What happened in the frame that health takes (`take_moved`).
     moved: Vec<Moved>,
     /// How far the sprint under way has gone (`Pedometer`).
@@ -797,6 +990,28 @@ pub struct Movement {
     /// set it decides; nothing pulls a character down that is within it.
     pub ground_check: f32,
     pub freefall_time: f32,
+    /// Which way the ground under the character faces this frame
+    /// (`SurfaceNormal`), its upward part over the last five frames, and
+    /// the pull of ground too steep to stand on (`Slope`; movement spec,
+    /// "Slopes and sliding").
+    pub surface: [f32; 3],
+    pub normal_history: slope::NormalHistory,
+    pub slope: [f32; 3],
+    /// Crouched in a sprint: the sprint is let go of from the next frame
+    /// on, whatever the keys, until its state is left
+    /// (`SprintPlayerState._slide`).
+    slide: bool,
+    /// Going down against something, the push back as last eased
+    /// (`Transit2ProneState._depenetration`, kept from one going down to
+    /// the next), and the view's yaw before this frame's turn, which such
+    /// a push puts back (`RestorePreviousYaw`; movement spec, "Room to move").
+    down_push: f32,
+    yaw_before_turn: f32,
+    /// Whether the head's lying capsule is the one in use (`SetPOMCollider`:
+    /// from going down until getting up is over), and the head's push as
+    /// the last limit found it (movement spec, "The head's push out of walls").
+    head_lying: bool,
+    head_push: [f32; 3],
     last_blend_velocity: [f32; 3],
     velocity_before_limit: [f32; 3],
     yaw_deltas: VecDeque<f32>,
@@ -844,6 +1059,20 @@ pub struct Movement {
     sprint_flag: bool,
     jump_flag: bool,
     landing_flag: bool,
+    /// Blind fire (`docs/spec/blind-fire.md`): the movement's own figure
+    /// (`MovementContext.BlindFire`: 1 over the top, -1 to the right, 0
+    /// none); what the body's animator is told of it (`BlindFire`, which the
+    /// lean alone puts to 0); the float the state works out
+    /// (`BlindFireFloat`); the part and the side of the blind-fire state
+    /// last entered (its side 1 over the top, -1 to the right); and the
+    /// figure as last taken, for the host to tell the weapon and its motion
+    /// (`take_blind_fire`).
+    blind_fire: i32,
+    blind_shown: f32,
+    blind_float: f32,
+    blind_part: i32,
+    blind_side: f32,
+    blind_told: Option<i32>,
     /// How far the animator moved the body this step, in world axes.
     animated_motion: [f32; 3],
     /// For the landing state: seconds without input, and whether the
@@ -877,6 +1106,10 @@ pub struct Movement {
     /// the moves' clips; and the move in hand.
     pub vaulting: Vaulting,
     vault_time: f32,
+    /// The surfaces the vault's sounds go by (footsteps spec, "The vault's
+    /// sounds"): the obstacle's and the terrain's, each as last found
+    /// (`CurrentObstacleSurface`, `CurrentTerrainSurface`: concrete to begin).
+    vault_surfaces: [u8; 2],
     /// The vault key as last seen, and whether its per-frame try is
     /// switched on. Every change of the key switches it over, and the
     /// inventory opening or shutting switches it off, so after a key held
@@ -938,7 +1171,44 @@ pub struct Movement {
     /// have been down for it since it opened.
     body_inventory: [bool; 2],
     inventory_reached: bool,
+    /// Mounting (`docs/spec/mounting.md`): its figures; the weapon in hand's
+    /// mount figures and whether its bipod is out, as the host last said
+    /// (`set_mount_weapon`); a search under way; the mount's own state while
+    /// it overrides the movement state; whether the animator's root motion
+    /// is ignored (`IgnoreDeltaMovement`, from a mount's approach until its
+    /// state is taken off); the lean the weapon's motion reads
+    /// (`ProceduralWeaponAnimation.SmoothedTilt`); and what it has to tell.
+    pub mount_settings: crate::mounting::Settings,
+    mount_weapon: Option<(crate::mounting::WeaponMount, bool)>,
+    mount_search: Option<crate::mounting::Search>,
+    mount_search_fresh: bool,
+    mount: Option<mount::Mounted>,
+    /// The bipod's gesture asked for and its mark not yet passed.
+    toggling_bipod: Option<Interaction>,
+    ignore_root_motion: bool,
+    weapon_tilt: f32,
+    mount_events: Vec<crate::mounting::MountEvent>,
+    /// The data of the last mount entered, kept after it (for a report).
+    mount_last: Option<crate::mounting::Data>,
+    /// The rig's turn as the frame began (`rig_frame`'s, the frame before's
+    /// view): what the mount turns its pivot by (`mounted_rig_apart`).
+    rig_turn_before: [f32; 4],
+    /// The left shoulder (`docs/spec/left-shoulder.md`): its controller;
+    /// whether a firearm is in hand, as the frame's keys last said
+    /// (`HasFirearmInHands`, which its putting back asks); whether a wall
+    /// has taken it off (`FirearmController._disableLeftStanceByOverlap`);
+    /// and whether the body played an animated interaction last frame.
+    left_stance: crate::left_stance::LeftStance,
+    left_stance_firearm: bool,
+    left_stance_overlap: bool,
+    left_stance_interaction: bool,
+    /// The wall's wait (`float_7`) and whether the inventory was open on the
+    /// last frame it was looked at (`bool_12`).
+    left_stance_overlap_clock: f32,
+    left_stance_inventory_was: bool,
 }
+
+// ==== What a step reports: interactions, moves, actions, kicks, approaches ====
 
 /// A thing of the world that is worked with something in the hand, a key
 /// or a card, or that is kicked in: the game then holds the character at
@@ -998,6 +1268,10 @@ pub enum Acted {
     /// come to the mark its state has for that, and the thing itself now
     /// leaves the inventory (`OnBackpackDrop`).
     BackpackDropped,
+    /// The bipod's gesture has come to its toggle's mark, or is gone
+    /// without it (`OnBipodToggle`, `FastForward`): the weapon's toggle is
+    /// over (`Firearm::bipod_toggled`).
+    BipodToggled,
 }
 
 /// A door being kicked (`MovementContext.StartDoorBreak`): whether the
@@ -1075,6 +1349,8 @@ const PICK_UP_CROUCH_PITCH: f32 = 60.0;
 /// metres (`InteractionContextHelper.OnContainerOpen`).
 const SEARCH_REACH: f32 = 0.25;
 
+// ==== The step itself (impl Movement) ====
+
 impl Movement {
     /// The character's carried weight changes, as when something is put
     /// on or taken off: the inertia, the speed limits and the stamina's
@@ -1096,6 +1372,27 @@ impl Movement {
         Ok(())
     }
 
+    /// Strength's level or its lift changes (`PhysicalBase.
+    /// UpdateWeightLimits`, which the game runs on Strength's level up as
+    /// on a change of weight): the inertia and every overweight share
+    /// worked out again for the weight carried, the pools and the skills'
+    /// stamina buffs kept.
+    pub fn set_weight_limits(
+        &mut self,
+        hard: &trp_data::hard_settings::HardSettings,
+        config: &serde_json::Value,
+        limits: crate::settings::WeightLimits,
+    ) -> anyhow::Result<()> {
+        if limits == self.settings.limits {
+            return Ok(());
+        }
+        let mut settings = self.settings.relimited(hard, config, self.settings.weight, limits)?;
+        self.stamina.reweigh(settings.stamina.overweight, settings.stamina.walk_overweight);
+        settings.stamina = self.stamina.settings.clone();
+        self.settings = settings;
+        Ok(())
+    }
+
     pub fn new(settings: MovementSettings, body: Body) -> Self {
         let stamina = Stamina::new(settings.stamina.clone());
         let speed_memo = settings.max_speed;
@@ -1111,8 +1408,11 @@ impl Movement {
             landing_limit_in_effect: None,
             limits_changed: false,
             conditions: crate::health::Conditions::default(),
-            held_limits: [None; 2],
-            held_limits_in_effect: [None; 2],
+            held_limits: [None; 3],
+            held_limits_in_effect: [None; 3],
+            shot_limit: None,
+            shot_limit_in_effect: None,
+            hits_burnt: (0, 0.0),
             moved: Vec::new(),
             sprint_distance: 0.0,
             frame_clock: 0.0,
@@ -1190,6 +1490,14 @@ impl Movement {
             grounded: true,
             ground_check: GROUND_CHECK,
             freefall_time: 0.0,
+            surface: [0.0, 1.0, 0.0],
+            normal_history: slope::NormalHistory::default(),
+            slope: [0.0; 3],
+            slide: false,
+            down_push: 0.0,
+            yaw_before_turn: 0.0,
+            head_lying: false,
+            head_push: [0.0; 3],
             last_blend_velocity: [0.0; 3],
             velocity_before_limit: [0.0; 3],
             yaw_deltas: VecDeque::new(),
@@ -1211,6 +1519,12 @@ impl Movement {
             sprint_flag: false,
             jump_flag: false,
             landing_flag: false,
+            blind_fire: 0,
+            blind_shown: 0.0,
+            blind_float: 0.0,
+            blind_part: part::IN,
+            blind_side: 1.0,
+            blind_told: None,
             animated_motion: [0.0; 3],
             landing_idle_time: 0.0,
             landing_still: false,
@@ -1225,6 +1539,7 @@ impl Movement {
             sounds,
             vaulting: Vaulting::default(),
             vault_time: 0.0,
+            vault_surfaces: [crate::steps::CONCRETE; 2],
             vault_key: false,
             vault_on: false,
             do_vault: false,
@@ -1258,6 +1573,23 @@ impl Movement {
             hands_idle: true,
             body_inventory: [false; 2],
             inventory_reached: false,
+            mount_settings: crate::mounting::Settings::default(),
+            mount_weapon: None,
+            mount_search: None,
+            mount_search_fresh: false,
+            mount: None,
+            toggling_bipod: None,
+            ignore_root_motion: false,
+            weapon_tilt: 0.0,
+            mount_events: Vec::new(),
+            mount_last: None,
+            rig_turn_before: [0.0, 0.0, 0.0, 1.0],
+            left_stance: crate::left_stance::LeftStance::default(),
+            left_stance_firearm: false,
+            left_stance_overlap: false,
+            left_stance_interaction: false,
+            left_stance_overlap_clock: 0.0,
+            left_stance_inventory_was: false,
         }
     }
 
@@ -1272,7 +1604,7 @@ impl Movement {
         if let Some(landing) = self.landing_limit_in_effect {
             limit = limit.min(landing);
         }
-        for held in self.held_limits_in_effect.into_iter().flatten() {
+        for held in self.held_limits_in_effect.into_iter().chain([self.shot_limit_in_effect]).flatten() {
             limit = limit.min(held);
         }
         self.character_speed.clamp(0.0, limit)
@@ -1289,7 +1621,7 @@ impl Movement {
         if let Some(landing) = self.landing_limit_in_effect {
             limit = limit.min(landing);
         }
-        for held in self.held_limits_in_effect.into_iter().flatten() {
+        for held in self.held_limits_in_effect.into_iter().chain([self.shot_limit_in_effect]).flatten() {
             limit = limit.min(held);
         }
         limit.min(self.settings.max_speed)
@@ -1338,6 +1670,55 @@ impl Movement {
         }
     }
 
+    /// What the armour and the backpack worn take off the speed, in percent
+    /// (`armor::speed_penalty`; `Player.UpdatePenalties`, `ESpeedLimit.Armor`):
+    /// below nought, the speed is held to that share of the top while it
+    /// is (the top as it stands when this is told; the game works it out
+    /// whenever what is worn changes).
+    pub fn set_armour_penalty(&mut self, percent: f32) {
+        let limit = (percent < 0.0).then(|| (100.0 + percent) / 100.0 * self.settings.max_speed);
+        if limit != self.held_limits[2] {
+            self.held_limits[2] = limit;
+            self.limits_changed = true;
+        }
+    }
+
+    /// A hit taken, as its movement half (`Player.ApplyHitDebuff`, which
+    /// every hit given to the player calls): `burn` the stamina it burns (the
+    /// round's figure a point times the damage: `DamageInfo.StaminaBurnRate
+    /// * Damage`). A weapon's hit (a bullet, a blow, a blunt one) caps the
+    /// selected speed for 0.66 s, by the stamina burnt by the frame's hits
+    /// together: none under 10, down to standing still at 55
+    /// (`InverseLerp(55, 10, burnt)`; a cap already running keeps the lower
+    /// and the later end), its burn comes off the legs' stamina at once
+    /// (`Physical.BulletHit`; stamina spec, "A drain"), and a leg's hit
+    /// without a painkiller ends a sprint (`Physical.Sprint(false)`).
+    /// Movement spec, "Speed limits".
+    /// PROVISIONAL: read from code; no recording has the player shot and
+    /// living.
+    pub fn hit(&mut self, burn: f32, part: crate::health::Part, kind: crate::health::DamageKind) {
+        /// The burn that leaves the speed whole and the one that stops it.
+        const BURN_RANGE: [f32; 2] = [55.0, 10.0];
+        /// How long the cap lasts, in seconds.
+        const SHOT_FOR: f32 = 0.66;
+        if !kind.weapon() {
+            return;
+        }
+        // The hit's burn comes off the legs (`Physical.BulletHit`).
+        self.stamina.wound(burn, self.frame_clock);
+        let burnt = if self.hits_burnt.0 == self.frame_count { self.hits_burnt.1 + burn } else { burn };
+        self.hits_burnt = (self.frame_count, burnt);
+        let share = inverse_lerp(BURN_RANGE[0], BURN_RANGE[1], burnt);
+        if share < 1.0 {
+            let (before, until) = self.shot_limit.unwrap_or((f32::MAX, 0.0));
+            self.shot_limit = Some((share.min(before), (self.frame_clock + SHOT_FOR).max(until)));
+            self.limits_changed = true;
+        }
+        if matches!(part, crate::health::Part::LeftLeg | crate::health::Part::RightLeg) && !self.conditions.on_painkillers {
+            self.enable_sprint(false);
+        }
+    }
+
     /// What happened in the frame that health takes: falls, jumps, sprints
     /// and vaults (health spec, "Falls", "What health does to the
     /// character").
@@ -1378,6 +1759,9 @@ impl Movement {
             // own either; nor have the approach to a door and the kick.
             State::Vault | State::Climb | State::VaultFall | State::VaultLanding => WALKING_SPEED_CAP,
             State::Approach | State::Breach => WALKING_SPEED_CAP,
+            // Blind fire has no cap of its own (`SpeedLimiter.
+            // DefaultSpeedLimits` does not list it): the general one.
+            State::BlindFire => WALKING_SPEED_CAP,
             State::Sprint | State::Jump | State::SprintStop => SPRINTING_SPEED_CAP,
             State::ProneMove => CRAWLING_SPEED_CAP,
         };
@@ -1526,6 +1910,16 @@ impl Movement {
         at
     }
 
+    /// Where the first-person camera's own object is, as `ribcage` gives the
+    /// ribcage (`Body::camera_container`): the camera hangs here, turned to
+    /// the view. It is the ribcage's place but where a clip shifts the
+    /// ribcage on its spine, as blind fire's do.
+    pub fn camera_container(&self) -> [f32; 3] {
+        let mut at = quat_rotate(self.body_tilt, self.body.camera_container());
+        at[1] += self.body_height_offset;
+        at
+    }
+
     /// The angle from the body round to the view and the view's pitch
     /// over the ground's, as last noted: what the animator's
     /// `DeltaRotation` and `Aim_angle` stand at when the frame is over.
@@ -1568,6 +1962,11 @@ impl Movement {
         (at, quat_mul(self.body_tilt, bone.1))
     }
 
+    /// The clock stamina's charges go by: the frames' own lengths summed.
+    pub fn frame_clock(&self) -> f32 {
+        self.frame_clock
+    }
+
     /// Whether the movement state lets the sights be up: not in a crawl,
     /// a sprint or a jump. For `Firearm::set_aim`.
     pub fn can_aim(&self) -> bool {
@@ -1594,6 +1993,18 @@ impl Movement {
         )
     }
 
+    /// The frame the first-person camera hangs in, in the world's axes, as
+    /// `rig_frame` gives the rig's: at the camera's own object
+    /// (`camera_container`), turned to where the player looks. The two are
+    /// one but where a clip shifts the ribcage on its spine (blind fire).
+    pub fn camera_frame(&self) -> ([f32; 3], [f32; 4]) {
+        let container = quat_rotate(quat_axis(1, self.body_yaw), self.camera_container());
+        (
+            std::array::from_fn(|k| self.position[k] + container[k]),
+            quat_mul(quat_axis(1, self.yaw), quat_axis(0, self.shown_pitch())),
+        )
+    }
+
     /// What the world does to the first-person camera's box ("The
     /// camera's collider" in the weapon-handling spec): how far the camera
     /// has to move for its box to be clear of everything solid, in the
@@ -1611,7 +2022,7 @@ impl Movement {
     ) -> [f32; 3] {
         /// What the game adds to each push, in metres.
         const MARGIN: f32 = 0.001;
-        let (origin, turn) = self.rig_frame();
+        let (origin, turn) = self.camera_frame();
         let facing = quat_mul(turn, rotation);
         let (beside, middle) = (quat_rotate(turn, position), quat_rotate(facing, centre));
         let at: [f32; 3] = std::array::from_fn(|k| origin[k] + beside[k] + middle[k]);
@@ -1641,6 +2052,13 @@ impl Movement {
         }
         let axis = [self.position[0], from[1], self.position[2]];
         if world.line(axis, from).is_some() { length } else { 0.0 }
+    }
+
+    /// Whether the movement state lets the hands act at all
+    /// (`Player.StateIsSuitableForHandInput`: not one of the install's
+    /// `UnsuitableStates`).
+    pub fn state_suits_hands(&self) -> bool {
+        !self.settings.no_hands_states.contains(&self.state.number())
     }
 
     /// Whether the movement state lets the hands take a press of the
@@ -1803,6 +2221,7 @@ impl Movement {
             speed: self.character_speed,
             max_speed: self.settings.max_speed,
             overweight: self.stamina.settings.overweight,
+            walk_overweight: self.stamina.settings.walk_overweight,
             leg_damaged: self.conditions.leg_damaged(),
             yaw: self.yaw,
             hands_to_body: self.hands_to_body,
@@ -1817,7 +2236,7 @@ impl Movement {
             direction: self.movement_direction,
             discrete_direction: self.discrete_direction,
             level: self.smoothed_pose_level,
-            tilt: self.smoothed_tilt,
+            tilt: self.mounted_tilt_shown().unwrap_or(self.smoothed_tilt),
             inert: self.inert,
             sprint: self.sprint_flag,
             sprint_speed: self.sprint_speed,
@@ -1847,14 +2266,105 @@ impl Movement {
             kick: self.kick.is_some(),
             kick_succeeds: self.kick.is_some_and(|kick| kick.opens),
             approached: self.kick.is_some_and(|kick| kick.approached),
+            blind_fire: self.blind_shown,
+            blind_fire_float: self.blind_float,
+            prone_bipods: self.mount.is_some() && self.prone,
+            left_stance: self.left_stance.animator,
+            force_left_stance: self.left_stance.force_one_frame,
         }
+    }
+
+    // ------------------------------------------------------------ blind fire
+
+    /// Blind fire's figure as the movement holds it (`MovementContext.
+    /// BlindFire`; `docs/spec/blind-fire.md`): 1 over the top, -1 to the
+    /// right, 0 none. While it is set the movement keys are not heard and
+    /// nothing is vaulted.
+    pub fn blind_fire(&self) -> i32 {
+        self.blind_fire
+    }
+
+    /// What the body's animator is told of blind fire's side (`BlindFire`),
+    /// which the lean alone may put to 0, and the float blind fire's state
+    /// last worked out (`BlindFireFloat`).
+    pub fn blind_fire_animator(&self) -> (f32, f32) {
+        (self.blind_shown, self.blind_float)
+    }
+
+    /// Blind fire's figure as the gate last took it, once (`None` if it has
+    /// taken nothing since this was last asked). The host hands it on to
+    /// the thing in hand (`Firearm::set_blind_fire`) and to the weapon's
+    /// motion (`Hands::start_blind_fire`), as the game's gate does
+    /// (`blind_fire::tell`).
+    pub fn take_blind_fire(&mut self) -> Option<i32> {
+        self.blind_told.take()
+    }
+
+    /// Blind fire ended from outside its keys (`MovementContext.
+    /// SetBlindFire(0)`): an operation of the weapon beginning that ends it
+    /// (`FirearmEvent::BlindFireEnded`), a change of what is in the hands.
+    /// The inventory's opening, a gesture of the hands, lying down and the
+    /// approach to a door end it here of themselves.
+    pub fn end_blind_fire(&mut self) {
+        self.set_blind_fire(0, true, true);
+    }
+
+    /// A blind-fire command (`side`: 1 over the top, -1 to the right, 0 the
+    /// end) as the movement state in hand passes it to the gate
+    /// (`MovementState.BlindFire` and what overrides it): standing and the
+    /// states built on it pass the side, the approach to a door passes
+    /// nothing, and every other state passes 0, which ends blind fire.
+    fn ask_blind_fire(&mut self, side: i32, input: &Input) {
+        let value = match self.state {
+            state if state.takes_blind_fire() => side,
+            State::Approach => return,
+            _ => 0,
+        };
+        self.set_blind_fire(value, input.blind_firearm, input.blind_may_start);
+    }
+
+    /// The gate (`MovementContext.SetBlindFire(int)`): anything but a
+    /// firearm in hand puts it to 0; a firearm takes the value if it may
+    /// start blind fire or the value is 0, and a refusal changes nothing.
+    /// Taken, the body's animator is told at once, and a start puts the
+    /// sights down, as the weapon's operation does with them
+    /// (`BlindFire_Internal`).
+    fn set_blind_fire(&mut self, value: i32, firearm: bool, may_start: bool) {
+        let value = if firearm { value } else { 0 };
+        if firearm && !may_start && value != 0 {
+            return;
+        }
+        self.blind_fire = value;
+        self.blind_shown = value as f32;
+        self.blind_told = Some(value);
+        if value != 0 {
+            self.aiming = false;
+        }
+    }
+
+    /// Blind fire's state's own work each frame (`BlindeFireState.
+    /// ManualAnimatorMoveUpdate`): standing's, then the float, the curve of
+    /// the blind-fire state last entered read at the time of the one being
+    /// entered if the animator is between two of them, else of the one
+    /// playing, times the side (recorded: the state being entered wins;
+    /// blind-fire spec, "The float").
+    fn update_blind_fire(&mut self, dt: f32, world: &dyn World) {
+        self.update_idle(dt, world);
+        let time = self.body.time_in(movement_state::BLIND_FIRE).unwrap_or(0.0);
+        let curve = self.body.blind_fire_curve(self.blind_part, self.blind_side).map_or(0.0, |curve| curve.evaluate(time));
+        self.blind_float = curve * self.blind_side;
     }
 
     /// Puts on the body's animator what the interactions' model asks.
     fn show(&mut self, shows: Vec<Show>) {
         for show in shows {
             match show {
-                Show::Play(index) => self.shown_interaction = Some(index),
+                // A gesture of the hands beginning ends blind fire
+                // (`Player.SendHandsInteractionStateChanged`).
+                Show::Play(index) => {
+                    self.end_blind_fire();
+                    self.shown_interaction = Some(index);
+                }
                 Show::Stop => self.shown_interaction = None,
                 Show::Reset => {
                     self.shown_interaction = None;
@@ -1868,7 +2378,8 @@ impl Movement {
     /// It is refused in a sprint, and while the animator of the thing in
     /// hand is anywhere but at rest (a backpack's dropping excepted).
     pub fn set_interaction(&mut self, interaction: Interaction) -> bool {
-        if self.sprinting || (!self.hands_idle && interaction != Interaction::DropBackpack) {
+        // (Nothing while mounted: `SetInteractInHands`.)
+        if self.mount.is_some() || self.sprinting || (!self.hands_idle && interaction != Interaction::DropBackpack) {
             return false;
         }
         let shows = self.interactions.set(interaction);
@@ -1879,6 +2390,25 @@ impl Movement {
     /// The gesture playing on the body's animator, if one is.
     pub fn interaction(&self) -> Option<Interaction> {
         self.interactions.current()
+    }
+
+    /// Whether the body may take a gesture for the bipod now
+    /// (`FirearmController.ToggleBipod`'s part of the movement's: the
+    /// gestures' queue takes one and nothing plays).
+    pub fn gesture_free(&self) -> bool {
+        !self.interactions.schedule_denied() && self.interactions.can_interact()
+    }
+
+    /// The bipod's gesture (`ToggleBipodOperation.Start`'s `SetInteractInHands`):
+    /// out or in, by the way it folds. `Acted::BipodToggled` comes when its
+    /// state passes the toggle's mark. Whether it plays.
+    pub fn bipod_gesture(&mut self, out: bool, forward: bool) -> bool {
+        let gesture = Interaction::bipod(out, forward);
+        let plays = self.set_interaction(gesture);
+        if plays {
+            self.toggling_bipod = Some(gesture);
+        }
+        plays
     }
 
     /// Whether the movement lets a backpack be dropped (`Player.DropBackpack`,
@@ -1894,6 +2424,8 @@ impl Movement {
     /// asked for whatever the thing in hand is doing; in a sprint it is
     /// refused, and then nothing is dropped. Returns whether it plays.
     pub fn drop_backpack(&mut self) -> bool {
+        // Dropping the backpack leaves a mount at once (`Player.DropBackpack`).
+        self.leave_mount_now();
         let plays = self.set_interaction(Interaction::DropBackpack);
         self.dropping_backpack |= plays;
         plays
@@ -2107,7 +2639,8 @@ impl Movement {
         self.set_interaction(Interaction::TakeItem);
         let level = self.pose_level;
         if self.pitch > PICK_UP_CROUCH_PITCH {
-            self.change_pose(level / 3.0 - level);
+            // Lower only, standing: the room to stand is never asked.
+            self.change_pose(level / 3.0 - level, &Flat);
         }
         self.acting = Some(Acting::PickingUp { time: 0.0, level, taken: false });
         true
@@ -2147,7 +2680,7 @@ impl Movement {
     /// is given the player's frame time (recorded: a lock opened with its
     /// key shut on the game's frame with it, a frame late with the
     /// engine's, 2026-10-16).
-    fn act(&mut self, dt: f32) {
+    fn act(&mut self, dt: f32, world: &dyn World) {
         match &mut self.acting {
             Some(Acting::Working { time, worked, snap }) => {
                 *time += dt;
@@ -2173,7 +2706,7 @@ impl Movement {
                     self.acting = None;
                     self.acted.push(Acted::PickedUp);
                     if !self.prone {
-                        self.change_pose(level - self.pose_level);
+                        self.change_pose(level - self.pose_level, world);
                     }
                 }
             }
@@ -2245,6 +2778,8 @@ impl Movement {
             return;
         }
         self.frame_dt = dt;
+        // The rig as the last frame left it turned, before this frame's view.
+        self.rig_turn_before = self.rig_frame().1;
         // The engine's clock, which the landing's cap and the stamina's
         // pauses are timed by.
         self.frame_clock += dt;
@@ -2256,8 +2791,25 @@ impl Movement {
         // turn of nothing, which would count among the last frames' turns.
         // Nor while a thing is being taken up: that state does not turn.
         let picking_up = matches!(self.acting, Some(Acting::PickingUp { .. }));
+        self.yaw_before_turn = self.yaw;
+        // Mounted, the turn is the mount's own (`IdleWeaponMountingState.
+        // Rotate`), whatever the movement state under it.
         if !input.screen && !picking_up {
-            self.look(if input.free_look { input.look_delta } else { self.limited_turn(input.look_delta) });
+            if self.mount.is_some() {
+                self.mount_rotate(input.look_delta, input.overlap_depth, world);
+            } else if input.free_look {
+                self.look(input.look_delta);
+            } else {
+                let mut turn = self.limited_turn(input.look_delta);
+                // Lying, a turn that would swing the body over an edge is
+                // dropped (`PronePlayerState.Rotate`, `IsAbleToRotateProne`).
+                if matches!(self.state, State::ProneIdle | State::ProneMove | State::Roll)
+                    && !(self.head_turn_clear(turn[0], world) && self.able_to_turn_prone(turn[0], world))
+                {
+                    turn[0] = 0.0;
+                }
+                self.look(turn);
+            }
         }
         // The head's free look is handed its axes on every frame the keys
         // reach the character, whatever the movement state makes of the
@@ -2276,7 +2828,7 @@ impl Movement {
             self.body.set_head_turn(self.head_look.bones_turn());
         }
         self.hands_idle = input.hands_idle;
-        self.act(player_dt);
+        self.act(player_dt, world);
         self.commands(input, world);
         self.watch_sprint();
         self.manual_update(player_dt, world);
@@ -2284,6 +2836,9 @@ impl Movement {
         // Stamina is worked here, before the animator: a movement state the
         // animator enters in this frame shows in the pools from the next.
         self.work_stamina(player_dt);
+        // A mount's search answers after the frame's updates, before the
+        // animator's (its batches of rays are awaited by `yield return null`).
+        self.answer_mount_search(world);
 
         // The animator runs on what the movement set so far. Entering one
         // of its states enters the movement state it names, and this
@@ -2292,8 +2847,11 @@ impl Movement {
         self.crawl_marks += self.body.take_crawl_marks();
         for entered in entered {
             if let Some(state) = State::from_number(entered.state) {
-                self.enter_state(state, entered);
+                self.enter_state(state, entered, world);
             }
+        }
+        for (kind, mark) in self.body.take_vault_marks() {
+            self.vault_mark(kind, mark, world);
         }
         // A gesture whose state the animator has left in this update is
         // over with it: the state's own script says so as it is left, and
@@ -2310,17 +2868,35 @@ impl Movement {
             self.dropping_backpack = false;
             self.acted.push(Acted::BackpackDropped);
         }
+        // So does the bipod's toggle, on its gesture's mark.
+        let toggled = self.body.take_bipod_toggled();
+        if let Some(gesture) = self.toggling_bipod {
+            if toggled || !self.interactions.has(gesture) {
+                self.toggling_bipod = None;
+                self.acted.push(Acted::BipodToggled);
+            }
+        }
         // The animator sits on the part of the body that is laid to the
         // ground, so its motion comes out turned with it.
         let moved = quat_rotate(self.body_tilt, self.body.motion());
         let across = self.to_world([moved[0], moved[2]]);
         self.animated_motion = [across[0], moved[1], across[1]];
+        // From a mount's approach until its state is off the animator's own
+        // motion is not taken (`IgnoreDeltaMovement`).
+        if self.ignore_root_motion {
+            self.animated_motion = [0.0; 3];
+        }
 
         // The current state's own handling of the frame. The animator calls
         // on a movement state once for each of its own states that names it
         // and had a part in the frame: not at all while none is playing,
         // and twice where one such state gives way to another.
         for _ in 0..self.body.calls(self.state.number()) {
+            // Where the character stood before this update's motion: the game
+            // schedules a state's motion and moves by the last one asked for
+            // in the frame (`ApplyMotion`), so a mount's approach after the
+            // state's update takes its place.
+            let before = self.position;
             match self.state {
                 State::Idle => self.update_idle(player_dt, world),
                 State::Move => self.update_move(player_dt, world),
@@ -2356,9 +2932,15 @@ impl Movement {
                 // approach does nothing to the body at all.
                 State::Approach => self.update_approach(player_dt, world),
                 State::Breach => self.update_breach(player_dt, world),
+                State::BlindFire => self.update_blind_fire(player_dt, world),
+            }
+            // The mount's state's frame comes after the movement state's.
+            if self.mount.is_some() {
+                self.update_mount(player_dt, world, before);
             }
         }
         self.watch_sprint();
+        self.left_stance_frame();
         self.watch_footsteps(dt);
         self.hear(dt, world);
         self.lag_body_height(player_dt);
@@ -2393,6 +2975,7 @@ impl Movement {
         self.stamina.set_pose(self.prone, self.pose_level);
         self.stamina.moving(self.state == State::Move, self.state == State::ProneMove);
         self.stamina.aim(self.aiming);
+        self.stamina.set_aim_drain_by(self.mount_drain());
         self.stamina.update(player_dt, self.frame_clock);
         if self.sprinting && !self.stamina.sprinting() {
             self.sprinting = false;
@@ -2433,7 +3016,7 @@ impl Movement {
     /// when its animator enters a state that names a different one.
     /// `entered` is that animator state's own word on which part of the
     /// movement it is and for which side.
-    fn enter_state(&mut self, state: State, entered: Entered) {
+    fn enter_state(&mut self, state: State, entered: Entered, world: &dyn World) {
         // Each of the animator's states says how freely the view turns in
         // it, and says so again every time it is entered.
         (self.turn_factor, self.turn_limit) = (entered.turn_factor, entered.turn_limit);
@@ -2451,12 +3034,26 @@ impl Movement {
             if state == State::Roll {
                 self.roll_data.part = entered.part;
             }
+            // Blind fire's shared state takes the new state's part, side
+            // and curve, and nothing else (`BlindeFireState.ReEnter`).
+            if state == State::BlindFire {
+                (self.blind_part, self.blind_side) = (entered.part, blind_side(entered.side));
+            }
             return;
         }
         // Leaving. Standing and the states built on it let a held breath
         // go on the way out, if the sights are up to hold one by.
         if self.state.stands() && self.aiming {
             self.stamina.hold_breath(false);
+        }
+        // The head's capsule: the standing one again on leaving the crawl,
+        // the roll or getting up, the lying one on entering going down,
+        // lying still, the crawl or the roll (`SetPOMCollider`).
+        if matches!(self.state, State::ProneMove | State::Roll | State::FromProne) {
+            self.head_lying = false;
+        }
+        if matches!(state, State::ToProne | State::ProneIdle | State::ProneMove | State::Roll) {
+            self.head_lying = true;
         }
         match self.state {
             State::Sidestep => {
@@ -2485,6 +3082,7 @@ impl Movement {
                 }
                 self.enable_sprint(false);
                 self.sprint_flag = false;
+                self.slide = false;
                 self.reset_speed_after_sprint();
                 // A jump out of a sprint keeps the sprint's pace for the
                 // landing; anything else puts it back.
@@ -2495,7 +3093,7 @@ impl Movement {
             State::Jump => {
                 // Lying down was asked for in the air: only if the
                 // character may lie (`JumpPlayerState.Exit`).
-                if self.prone && !self.conditions.can_prone() {
+                if self.prone && !(self.conditions.can_prone() && self.room_to_lie(world)) {
                     self.prone = false;
                 }
                 self.moved.push(Moved::JumpEnded);
@@ -2532,6 +3130,10 @@ impl Movement {
                 self.kick = None;
                 self.acted.push(Acted::Done);
             }
+            // Out of blind fire to another state: the float is put back to
+            // the state's start, 0, whichever part was playing
+            // (`BlindeFireState.Exit`).
+            State::BlindFire => self.blind_float = 0.0,
             State::FromProne => {
                 // Up again: the view and the body's turning are free as
                 // they were, at once.
@@ -2544,7 +3146,9 @@ impl Movement {
             _ => {}
         }
         let from = self.state;
+        self.left_stance_exit(from);
         self.set_state(state);
+        self.left_stance_enter(state, entered.part);
         self.aim_lowered |= self.settings.no_aim_states.contains(&state.number());
         // Entering.
         match state {
@@ -2562,6 +3166,8 @@ impl Movement {
                 self.smoothed_pose_level = 0.0;
                 self.pitch_target = PRONE_PITCH_RANGE;
                 self.pending_step = 0;
+                // Lying down ends blind fire (`PronePlayerState.Enter`).
+                self.end_blind_fire();
             }
             State::Roll => {
                 self.enable_sprint(false);
@@ -2637,12 +3243,23 @@ impl Movement {
             State::Climb => self.enter_vault(Move::Climb, from),
             State::VaultFall => {}
             // The approach lets the lean go and takes the character out of
-            // its lying pose (`ApproachState.Enter`).
+            // its lying pose (`ApproachState.Enter`), and ends blind fire.
             State::Approach => {
                 self.tilt = 0.0;
                 self.prone = false;
                 self.enable_sprint(false);
+                self.end_blind_fire();
                 self.begin_approach();
+            }
+            // Blind fire's state from outside it: standing's entry (the
+            // sprint off), then its own: the lean let go, and the float at
+            // the state's start for a way in or at its side for a way out
+            // (`BlindeFireState.Enter`).
+            State::BlindFire => {
+                self.enable_sprint(false);
+                self.tilt = 0.0;
+                (self.blind_part, self.blind_side) = (entered.part, blind_side(entered.side));
+                self.blind_float = if entered.part == part::OUT { self.blind_side } else { 0.0 };
             }
             State::Breach => {}
             State::Landing | State::VaultLanding => {
@@ -2725,8 +3342,12 @@ impl Movement {
             self.vault_on = false;
             self.vault_time = 0.0;
             // Opening stops the hands' gestures where they are, all but
-            // those that are operations (`Player.SetInventoryOpened`).
+            // those that are operations, and ends blind fire
+            // (`Player.SetInventoryOpened`).
             if input.inventory {
+                self.end_blind_fire();
+                // And leaves a mount at once.
+                self.leave_mount_now();
                 let shows = self.interactions.force_stop();
                 self.show(shows);
             }
@@ -2757,7 +3378,7 @@ impl Movement {
         if input.screen || self.acting.is_some() {
             self.unheard(input);
         } else {
-            self.heard(input);
+            self.heard(input, world);
         }
         // Neither of these is a key's doing. The sights coming down let a
         // held breath go whatever the state; and the vault key's try is
@@ -2768,6 +3389,8 @@ impl Movement {
             self.stamina.hold_breath(false);
         }
         if self.vault_on {
+            // A mounted state's vault leaves the mount at once and passes it on.
+            self.leave_mount_now();
             let asks = (self.state.stands() && !matches!(self.state, State::ProneIdle | State::Roll))
                 || matches!(self.state, State::Move | State::ProneMove | State::Sprint);
             if asks {
@@ -2803,8 +3426,33 @@ impl Movement {
     }
 
     /// A frame's keys, in the order the game takes them.
-    fn heard(&mut self, input: &Input) {
-        if input.speed_delta != 0.0 && self.state != State::Sprint {
+    fn heard(&mut self, input: &Input, world: &dyn World) {
+        // Blind fire's commands, each passed by the state in hand to the
+        // gate (`Player.ToggleBlindFire`, `StopBlindFire`): the end, then
+        // a start.
+        // Mounted, the mount's state has every command first (`Player.
+        // CurrentManagedState`): blind fire, the stance, the step aside and the
+        // jump start its exit and are passed on; lying down and a vault leave
+        // at once and are passed on; the lean, the walk keys and the slow lean
+        // start the exit and are dropped; the sprint and the speed are dropped.
+        let mounted = self.mount.is_some();
+        self.left_stance_firearm = input.blind_firearm;
+        if input.blind_end {
+            if mounted {
+                self.start_leaving_mount();
+            }
+            self.ask_blind_fire(0, input);
+        }
+        // A start with the left shoulder wanted is dropped by the gate
+        // (`Player.ToggleBlindFire`), before the state in hand hears it.
+        if input.blind_toggle != 0 && !self.left_stance.wanted {
+            if mounted {
+                self.start_leaving_mount();
+            }
+            self.ask_blind_fire(input.blind_toggle.signum(), input);
+        }
+        self.ask_left_stance(input);
+        if input.speed_delta != 0.0 && self.state != State::Sprint && !mounted {
             self.select_speed(self.clamped_speed() + input.speed_delta);
         }
         // The walk key (`Player.ToggleMinSpeed`): a speed above none is
@@ -2812,7 +3460,8 @@ impl Movement {
         // under a walk's pace; at none already, what was put aside is
         // taken up again. The key coming up, where it is bound to be held,
         // only takes it up again (`RestoreSpeed`).
-        if input.walk_toggle && self.clamped_speed() >= f32::EPSILON {
+        if mounted {
+        } else if input.walk_toggle && self.clamped_speed() >= f32::EPSILON {
             self.speed_memo = self.character_speed;
             self.change_speed(-self.speed_memo);
         } else if input.walk_toggle || input.walk_end {
@@ -2821,7 +3470,11 @@ impl Movement {
             }
         }
         if input.prone {
-            self.prone_command();
+            self.leave_mount_now();
+            self.prone_command(world);
+        }
+        if (input.crouch || (input.restore_pose && !self.prone && self.pose_level < 0.5) || input.pose_delta != 0.0) && self.mount.is_some() {
+            self.start_leaving_mount();
         }
         if input.crouch {
             // Back to the stance last chosen with the stance keys, if the
@@ -2837,17 +3490,17 @@ impl Movement {
             } else {
                 self.pose_memo
             };
-            self.change_pose(target - self.pose_level);
+            self.change_pose(target - self.pose_level, world);
         }
         // The crouch key coming up, where it is bound to be held
         // (`Player.RestorePose`): a character lower than half way is put
         // back to the stance last chosen, or upright if that was as low.
         if input.restore_pose && !self.prone && self.pose_level < 0.5 {
             let to = if self.pose_memo < 0.5 { 1.0 } else { self.pose_memo };
-            self.change_pose(to - self.pose_level);
+            self.change_pose(to - self.pose_level, world);
         }
         if input.pose_delta != 0.0 {
-            self.change_pose(input.pose_delta);
+            self.change_pose(input.pose_delta, world);
             self.pose_memo = self.pose_level;
         }
         // The lean keys are presses and releases (`Player.ToggleLean`,
@@ -2861,13 +3514,27 @@ impl Movement {
         let sides = [(0, -1.0f32), (1, 1.0)];
         for (key, side) in sides {
             if ((self.lean_keys[key] && !keys[key]) || input.lean_end[key]) && !self.last_slow_lean && self.tilt * side > 0.0 {
-                self.ask_tilt(0.0);
+                if self.mount.is_some() {
+                    self.mount_tilt(0.0);
+                } else {
+                    self.ask_tilt(0.0);
+                }
             }
         }
         for (key, side) in sides {
             if ((!self.lean_keys[key] && keys[key]) || input.lean_toggle[key]) && !self.last_slow_lean {
                 self.slow_leaning = false;
-                self.ask_tilt(if self.tilt * side > 0.0 { 0.0 } else { side * MAX_TILT });
+                // A lean pressed tells the body's animator blind fire is
+                // over, and nothing else of it (blind-fire spec, "The
+                // lean's quirk": `MovementContext.SetBlindFire(float)`).
+                // PROVISIONAL: read from code, not recorded.
+                self.blind_shown = 0.0;
+                let tilt = if self.tilt * side > 0.0 { 0.0 } else { side * MAX_TILT };
+                if self.mount.is_some() {
+                    self.mount_tilt(tilt);
+                } else {
+                    self.ask_tilt(tilt);
+                }
             }
         }
         self.lean_keys = keys;
@@ -2877,46 +3544,60 @@ impl Movement {
         if input.step != self.step_key {
             let before = std::mem::replace(&mut self.step_key, input.step);
             if before != 0 && self.step == before {
-                self.set_step(0);
+                self.step_command(0, world);
             }
             if input.step != 0 {
-                self.set_step(if self.step == input.step { 0 } else { input.step });
+                self.step_command(if self.step == input.step { 0 } else { input.step }, world);
             }
         }
         // The same as commands (`Player.ToggleStep`, `ReturnFromStep`).
         for (at, side) in [(0, -1), (1, 1)] {
             if input.step_end[at] && self.step == side {
-                self.set_step(0);
+                self.step_command(0, world);
             }
             if input.step_toggle[at] {
-                self.set_step(if self.step == side { 0 } else { side });
+                self.step_command(if self.step == side { 0 } else { side }, world);
             }
         }
         // The key press is a toggle command and the release an explicit stop.
         if input.sprint != self.sprint_input {
             self.sprint_input = input.sprint;
-            if input.sprint {
+            if mounted {
+            } else if input.sprint {
                 self.sprint_command(!self.sprinting, true);
             } else {
                 self.sprint_command(false, false);
             }
         }
         // The two as commands (`Player.ToggleSprint`, `EnableSprint`).
-        if input.sprint_toggle {
+        if input.sprint_toggle && !mounted {
             self.sprint_command(!self.sprinting, true);
         }
-        if input.sprint_end {
+        if input.sprint_end && !mounted {
             self.sprint_command(false, false);
         }
         // A toggle pressed before the character is moving forward is ignored
         // by the movement states, and nothing repeats it: in a recorded run
         // with sprint held first and forward pressed after, the game walks.
-        self.direction = input.move_dir;
-        self.input_direction = input.move_dir;
-        match self.state {
-            State::Jump => self.jump.move_dir = input.move_dir,
-            state if state.stands() => self.idle_move(input.move_dir),
-            _ => {}
+        // With blind fire's figure set the movement keys are not handed on
+        // at all, and the last direction given stands
+        // (`MoveInputTranslator.TranslateAxes`).
+        if self.blind_fire == 0 {
+            self.input_direction = input.move_dir;
+            if self.mount.is_some() {
+                // A mounted state's walk: any key starts the exit, and the
+                // movement state is handed nothing (`IdleWeaponMountingState.Move`).
+                if !is_zero(input.move_dir) {
+                    self.start_leaving_mount();
+                }
+            } else {
+                self.direction = input.move_dir;
+                match self.state {
+                    State::Jump => self.jump.move_dir = input.move_dir,
+                    state if state.stands() => self.idle_move(input.move_dir),
+                    _ => {}
+                }
+            }
         }
         // The slow lean's axis (`Player.SlowLean`), which the game hands
         // out with the walk's, after the frame's commands: pushed, and
@@ -2926,7 +3607,11 @@ impl Movement {
         self.last_slow_lean = false;
         if (self.smoothed_tilt - self.tilt).abs() < 1.0 && input.slow_lean != 0.0 {
             self.slow_leaning = true;
-            self.ask_tilt(self.tilt + input.slow_lean * SLOW_LEAN_STEP);
+            if self.mount.is_some() {
+                self.mount_tilt(self.tilt + input.slow_lean * SLOW_LEAN_STEP);
+            } else {
+                self.ask_tilt(self.tilt + input.slow_lean * SLOW_LEAN_STEP);
+            }
             self.last_slow_lean = true;
         }
         // The jump is refused once the vault key has been held past its
@@ -2934,10 +3619,17 @@ impl Movement {
         // game's default binding the two are one key, and the jump comes
         // when it is let go.
         let jump = input.jump && self.vault_time <= self.settings.vaulting.input_time && !self.is_vaulting;
+        // A mounted state's jump starts the exit and is passed on.
+        if jump {
+            self.start_leaving_mount();
+        }
         if jump && matches!(self.state, State::ProneIdle | State::ProneMove) {
             // Lying down, jump gets up.
-            self.prone_command();
-        } else if jump && matches!(self.state, State::Idle | State::Move | State::Sprint) {
+            self.prone_command(world);
+        } else if jump && matches!(self.state, State::Idle | State::Move | State::Sprint | State::BlindFire) {
+            // (Blind fire's state jumps as standing does; its animator states
+            // lead to no jump, which waits for standing: blind-fire spec, "The
+            // jump". PROVISIONAL: read from code, not recorded.)
             if self.pose_level > JUMP_POSE_THRESHOLD && self.grounded {
                 // The animator takes it from here: its jump state starts
                 // the jump proper. Legs at or under the threshold do not
@@ -2947,21 +3639,23 @@ impl Movement {
                 }
             } else {
                 // Too low to jump: stand up instead.
-                self.change_pose(1.0 - self.pose_level);
+                self.change_pose(1.0 - self.pose_level, world);
             }
         } else if jump && self.state == State::Sidestep {
             // Stepped aside, jump only takes the step back.
-            self.set_step(0);
+            self.set_step(0, world);
             self.sidestep = 0.0;
         } else if jump && self.state == State::Roll {
             // Rolled over, the same.
-            self.set_step(0);
+            self.set_step(0, world);
         }
         // The hold-breath key: a press holds the breath or lets it go.
         // Only the standing state and those built on it listen
         // (`IdlePlayerState.EnableBreath`), and only with the sights up
         // (`MovementContext.HoldBreath`).
-        if input.hold_breath && self.state.stands() && self.aiming {
+        // (A mounted state holds the breath whatever the movement state under
+        // it: `IdleWeaponMountingState.EnableBreath`.)
+        if input.hold_breath && (self.state.stands() || self.mount.is_some()) && self.aiming {
             let held = self.stamina.holding_breath();
             self.stamina.hold_breath(!held);
         }
@@ -2979,6 +3673,17 @@ impl Movement {
                 self.vault_time = 0.0;
             }
         }
+        // The mount's key (`ECommand.WeaponMounting`), from the hands' input.
+        if input.mount {
+            self.ask_mount(input, world);
+        }
+    }
+
+    /// The step-aside command as the state in hand takes it: a mounted
+    /// state starts its exit and passes it on (`IdleWeaponMountingState.SetStep`).
+    fn step_command(&mut self, step: i32, world: &dyn World) {
+        self.start_leaving_mount();
+        self.set_step(step, world);
     }
 
     /// Asks for a step aside (1 right, -1 left) or takes it back (0), as
@@ -2987,14 +3692,18 @@ impl Movement {
     /// already under way. The walk, the sprint, the crawl and a jump do
     /// not listen. Lying still it is the roll: the lean is put to zero and
     /// the step waits for it to straighten, unless it already leaned that
-    /// way; rolled over it is taken unless the roll back is under way.
-    /// (The game also refuses a step with something in the way or no
-    /// ground to that side; there is nothing here to be in the way.)
-    fn set_step(&mut self, step: i32) {
+    /// way; rolled over it is taken unless the roll back is under way. A
+    /// step with something in the way or no steady ground to that side,
+    /// and a roll with no room, ask for no step at all (movement spec,
+    /// "Room to move").
+    fn set_step(&mut self, step: i32, world: &dyn World) {
+        let stepped = |m: &Self| if step != 0 && !m.room_to_step(step, world) { 0 } else { step };
         match self.state {
-            State::Idle => self.step = step,
-            State::Sidestep if self.sidestep_data.part != part::OUT => self.step = step,
-            State::ProneIdle if step != 0 => {
+            // Blind fire's state takes it as standing does; its animator
+            // states lead to no step, which waits for standing.
+            State::Idle | State::BlindFire => self.step = stepped(self),
+            State::Sidestep if self.sidestep_data.part != part::OUT => self.step = stepped(self),
+            State::ProneIdle if step != 0 && self.room_to_roll(step, world) => {
                 if (step < 0 && self.tilt < 0.0) || (step > 0 && self.tilt > 0.0) {
                     self.step = step;
                 } else {
@@ -3004,7 +3713,9 @@ impl Movement {
             }
             // Taking it back does not take back a step still waiting.
             State::ProneIdle => self.step = 0,
-            State::Roll if self.roll_data.part != part::OUT => self.step = step,
+            State::Roll if self.roll_data.part != part::OUT => {
+                self.step = if step != 0 && self.room_to_roll(step, world) { step } else { 0 };
+            }
             _ => {}
         }
     }
@@ -3079,7 +3790,10 @@ impl Movement {
             | State::VaultFall
             | State::VaultLanding
             | State::Approach
-            | State::Breach => {}
+            | State::Breach
+            // Blind fire's own note of the key, as each state built on
+            // standing keeps one, is never read.
+            | State::BlindFire => {}
         }
     }
 
@@ -3087,7 +3801,7 @@ impl Movement {
     /// player of an online raid refuses the change both ways with a
     /// reload in hand, and still sets the stance of a lying character to
     /// the one last chosen; the offline player takes it at any time.
-    fn prone_command(&mut self) {
+    fn prone_command(&mut self, world: &dyn World) {
         // The approach to a thing does not hear the key at all.
         if self.state == State::Approach {
             return;
@@ -3095,19 +3809,52 @@ impl Movement {
         let refused = self.reloading && self.settings.prone_key_refused_in_reload;
         if matches!(self.state, State::ProneIdle | State::ProneMove | State::Roll) {
             if !refused {
-                // Getting up is paid for at the key.
-                if self.prone {
-                    self.stamina.stand_up(self.frame_clock);
+                // Getting up needs room to stand at the stance held lying,
+                // or failing that room to crouch, which is then taken at
+                // once; with neither the character lies on
+                // (`IsInPronePose`'s setter, `CanStandAt`, `CanSit`).
+                let room = self.can_stand_at(self.pose_level, world) || {
+                    let sit = self.can_stand_at(0.0, world);
+                    if sit {
+                        self.pose_level = 0.0;
+                        self.smoothed_pose_level = 0.0;
+                    }
+                    sit
+                };
+                if room {
+                    // Getting up is paid for at the key.
+                    if self.prone {
+                        self.stamina.stand_up(self.frame_clock);
+                    }
+                    self.prone = false;
                 }
-                self.prone = false;
             }
-            self.pose_level = self.pose_memo.clamp(0.0, 1.0);
-        } else if !refused && self.conditions.can_prone() {
+            // Then the stance last chosen, where there is room to stand
+            // at it (`UpdatePoseAfterProne`).
+            self.set_pose_level(self.pose_memo, world);
+        } else if !refused && self.conditions.can_prone() && self.room_to_lie(world) {
             // The animator takes it from here, when it can. Health may
-            // forbid lying down (`MovementContext.CanProne`; the room to
-            // lie in, its other half, is not read).
+            // forbid lying down, and so may the room to lie in
+            // (`MovementContext.CanProne`).
             self.prone = true;
         }
+    }
+
+    /// The stance set (`MovementContext.SetPoseLevel`): refused in a vault
+    /// or a climb and where there is no room to stand at it, else clamped
+    /// to the character's range. Whether it was taken.
+    fn set_pose_level(&mut self, level: f32, world: &dyn World) -> bool {
+        if matches!(self.state, State::Vault | State::Climb) {
+            return false;
+        }
+        if (self.pose_level - level).abs() < f32::EPSILON {
+            return true;
+        }
+        if !self.can_stand_at(level, world) {
+            return false;
+        }
+        self.pose_level = level.clamp(0.0, 1.0);
+        true
     }
 
     /// The character turns to something to open it (`ApproachState`;
@@ -3127,26 +3874,34 @@ impl Movement {
         self.tilt = 0.0;
         if self.ribcage()[1] - height > LOWER && self.pose_level > 0.0 {
             self.approach_level = Some(self.pose_level);
-            self.change_pose(-self.pose_level);
+            // Lower only, not lying: the room to stand is never asked.
+            self.change_pose(-self.pose_level, &Flat);
         }
     }
 
     /// What was approached is let go: the stance held before it is taken
-    /// again (`Player.TryInteractionCallback`).
-    pub fn let_go(&mut self) {
+    /// again where there is room for it (`Player.TryInteractionCallback`).
+    pub fn let_go(&mut self, world: &dyn World) {
         if let Some(level) = self.approach_level.take().filter(|_| !self.prone) {
-            self.change_pose(level - self.pose_level);
+            self.change_pose(level - self.pose_level, world);
         }
     }
 
-    fn change_pose(&mut self, delta: f32) {
+    fn change_pose(&mut self, delta: f32, world: &dyn World) {
         match self.state {
             State::Sprint => {
-                // Crouching out of a sprint. The slide itself is not implemented.
+                // Crouching in a sprint is the slide: a full crouch at
+                // once, the smoothed stance with it (`SetPoseLevel`'s
+                // force), and the sprint let go of from the next frame on
+                // (`SprintPlayerState.ChangePose`). The body plays its
+                // crouched way out of the sprint, and the sprint itself is
+                // switched off only as its state is left. PROVISIONAL: read
+                // from code, no recording has a crouch in a sprint.
                 if delta < 0.0 {
-                    self.pose_level = 0.0;
-                    self.enable_sprint(false);
+                    self.slide = true;
                     self.inert = false;
+                    self.pose_level = 0.0;
+                    self.smoothed_pose_level = 0.0;
                 }
             }
             // In a vault or a climb the stance is not to be changed.
@@ -3154,25 +3909,27 @@ impl Movement {
             // Lying still, any change of stance gets up into a full crouch;
             // crawling, into the stance held before.
             State::ProneIdle | State::Roll => {
-                self.prone_command();
+                self.prone_command(world);
                 // Not if the command was refused and the character lies on.
                 if !self.prone {
                     self.pose_level = 0.0;
                     self.smoothed_pose_level = 0.0;
                 }
             }
-            State::ProneMove => self.prone_command(),
+            State::ProneMove => self.prone_command(world),
             // Walking, a stance too low to sprint from ends the sprint's
             // wind-up.
             State::Move => {
-                self.pose_level = (self.pose_level + delta).clamp(0.0, 1.0);
+                self.set_pose_level(self.pose_level + delta, world);
                 if self.pose_level < SPRINT_POSE_THRESHOLD {
                     self.enable_sprint(false);
                 }
             }
             // Everywhere else the stance changes and nothing more: in the
             // air too.
+            // (Blind fire's too: recorded, crouched and stood up inside it.)
             State::Idle
+            | State::BlindFire
             | State::Jump
             | State::SprintStop
             | State::Landing
@@ -3182,7 +3939,9 @@ impl Movement {
             | State::VaultFall
             | State::VaultLanding
             | State::Approach
-            | State::Breach => self.pose_level = (self.pose_level + delta).clamp(0.0, 1.0),
+            | State::Breach => {
+                self.set_pose_level(self.pose_level + delta, world);
+            }
         }
     }
 
@@ -3240,7 +3999,12 @@ impl Movement {
     fn work_in_limits(&mut self) {
         if std::mem::take(&mut self.limits_changed) {
             self.landing_limit_in_effect = self.landing_limit.map(|(limit, _)| limit);
+            self.shot_limit_in_effect = self.shot_limit.map(|(limit, _)| limit);
             self.held_limits_in_effect = self.held_limits;
+        }
+        if self.shot_limit.is_some_and(|(_, until)| self.frame_clock >= until) {
+            self.shot_limit = None;
+            self.limits_changed = true;
         }
         if self.landing_limit.is_some_and(|(_, until)| self.frame_clock >= until) {
             self.landing_limit = None;
@@ -3259,6 +4023,7 @@ impl Movement {
         let capsule = self.capsule();
         self.grounded =
             self.position[1] + capsule.underside - ground <= self.ground_check || world.held(self.position, capsule);
+        self.feel_slope(world);
         self.watch_fall();
         self.smooth_pose(dt);
         if self.sprinting {
@@ -3273,6 +4038,23 @@ impl Movement {
         } else {
             [0, 1].map(|i| lerp(self.pitch_limit[i], self.pitch_target[i], dt * PITCH_LIMIT_SPEED))
         };
+    }
+
+    /// The ground's slope, as the frame's ground check finds it
+    /// (`UpdateGroundCollision`; movement spec, "Slopes and sliding"): the
+    /// ray down the capsule's axis reports the normal of what it meets a
+    /// quarter metre further than the check reaches, the capsule's contact
+    /// is the host's, and the two give the frame's surface, its average
+    /// and the slide's pull. Standing on another character (the game's
+    /// `HumanPyramidSlopeLength`) is not built.
+    fn feel_slope(&mut self, world: &dyn World) {
+        let [x, y, z] = self.position;
+        let capsule = self.capsule();
+        let reached = y + capsule.underside - world.ground_height(x, z) <= self.ground_check + slope::GROUND_SEARCH;
+        let hit = reached.then(|| world.ground_normal(x, z));
+        self.surface = slope::surface_normal(hit, world.contact_normal(self.position, capsule));
+        self.normal_history.add(self.surface[1]);
+        self.slope = slope::slide(self.surface, self.normal_history.average());
     }
 
     fn smooth_pose(&mut self, dt: f32) {
@@ -3310,11 +4092,22 @@ impl Movement {
     }
 
     fn smooth_tilt(&mut self, dt: f32) {
-        let s = &self.settings;
         let diff = (self.smoothed_tilt - self.tilt).abs();
         if diff < f32::EPSILON {
             return;
         }
+        // Mounted, the smoothed lean takes no value (`SmoothedTilt`'s setter)
+        // and the weapon's motion reads the mount's camera lean.
+        if let Some(camera) = self.mount_camera_tilt() {
+            self.weapon_tilt = camera;
+            return;
+        }
+        self.smooth_tilt_on(dt, diff);
+        self.weapon_tilt = self.smoothed_tilt;
+    }
+
+    fn smooth_tilt_on(&mut self, dt: f32, diff: f32) {
+        let s = &self.settings;
         // A lean made slowly is followed by the older rule
         // (`LegacySmoothTilt`): a share of what is left each frame.
         if self.slow_leaning {
@@ -3379,6 +4172,10 @@ impl Movement {
     /// The body turns only once the look direction has left its
     /// comfortable range, going by the angle as last noted.
     fn turn_body(&mut self, dt: f32) {
+        // Mounted, the body is the mount's (`ProcessRotation`).
+        if self.mount.is_some() {
+            return;
+        }
         let angle = self.hands_to_body;
         let limit = self.trunk_limit;
         if angle.abs() > limit {
@@ -3799,6 +4596,9 @@ impl Movement {
     }
 
     fn follow_look_yaw(&mut self, dt: f32) {
+        if self.mount.is_some() {
+            return;
+        }
         let behind = delta_angle(self.yaw, self.mv.smoothed_yaw).abs();
         let hurry = inverse_lerp(10.0, 45.0, behind) + 1.0;
         self.mv.smoothed_yaw =
@@ -3816,9 +4616,9 @@ impl Movement {
         // an update has already dropped its input (below): that one goes
         // on to sprint with none.
         let dropped = self.frame_count == self.sprint_dropped_in;
-        if (input[1].abs() < f32::EPSILON || self.walk_refused()) && !dropped {
+        if (input[1].abs() < f32::EPSILON || self.slide || self.walk_refused()) && !dropped {
             self.sprint_flag = false;
-            if input[0].abs() < f32::EPSILON {
+            if input[0].abs() < f32::EPSILON || self.slide {
                 self.inert = false;
             }
             self.check_obstacle();
@@ -4029,6 +4829,8 @@ impl Movement {
         let height_before = self.position[1];
         j.potential_height = self.position[1] + j.lift_velocity * dt;
         let descending_by_velocity = j.lift_velocity < 0.0;
+        // In the air the head is kept out of walls too (`JumpPlayerState`).
+        let motion = self.limit_motion_xz(motion, false, world);
         self.move_by(motion, dt, world);
         if self.position[1] - height_before < 0.001 || descending_by_velocity {
             self.jump.time_descending += dt;
@@ -4212,7 +5014,9 @@ impl Movement {
         // only what leaves the hands on it.
         let stale = self.vaulting.choose(&s, &self.standing());
         let high = stale.is_some_and(|kind| self.vaulting.obstacle.height >= s.of(kind).max_without_hand);
-        if self.prone || (input.weapon_occupied && high) || self.input_direction[1] <= 0.0 {
+        // Nor with blind fire's figure set (`CheckBlindFireCondition`).
+        let hands_held = input.hands_limit_vault && (stale.is_none() || high);
+        if self.prone || self.blind_fire != 0 || (input.weapon_occupied && high) || hands_held || self.input_direction[1] <= 0.0 {
             return;
         }
         // How fast the character goes along the view's heading; nothing if
@@ -4229,6 +5033,51 @@ impl Movement {
         match kind {
             Move::Vault => self.do_vault = true,
             Move::Climb => self.do_climb = true,
+        }
+    }
+
+    /// A mark of a move over an obstacle (`FirstPersonVaultingAudioController`,
+    /// `kind` the move by `body::VAULT_STATES`, `mark` 0 to 3: start, grab,
+    /// slide, end): at the start the obstacle's surface is found (a cast
+    /// 0.1 m down onto the heaviest point, 0.6 m at most: a line here for
+    /// the game's sphere of 0.1 m, `PROVISIONAL`) and the terrain's (from
+    /// the capsule's centre down its height and half a metre more); the
+    /// start and the end play the terrain's surface set's element, the
+    /// grab and the slide the obstacle's; the grab and the end play the
+    /// move's kit bank first, and the end finds the terrain's surface
+    /// again before it.
+    fn vault_mark(&mut self, kind: usize, mark: usize, world: &dyn World) {
+        // The height as the animator holds it (`VaultingHeight`), and the
+        // capsule as the game's controller stands just now.
+        let height = self.vault_figures[0];
+        let terrain = |m: &Self| {
+            let [x, y, z] = m.position;
+            let [capsule_height, centre_up] = m.capsule_figures();
+            let centre = [x, y + centre_up, z];
+            world.surface(centre, [x, centre[1] - (capsule_height + 0.5), z])
+        };
+        match mark {
+            0 => {
+                if let Some(found) = self.vaulting.heaviest_point().and_then(|[x, y, z]| world.surface([x, y + 0.1, z], [x, y - 0.5, z])) {
+                    self.vault_surfaces[0] = found;
+                }
+                if let Some(found) = terrain(self) {
+                    self.vault_surfaces[1] = found;
+                }
+                self.sounds.vault_element(kind, mark, self.vault_surfaces[1], height);
+            }
+            1 => {
+                self.sounds.vault_gear(kind, height);
+                self.sounds.vault_element(kind, mark, self.vault_surfaces[0], height);
+            }
+            2 => self.sounds.vault_element(kind, mark, self.vault_surfaces[0], height),
+            _ => {
+                if let Some(found) = terrain(self) {
+                    self.vault_surfaces[1] = found;
+                }
+                self.sounds.vault_gear(kind, height);
+                self.sounds.vault_element(kind, mark, self.vault_surfaces[1], height);
+            }
         }
     }
 
@@ -4249,18 +5098,42 @@ impl Movement {
     /// gravity, move.
     fn apply_motion(&mut self, motion: [f32; 3], dt: f32, world: &dyn World) {
         self.last_blend_velocity = motion.map(|m| m / dt);
+        // Down a slope the motion is laid along it (`ProjectMotionToSurface`).
+        let motion = slope::along_surface(motion, self.surface, self.normal_history.average());
         self.fall_and_move(motion, dt, world);
     }
 
     /// Adds gravity and moves, for the states that do not remember their
-    /// motion for standing's carry-over.
+    /// motion for standing's carry-over. On ground too steep to stand on
+    /// the slope's pull takes gravity's place, unless the character has
+    /// been falling for a while (`MovementContext.ApplyGravity`).
     fn fall_and_move(&mut self, mut motion: [f32; 3], dt: f32, world: &dyn World) {
         let g = self.settings.gravity;
         if self.freefall_time >= FREEFALL_GRACE && !self.grounded {
             let damp = 1.0 / (1.0 + 2.0 * self.freefall_time);
             motion = motion.map(|m| m * damp);
+            motion[1] += g * self.freefall_time * dt;
+        } else if self.slope != [0.0; 3] {
+            for k in 0..3 {
+                motion[k] += self.slope[k] * g * dt;
+            }
+        } else {
+            motion[1] += g * self.freefall_time * dt;
         }
-        motion[1] += g * self.freefall_time * dt;
+        // The head is kept out of walls, but going down (movement spec,
+        // "The head's push out of walls"); lying still and crawling, motion
+        // toward ground that is not there is then turned back; going down,
+        // something ahead or behind pushes the character off it ("Room to
+        // move").
+        let motion = match self.state {
+            State::ToProne => motion,
+            _ => self.limit_motion_xz(motion, self.state == State::ProneIdle, world),
+        };
+        let motion = match self.state {
+            State::ProneIdle | State::ProneMove => self.limit_prone_motion(motion, world),
+            State::ToProne => self.going_down_push(motion, dt, world).unwrap_or(motion),
+            _ => motion,
+        };
         if self.grounded {
             self.freefall_time = 0.0;
         } else {
@@ -4325,6 +5198,8 @@ impl Movement {
         [v[0] * cos - v[1] * sin, v[0] * sin + v[1] * cos]
     }
 }
+
+// ==== Helpers ====
 
 /// The animator's eight-way direction value: left 0, front 1, right 2,
 /// back 3, with the diagonals halfway between. `None` for no direction.

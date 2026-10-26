@@ -24,13 +24,17 @@ use crate::controller::Controller;
 use crate::inventory_view::{words, FAINT, WORDS};
 use crate::range::Range;
 
+// ==== The plugin and the words ====
+
 pub struct HealthViewPlugin;
 
 impl Plugin for HealthViewPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, (spawn_death_screen, make_pictures, share_item_looks.after(make_pictures)))
-            .add_systems(Update, (fill_panel, fill_own, fill_effect_icons, show_effect_tooltip, light_drop_glow).after(crate::inventory_view::ScreenDrawn))
+            .add_systems(Update, (fill_panel, fill_own, fill_effect_icons, show_effect_tooltip, light_drop_glow, light_info_buttons).after(crate::inventory_view::ScreenDrawn))
             .add_systems(Update, (show_death, damage_asked, damage_keys.after(crate::inventory_view::ScreenDrawn), show_version))
+            .add_systems(Update, hits_taken.after(damage_asked).after(damage_keys).after(barbed_wire))
+            .add_systems(Update, armour_slows)
             .add_systems(Update, barbed_wire.after(crate::controller::step))
             // Texts drawn as the game draws them, as they are made or
             // changed, before the screen is laid out.
@@ -48,7 +52,7 @@ impl Words {
     /// `LocalizedText`).
     pub fn load(install: &trp_data::Install, extra: &[String]) -> Self {
         let mut wanted: Vec<String> = Part::ALL.iter().map(|part| part.name().to_owned()).collect();
-        let kinds = [Kind::LightBleeding, Kind::HeavyBleeding, Kind::Wound, Kind::Pain, Kind::Tremor, Kind::Dehydration, Kind::Exhaustion, Kind::ChronicFatigue];
+        let kinds = [Kind::LightBleeding, Kind::HeavyBleeding, Kind::Wound, Kind::Pain, Kind::Tremor, Kind::Dehydration, Kind::Exhaustion, Kind::ChronicFatigue, Kind::Contusion];
         wanted.extend(kinds.iter().map(|kind| kind.name().to_owned()));
         wanted.extend(["Painkiller", "BrokenBone", "Encumbered", "OverEncumbered", "Killed in Action", "Killed by"].map(str::to_owned));
         wanted.extend(FIGURES.iter().map(|(_, key, _)| (*key).to_owned()));
@@ -73,6 +77,16 @@ impl Words {
         // The menu of a right click: its lines' captions and its reasons.
         wanted.extend(trp_sim::item_menu::Line::ALL.iter().map(|line| line.name().to_owned()));
         wanted.extend(trp_sim::item_menu::REASONS.iter().map(|key| (*key).to_owned()));
+        wanted.extend(trp_sim::item_menu::WishLine::ALL.iter().map(|line| line.caption_key().to_owned()));
+        // The window that edits a tag: its caption, its field's placeholder
+        // and its button.
+        wanted.extend(["ADD/EDIT CONTAINER TAG", "container tag", "Save"].map(str::to_owned));
+        // The weapon's malfunctions' notices (`crate::wear`) and the repair
+        // window's words (`crate::repair_view`).
+        wanted.extend(crate::wear::word_keys());
+        wanted.extend(crate::repair_view::word_keys());
+        // The SKILLS tab's: the skills', the buffs' and the page's words.
+        wanted.extend(crate::skills_view::word_keys());
         wanted.extend(extra.iter().cloned());
         let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
         match trp_data::inventory::texts(install, "en", &names) {
@@ -129,6 +143,8 @@ impl Words {
     }
 }
 
+// ==== The looks read from the game's scene: HEALTH, the inspect rows, the edit build screen, OVERALL ====
+
 /// The game's own panels of the inventory's left panel and their pictures:
 /// the health panel (the HEALTH tab), and with `TARKOV UI` the GEAR tab's
 /// strip of figures and the left panel's foot under both.
@@ -181,6 +197,10 @@ pub struct HealthLook {
     items: Option<trp_data::screen::ItemViews>,
     slot_item: Drawn,
     grid_item: Drawn,
+    /// The load component a magazine's view shows while it is worked
+    /// (`ItemViewLoadAmmoComponent`), and its pictures.
+    spin: Option<trp_data::screen::ScenePanel>,
+    spin_drawn: Drawn,
     pub item_looks: [Option<std::sync::Arc<ItemViewLook>>; 2],
     /// The containers' column (`TARKOV UI`): the scene's panel and its
     /// pictures, a grid view's, each container slot's empty picture
@@ -245,6 +265,17 @@ pub struct HealthLook {
     /// the figure's box (`ContentSizeFitter`).
     pub(crate) info: Option<trp_data::screen::ScenePanel>,
     info_drawn: Drawn,
+    /// The window of a container's grids (`TARKOV UI`; `GridWindow`) as its
+    /// script leaves it in a raid, and its pictures.
+    pub(crate) grid_window: Option<trp_data::screen::GridWindowLook>,
+    grid_window_drawn: Drawn,
+    /// The game's repair window (`RepairWindow`; `repair_built`): its
+    /// prefab, its objects as drawn, its scripts' figures and the two
+    /// icons a kit's points take.
+    pub(crate) repair: Option<trp_data::screen::ScenePanel>,
+    repair_drawn: Drawn,
+    pub(crate) repair_figures: trp_data::screen::RepairFigures,
+    repair_icons: [Option<Picture>; 2],
     info_mass_font: Option<trp_data::screen::TmpFont>,
     /// The menu of a right click (`TARKOV UI`; `ItemContextMenu`), its
     /// pictures with its templates of a line on, the font asset of a
@@ -252,6 +283,22 @@ pub struct HealthLook {
     /// line's name (`Characteristics/Icons/<line>`).
     pub(crate) menu: Option<trp_data::screen::ScenePanel>,
     menu_drawn: Drawn,
+    /// The menu of a line's own lines (`TARKOV UI`; `SubMenuTemplate`) and
+    /// its pictures with its templates of a line on.
+    pub(crate) submenu: Option<trp_data::screen::ScenePanel>,
+    submenu_drawn: Drawn,
+    /// The wish list's groups' icons (`StaticIcons.WishlistSprites`), and
+    /// the outlined ones a thing's view shows (`WishlistSpritesOutline`), by
+    /// the group's name.
+    wish_icons: HashMap<&'static str, Picture>,
+    wish_outlines: HashMap<&'static str, Picture>,
+    /// The window that edits a tag (`TARKOV UI`; `EditTagWindow`), with its
+    /// seven colour cells on and what its texts and its grid of colours ask
+    /// of its layout put on them; its pictures; and the most letters its
+    /// field takes (`m_CharacterLimit`).
+    pub(crate) tag_window: Option<trp_data::screen::ScenePanel>,
+    tag_window_drawn: Drawn,
+    pub(crate) tag_limit: u32,
     menu_font: Option<trp_data::screen::TmpFont>,
     menu_icons: HashMap<&'static str, Picture>,
     /// The font assets its texts are drawn from as the game draws them
@@ -261,7 +308,170 @@ pub struct HealthLook {
     pub(crate) tmp_faces: HashMap<(String, i64), std::sync::Arc<trp_data::tmp_text::TmpFace>>,
     pub(crate) tmp_materials: HashMap<(String, i64), trp_data::tmp_text::TmpMaterial>,
     tmp_default_material: HashMap<(String, i64), (String, i64)>,
+    /// The OVERALL tab (`TARKOV UI`; inventory spec, "The OVERALL tab"): the
+    /// scene's panel, its clothing panel on where the options' `CLOTHING`
+    /// is; its pictures, a dropdown line's, and those its scripts put on it
+    /// (the level's rank, the side's, the prestige's), by their names.
+    pub overall: Option<trp_data::screen::OverallPanel>,
+    overall_drawn: Drawn,
+    line_drawn: Drawn,
+    overall_pictures: HashMap<&'static str, Picture>,
+    /// The SKILLS tab as the game draws it (`TARKOV UI`; `skills_view`),
+    /// and the experience each level takes (`exp_table`), which its top
+    /// panel counts by.
+    pub(crate) skills: Option<crate::skills_view::SkillsLook>,
+    pub(crate) level_experience: Vec<u32>,
+    /// A skill's effectiveness as the raid begins (`skills_view::
+    /// effectiveness` at none earned), which the skills' views and
+    /// tooltip show; 1 where it was not read.
+    pub(crate) skill_effectiveness: Option<f32>,
+    /// The edit build screen as the game draws it (`TARKOV UI` with the
+    /// workbench on; workbench spec, "The screen as the game draws it").
+    pub(crate) edit_build: Option<EditBuildLook>,
+    /// The inspect window's rows (inspect-window spec, "A row"): its bar,
+    /// compact and dropdown rows' templates and pictures, their scripts'
+    /// colours and the bar's adding and subtracting pictures; and the
+    /// attributes' icons by the attribute's name.
+    pub(crate) info_rows: Option<InfoRowsLook>,
+    attribute_icons: HashMap<String, Picture>,
+    /// The other three tables of a figure's icons, by the enum its id is of
+    /// (`trp_sim::item_attributes::Table`): a health effect's, a damage
+    /// effect's and a buff's (the buffs' by our name for the kind: the
+    /// table cuts its names to thirteen letters).
+    figure_icons: [HashMap<String, Picture>; 3],
+    /// The slots' pictures (`Resources/Slots/<name>`, by the name in lower
+    /// case), which an empty slot of the parts' panel shows; how far the
+    /// window stretches (`StretchWindow._maxSize`).
+    slot_pictures: HashMap<String, Picture>,
+    pub(crate) info_stretch: Option<[f32; 2]>,
+    /// The armour classes' marks a tooltip's words name
+    /// (`<sprite name="armor_classes_N">`), by class.
+    class_marks: HashMap<u32, Picture>,
 }
+
+/// The inspect window's row templates as drawn.
+pub(crate) struct InfoRowsLook {
+    bar: (trp_data::screen::ScenePanel, Drawn),
+    compact: (trp_data::screen::ScenePanel, Drawn),
+    dropdown: (trp_data::screen::ScenePanel, Drawn),
+    bar_look: trp_data::screen::RowLook,
+    compact_look: trp_data::screen::RowLook,
+    add: Option<Picture>,
+    sub: Option<Picture>,
+    /// A slot of the parts' panel (`ModSlotView`), its pieces as its script
+    /// shows them per slot.
+    mod_slot: Option<(trp_data::screen::ScenePanel, Drawn)>,
+}
+
+/// The edit build screen as the game draws it (`EditBuildScreen`): its
+/// scene, with its objects as drawn (the dropdown, the panel of a build
+/// ready to assemble and the loader shown as their scripts have them); a
+/// slot's view (`Prefabs/UGUI/modding_screen_slot`), its dropdown's button
+/// and its bone's name shown as its script has them; an empty slot's view
+/// (`EmptyItemView`, the slot's `_emptyItemViewTemplate`); a part's view
+/// (`Prefabs/UGUI/Layouts/modding_selectable_layout`), made at the start
+/// into how a thing's view is drawn; the bone's icons (`Modding Screen
+/// Icons/<name>`, `ModdingScreenSlotView.UpdateInfo`) and the dropdown's
+/// button as open and as shut (`button_mod_dropdown_open`, `_close`).
+pub(crate) struct EditBuildLook {
+    pub(crate) scene: std::sync::Arc<trp_data::edit_build::EditBuildScene>,
+    pub(crate) screen: Drawn,
+    pub(crate) slot: trp_data::screen::ScenePanel,
+    pub(crate) slot_drawn: Drawn,
+    pub(crate) empty: trp_data::screen::ScenePanel,
+    pub(crate) empty_drawn: Drawn,
+    part: Option<(trp_data::screen::ScenePanel, Drawn)>,
+    pub(crate) part_look: Option<std::sync::Arc<ItemViewLook>>,
+    pub(crate) bones: HashMap<String, Picture>,
+    pub(crate) dropdown: [Option<Picture>; 2],
+    /// Its characteristics panel (`CharacteristicsPanel`), where it was read.
+    pub(crate) stats: Option<EbStatsLook>,
+}
+
+/// The edit build screen's characteristics panel as the scene has it
+/// (`CharacteristicsPanel`: its durability and weight rows, its row
+/// templates, the container the rows go in, its switcher and its INFO
+/// button); its templates' scripts' colours.
+pub(crate) struct EbStatsLook {
+    panel: trp_data::screen::ScenePanel,
+    drawn: Drawn,
+    bar: (trp_data::screen::ScenePanel, Drawn),
+    compact: (trp_data::screen::ScenePanel, Drawn),
+    bar_look: trp_data::screen::RowLook,
+    compact_look: trp_data::screen::RowLook,
+    weight_look: trp_data::screen::RowLook,
+}
+
+impl EditBuildLook {
+    /// A part's view's size as the rows and grids that hold it make it
+    /// (its `LayoutElement`'s preferred size, which the slot's row and the
+    /// dropdown's grid both size it by: a part of any cells is shown in a
+    /// box of that size, its picture fitted in it).
+    pub(crate) fn part_side(&self) -> [f32; 2] {
+        let top = self.part.as_ref().and_then(|(panel, _)| panel.nodes.first());
+        let element = top.and_then(|top| top.element).map(|element| element.preferred);
+        match (element, top) {
+            (Some([w, h]), _) if w > 0.0 && h > 0.0 => [w, h],
+            (_, Some(top)) => top.layout.size_delta,
+            _ => [64.0, 64.0],
+        }
+    }
+}
+
+/// The objects of the edit build screen its scripts show and hide: the
+/// dropdown (`DropDownMenu.Show`), the panel of a build ready to assemble
+/// (`SetItemReadyToAssembleActive`), the loader (`_loader`, while the
+/// preview is made); and those never shown here: the warning of a vital
+/// part missing (no script of the screen's shows it), the characteristics
+/// (not built), the windows of the saved builds (not built), the ellipse's
+/// rectangle (it draws nothing).
+pub(crate) const EB_DROPDOWN: &str = "Preview Panel/DropdownMenu";
+pub(crate) const EB_READY: &str = "ItemReadyToAssemble";
+pub(crate) const EB_LOADER: &str = "Loader";
+const EB_NEVER: [&str; 4] = ["Attention", "CharacteristicsPanel", "Context Menu Area", "Ellipse Rect"];
+/// The characteristics panel's row templates, in it.
+const EB_CHAR_TEMPLATE: &str = "CharacteristicsExpanded/CharTemplate";
+const EB_COMPACT_TEMPLATE: &str = "CharacteristicsExpanded/CompactTemplate";
+/// A slot's view's objects its script shows and hides: the dropdown's
+/// button (on the mouse), the bone's name (a vital or gear slot), the
+/// locked slot's fade.
+pub(crate) const EB_SLOT_BUTTON: &str = "modding_menu_item/Button";
+pub(crate) const EB_SLOT_NAME: &str = "Bone Icon/Bone Name Panel";
+pub(crate) const EB_SLOT_FADE: &str = "modding_menu_item/LockedFade";
+/// The bone's icons, by class and full or empty.
+pub(crate) const EB_BONES: [&str; 6] = [
+    "icon_mod_tactical_big_installed",
+    "icon_mod_tactical_big_nomod",
+    "icon_mod_vital_big_installed",
+    "icon_mod_vital_big_nomod",
+    "icon_mod_gear_big_installed",
+    "icon_mod_gear_big_nomod",
+];
+/// Where a slot's view's script keeps its empty view's template: its
+/// fourteenth field (`_emptyItemViewTemplate`), a pointer of twelve bytes
+/// after the forty its fields begin at.
+const EB_EMPTY_FIELD: usize = 40 + 13 * 12;
+
+/// The OVERALL tab's objects the app goes by, below its panel's top.
+pub const OVERALL_VIEW: &str = "LeftSide/CharacterPanel/PlayerModelView";
+pub const OVERALL_CLOTHING: &str = "LeftSide/ClothingPanel";
+pub const OVERALL_SELECTORS: [&str; 2] = ["LeftSide/ClothingPanel/Upper/ClothingSelector", "LeftSide/ClothingPanel/Lower/ClothingSelector"];
+/// What of the tab is the profile's figures (its level and rank, its
+/// nickname and experience, the statistics), drawn dimmed (the user,
+/// 2026-10-18: "Dim out the stats for now, since we won't track them").
+const OVERALL_DIMMED: [&str; 3] = ["LeftSide/CharacterPanel/Level Panel", "LeftSide/CharacterPanel/PlayerModelView/BottomField", "RightSide"];
+/// How far they are dimmed: the alpha the game's own screens give what does
+/// not work (`Tab.SetUnlockStatus`: its group at 0.3), as the tabs not built
+/// are.
+const OVERALL_DIM: f32 = 0.3;
+/// The level of a character with no experience (`ProfileInfo.GetLevel(0)`:
+/// the first of the experience table's levels), its rank's picture
+/// (`PlayerLevelPanel.SetLevelIcon`: `Level Icons/rank` and the level's
+/// five up from it) and how it is written (`{level:D2}`).
+const OVERALL_RANK: &str = "Level Icons/rank5";
+const OVERALL_LEVEL: &str = "01";
+
+// ==== Pixels, masked fills and colour spaces ====
 
 /// A texture's pixels as the engine keeps them (RGBA, its lowest row
 /// first), and whether it is sampled at its nearest pixel.
@@ -402,9 +612,11 @@ fn to_srgb(value: f32) -> u8 {
     (c * 255.0).round() as u8
 }
 
+// ==== What is drawn: the pieces, the pictures, the limits ====
+
 /// One of the game's panels as drawn: whether each object shows, and its
 /// picture, by its place in the panel.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Drawn {
     pub(crate) shown: Vec<Shown>,
     pub(crate) pictures: Vec<Option<Picture>>,
@@ -426,6 +638,8 @@ const BACK_BUTTON: usize = 10 << 20;
 const INFO: usize = 14 << 20;
 /// The menu of a right click.
 const MENU: usize = 15 << 20;
+/// The windows that edit a tag, each window's past the one before it.
+const TAG_WINDOW: usize = 16 << 20;
 /// The menu's lines' templates below its top (an ordinary line's, the wish
 /// list's, Discard's: `SimpleSpecifiedContextButtons`), and what holds the
 /// lines.
@@ -460,6 +674,7 @@ pub(crate) struct Picture {
     size: [f32; 2],
 }
 
+
 /// The carried weight's limits as the inventory's figures go by them
 /// (`GlobalConfiguration.Stamina`): the least start of the four
 /// overweight limits, and the base limit's end; the Strength skill's
@@ -471,13 +686,23 @@ pub fn weight_limits(config: &serde_json::Value) -> Option<[f32; 2]> {
     Some([lower.into_iter().fold(f32::MAX, f32::min), at("BaseOverweightLimits", "y")?])
 }
 
+/// The experience each level takes beyond the one before
+/// (`GlobalConfiguration.Experience.Level.Table`, `exp.level.exp_table`),
+/// the first level's first.
+pub fn level_experience(config: &serde_json::Value) -> Vec<u32> {
+    let table = config.get("exp").and_then(|exp| exp.get("level")).and_then(|level| level.get("exp_table")).and_then(|table| table.as_array());
+    table.map_or_else(Vec::new, |rows| rows.iter().filter_map(|row| row.get("exp")?.as_u64().map(|v| v as u32)).collect())
+}
+
+// ==== HealthLook: the scene read ====
+
 impl HealthLook {
     /// Reads the panels from the scene file that holds the inventory
     /// screen (`file`), and with `TARKOV UI` on (`pictures`) the pictures
     /// their objects draw and the clips their animators play; off, the
     /// health panel's layout alone, where the app's own look puts its
     /// boxes.
-    pub fn read(install: &trp_data::Install, file: &str, pictures: bool, weight_limits: Option<[f32; 2]>, layouts: &[String]) -> Self {
+    pub fn read(install: &trp_data::Install, file: &str, pictures: bool, weight_limits: Option<[f32; 2]>, layouts: &[String], clothing: bool, workbench: bool) -> Self {
         let panel = match trp_data::screen::HealthPanel::load(install, file) {
             Ok(panel) => panel,
             Err(e) => {
@@ -506,6 +731,9 @@ impl HealthLook {
             look.gear.shown = shown_of(&gear.nodes, &[], &arrows, &scripted);
         }
         if !pictures {
+            // The OVERALL tab's layout, where the app's own look puts its
+            // boxes.
+            look.overall = overall_panel(install, file, clothing);
             look.panel = Some(panel);
             return look;
         }
@@ -637,7 +865,12 @@ impl HealthLook {
                 look.battle_modes = crate::battle_view::BattleModes::read(install);
                 match trp_data::screen::BattleViews::load(install, file) {
                     Ok(views) => {
-                        let figures: Vec<usize> = views.figures.iter().map(|(object, _)| *object).collect();
+                        if let Some(why) = &views.action_missing {
+                            eprintln!("the game's interaction panel could not be read; the app's prompt is drawn: {why}");
+                        }
+                        // (And the mount's icon and arrows, which its script
+                        // turns on: `battle_view`.)
+                        let figures: Vec<usize> = views.figures.iter().map(|(object, _)| *object).chain(views.mount.iter().flat_map(|mount| mount.scripted())).collect();
                         look.stance_drawn.shown = shown_of(&views.stance.nodes, &[], &[], &figures);
                         look.stance_drawn.pictures = read(&views.stance, &look.stance_drawn.shown, &mut look.textures);
                         look.body_drawn.shown = shown_of(&views.health.nodes, &[], &[], &[]);
@@ -663,7 +896,8 @@ impl HealthLook {
                                 // weapon (`ValidateMastering`) and a part
                                 // (`ItemViewStats`): their pictures read.
                                 let named = |name: &str| (0..view.nodes.len()).filter(|&index| view.nodes[index].name == name).collect::<Vec<_>>();
-                                let mut turned: Vec<usize> = ["MasteringContainer", "MasteringIcon", "Level", "ModIconContainer"].iter().flat_map(|name| named(name)).collect();
+                                let mut turned: Vec<usize> =
+                                    ["MasteringContainer", "MasteringIcon", "Level", "ModIconContainer", "WishlistGlow", "WishlistBorder", "WishlistBorders", "WishlistIcon", "Loader"].iter().flat_map(|name| named(name)).collect();
                                 turned.extend(named("Image").into_iter().filter(|&index| view.nodes[index].parent.is_some_and(|parent| view.nodes[parent].name == "MasteringIcon")));
                                 drawn.shown = shown_of(&view.nodes, &turned, &[], &[]);
                                 drawn.pictures = read(view, &drawn.shown, &mut look.textures);
@@ -672,6 +906,16 @@ impl HealthLook {
                         look.items = Some(items);
                     }
                     Err(e) => eprintln!("the game's views of a thing could not be read; things are drawn the app's way: {e:#}"),
+                }
+                // The load component over a magazine's view, all of it.
+                match trp_data::screen::load_ammo_component(install) {
+                    Ok(panel) => {
+                        let all: Vec<usize> = (0..panel.nodes.len()).collect();
+                        look.spin_drawn.shown = shown_of(&panel.nodes, &all, &[], &[]);
+                        look.spin_drawn.pictures = read(&panel, &look.spin_drawn.shown, &mut look.textures);
+                        look.spin = Some(panel);
+                    }
+                    Err(e) => eprintln!("the game's load component of a magazine could not be read; the app's is drawn: {e:#}"),
                 }
                 // The window that shows a thing, as its script leaves it
                 // for a thing with no tag (`InfoWindow.UpdateTag`), not on
@@ -684,12 +928,115 @@ impl HealthLook {
                         for &index in &off {
                             info.nodes[index].active = false;
                         }
-                        look.info_drawn.shown = shown_of(&info.nodes, &[], &off, &[]);
+                        // (Its loader while the model is made, and a
+                        // weapon's durability row: as its script shows
+                        // them.)
+                        let scripted: Vec<usize> = [INFO_TAG, INFO_WISH, INFO_LOADER, INFO_DURABILITY, INFO_MODS, INFO_MASTERING, INFO_MASTERING_BADGE, INFO_CORNER].iter().filter_map(|path| info.find(path)).collect();
+                        if let Some(wish) = info.find(INFO_WISH) {
+                            info.nodes[wish].active = false;
+                        }
+                        // (The buttons' templates and the mastering row's
+                        // value read as on, for the copies made of them.)
+                        let turned: Vec<usize> = scripted.iter().copied().chain(INFO_BUTTON_TEMPLATES.iter().chain([&INFO_MASTERING_VALUE]).filter_map(|path| info.find(path))).collect();
+                        look.info_drawn.shown = shown_of(&info.nodes, &turned, &off, &scripted);
+                        look.info_stretch = trp_data::screen::stretch_limit(&info);
                         look.info_drawn.pictures = read(&info, &look.info_drawn.shown, &mut look.textures);
                         look.info_mass_font = info.find(INFO_MASS).and_then(|mass| info.nodes[mass].text.as_ref()).and_then(|text| trp_data::screen::TmpFont::read(install, &info.file_of(text.font.0)?, text.font.1).ok());
+                        // Its rows' templates: each whole, its value on
+                        // (`SetValues`), a bar's comparison never.
+                        match trp_data::screen::info_rows(install, &info) {
+                            Ok(rows) => {
+                                let mut drawn_of = |panel: &trp_data::screen::ScenePanel| {
+                                    let turned: Vec<usize> = panel.find("Value").into_iter().collect();
+                                    let never: Vec<usize> = panel.find("bars/CompareDelta").into_iter().collect();
+                                    let mut drawn = Drawn { shown: shown_of(&panel.nodes, &turned, &never, &[]), pictures: Vec::new() };
+                                    drawn.pictures = read(panel, &drawn.shown, &mut look.textures);
+                                    drawn
+                                };
+                                let (bar, compact, dropdown) = (drawn_of(&rows.bar), drawn_of(&rows.compact), drawn_of(&rows.dropdown));
+                                let bar_look = trp_data::screen::row_look(&rows.bar, "CharacteristicPanel").unwrap_or_default();
+                                let compact_look = trp_data::screen::row_look(&rows.compact, "CompactCharacteristicPanel").unwrap_or_default();
+                                // A slot's pieces that its script turns on
+                                // and off (`SetSlotGraphics`, `Show`); a
+                                // revolver's drum's border never here.
+                                let mod_slot = rows.mod_slot.map(|panel| {
+                                    let scripted: Vec<usize> = MOD_SLOT_PIECES.iter().filter_map(|path| panel.find(path)).collect();
+                                    let never: Vec<usize> = panel.find("CanvasGroup/ActiveCamoraBorder").into_iter().collect();
+                                    let mut drawn = Drawn { shown: shown_of(&panel.nodes, &[], &never, &scripted), pictures: Vec::new() };
+                                    drawn.pictures = read(&panel, &drawn.shown, &mut look.textures);
+                                    (panel, drawn)
+                                });
+                                look.info_rows = Some(InfoRowsLook { bar: (rows.bar, bar), compact: (rows.compact, compact), dropdown: (rows.dropdown, dropdown), bar_look, compact_look, add: None, sub: None, mod_slot });
+                            }
+                            Err(e) => eprintln!("the game's rows of a thing's figures could not be read; none are listed: {e:#}"),
+                        }
                         look.info = Some(info);
                     }
                     Err(e) => eprintln!("the game's window that shows a thing could not be read; the app's is drawn: {e:#}"),
+                }
+                // The window of a container's grids, as its script leaves it
+                // in a raid with the install's `PriorityWindowMode` (Auto):
+                // its priority toggle off (`GridWindow.Show`), as are its
+                // tag, its sorting, its search and its loader in the prefab;
+                // so its caption's row holds the icon, the caption and the
+                // cross. The icon and the cross ask the row for their
+                // pictures' own sizes where their elements set none (an
+                // `Image`'s preferred size, which the panel's layout does
+                // not have of itself). PROVISIONAL: a picture's pixel taken
+                // as a unit (the sprite's `pixelsPerUnit` against the
+                // canvas's not read); the icon is then 19 wide, the words
+                // from 24.
+                match trp_data::screen::grid_window(install) {
+                    Ok(mut window) => {
+                        if let Some(priority) = window.priority {
+                            window.panel.nodes[priority].active = false;
+                        }
+                        look.grid_window_drawn.shown = shown_of(&window.panel.nodes, &[], &[], &[]);
+                        look.grid_window_drawn.pictures = read(&window.panel, &look.grid_window_drawn.shown, &mut look.textures);
+                        for node in [window.icon, window.close] {
+                            let Some(picture) = look.grid_window_drawn.pictures[node] else { continue };
+                            let element = window.panel.nodes[node].element.unwrap_or(trp_data::screen::Element { ignore: false, min: [-1.0; 2], preferred: [-1.0; 2], flexible: [-1.0; 2] });
+                            let preferred = [0, 1].map(|axis| if element.preferred[axis] >= 0.0 { element.preferred[axis] } else { picture.size[axis] });
+                            window.panel.nodes[node].element = Some(trp_data::screen::Element { preferred, ..element });
+                        }
+                        look.grid_window = Some(window);
+                    }
+                    Err(e) => eprintln!("the game's window of a container's grids could not be read; the app's is drawn: {e:#}"),
+                }
+                // The window that edits a tag: the seven cells its colours'
+                // panel makes from its template (`TagColorsPanel.Show`),
+                // drawn as the prefab's own seven of the same colours lie
+                // (where its grid puts them: 25 by 25, 15 apart, one row),
+                // each cell's border, the field's text and its placeholder
+                // left to its script.
+                match trp_data::screen::tag_window(install) {
+                    Ok(mut panel) => {
+                        let cells: Vec<usize> = (0..TAG_COLORS).filter_map(|n| panel.find(&tag_cell(n))).collect();
+                        for &cell in &cells {
+                            panel.nodes[cell].active = true;
+                        }
+                        let mut scripted: Vec<usize> = (0..TAG_COLORS).filter_map(|n| panel.find(&format!("{}/Border", tag_cell(n)))).collect();
+                        scripted.extend([TAG_TEXT, TAG_PLACEHOLDER].iter().filter_map(|path| panel.find(path)));
+                        look.tag_limit = panel.find(TAG_INPUT).and_then(|input| panel.script(input, "ValidationInputField")).and_then(trp_data::screen::input_limit).unwrap_or(TAG_LIMIT);
+                        // The field's text and placeholder kept off its edges
+                        // by their margins (left, top, right, bottom), put
+                        // into their rectangles: the panel's drawing lays a
+                        // text in its rectangle as it is.
+                        let fields: Vec<usize> = [TAG_TEXT, TAG_PLACEHOLDER].iter().filter_map(|path| panel.find(path)).collect();
+                        for index in fields {
+                            let Some(margin) = panel.nodes[index].text.as_ref().map(|text| text.margin) else { continue };
+                            let layout = &mut panel.nodes[index].layout;
+                            layout.offset = [layout.offset[0] + margin[0], layout.offset[1] - margin[1]];
+                            layout.size_delta = [layout.size_delta[0] - margin[0] - margin[2], layout.size_delta[1] - margin[1] - margin[3]];
+                            if let Some(text) = panel.nodes[index].text.as_mut() {
+                                text.margin = [0.0; 4];
+                            }
+                        }
+                        look.tag_window_drawn.shown = shown_of(&panel.nodes, &[], &[], &scripted);
+                        look.tag_window_drawn.pictures = read(&panel, &look.tag_window_drawn.shown, &mut look.textures);
+                        look.tag_window = Some(panel);
+                    }
+                    Err(e) => eprintln!("the game's window that edits a tag could not be read; the app's is drawn: {e:#}"),
                 }
                 // The menu of a right click, its templates of a line on.
                 match trp_data::screen::context_menu(install) {
@@ -703,7 +1050,197 @@ impl HealthLook {
                     }
                     Err(e) => eprintln!("the game's menu of a right click could not be read; the app's is drawn: {e:#}"),
                 }
+                // The menu of a line's own lines, from the same templates.
+                match trp_data::screen::context_submenu(install) {
+                    Ok(mut sub) => {
+                        // Its holder of lines is kept off, and shown with
+                        // the menu (`ShowMenu`: the holder's `Show`).
+                        if let Some(holder) = sub.find(MENU_LINES) {
+                            sub.nodes[holder].active = true;
+                        }
+                        let templates: Vec<usize> = MENU_TEMPLATES.iter().filter_map(|path| sub.find(path)).collect();
+                        look.submenu_drawn.shown = shown_of(&sub.nodes, &templates, &[], &[]);
+                        look.submenu_drawn.pictures = read(&sub, &look.submenu_drawn.shown, &mut look.textures);
+                        look.submenu = Some(sub);
+                    }
+                    Err(e) => eprintln!("the game's menu of a line's own lines could not be read; the app's is drawn: {e:#}"),
+                }
+                // The OVERALL tab, as it shows in a raid: its clothing panel
+                // on where the options' `CLOTHING` is (the game's only out of
+                // one, `ShowClothingPanel`: the user's departure), its lists'
+                // scroll areas as high as they show of their lines (at most
+                // `_maxVisibleHeight`: the install's suits are many more
+                // than that holds, `DropDownBox.Update`), its back button
+                // and its lines' template never (the inventory's own back
+                // button is the tab bar's; the lines are drawn from the
+                // template, `line`), its lists, their arrows and the
+                // loading spinner as its scripts have them.
+                if let Some(overall) = overall_panel(install, file, clothing) {
+                    let panel = &overall.panel;
+                    let never: Vec<usize> = ["BackButton"].into_iter().chain(OVERALL_SELECTORS.map(|selector| format!("{selector}/Element")).iter().map(String::as_str).collect::<Vec<_>>()).filter_map(|path| panel.find(path)).collect();
+                    let mut scripted: Vec<usize> = OVERALL_SELECTORS.iter().flat_map(|selector| ["Open Panel", "Button/Closed Image", "Button/Open Image"].map(|end| format!("{selector}/{end}"))).filter_map(|path| panel.find(&path)).collect();
+                    scripted.extend(panel.find(&format!("{OVERALL_VIEW}/Progress Spinner")));
+                    look.overall_drawn.shown = shown_of(&panel.nodes, &scripted, &never, &scripted);
+                    look.overall_drawn.pictures = read(panel, &look.overall_drawn.shown, &mut look.textures);
+                    if let Some(line) = &overall.line {
+                        look.line_drawn.shown = shown_of(&line.nodes, &[], &[], &[]);
+                        look.line_drawn.pictures = read(line, &look.line_drawn.shown, &mut look.textures);
+                    }
+                    look.overall = Some(overall);
+                }
+                // The edit build screen, with the workbench on.
+                let mut edit_build = None;
+                if workbench {
+                    match edit_build_panels(install) {
+                        Ok((scene, slot, empty, part)) => {
+                            let panel = &scene.panel;
+                            let find = |path: &str| panel.find(path);
+                            let turned: Vec<usize> = [EB_DROPDOWN, EB_READY].iter().filter_map(|path| find(path)).collect();
+                            let never: Vec<usize> = EB_NEVER.iter().filter_map(|path| find(path)).collect();
+                            let mut scripted = turned.clone();
+                            scripted.extend(find(EB_LOADER));
+                            scripted.extend((0..panel.nodes.len()).filter(|&index| panel.nodes[index].path.starts_with("Toggle Group/") && panel.nodes[index].path.ends_with("/Checkmark/Mark")));
+                            let mut screen = Drawn { shown: shown_of(&panel.nodes, &turned, &never, &scripted), pictures: Vec::new() };
+                            screen.pictures = read(panel, &screen.shown, &mut look.textures);
+                            let slot_turned: Vec<usize> = [EB_SLOT_BUTTON].iter().filter_map(|path| slot.find(path)).collect();
+                            let slot_scripted: Vec<usize> = [EB_SLOT_BUTTON, EB_SLOT_NAME, EB_SLOT_FADE].iter().filter_map(|path| slot.find(path)).collect();
+                            let mut slot_drawn = Drawn { shown: shown_of(&slot.nodes, &slot_turned, &[], &slot_scripted), pictures: Vec::new() };
+                            slot_drawn.pictures = read(&slot, &slot_drawn.shown, &mut look.textures);
+                            let mut empty_drawn = Drawn { shown: shown_of(&empty.nodes, &[], &[], &[]), pictures: Vec::new() };
+                            empty_drawn.pictures = read(&empty, &empty_drawn.shown, &mut look.textures);
+                            // A part's view as the grid's is read: what its
+                            // scripts turn on for a part.
+                            let named = |name: &str| (0..part.nodes.len()).filter(|&index| part.nodes[index].name == name).collect::<Vec<_>>();
+                            let part_turned: Vec<usize> = ["ModIconContainer", "Loader"].iter().flat_map(|name| named(name)).collect();
+                            let mut part_drawn = Drawn { shown: shown_of(&part.nodes, &part_turned, &[], &[]), pictures: Vec::new() };
+                            part_drawn.pictures = read(&part, &part_drawn.shown, &mut look.textures);
+                            // The characteristics panel: its templates and
+                            // the mastering row never drawn in it, the
+                            // expanded rows and the INFO button by the
+                            // fold, each bar's comparison by its figures.
+                            let stats = panel.find("CharacteristicsPanel").and_then(|top| {
+                                let sub = panel.subtree(top);
+                                let find = |path: &str| sub.find(path);
+                                let template = |path: &str| find(path).map(|at| sub.subtree(at));
+                                let (bar, compact) = (template(EB_CHAR_TEMPLATE)?, template(EB_COMPACT_TEMPLATE)?);
+                                let never: Vec<usize> = [EB_CHAR_TEMPLATE, EB_COMPACT_TEMPLATE, "CharacteristicsExpanded/Mastering"].iter().filter_map(|path| find(path)).collect();
+                                let scripted: Vec<usize> = ["CharacteristicsExpanded", "InfoButton", "CharacteristicsExpanded/Durability/bars/CompareDelta", "CharacteristicsExpanded/Weight/bars/CompareDelta"].iter().filter_map(|path| find(path)).collect();
+                                let mut drawn = Drawn { shown: shown_of(&sub.nodes, &scripted, &never, &scripted), pictures: Vec::new() };
+                                drawn.pictures = read(&sub, &drawn.shown, &mut look.textures);
+                                let mut row_drawn = |row: &trp_data::screen::ScenePanel| {
+                                    let turned: Vec<usize> = row.find("Value").into_iter().collect();
+                                    let scripted: Vec<usize> = row.find("bars/CompareDelta").into_iter().collect();
+                                    let mut drawn = Drawn { shown: shown_of(&row.nodes, &turned, &[], &scripted), pictures: Vec::new() };
+                                    drawn.pictures = read(row, &drawn.shown, &mut look.textures);
+                                    drawn
+                                };
+                                let (bar_drawn, compact_drawn) = (row_drawn(&bar), row_drawn(&compact));
+                                let bar_look = trp_data::screen::row_look(&bar, "CharacteristicPanel").unwrap_or_default();
+                                let compact_look = trp_data::screen::row_look(&compact, "CompactCharacteristicPanel").unwrap_or_default();
+                                let weight_look = find("CharacteristicsExpanded/Weight").and_then(|row| trp_data::screen::row_look(&sub.subtree(row), "CharacteristicPanel")).unwrap_or_else(|| bar_look.clone());
+                                Some(EbStatsLook { panel: sub, drawn, bar: (bar, bar_drawn), compact: (compact, compact_drawn), bar_look, compact_look, weight_look })
+                            });
+                            edit_build = Some(EditBuildLook {
+                                scene: std::sync::Arc::new(scene),
+                                screen,
+                                slot,
+                                slot_drawn,
+                                empty,
+                                empty_drawn,
+                                part: Some((part, part_drawn)),
+                                part_look: None,
+                                bones: HashMap::new(),
+                                dropdown: [None, None],
+                                stats,
+                            });
+                        }
+                        Err(e) => eprintln!("the game's edit build screen could not be read; the app's look of it is drawn: {e:#}"),
+                    }
+                }
                 drop(read);
+                // The edit build screen's pictures its scripts put on it.
+                if let Some(screen) = edit_build.as_mut() {
+                    for name in EB_BONES {
+                        let Some((file, id)) = trp_data::screen::resource_sprite(install, &format!("Modding Screen Icons/{name}")) else { continue };
+                        if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
+                            screen.bones.insert(name.to_owned(), picture);
+                        }
+                    }
+                    for (at, name) in ["button_mod_dropdown_open", "button_mod_dropdown_close"].iter().enumerate() {
+                        screen.dropdown[at] = trp_data::screen::resource_sprite(install, name).and_then(|(file, id)| reader.sprite(&file, id, &mut look.textures));
+                    }
+                }
+                look.edit_build = edit_build;
+                // The SKILLS tab: its page, a skill's two views, the
+                // tooltip, and the pictures its scripts put on them.
+                look.skills = crate::skills_view::SkillsLook::read(install, file, &mut reader, &mut look.textures);
+                // The inspect window's bar's pictures and the attributes'
+                // icons.
+                if let Some(rows) = look.info_rows.as_mut() {
+                    let figures = rows.bar_look.bar.clone().unwrap_or_default();
+                    rows.add = figures.add_sprite.and_then(|(file, id)| reader.sprite(&file, id, &mut look.textures));
+                    rows.sub = figures.sub_sprite.and_then(|(file, id)| reader.sprite(&file, id, &mut look.textures));
+                }
+                // The armour classes' marks (`Sprite Assets/armor_classes`).
+                match trp_data::screen::tmp_sprite_names(install, "Sprite Assets/armor_classes") {
+                    Ok(marks) => {
+                        for (name, (file, id)) in marks {
+                            let Some(class) = name.strip_prefix("armor_classes_").and_then(|class| class.parse::<u32>().ok()) else { continue };
+                            if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
+                                look.class_marks.insert(class, picture);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("the game's marks of the armour classes could not be read; a tooltip shows none: {e:#}"),
+                }
+                // The slots' pictures, by their names.
+                match trp_data::screen::resource_sprites(install, "Slots/") {
+                    Ok(sprites) => {
+                        for (name, (file, id)) in sprites.into_iter().filter(|(name, _)| !name.contains('/')) {
+                            if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
+                                look.slot_pictures.insert(name, picture);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("the game's pictures of the slots could not be read; an empty slot of a thing's parts shows none: {e:#}"),
+                }
+                match trp_data::screen::attribute_icons(install) {
+                    Ok(icons) => {
+                        for (name, (file, id)) in icons {
+                            if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
+                                look.attribute_icons.insert(name, picture);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("the game's icons of a thing's figures could not be read; its rows have none: {e:#}"),
+                }
+                match trp_data::screen::figure_icons(install) {
+                    Ok(tables) => {
+                        for (number, table) in tables.into_iter().enumerate() {
+                            for (name, (file, id)) in table {
+                                let name = if number == 2 { trp_sim::health::BuffKind::of_name(&name).name().to_owned() } else { name };
+                                if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
+                                    look.figure_icons[number].insert(name, picture);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("the game's icons of medicine's figures could not be read; their rows have none: {e:#}"),
+                }
+                // The pictures the OVERALL tab's scripts put on it: the
+                // level's rank, the side's (the BEAR's, the side of the
+                // character's starting kit, `PROVISIONAL`) and the
+                // prestige's (none: `_noSprite`).
+                if let Some(overall) = &look.overall {
+                    let [bear, _, none] = overall.side_sprites.clone();
+                    let rank = trp_data::screen::resource_sprite(install, OVERALL_RANK);
+                    for (name, sprite) in [("rank", rank), ("side", bear), ("prestige", none)] {
+                        let Some((file, id)) = sprite else { continue };
+                        if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
+                            look.overall_pictures.insert(name, picture);
+                        }
+                    }
+                }
                 // The tabs' fills and the crate panel's stripes cut to their
                 // masks, from the pictures' pixels.
                 let mut decoded = HashMap::new();
@@ -725,7 +1262,11 @@ impl HealthLook {
                 // `LoadModIconSprite`): its class's and its kind's.
                 let marks = MOD_CLASSES.iter().map(|(_, name)| (format!("type_{name}"), format!("Mod Types/icon_type_mod_{name}")));
                 let kinds = MOD_KINDS.iter().map(|(_, name)| (format!("mod_{name}"), format!("Mod Tactical Types/icon_mod_{name}")));
-                for (key, path) in marks.chain(kinds) {
+                // And a plate's armour class's, which a plate that may be
+                // taken out shows instead (`ItemViewStats.
+                // GetArmorPlateClassIconName`).
+                let plates = (1..=6).map(|class| (format!("plate_{class}"), format!("Mod Types/icon_type_mod_armor_plate_{class}")));
+                for (key, path) in marks.chain(kinds).chain(plates) {
                     let Some((file, id)) = trp_data::screen::resource_sprite(install, &path) else { continue };
                     if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
                         look.mod_pictures.insert(key, picture);
@@ -740,6 +1281,16 @@ impl HealthLook {
                             look.battle_sprites.insert((outside, id), picture);
                         }
                     }
+                    // The interaction panel's pointer: the hand, the hand
+                    // refused, the sense's dot (`UIPointer`).
+                    if let Some(action) = &views.action {
+                        for (outside, id) in [action.hover_sprite, action.unavailable_sprite, action.sense_sprite].into_iter().flatten() {
+                            let Some(name) = action.panel.file_of(outside) else { continue };
+                            if let Some(picture) = reader.sprite(&name, id, &mut look.textures) {
+                                look.battle_sprites.insert((outside, id), picture);
+                            }
+                        }
+                    }
                 }
                 // The icons of the menu's lines (`InteractionButtonsContainer`:
                 // `Characteristics/Icons/<line>`).
@@ -748,6 +1299,50 @@ impl HealthLook {
                     if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
                         look.menu_icons.insert(line.name(), picture);
                     }
+                }
+                // The wish list's: Remove's as the menu's, the groups' from
+                // the static icons, and the outlined ones of a view.
+                if let Some((file, id)) = trp_data::screen::resource_sprite(install, "Characteristics/Icons/RemoveFromWishlist") {
+                    if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
+                        look.menu_icons.insert("RemoveFromWishlist", picture);
+                    }
+                }
+                match trp_data::screen::wishlist_icons(install) {
+                    Ok([plain, outlined]) => {
+                        for (name, (file, id)) in plain {
+                            if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
+                                look.menu_icons.insert(name, picture);
+                                look.wish_icons.insert(name, picture);
+                            }
+                        }
+                        for (name, (file, id)) in outlined {
+                            if let Some(picture) = reader.sprite(&file, id, &mut look.textures) {
+                                look.wish_outlines.insert(name, picture);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("the game's icons of the wish list could not be read; its lines and marks have none: {e:#}"),
+                }
+                // The repair window, as its scripts leave it for a kit: its
+                // warnings' templates copied as they are needed, its loader,
+                // its repair's progress, the rank and standing (a trader's),
+                // the slider shown by its script.
+                match trp_data::screen::repair_window(install) {
+                    Ok(panel) => {
+                        let scripted: Vec<usize> = REPAIR_SCRIPTED.iter().filter_map(|path| panel.find(path)).collect();
+                        let turned: Vec<usize> = REPAIR_TEMPLATES.iter().filter_map(|path| panel.find(path)).collect();
+                        let by_script: Vec<usize> = scripted.iter().chain(&turned).copied().collect();
+                        look.repair_drawn.shown = shown_of(&panel.nodes, &turned, &[], &by_script);
+                        look.repair_drawn.pictures = reader.panel(&panel, &look.repair_drawn.shown, file, &mut look.textures);
+                        look.repair_figures = trp_data::screen::repair_figures(&panel).unwrap_or_else(|e| {
+                            eprintln!("the repair window's scripts could not be read; its kit's icons and colours are the prefab's: {e:#}");
+                            trp_data::screen::RepairFigures::default()
+                        });
+                        let figures = look.repair_figures.clone();
+                        look.repair_icons = [figures.in_stash, figures.to_pay].map(|sprite| sprite.and_then(|(file, id)| reader.sprite(&file, id, &mut look.textures)));
+                        look.repair = Some(panel);
+                    }
+                    Err(e) => eprintln!("the game's repair window could not be read; the app's is drawn: {e:#}"),
                 }
                 // The health's effects' icons (`StaticIcons.EffectIcons`).
                 match trp_data::screen::effect_icons(install) {
@@ -775,6 +1370,15 @@ impl HealthLook {
                 let battle_quick = look.battle_quick.as_ref().map(|quick| &quick.panel);
                 let info = look.info.as_ref();
                 let menu = look.menu.as_ref();
+                let tag_window = look.tag_window.as_ref();
+                let submenu = look.submenu.as_ref();
+                let overall = look.overall.as_ref().map(|overall| &overall.panel);
+                let overall_line = look.overall.as_ref().and_then(|overall| overall.line.as_ref());
+                let edit_build = look.edit_build.as_ref().map_or([None, None, None, None], |eb| [Some(&eb.scene.panel), Some(&eb.slot), Some(&eb.empty), eb.part.as_ref().map(|(part, _)| part)]);
+                let info_rows = look.info_rows.as_ref().map_or([None, None, None, None], |rows| [Some(&rows.bar.0), Some(&rows.compact.0), Some(&rows.dropdown.0), rows.mod_slot.as_ref().map(|(panel, _)| panel)]);
+                let action = look.battle.as_ref().and_then(|views| views.action.as_ref()).map(|action| &action.panel);
+                let grid_window = look.grid_window.as_ref().map(|window| &window.panel);
+                let repair_window = look.repair.as_ref();
                 match trp_data::screen::version_label(install) {
                     Ok(version) => look.version = Some(version),
                     Err(e) => eprintln!("the game's line of its version could not be read; none is drawn: {e:#}"),
@@ -785,15 +1389,18 @@ impl HealthLook {
                 }
                 let version = look.version.as_ref().map(|(label, _)| label).or(look.tooltip.as_ref());
                 let tooltip = look.tooltip.as_ref();
-                let mut assets: std::collections::BTreeSet<(String, i64)> = [Some(&panel.panel), panel.strip.as_ref(), panel.foot.as_ref(), panel.gear_panel.as_ref(), items[0], items[1], containers, tabs, stash, quick, back, version, tooltip, battle[0], battle[1], battle_quick, info, menu]
+                let skill_panels: Vec<&trp_data::screen::ScenePanel> = look.skills.as_ref().map(|skills| skills.panels()).unwrap_or_default();
+                let mut assets: std::collections::BTreeSet<(String, i64)> = [Some(&panel.panel), panel.strip.as_ref(), panel.foot.as_ref(), panel.gear_panel.as_ref(), items[0], items[1], containers, tabs, stash, quick, back, version, tooltip, battle[0], battle[1], battle_quick, info, menu, tag_window, submenu, overall, overall_line, edit_build[0], edit_build[1], edit_build[2], edit_build[3], info_rows[0], info_rows[1], info_rows[2], info_rows[3], action, grid_window, repair_window]
                     .into_iter()
                     .flatten()
+                    .chain(skill_panels.iter().copied())
                     .flat_map(|scene| scene.nodes.iter().filter_map(|node| node.text.as_ref().and_then(|text| Some((scene.file_of(text.font.0)?, text.font.1)))))
                     .collect();
                 // The materials the texts name for themselves, where they do.
-                let text_materials: std::collections::BTreeSet<(String, i64)> = [Some(&panel.panel), panel.strip.as_ref(), panel.foot.as_ref(), panel.gear_panel.as_ref(), items[0], items[1], containers, tabs, stash, quick, back, version, tooltip, battle[0], battle[1], battle_quick, info, menu]
+                let text_materials: std::collections::BTreeSet<(String, i64)> = [Some(&panel.panel), panel.strip.as_ref(), panel.foot.as_ref(), panel.gear_panel.as_ref(), items[0], items[1], containers, tabs, stash, quick, back, version, tooltip, battle[0], battle[1], battle_quick, info, menu, tag_window, submenu, overall, overall_line, edit_build[0], edit_build[1], edit_build[2], edit_build[3], info_rows[0], info_rows[1], info_rows[2], info_rows[3], action, grid_window, repair_window]
                     .into_iter()
                     .flatten()
+                    .chain(skill_panels.iter().copied())
                     .flat_map(|scene| scene.nodes.iter().filter_map(|node| node.text.as_ref().and_then(|text| text.material).and_then(|(file, id)| Some((scene.file_of(file)?, id)))))
                     .collect();
                 // And each one's bold typeface, where it has one.
@@ -853,6 +1460,30 @@ impl HealthLook {
                     face.bold = face.font.bold.as_ref().and_then(|bold| look.tmp_faces.get(bold)).cloned();
                     look.tmp_faces.insert(key, std::sync::Arc::new(face));
                 }
+                // What the tag window's texts and its grid of colours ask of
+                // its layout (TextMeshPro's preferred size; the grid's one
+                // row), which the layout here does not ask of them itself.
+                if let Some(mut panel) = look.tag_window.take() {
+                    let asks = |panel: &trp_data::screen::ScenePanel, index: usize, words: &str| -> Option<[f32; 2]> {
+                        let text = panel.nodes[index].text.as_ref()?;
+                        let font = &look.tmp_faces.get(&(panel.file_of(text.font.0)?, text.font.1))?.font;
+                        let width = font.width(words, text.size, text.spacing, text.style & 1 != 0) + text.margin[0] + text.margin[2];
+                        Some([width, tmp_line(font, text.size) + text.margin[1] + text.margin[3]])
+                    };
+                    let element = |preferred: [f32; 2]| trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred, flexible: [-1.0, -1.0] };
+                    if let Some(colors) = panel.find(TAG_COLORS_PANEL) {
+                        let width = panel.nodes[colors].element.map_or(360.0, |element| element.preferred[0]);
+                        panel.nodes[colors].element = Some(trp_data::screen::Element { preferred: [width, TAG_CELL], ..element([width, TAG_CELL]) });
+                    }
+                    let counter = format!("{0}/{0}", look.tag_limit);
+                    if let Some((index, size)) = panel.find(TAG_COUNT).and_then(|index| Some((index, asks(&panel, index, &counter)?))) {
+                        panel.nodes[index].element = Some(element(size));
+                    }
+                    if let Some((index, size)) = panel.find(TAG_SAVE_SIZE).and_then(|index| Some((index, asks(&panel, index, "SAVE")?))) {
+                        panel.nodes[index].element = Some(element(size));
+                    }
+                    look.tag_window = Some(panel);
+                }
                 // The materials: the assets' own and the texts' own.
                 let wanted: std::collections::BTreeSet<(String, i64)> = look.tmp_default_material.values().cloned().chain(text_materials).collect();
                 for (file, id) in wanted {
@@ -901,12 +1532,185 @@ impl HealthLook {
         // And the containers' slots', which their rows' headers say.
         let containers = ["TacticalVest", "Pockets", "Backpack", "SecuredContainer"].map(str::to_owned);
         // And what the panel for a container opened calls what it holds.
-        headers.chain(game.slot_views.iter().map(|(slot, _)| slot.to_string())).chain(containers).chain(["LOOT".to_owned()]).collect()
+        let mut keys: Vec<String> = headers.chain(game.slot_views.iter().map(|(slot, _)| slot.to_string())).chain(containers).chain(["LOOT".to_owned()]).collect();
+        // And the OVERALL tab's texts the install's words fill.
+        keys.extend(self.overall.iter().flat_map(|overall| overall.localized.iter().map(|(_, key, _)| key.clone())));
+        // And the SKILLS tab's.
+        keys.extend(self.skills.iter().flat_map(|skills| skills.page.localized.iter().map(|(_, key, _)| key.clone())));
+        // And the edit build screen's, its slots' and its empty view's.
+        if let Some(eb) = &self.edit_build {
+            for panel in [&eb.scene.panel, &eb.slot, &eb.empty] {
+                keys.extend((0..panel.nodes.len()).filter_map(|index| trp_data::screen::localized(panel, index)).map(|(key, _)| key));
+            }
+        }
+        keys
+    }
+
+    /// The edit build screen as the game draws it, where it was read.
+    pub(crate) fn edit_build(&self) -> Option<&EditBuildLook> {
+        self.edit_build.as_ref()
+    }
+
+    /// One of the game's pictures as drawn by hand, in that colour.
+    pub(crate) fn sprite_of(&self, picture: Picture, color: Color) -> Option<Sprite> {
+        let image = self.images.get(picture.texture)?.clone()?;
+        Some(Sprite { image, cut: picture.cut, size: picture.size, border: picture.border, color })
+    }
+
+    /// A part's kind's mark (`Mod Tactical Types/icon_mod_<kind>`) by its
+    /// kind's name.
+    pub(crate) fn mod_mark(&self, kind: &str) -> Option<Picture> {
+        self.mod_pictures.get(&format!("mod_{kind}")).copied()
+    }
+
+    /// What a panel's pictures and texts ask of the layout groups that lay
+    /// them out, put on them where no `LayoutElement` of theirs says
+    /// (`Image.preferredWidth`: a simple or filled picture its sprite's
+    /// size, a sliced or tiled one its border's; TextMeshPro's preferred
+    /// size: its words' width in its font asset and a line's height, with
+    /// its margins), so that the panel's groups and fitters lay out as the
+    /// game's: the layout here asks nothing of either by itself. `words`:
+    /// what the texts say where not what the scene has; an object with a
+    /// group of its own asks what its group does.
+    pub(crate) fn ask_by_content(&self, panel: &mut trp_data::screen::ScenePanel, drawn: &Drawn, words: &HashMap<usize, String>) {
+        self.ask_by_content_under(panel, drawn, words, None);
+    }
+
+    /// The same, only for what lies under one object of the panel (itself
+    /// among it), where one is named.
+    pub(crate) fn ask_by_content_under(&self, panel: &mut trp_data::screen::ScenePanel, drawn: &Drawn, words: &HashMap<usize, String>, top: Option<usize>) {
+        let under = |panel: &trp_data::screen::ScenePanel, index: usize| {
+            let Some(top) = top else { return true };
+            let mut at = Some(index);
+            while let Some(here) = at {
+                if here == top {
+                    return true;
+                }
+                at = panel.nodes[here].parent;
+            }
+            false
+        };
+        for index in 0..panel.nodes.len() {
+            if panel.nodes[index].group.is_some() || !under(panel, index) {
+                continue;
+            }
+            let mut asked: Option<[f32; 2]> = None;
+            if let (Some(image), Some(Some(picture))) = (panel.nodes[index].image, drawn.pictures.get(index)) {
+                let per = image.pixels_per_unit.max(1e-3);
+                let [l, b, r, t] = picture.border;
+                asked = Some(match image.kind {
+                    1 | 2 => [(l + r) / per, (b + t) / per],
+                    _ => [picture.size[0] / per, picture.size[1] / per],
+                });
+            }
+            if let Some(text) = panel.nodes[index].text.as_ref() {
+                let said = words.get(&index).cloned().unwrap_or_else(|| text.text.clone());
+                let said = if text.style & 16 != 0 { said.to_uppercase() } else { said };
+                if let Some(face) = panel.file_of(text.font.0).and_then(|file| self.tmp_faces.get(&(file, text.font.1))) {
+                    let width = face.font.width(&said, text.size, text.spacing, text.style & 1 != 0) + text.margin[0] + text.margin[2];
+                    let height = tmp_line(&face.font, text.size) + text.margin[1] + text.margin[3];
+                    asked = Some(asked.map_or([width, height], |own| [own[0].max(width), own[1].max(height)]));
+                }
+            }
+            let Some(asked) = asked else { continue };
+            let element = panel.nodes[index].element.get_or_insert(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+            for axis in 0..2 {
+                if element.preferred[axis] < 0.0 {
+                    element.preferred[axis] = asked[axis];
+                }
+            }
+        }
+    }
+}
+
+// ==== The edit build and OVERALL panels, the picture reader, what is shown ====
+
+/// The edit build screen's panels from the install: its scene, a slot's
+/// view, the empty view its script names, a part's view.
+fn edit_build_panels(install: &trp_data::Install) -> anyhow::Result<(trp_data::edit_build::EditBuildScene, trp_data::screen::ScenePanel, trp_data::screen::ScenePanel, trp_data::screen::ScenePanel)> {
+    use anyhow::Context;
+    let scene = trp_data::edit_build::EditBuildScene::load(install)?;
+    let paths = trp_data::screen::resource_paths(install)?;
+    let prefab = |wanted: &str| -> anyhow::Result<trp_data::screen::ScenePanel> {
+        let (_, file, id) = paths.iter().find(|(path, ..)| path == wanted).with_context(|| format!("no resource is at {wanted}"))?;
+        let scene = trp_data::screen::Scene::load_prefab(install, file, *id)?;
+        let mut panel = trp_data::screen::ScenePanel::of(&scene, 0);
+        panel.file = file.clone();
+        Ok(panel)
+    };
+    let slot = prefab("prefabs/ugui/modding_screen_slot")?;
+    let part = prefab("prefabs/ugui/layouts/modding_selectable_layout")?;
+    // The empty view: the prefab its template pointer's script is on.
+    let fields = slot.script(0, "ModdingScreenSlotView").context("the slot's view has no script")?;
+    let pointer = fields.get(EB_EMPTY_FIELD..EB_EMPTY_FIELD + 12).context("the slot's view's script is short")?;
+    let (outside, id) = (i32::from_le_bytes(pointer[..4].try_into()?), i64::from_le_bytes(pointer[4..].try_into()?));
+    let file = slot.file_of(outside).context("the empty view's file is not had")?;
+    let empty = trp_data::screen::Scene::load_prefab_of_script(install, &file, id)?;
+    let mut empty = trp_data::screen::ScenePanel::of(&empty, 0);
+    empty.file = file.clone();
+    Ok((scene, slot, empty, part))
+}
+
+/// The OVERALL tab as the scene has it, as it shows in a raid: its clothing
+/// panel on where the options' `CLOTHING` is (the game's only out of one,
+/// `ShowClothingPanel`: the user's departure), its lists' scroll areas as
+/// high as they show of their lines (at most `_maxVisibleHeight`: the
+/// install's suits are many more than that holds, `DropDownBox.Update`),
+/// the level's icon kept to its shape (`SetLevelIcon`), the dropdowns'
+/// words and their lines' put within their margins.
+fn overall_panel(install: &trp_data::Install, file: &str, clothing: bool) -> Option<trp_data::screen::OverallPanel> {
+    let mut overall = match trp_data::screen::OverallPanel::load(install, file) {
+        Ok(overall) => overall,
+        Err(e) => {
+            eprintln!("the game's OVERALL tab could not be read; none is drawn: {e:#}");
+            return None;
+        }
+    };
+    let most_seen = overall.dropdown_most_seen.unwrap_or(120.0);
+    let panel = &mut overall.panel;
+    if let Some(clothing_panel) = panel.find(OVERALL_CLOTHING).filter(|_| clothing) {
+        panel.nodes[clothing_panel].active = true;
+    }
+    for selector in OVERALL_SELECTORS {
+        if let Some(area) = panel.find(&format!("{selector}/Open Panel/Scroll Area")) {
+            let element = panel.nodes[area].element.get_or_insert(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+            element.min[1] = most_seen;
+        }
+    }
+    if let Some(icon) = panel.find("LeftSide/CharacterPanel/Level Panel/Level Icon") {
+        if let Some(image) = panel.nodes[icon].image.as_mut() {
+            image.preserve_aspect = true;
+        }
+    }
+    let boxes: Vec<usize> = OVERALL_SELECTORS.iter().filter_map(|selector| panel.find(&format!("{selector}/Text"))).collect();
+    inset_by_margins(panel, &boxes);
+    if let Some(line) = overall.line.as_mut() {
+        let texts: Vec<usize> = (0..line.nodes.len()).filter(|&index| line.nodes[index].text.is_some()).collect();
+        inset_by_margins(line, &texts);
+    }
+    Some(overall)
+}
+
+/// Texts of a panel kept off their rectangles' edges by their margins (left,
+/// top, right, bottom: TextMeshPro's), put into their rectangles instead,
+/// about their pivots: the panels' drawing lays a text in its rectangle as
+/// it is.
+pub(crate) fn inset_by_margins(panel: &mut trp_data::screen::ScenePanel, texts: &[usize]) {
+    for &index in texts {
+        let Some(margin) = panel.nodes[index].text.as_ref().map(|text| text.margin) else { continue };
+        let [left, top, right, bottom] = margin;
+        let layout = &mut panel.nodes[index].layout;
+        let pivot = layout.pivot;
+        layout.offset = [layout.offset[0] + left - pivot[0] * (left + right), layout.offset[1] + bottom - pivot[1] * (top + bottom)];
+        layout.size_delta = [layout.size_delta[0] - left - right, layout.size_delta[1] - top - bottom];
+        if let Some(text) = panel.nodes[index].text.as_mut() {
+            text.margin = [0.0; 4];
+        }
     }
 }
 
 /// What reads the game's pictures for its panels, each texture once.
-struct PictureReader<'a> {
+pub(crate) struct PictureReader<'a> {
     pictures: &'a mut trp_data::screen::ScenePictures,
     textures: HashMap<(String, i64), usize>,
     missing: Vec<String>,
@@ -915,7 +1719,7 @@ struct PictureReader<'a> {
 impl PictureReader<'_> {
     /// A sprite of that file and number as a picture, its texture among
     /// those kept (`kept`) once.
-    fn sprite(&mut self, name: &str, id: i64, kept: &mut Vec<Option<trp_data::unity::extract::TextureData>>) -> Option<Picture> {
+    pub(crate) fn sprite(&mut self, name: &str, id: i64, kept: &mut Vec<Option<trp_data::unity::extract::TextureData>>) -> Option<Picture> {
         let cut = self.pictures.sprite(name, id).ok().filter(|cut| !cut.turned)?;
         let texture = match self.textures.get(&cut.texture) {
             Some(&texture) => texture,
@@ -931,7 +1735,7 @@ impl PictureReader<'_> {
     }
 
     /// The pictures of a panel's objects that show, by their places.
-    fn panel(&mut self, scene: &trp_data::screen::ScenePanel, shown: &[Shown], file: &str, kept: &mut Vec<Option<trp_data::unity::extract::TextureData>>) -> Vec<Option<Picture>> {
+    pub(crate) fn panel(&mut self, scene: &trp_data::screen::ScenePanel, shown: &[Shown], file: &str, kept: &mut Vec<Option<trp_data::unity::extract::TextureData>>) -> Vec<Option<Picture>> {
         let mut out = vec![None; scene.nodes.len()];
         for (index, node) in scene.nodes.iter().enumerate() {
             if shown[index] == Shown::Never {
@@ -970,7 +1774,7 @@ fn health_shown(panel: &trp_data::screen::HealthPanel) -> Vec<Shown> {
 /// turned on as the panel shows, with all they hang from (the panel's top
 /// is shown by its tab); never those of `never` or under them; as their
 /// script has it, those of `scripted`.
-fn shown_of(nodes: &[trp_data::screen::PanelNode], turned_on: &[usize], never: &[usize], scripted: &[usize]) -> Vec<Shown> {
+pub(crate) fn shown_of(nodes: &[trp_data::screen::PanelNode], turned_on: &[usize], never: &[usize], scripted: &[usize]) -> Vec<Shown> {
     let on = |index: usize| nodes[index].active || turned_on.contains(&index);
     (0..nodes.len())
         .map(|index| {
@@ -1024,6 +1828,8 @@ impl HealthLook {
         }
     }
 }
+
+// ==== TextMeshPro's texts: effects, copies, drawing ====
 
 /// What a font asset's material draws under its letters (TextMeshPro's
 /// distance-field shader): a dark rim all round them, from its outline
@@ -1275,6 +2081,8 @@ pub fn weight_of(style: u32) -> FontWeight {
     if style & 1 != 0 { FontWeight::BOLD } else { FontWeight::NORMAL }
 }
 
+// ==== The item view's, the spinner's, the wish's and the tag's looks ====
+
 /// What the game's own view of a thing looks like (`TARKOV UI`), in a slot
 /// (`SlotItemView`, `slot_layout`) or in a grid (`GridItemView`,
 /// `grid_layout`): its prefab, where its caption and its value lie in it
@@ -1305,6 +2113,9 @@ pub struct ItemViewLook {
     pub caption_tmp: Option<((String, i64), (String, i64))>,
     pub inscription_tmp: Option<((String, i64), (String, i64))>,
     pub value_tmp: Option<((String, i64), (String, i64))>,
+    /// The caption's font asset, which measures what of it fits (its
+    /// overflow cuts what does not: `m_overflowMode`).
+    pub caption_face: Option<std::sync::Arc<trp_data::tmp_text::TmpFace>>,
     /// A weapon's mastering in a slot (`SlotItemView.UpdateInfo`): the
     /// mark (`MasteringIcon/Image`) and its level's words' size, colour
     /// and font (`Level`).
@@ -1316,16 +2127,103 @@ pub struct ItemViewLook {
     /// `type_<class>` (`Mod Types/icon_type_mod_<class>`) and its kind's
     /// mark by `mod_<kind>` (`Mod Tactical Types/icon_mod_<kind>`).
     pub mods: HashMap<String, Sprite>,
+    /// A tag's plate (`TagPanel`, `_tagColor`) and its name (`TagName`),
+    /// with the name's and the caption's font assets as TextMeshPro has
+    /// them, which size the plate (`ResizeTag`).
+    pub tag: Option<TagPlateLook>,
+    /// A thing on the wish list's marks (`WishlistGridView`).
+    pub wish: Option<WishLook>,
+    /// The load component over a magazine's view while it is worked.
+    pub spin: Option<SpinLook>,
+    /// Its loader, shown while its picture is still to come (`ItemView.
+    /// _iconLoader`: `Loader`, kept its own size in the view's middle),
+    /// and that size.
+    pub loader: Option<(Sprite, [f32; 2])>,
+}
+
+/// The load component (`ItemViewLoadAmmoComponent`; inventory spec, "The
+/// load component") as `ItemViewLook::spin` has it: its panel, laid out
+/// over a view, and its pieces, each its object and its picture: the
+/// spinner's back and fill, the loader, the stop cross.
+pub struct SpinLook {
+    pub panel: trp_data::screen::ScenePanel,
+    pub back: Option<(usize, SpinPicture)>,
+    pub fill: Option<(usize, SpinPicture)>,
+    pub loader: Option<(usize, SpinPicture)>,
+    pub stop: Option<(usize, SpinPicture)>,
+}
+
+/// A piece's picture: its texture, its cut and the share of the piece's
+/// rectangle the cut covers (a trimmed sprite).
+#[derive(Clone)]
+pub struct SpinPicture {
+    pub image: Handle<Image>,
+    pub cut: Rect,
+    covers: [f32; 4],
+}
+
+impl SpinLook {
+    /// A piece's picture's rectangle over a view of that size, in units.
+    pub fn rect(&self, index: usize, picture: &SpinPicture, view: [f32; 2]) -> [f32; 4] {
+        let [x, y, w, h] = self.panel.placed(index, view).rect;
+        let c = picture.covers;
+        [x + w * c[0], y + h * (1.0 - c[3]), w * (c[2] - c[0]), h * (c[3] - c[1])]
+    }
+}
+
+/// A view's marks of the wish list as `ItemViewLook::wish` has them: the
+/// glow over it and its border's edges, each its object and its picture;
+/// its icon's object, the column it is the first of
+/// (`BottomLeftLayoutGroup`), and what the column asks for a part's marks
+/// (`ModIconContainer`) and, where the weapon's round is written in it, for
+/// that line (TextMeshPro's height of it); and the groups' outlined icons.
+pub struct WishLook {
+    pub glow: Option<(usize, Sprite)>,
+    pub edges: Vec<(usize, Sprite)>,
+    pub icon: usize,
+    pub column: usize,
+    pub mod_height: f32,
+    pub inscription_height: Option<f32>,
+    pub icons: HashMap<&'static str, Sprite>,
+}
+
+/// A view's tag plate as `ItemViewLook::tag` has it.
+pub struct TagPlateLook {
+    pub plate: usize,
+    pub name: usize,
+    pub name_tmp: Option<((String, i64), (String, i64))>,
+    pub name_font: Handle<Font>,
+    pub name_face: Option<std::sync::Arc<trp_data::tmp_text::TmpFace>>,
+    pub caption_face: Option<std::sync::Arc<trp_data::tmp_text::TmpFace>>,
+}
+
+impl TagPlateLook {
+    /// The plate's width in units and whether its name shows
+    /// (`GridItemView.ResizeTag`): where the view's width less the
+    /// caption's drawn width and 2 leaves less than 40 the plate is the
+    /// view's width with no name, else the name's width and 12, from 40 to
+    /// that room.
+    pub fn width(&self, panel: &trp_data::screen::ScenePanel, caption: Option<usize>, caption_words: &str, name: &str, view_width: f32) -> (f32, bool) {
+        let drawn = |face: &Option<std::sync::Arc<trp_data::tmp_text::TmpFace>>, index: Option<usize>, words: &str| {
+            let text = index.and_then(|index| panel.nodes[index].text.as_ref());
+            face.as_ref().zip(text).map_or(0.0, |(face, text)| face.font.width(words, text.size, text.spacing, text.style & 1 != 0))
+        };
+        let room = view_width - drawn(&self.caption_face, caption, caption_words) - 2.0;
+        if room < 40.0 {
+            return (view_width, false);
+        }
+        ((drawn(&self.name_face, Some(self.name), name) + 12.0).clamp(40.0, room), true)
+    }
 }
 
 /// A part's class and the name of its ground's picture
 /// (`ItemViewFactory.GetModClass`, `GetModClassIconName`), by the
 /// database's names of the game's classes, in the game's order of asking.
-pub const MOD_CLASSES: [(&str, &str); 3] = [("FunctionalMod", "generic"), ("GearMod", "gear"), ("MasterMod", "vital")];
+pub const MOD_CLASSES: [(&str, &str); 5] = [("FunctionalMod", "generic"), ("GearMod", "gear"), ("MasterMod", "vital"), ("AuxiliaryMod", "gear"), ("ArmorPlate", "armor_plate")];
 
 /// A part's kind and the name of its mark's picture (`GetModSubclass`,
 /// `GetModIconName`), the same way: the first the part is of wins.
-pub const MOD_KINDS: [(&str, &str); 20] = [
+pub const MOD_KINDS: [(&str, &str); 21] = [
     ("Bipod", "bipod"),
     ("IronSight", "ironsight"),
     ("Launcher", "launcher"),
@@ -1346,7 +2244,11 @@ pub const MOD_KINDS: [(&str, &str); 20] = [
     ("Charge", "charge"),
     ("Stock", "stock"),
     ("Barrel", "barrel"),
+    // (A plate, or a built-in insert: `ArmorPlate`, the game's last.)
+    ("ArmorPlate", "armor_plate"),
 ];
+
+// ==== Sprites, and the inspect window: places, parts, buttons, mastering, rows ====
 
 /// One of the game's pictures as the inventory draws it by hand: its
 /// texture's cut at its sprite's own size in units, how far in a sliced
@@ -1380,14 +2282,20 @@ pub fn draw_sprite(parent: &mut ChildSpawnerCommands, sprite: &Sprite, rect: [f3
 /// at a scale of a third (a slot's header, the middle tiled between two
 /// ends, a pixel short of its right end at 2560 by 1440), where the game
 /// draws them edge to edge. Texts keep their rounding (sharp).
-const EXACT: bevy::ui::LayoutConfig = bevy::ui::LayoutConfig { use_rounding: false };
+pub(crate) const EXACT: bevy::ui::LayoutConfig = bevy::ui::LayoutConfig { use_rounding: false };
 
 /// What the window that shows a thing writes of it
 /// (`ItemSpecificationPanel`, into `ItemInfoWindowLabels`): its name in
 /// the caption (`ItemName`), its kind as the handbook files it
 /// (`_handbookNode.Category`, " > " between), its weight with the unit
 /// (`GetTruncatedWeightString`, three places) and its description.
+#[derive(Default)]
 pub struct InfoWords {
+    /// Its tag, where it has one named (`InfoWindow.UpdateTag`).
+    pub tag: Option<(String, u32)>,
+    /// Its kind's group on the wish list, where it is on it
+    /// (`ItemSpecificationPanel._wishlistIcon`).
+    pub wish: Option<&'static str>,
     pub caption: String,
     pub kind: String,
     pub weight: String,
@@ -1397,7 +2305,51 @@ pub struct InfoWords {
 /// The objects of the window that shows a thing its script turns off for
 /// a thing of the range (`HealthLook::read`); its weight's figure, its
 /// caption bar, its cross, its preview and its description's box.
-const INFO_OFF: [&str; 4] = ["Inner/Caption Panel/TagPanel", "Inner/Contents/Preview Panel/Loader", "Inner/Contents/Preview Panel/MasteringAndQuestPanel/WishlistIcon", "Inner/Contents/DescriptionPanel/ModsPanel"];
+const INFO_OFF: [&str; 0] = [];
+/// Its panel of a thing's parts' slots (`_modsPanel`), on for a thing with
+/// slots, its grid of slots and its scrollbar; a weapon's mastering row,
+/// its value, its badge under the preview and the preview's corner beside
+/// it (`_masteringBg`), on for a weapon; its buttons' grid and its three
+/// templates (`SimpleSpecifiedContextButtons`: Discard's own, the wish
+/// list's own, the rest).
+const INFO_MODS: &str = "Inner/Contents/DescriptionPanel/ModsPanel";
+const INFO_MODS_CONTENT: &str = "Inner/Contents/DescriptionPanel/ModsPanel/Padding/Content";
+const INFO_MODS_BAR: &str = "Inner/Contents/DescriptionPanel/ModsPanel/Scrollbar";
+const INFO_MASTERING: &str = "Inner/Contents/DescriptionPanel/CharacteristicsPanel/Mastering";
+const INFO_MASTERING_VALUE: &str = "Inner/Contents/DescriptionPanel/CharacteristicsPanel/Mastering/Value";
+const INFO_MASTERING_BADGE: &str = "Inner/Contents/Preview Panel/MasteringAndQuestPanel/MasteringPanel";
+const INFO_CORNER: &str = "Inner/Contents/Preview Panel/bottom_left";
+const INFO_BUTTONS: &str = "Inner/Contents/InteractionButtonsPanel/InteractionButtonsContainer";
+const INFO_BUTTON_TEMPLATES: [&str; 3] = [
+    "Inner/Contents/InteractionButtonsPanel/InteractionButtonsContainer/Button Template",
+    "Inner/Contents/InteractionButtonsPanel/InteractionButtonsContainer/Wishlist Template",
+    "Inner/Contents/InteractionButtonsPanel/InteractionButtonsContainer/Dispose Template",
+];
+/// The window's stretching places (`StretchButtons`' `StretchArea`s), each
+/// with its sides (`EStretchAreaType`: top 1, bottom 2, left 4, right 8).
+const INFO_STRETCH: [(&str, u8); 8] = [
+    ("StretchButtons/TopStretch", 1),
+    ("StretchButtons/BottomStretch", 2),
+    ("StretchButtons/LeftStretch", 4),
+    ("StretchButtons/RightStretch", 8),
+    ("StretchButtons/TopLeftStretch", 5),
+    ("StretchButtons/TopRightStretch", 9),
+    ("StretchButtons/BottomLeftStretch", 6),
+    ("StretchButtons/BottomRightStretch", 10),
+];
+/// A slot's pieces its script shows as the slot is full or empty.
+const MOD_SLOT_PIECES: [&str; 6] = ["CanvasGroup/Empty Border", "CanvasGroup/Full Border", "CanvasGroup/Background", "CanvasGroup/Background Image", "CanvasGroup/Text", "CanvasGroup/filters"];
+/// Its loader (shown until its model is in), its column of bars and the
+/// weapon's durability row at its top, its compact grid.
+const INFO_LOADER: &str = "Inner/Contents/Preview Panel/Loader";
+const INFO_DURABILITY: &str = "Inner/Contents/DescriptionPanel/CharacteristicsPanel/Durability";
+const INFO_BARS: &str = "Inner/Contents/DescriptionPanel/CharacteristicsPanel";
+const INFO_COMPACT: &str = "Inner/Contents/DescriptionPanel/CompactPanel";
+/// Its mark of the wish list, which its script shows for a thing on it.
+const INFO_WISH: &str = "Inner/Contents/Preview Panel/MasteringAndQuestPanel/WishlistIcon";
+/// Its tag's plate and name, which its script shows for a thing tagged.
+const INFO_TAG: &str = "Inner/Caption Panel/TagPanel";
+const INFO_TAG_TEXT: &str = "Inner/Caption Panel/TagPanel/TagText";
 const INFO_MASS: &str = "Inner/Caption Panel/MassText";
 const INFO_CAPTION: &str = "Inner/Caption Panel";
 const INFO_CLOSE: &str = "Inner/Caption Panel/Close Button";
@@ -1427,18 +2379,215 @@ fn info_size(info: &trp_data::screen::ScenePanel) -> [f32; 2] {
     [w, h]
 }
 
-/// The window that shows a thing (`InfoWindow`), as the game draws it
-/// with what its script writes (`InfoWords`), in a frame at its top left
-/// corner, `s` pixels to a unit, the `index`th window open. Its preview is
-/// the thing's own picture, whole in the middle of the preview's room at
-/// most four fifths of it each way (`ESTIMATE`; the game draws the thing's
-/// model there, turned by a drag: not built); its description in its box,
-/// cut to it (`Mask`; the game's scrolls, not built).
-#[allow(clippy::too_many_arguments)]
-pub fn draw_info_window(column: &mut ChildSpawnerCommands, look: &HealthLook, said: &Words, words: &InfoWords, picture: Option<(Handle<Image>, f32)>, index: usize, s: f32) {
-    let Some(info) = &look.info else { return };
-    let size = info_size(info);
+/// The window that shows a thing laid out for it (`TARKOV UI`): the game's
+/// window with what its script writes (`InfoWords`), a weapon's durability
+/// row, a copy of a row template for each of its figures (inspect-window
+/// spec, "Where the figures go"), its loader while its model is made, all
+/// laid out by the game's layout; the window as tall as what it holds asks
+/// and at least its own height (its `ContentSizeFitter` and
+/// `LayoutElement`).
+pub struct InfoBuilt {
+    panel: trp_data::screen::ScenePanel,
+    drawn: Drawn,
+    texts: HashMap<usize, String>,
+    set: HashMap<usize, bool>,
+    colors: HashMap<usize, Color>,
+    sprites: HashMap<usize, Picture>,
+    groups: HashMap<usize, f32>,
+    /// The kinds' marks of an empty slot's filters, each where it lies.
+    icons: Vec<([f32; 4], Picture)>,
+    pub size: [f32; 2],
+    /// Where each slot of the parts' panel lies, and each button, in the
+    /// order given; each stretching place with its sides; in units from
+    /// the window's top left corner.
+    pub slots: Vec<[f32; 4]>,
+    pub buttons: Vec<[f32; 4]>,
+    /// Beside `buttons`, each one's ground (`_backgroundImage`): its node,
+    /// its colours at rest and under the mouse, and its group's alpha.
+    pub grounds: Vec<Option<(usize, [Color; 2], f32)>>,
+    pub stretch: Vec<(u8, [f32; 4])>,
+    /// Each dropdown row's arrow (`_dropdownImage`), with the row's place
+    /// among the figures' rows.
+    pub tips: Vec<([f32; 4], usize)>,
+    /// The description's scroll view, where its text is taller than its
+    /// area (else its bar is hidden: `AutoHide`).
+    pub scroll: Option<InfoScroll>,
+}
+
+/// The description's scroll view as the window is built
+/// (`DescriptionPanel/Scroll Area`'s `ScrollRectNoDrag`; inspect-window
+/// spec, "The description"): where its area, its bar and its bar's sliding
+/// area lie, in units from the window's top left; its handle (its node,
+/// layout and colour) and how the bar runs and is tinted; how tall the text
+/// is and how much of it shows; the units a notch of the wheel moves it.
+#[derive(Clone)]
+pub struct InfoScroll {
+    pub area: [f32; 4],
+    pub bar: [f32; 4],
+    pub sliding: [f32; 4],
+    handle: usize,
+    handle_layout: trp_data::screen::Layout,
+    bottom_up: bool,
+    pub tints: Option<trp_data::screen::Tints>,
+    pub color: Color,
+    pub whole: f32,
+    pub shown: f32,
+    pub sensitivity: f32,
+    pub vertical: bool,
+}
+
+impl InfoScroll {
+    /// How far it scrolls, units.
+    pub fn most(&self) -> f32 {
+        (self.whole - self.shown).max(0.0)
+    }
+
+    /// The handle's share of its bar (`Scrollbar.size`).
+    pub fn share(&self) -> f32 {
+        if self.whole > 0.0 { (self.shown / self.whole).clamp(0.0, 1.0) } else { 1.0 }
+    }
+
+    /// The bar's value with the text moved `at` units up, and back.
+    pub fn value_of(&self, at: f32) -> f32 {
+        let most = self.most();
+        if most > 0.0 { 1.0 - at / most } else { 1.0 }
+    }
+    pub fn at_of(&self, value: f32) -> f32 {
+        (1.0 - value.clamp(0.0, 1.0)) * self.most()
+    }
+
+    /// Whether the bar runs from the bottom up.
+    pub fn bottom_up(&self) -> bool {
+        self.bottom_up
+    }
+
+    /// Where the handle lies with the text moved `at` units up.
+    pub fn handle_at(&self, at: f32) -> [f32; 4] {
+        trp_data::screen::handle_on(self.sliding, self.handle_layout, self.bottom_up, self.value_of(at), self.share())
+    }
+}
+
+/// What of the description moves as it is scrolled, and the bar's handle
+/// with its own colour, by the window's opening (`Win::opened`).
+#[derive(Component)]
+pub(crate) struct InfoScrollContent(pub(crate) u64);
+#[derive(Component)]
+pub(crate) struct InfoScrollHandle(pub(crate) u64, pub(crate) Color);
+
+/// The description's scroll view (`ScrollRectNoDrag`, vertical, its bar
+/// hidden while the text fits): the text's height as its font lays it out
+/// at the area's width less its margins, with its margins above and below
+/// (`Contents`' `ContentSizeFitter` at its preferred height), against the
+/// area's height; none where it fits by a hundredth, or where the text is
+/// not one of the game's fonts (`PROVISIONAL`: then taken to fit).
+fn info_scroll(look: &HealthLook, panel: &trp_data::screen::ScenePanel, size: [f32; 2], description: &str) -> Option<InfoScroll> {
+    let area = panel.find(INFO_SCROLL)?;
+    let scrolling = trp_data::screen::Scrolling::of(panel, area, "ScrollRectNoDrag")?;
+    let bar = scrolling.bar?;
+    let text = panel.nodes[panel.find(INFO_DESCRIPTION)?].text.as_ref()?;
+    let [_, _, w, h] = panel.rect(area, size);
+    let (asset, _) = look.tmp_of(panel, text)?;
+    let face = look.tmp_faces.get(&asset)?;
+    let run = trp_data::tmp_text::TmpRun { text: description.to_owned(), size: text.size, color: [1.0; 4], bold: text.style & 1 != 0 };
+    let layout = trp_data::tmp_text::TmpLayout { em: text.size, spacing: text.spacing, kerning: text.kerning, wrap: Some(w - text.margin[0] - text.margin[2]), align: text.horizontal & 7 };
+    let [_, tall] = trp_data::tmp_text::measure(face, &[run], &layout);
+    let whole = tall + text.margin[1] + text.margin[3];
+    if whole <= h + 0.01 {
+        return None;
+    }
+    let (handle, sliding) = (bar.handle?, bar.sliding?);
+    let color = panel.nodes[handle].image.map_or(Color::WHITE, |image| rgba(image.color));
+    Some(InfoScroll {
+        area: panel.rect(area, size),
+        bar: panel.rect(bar.object, size),
+        sliding: panel.rect(sliding, size),
+        handle,
+        handle_layout: panel.nodes[handle].layout,
+        bottom_up: bar.bottom_up,
+        tints: bar.tints.filter(|_| bar.tinted == bar.handle),
+        color,
+        whole,
+        shown: h,
+        sensitivity: scrolling.sensitivity,
+        vertical: scrolling.vertical,
+    })
+}
+
+/// A slot of the parts' panel as the window shows it (`ModSlotView.Show`,
+/// `SetLocked`; inspect-window spec, "The parts' panel").
+pub struct InfoSlot {
+    /// Its name in the install's words, upper case
+    /// (`slot.Name.Localized().ToUpper()`), shown while it is empty.
+    pub name: String,
+    /// Its picture's name (`Slots/<name>`, lower case), and whether it is
+    /// an armour's (`armor_plate`'s picture where its own has none).
+    pub picture: String,
+    pub armour: bool,
+    pub full: bool,
+    /// Locked (`ModLock`: the slot at half its alpha, nothing taken from it).
+    pub locked: bool,
+    /// The marks of the kinds of part it takes (`SetFilters`), shown while
+    /// it is empty.
+    pub marks: Vec<&'static str>,
+}
+
+/// A button of the window's grid of them (`InteractionButtonsContainer`):
+/// its line's name (its template and icon go by it), its caption, whether
+/// it can be done now, whether it opens lines of its own.
+pub struct InfoButtonLook {
+    pub name: &'static str,
+    pub caption: String,
+    pub enabled: bool,
+    pub arrow: bool,
+}
+
+/// A weapon's mastering as the window shows it: its level (0 to 2), its
+/// points into it and the points the level takes.
+pub struct InfoMastering {
+    pub level: u32,
+    pub points: f32,
+    pub most: f32,
+}
+
+/// What the window holds besides its figures (inspect-window spec): its
+/// parts' slots, its buttons, a weapon's mastering, and the size it is
+/// stretched to (its `LayoutElement`'s preferred size, in units; none as
+/// made, 670 by 500).
+#[derive(Default)]
+pub struct InfoParts {
+    pub slots: Vec<InfoSlot>,
+    pub buttons: Vec<InfoButtonLook>,
+    pub mastering: Option<InfoMastering>,
+    pub stretched: Option<[f32; 2]>,
+}
+
+impl InfoBuilt {
+    /// Where its caption bar and its cross lie.
+    pub fn places(&self) -> Option<InfoPlaces> {
+        let rect = |path: &str| self.panel.find(path).map(|index| self.panel.rect(index, self.size));
+        Some(InfoPlaces { size: self.size, caption: rect(INFO_CAPTION)?, close: rect(INFO_CLOSE)? })
+    }
+
+    /// Where its model is drawn (`Camera Image`), in units from its top
+    /// left corner.
+    pub fn preview(&self) -> Option<[f32; 4]> {
+        self.panel.find(INFO_PREVIEW).map(|index| self.panel.rect(index, self.size))
+    }
+}
+
+/// The window laid out for a thing with those figures (none: its frame
+/// alone), its loader shown while `loading`.
+pub fn info_built(look: &HealthLook, words: &InfoWords, figures: Option<&trp_sim::item_attributes::Figures>, parts: &InfoParts, loading: bool) -> Option<InfoBuilt> {
+    let info = look.info.as_ref()?;
     let mut panel = info.clone();
+    let mut drawn = Drawn { shown: look.info_drawn.shown.clone(), pictures: look.info_drawn.pictures.clone() };
+    // Stretched (`StretchArea.OnDrag`): its preferred size the one dragged
+    // to, which it is never smaller than what it holds asks; first, as the
+    // grids within it lay out by its width.
+    if let Some(stretched) = parts.stretched {
+        let element = panel.nodes[0].element.unwrap_or(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+        panel.nodes[0].element = Some(trp_data::screen::Element { preferred: stretched, ..element });
+    }
     // The weight's figure sized to its words (its `ContentSizeFitter`),
     // its icon at its left.
     if let (Some(mass), Some(font)) = (panel.find(INFO_MASS), look.info_mass_font.as_ref()) {
@@ -1453,16 +2602,1040 @@ pub fn draw_info_window(column: &mut ChildSpawnerCommands, look: &HealthLook, sa
             texts.insert(index, said_now.clone());
         }
     }
-    let skip: Vec<usize> = panel.find(INFO_DESCRIPTION).into_iter().collect();
-    let base = INFO + (index << 12);
-    draw_nodes(column, look, &panel, &look.info_drawn, base, Marks { words: Some(&texts), skip: &skip, ..Marks::default() }, said, Frame::Is(size), [0.0, 0.0], s);
-    let place = |x: f32, y: f32, w: f32, h: f32| Node { position_type: PositionType::Absolute, left: Val::Px(x * s), top: Val::Px(y * s), width: Val::Px(w * s), height: Val::Px(h * s), ..default() };
-    if let (Some((image, shape)), Some(preview)) = (picture, panel.find(INFO_PREVIEW)) {
-        let [x, y, w, h] = panel.rect(preview, size);
-        let height = (h * 0.8).min(w * 0.8 / shape.max(1e-3));
-        let width = height * shape;
-        column.spawn((place(x + (w - width) / 2.0, y + (h - height) / 2.0, width, height), ImageNode::new(image)));
+    // Its tag's plate, coloured and sized to its name (`UpdateTag`,
+    // `ResizeTag`: the name's drawn width and 12, at least 40).
+    let mut set = HashMap::new();
+    let mut colors = HashMap::new();
+    if let (Some((name, color)), Some(plate), Some(text)) = (&words.tag, panel.find(INFO_TAG), panel.find(INFO_TAG_TEXT)) {
+        set.insert(plate, true);
+        colors.insert(plate, tag_colour(*color));
+        texts.insert(text, name.clone());
+        let drawn = panel.nodes[text].text.as_ref().and_then(|look_of| Some((look_of, look.tmp_faces.get(&(panel.file_of(look_of.font.0)?, look_of.font.1))?))).map_or(0.0, |(text, face)| face.font.width(name, text.size, text.spacing, text.style & 1 != 0));
+        panel.nodes[plate].layout.size_delta[0] = (drawn + 12.0).max(40.0);
+    } else if let Some(text) = panel.find(INFO_TAG_TEXT) {
+        // With no tag its text goes with its plate (the pieces are drawn
+        // apart, and the plate's being off does not hide it).
+        set.insert(text, false);
     }
+    // Its mark of the wish list: the group's icon (`_wishlistIcon`).
+    let mut sprites = HashMap::new();
+    if let (Some(group), Some(icon)) = (words.wish, panel.find(INFO_WISH)) {
+        if let Some(picture) = look.wish_icons.get(group) {
+            set.insert(icon, true);
+            panel.nodes[icon].active = true;
+            // Its row lays it out at its sprite's own size (an `Image`'s
+            // preferred size, which the layout here does not ask of it).
+            panel.nodes[icon].element = Some(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: picture.size, flexible: [-1.0, -1.0] });
+            sprites.insert(icon, *picture);
+        }
+    }
+    // Its loader while the model is made (`SetupItemPreview`'s first
+    // call), and the picture it is drawn into after.
+    if let Some(loader) = panel.find(INFO_LOADER) {
+        set.insert(loader, loading);
+    }
+    let mut tip_nodes = Vec::new();
+    if let Some(figures) = figures {
+        tip_nodes = info_rows(look, &mut panel, &mut drawn, &mut texts, &mut set, &mut colors, &mut sprites, figures);
+    }
+    let mut groups = HashMap::new();
+    let mut marks = PartsMarks { texts: &mut texts, set: &mut set, colors: &mut colors, sprites: &mut sprites, groups: &mut groups };
+    info_mastering(look, &mut panel, &mut marks, parts.mastering.as_ref());
+    let (button_tops, grounds): (Vec<usize>, Vec<Option<(usize, [Color; 2], f32)>>) = info_buttons(look, &mut panel, &mut drawn, &mut marks, &parts.buttons).into_iter().unzip();
+    let (slot_tops, filters) = info_slots(look, &mut panel, &mut drawn, &mut marks, &parts.slots);
+    let size = fitted_size(&panel);
+    let rect = |index: usize| panel.rect(index, size);
+    let slots = slot_tops.iter().map(|&top| rect(top)).collect();
+    let buttons = button_tops.iter().map(|&top| rect(top)).collect();
+    let stretch = INFO_STRETCH.iter().filter_map(|(path, sides)| panel.find(path).map(|index| (*sides, rect(index)))).collect();
+    let tips = tip_nodes.iter().map(|&(node, row)| (rect(node), row)).collect();
+    // The description's bar, hidden while its text fits.
+    let scroll = info_scroll(look, &panel, size, &words.description);
+    if scroll.is_none() {
+        let bar = panel.find(INFO_SCROLL).and_then(|area| trp_data::screen::Scrolling::of(&panel, area, "ScrollRectNoDrag")).and_then(|scrolling| scrolling.bar);
+        if let Some(bar) = bar {
+            set.insert(bar.object, false);
+        }
+    }
+    // The filters' marks: in their row at the slot's foot (a row from the
+    // lower left, 2 apart), each at its own size (`SetNativeSize`).
+    let mut icons = Vec::new();
+    for (row, pictures) in filters {
+        let [x, y, _, h] = rect(row);
+        let spacing = panel.nodes[row].group.map_or(2.0, |group| group.spacing);
+        let mut left = x;
+        for picture in pictures {
+            icons.push(([left, y + h - picture.size[1], picture.size[0], picture.size[1]], picture));
+            left += picture.size[0] + spacing;
+        }
+    }
+    Some(InfoBuilt { panel, drawn, texts, set, colors, sprites, groups, icons, size, slots, buttons, grounds, stretch, tips, scroll })
+}
+
+/// A row's tooltip as the game's draw (`SimpleTooltip` for a list of
+/// words, `MultiLineTooltip` for lines): in the simple tooltip's look (its
+/// font, size and colours, on black within its frame's colour), a line
+/// each, an armour class's mark before one that has it at its own size
+/// (or as much room), the words in their colours (their colour tags), a
+/// break as a line of the frame's colour; its bottom left corner at
+/// `corner` (pixels), `s` pixels to a unit. Its padding and line spacing
+/// the app's (`ESTIMATE`: the tooltips' prefabs are not read).
+pub fn draw_tip(commands: &mut Commands, look: &HealthLook, lines: &[trp_sim::item_attributes::TipLine], corner: Vec2, screen: Vec2, s: f32) -> Entity {
+    let (font, size, color, frame) = look.tooltip_words();
+    let node = Node {
+        position_type: PositionType::Absolute,
+        left: Val::Px(corner.x.max(0.0)),
+        bottom: Val::Px((screen.y - corner.y).max(0.0)),
+        flex_direction: FlexDirection::Column,
+        row_gap: Val::Px(3.0 * s),
+        padding: UiRect { left: Val::Px(6.0 * s), right: Val::Px(8.0 * s), top: Val::Px(4.0 * s), bottom: Val::Px(5.0 * s) },
+        border: UiRect::all(Val::Px(1.0)),
+        ..default()
+    };
+    commands
+        .spawn((node, BackgroundColor(Color::BLACK), BorderColor::all(frame), GlobalZIndex(40)))
+        .with_children(|tip| {
+            for line in lines {
+                if line.divider {
+                    tip.spawn((Node { height: Val::Px(1.0), width: Val::Percent(100.0), ..default() }, BackgroundColor(frame)));
+                    continue;
+                }
+                tip.spawn(Node { align_items: AlignItems::Center, column_gap: Val::Px(4.0 * s), ..default() }).with_children(|row| {
+                    let mark = line.class.and_then(|class| look.class_marks.get(&class)).and_then(|picture| look.sprite_of(*picture, Color::WHITE));
+                    match mark {
+                        Some(mark) => {
+                            row.spawn((Node { width: Val::Px(mark.size[0] * s), height: Val::Px(mark.size[1] * s), ..default() }, ImageNode { image: mark.image.clone(), rect: Some(mark.cut), flip_y: true, ..default() }));
+                        }
+                        None if line.indent || line.class.is_some() => {
+                            row.spawn(Node { width: Val::Px(20.0 * s), ..default() });
+                        }
+                        None => {}
+                    }
+                    let spans = rich_spans(&line.text).unwrap_or_else(|| vec![(line.text.clone(), None)]);
+                    row.spawn((Text::default(), TextFont { font: font.clone(), font_size: size * s, ..default() }, TextColor(color), TextLayout::new_with_no_wrap())).with_children(|text| {
+                        for (said, tint) in spans {
+                            let tinted = tint.map_or(color, |c| Color::srgba(c[0], c[1], c[2], c[3]));
+                            text.spawn((TextSpan::new(said.trim_end().to_owned()), TextFont { font: font.clone(), font_size: size * s, ..default() }, TextColor(tinted)));
+                        }
+                    });
+                });
+            }
+        })
+        .id()
+}
+
+/// What a part of the window puts on its pieces, besides their places.
+struct PartsMarks<'a> {
+    texts: &'a mut HashMap<usize, String>,
+    set: &'a mut HashMap<usize, bool>,
+    colors: &'a mut HashMap<usize, Color>,
+    sprites: &'a mut HashMap<usize, Picture>,
+    groups: &'a mut HashMap<usize, f32>,
+}
+
+/// An element's preferred size set, its least and its share of what is
+/// left kept.
+pub(crate) fn prefer_size(panel: &mut trp_data::screen::ScenePanel, index: usize, size: [f32; 2]) {
+    let element = panel.nodes[index].element.unwrap_or(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+    panel.nodes[index].element = Some(trp_data::screen::Element { preferred: size, ..element });
+}
+
+/// Words cut to what of them fits a width (units) as TextMeshPro cuts a
+/// line that does not break (`m_overflowMode`): truncated (3), the letters
+/// past the width left out; with an ellipsis (1), as many as leave room
+/// for "…", and it; any other mode, or words that fit, as they are. Its
+/// margins come off the width.
+pub(crate) fn fitted_words(font: &trp_data::screen::TmpFont, text: &trp_data::screen::TextLook, words: &str, width: f32) -> String {
+    let room = width - text.margin[0] - text.margin[2];
+    let bold = text.style & 1 != 0;
+    let said = if text.style & 16 != 0 { words.to_uppercase() } else { words.to_owned() };
+    // TextMeshPro tests a line against its room at its visible letters
+    // only, so a trailing space never cuts it.
+    let wide = |words: &str| font.width(words.trim_end(), text.size, text.spacing, bold);
+    if text.wraps || !matches!(text.overflow, 1 | 3) || wide(&said) <= room {
+        return said;
+    }
+    let tail = if text.overflow == 1 { "\u{2026}" } else { "" };
+    let mut kept: Vec<char> = said.chars().collect();
+    while !kept.is_empty() && wide(&format!("{}{tail}", kept.iter().collect::<String>().trim_end())) > room {
+        kept.pop();
+    }
+    format!("{}{tail}", kept.iter().collect::<String>())
+}
+
+/// A text's size as its font draws it, its margins with it.
+pub(crate) fn text_size(look: &HealthLook, panel: &trp_data::screen::ScenePanel, index: usize, said: &str) -> Option<[f32; 2]> {
+    let text = panel.nodes[index].text.as_ref()?;
+    let face = look.tmp_faces.get(&(panel.file_of(text.font.0)?, text.font.1))?;
+    Some([face.font.width(said, text.size, text.spacing, text.style & 1 != 0) + text.margin[0] + text.margin[2], face.font.height(text.size) + text.margin[1] + text.margin[3]])
+}
+
+/// A copy of one of the panel's own objects and all under it put last
+/// under `holder`, the original left undrawn; the place of the copy's top.
+pub(crate) fn copy_within(panel: &mut trp_data::screen::ScenePanel, drawn: &mut Drawn, top: usize, holder: usize) -> usize {
+    let under = |index: usize, nodes: &[trp_data::screen::PanelNode]| {
+        let mut at = Some(index);
+        while let Some(here) = at {
+            if here == top {
+                return true;
+            }
+            at = nodes[here].parent;
+        }
+        false
+    };
+    let copied: Vec<usize> = (0..panel.nodes.len()).filter(|&index| under(index, &panel.nodes)).collect();
+    let first = panel.nodes.len();
+    let new_of = |old: usize| copied.iter().position(|&i| i == old).map(|at| first + at);
+    let holder_path = panel.nodes[holder].path.clone();
+    for &old in &copied {
+        let mut node = panel.nodes[old].clone();
+        node.parent = if old == top { Some(holder) } else { node.parent.and_then(new_of) };
+        node.active |= old == top;
+        node.path = format!("{holder_path}/#{first}/{}", node.path);
+        panel.nodes.push(node);
+        drawn.shown.push(drawn.shown.get(old).copied().unwrap_or(Shown::Never));
+        drawn.pictures.push(drawn.pictures.get(old).copied().flatten());
+    }
+    first
+}
+
+/// A weapon's mastering (`ItemSpecificationPanel.method_1`,
+/// `MasteringCharacteristicPanel.SetValues`): its row named
+/// "WEAPON MASTERING (0N)" with "points/points the level takes" and its
+/// fill to their share; its badge under the preview with "0N", and the
+/// preview's corner beside it; none of it for anything else.
+fn info_mastering(look: &HealthLook, panel: &mut trp_data::screen::ScenePanel, marks: &mut PartsMarks, mastering: Option<&InfoMastering>) {
+    for path in [INFO_MASTERING, INFO_MASTERING_BADGE, INFO_CORNER] {
+        if let Some(index) = panel.find(path) {
+            marks.set.insert(index, mastering.is_some());
+            panel.nodes[index].active |= mastering.is_some();
+        }
+    }
+    let Some(mastering) = mastering else { return };
+    let level = format!("0{}", mastering.level + 1);
+    let at = |panel: &trp_data::screen::ScenePanel, end: &str| panel.find(&format!("{INFO_MASTERING}/{end}"));
+    if let Some(name) = at(panel, "Name") {
+        marks.texts.insert(name, format!("WEAPON MASTERING ({level})"));
+    }
+    if let Some(value) = at(panel, "Value") {
+        marks.texts.insert(value, format!("{}/{}", trimmed_figure(mastering.points), mastering.most.round()));
+    }
+    let share = inverse_lerp(0.0, mastering.most, mastering.points);
+    if let Some(full) = at(panel, "bars/Full") {
+        panel.nodes[full].layout.anchor_max[0] = share;
+    }
+    if let Some(delta) = at(panel, "bars/Delta") {
+        panel.nodes[delta].layout.anchor_min[0] = share;
+        panel.nodes[delta].layout.anchor_max[0] = share;
+    }
+    // The badge: its icon and its level at their own sizes in its row.
+    let badge = format!("{INFO_MASTERING_BADGE}/MasteringText");
+    if let Some(text) = panel.find(&badge) {
+        let size = text_size(look, panel, text, &level).unwrap_or([20.0, 15.0]);
+        prefer_size(panel, text, size);
+        marks.texts.insert(text, level);
+    }
+    if let Some(icon) = panel.find(&format!("{INFO_MASTERING_BADGE}/MasteringIcon")) {
+        let size = panel.nodes[icon].image.and_then(|_| Some(panel.nodes[icon].layout.size_delta)).filter(|size| size[0] > 0.0).unwrap_or([19.0, 25.0]);
+        prefer_size(panel, icon, size);
+    }
+}
+
+/// A figure as C# writes a float (`ToString()`): no decimals where it is
+/// whole.
+pub(crate) fn trimmed_figure(value: f32) -> String {
+    let written = format!("{value}");
+    written.strip_suffix(".0").map(str::to_owned).unwrap_or(written)
+}
+
+/// The window's buttons (`InteractionButtonsContainer.Show`, the thing's
+/// lines but Inspect): a copy of a template for each (Discard's own, the
+/// wish list's own, the rest's), its caption at its font's width, its icon,
+/// its arrow where it opens lines of its own, at 0.3 where it cannot be
+/// done; in the container's grid (`GridLayoutGroup`: three columns, filled
+/// row by row from the top left, the block in its middle), the container
+/// as large as the grid asks. The places of the copies' tops, each with its
+/// ground's node, colours and alpha (`light_info_buttons`).
+#[allow(clippy::type_complexity)]
+fn info_buttons(look: &HealthLook, panel: &mut trp_data::screen::ScenePanel, drawn: &mut Drawn, marks: &mut PartsMarks, buttons: &[InfoButtonLook]) -> Vec<(usize, Option<(usize, [Color; 2], f32)>)> {
+    let Some(holder) = panel.find(INFO_BUTTONS) else { return Vec::new() };
+    let templates: Vec<Option<usize>> = INFO_BUTTON_TEMPLATES.iter().map(|path| panel.find(path)).collect();
+    let mut tops = Vec::new();
+    for button in buttons {
+        let template = match button.name {
+            "Discard" => templates[2],
+            "AddToWishlist" => templates[1],
+            _ => templates[0],
+        };
+        let Some(template) = template else { continue };
+        let first = copy_within(panel, drawn, template, holder);
+        let named = |panel: &trp_data::screen::ScenePanel, name: &str| (first..panel.nodes.len()).find(|&index| panel.nodes[index].name == name);
+        if let Some(text) = named(panel, "Text") {
+            let caption = button.caption.to_uppercase();
+            let width = text_size(look, panel, text, &caption).map_or(0.0, |size| size[0]);
+            let flexible = panel.nodes[text].element.map_or([1.0, -1.0], |element| element.flexible);
+            panel.nodes[text].element = Some(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [width, -1.0], flexible });
+            marks.texts.insert(text, caption);
+        }
+        if let (Some(icon), Some(picture)) = (named(panel, "Icon"), look.menu_icons.get(button.name)) {
+            marks.sprites.insert(icon, *picture);
+        }
+        if let Some(arrow) = named(panel, "SubmenuArrow") {
+            if button.arrow {
+                let size = drawn.pictures.get(arrow).copied().flatten().map_or([9.0, 11.0], |picture| picture.size);
+                panel.nodes[arrow].element = Some(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: size, flexible: [-1.0, -1.0] });
+            } else {
+                marks.set.insert(arrow, false);
+            }
+        }
+        if !button.enabled {
+            marks.groups.insert(first, 0.3);
+        }
+        let icon_holder = named(panel, "IconPlaceholder").and_then(|index| panel.nodes[index].parent);
+        let ground = (first..panel.nodes.len()).find(|&index| panel.nodes[index].name == "Background" && panel.nodes[index].parent == icon_holder);
+        let line_colors = panel.script(first, "ContextMenuButton").and_then(menu_line_colors);
+        if let (Some(ground), Some([normal, _])) = (ground, line_colors) {
+            marks.colors.insert(ground, normal);
+        }
+        tops.push((first, ground.zip(line_colors).map(|(ground, colors)| (ground, colors, if button.enabled { 1.0 } else { 0.3 }))));
+    }
+    // The templates themselves are not drawn.
+    for template in templates.into_iter().flatten() {
+        marks.set.insert(template, false);
+    }
+    let Some(grid) = panel.grid(holder) else { return tops };
+    let columns = grid.columns.unwrap_or(3).max(1) as usize;
+    let count = tops.len();
+    let rows = count.div_ceil(columns);
+    let [cell_w, cell_h] = grid.cell;
+    let [space_w, space_h] = grid.spacing;
+    let width = grid.padding[0] + grid.padding[1] + columns as f32 * (cell_w + space_w) - space_w;
+    let height = if rows == 0 { 0.0 } else { grid.padding[2] + grid.padding[3] + rows as f32 * (cell_h + space_h) - space_h };
+    let shown_columns = columns.min(count.max(1));
+    let block = shown_columns as f32 * (cell_w + space_w) - space_w;
+    let start = grid.padding[0] + (width - grid.padding[0] - grid.padding[1] - block) * (grid.alignment % 3) as f32 * 0.5;
+    for (n, &(top, _)) in tops.iter().enumerate() {
+        let layout = &mut panel.nodes[top].layout;
+        layout.anchor_min = [0.0, 1.0];
+        layout.anchor_max = [0.0, 1.0];
+        layout.pivot = [0.0, 1.0];
+        layout.offset = [start + (n % columns) as f32 * (cell_w + space_w), -(grid.padding[2] + (n / columns) as f32 * (cell_h + space_h))];
+        layout.size_delta = [cell_w, cell_h];
+    }
+    let element = panel.nodes[holder].element.unwrap_or(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+    panel.nodes[holder].element = Some(trp_data::screen::Element { min: [width, height], preferred: [width, height], ..element });
+    tops
+}
+
+/// The parts' panel (`CreateModSlots`): on for a thing with slots, a copy
+/// of the slot's view for each (`ModSlotView`), full or empty as its slot
+/// is (`SetSlotGraphics`: the full border, or the empty border, the ground,
+/// the slot's picture at its own size, its name and its filters' marks),
+/// in the grid (`GridLayoutGroup`: 64 square, 3 apart, as many to a row as
+/// fit, the block in the middle of the top), the grid as tall as its rows;
+/// the window at least as wide as six slots, or a third of them, ask with
+/// the paddings about them. The places of the copies' tops, and each empty
+/// slot's filters' row with its marks' pictures.
+#[allow(clippy::type_complexity)]
+fn info_slots(look: &HealthLook, panel: &mut trp_data::screen::ScenePanel, drawn: &mut Drawn, marks: &mut PartsMarks, slots: &[InfoSlot]) -> (Vec<usize>, Vec<(usize, Vec<Picture>)>) {
+    let (Some(mods), Some(content)) = (panel.find(INFO_MODS), panel.find(INFO_MODS_CONTENT)) else { return (Vec::new(), Vec::new()) };
+    let template = look.info_rows.as_ref().and_then(|rows| rows.mod_slot.as_ref());
+    let (false, Some(template)) = (slots.is_empty(), template) else {
+        marks.set.insert(mods, false);
+        return (Vec::new(), Vec::new());
+    };
+    panel.nodes[mods].active = true;
+    marks.set.insert(mods, true);
+    // (Its scrollbar is never wanted: the rows take as many as fit.)
+    if let Some(bar) = panel.find(INFO_MODS_BAR) {
+        marks.set.insert(bar, false);
+    }
+    let mut tops = Vec::new();
+    let mut filters = Vec::new();
+    for slot in slots {
+        let top = graft_row(panel, drawn, template, content);
+        let at = |end: &str| template.0.find(end).map(|index| top + index);
+        for (end, on) in [("CanvasGroup/Empty Border", !slot.full), ("CanvasGroup/Full Border", slot.full), ("CanvasGroup/Background", !slot.full), ("CanvasGroup/Text", !slot.full), ("CanvasGroup/filters", !slot.full)] {
+            if let Some(index) = at(end) {
+                marks.set.insert(index, on);
+            }
+        }
+        if let Some(text) = at("CanvasGroup/Text") {
+            // What of it fits the slot (its text's ellipsis: "…" where a
+            // name is wider than the slot, `ModSlotView._slotName`).
+            let fitted = template.0.find("CanvasGroup/Text").and_then(|index| {
+                let look_of = template.0.nodes[index].text.as_ref()?;
+                let face = look.tmp_faces.get(&(template.0.file_of(look_of.font.0)?, look_of.font.1))?;
+                Some(fitted_words(&face.font, look_of, &slot.name, template.0.rect(index, [64.0, 64.0])[2]))
+            });
+            marks.texts.insert(text, fitted.unwrap_or_else(|| slot.name.clone()));
+        }
+        // Its picture, at its own size in the middle (`SetSlotBackImage`).
+        if let Some(back) = at("CanvasGroup/Background Image") {
+            let picture = look.slot_pictures.get(&slot.picture).or_else(|| slot.armour.then(|| look.slot_pictures.get("armor_plate")).flatten()).copied();
+            match picture.filter(|_| !slot.full) {
+                Some(picture) => {
+                    marks.set.insert(back, true);
+                    marks.sprites.insert(back, picture);
+                    panel.nodes[back].layout.size_delta = picture.size;
+                }
+                None => {
+                    marks.set.insert(back, false);
+                }
+            }
+        }
+        if let (false, Some(row)) = (slot.full, at("CanvasGroup/filters")) {
+            let pictures: Vec<Picture> = slot.marks.iter().filter_map(|mark| look.mod_pictures.get(&format!("mod_{mark}")).copied()).collect();
+            if !pictures.is_empty() {
+                filters.push((row, pictures));
+            }
+        }
+        tops.push(top);
+    }
+    let size = fitted_size(panel);
+    let Some(grid) = panel.grid(content) else { return (tops, filters) };
+    let width = panel.rect(content, size)[2];
+    let [cell_w, cell_h] = grid.cell;
+    let [space_w, space_h] = grid.spacing;
+    let inner = width - grid.padding[0] - grid.padding[1];
+    let columns = (((inner + space_w) / (cell_w + space_w)).floor() as usize).max(1);
+    let count = tops.len();
+    let shown_columns = columns.min(count);
+    let block = shown_columns as f32 * (cell_w + space_w) - space_w;
+    let start = grid.padding[0] + (inner - block) * (grid.alignment % 3) as f32 * 0.5;
+    for (n, &top) in tops.iter().enumerate() {
+        let layout = &mut panel.nodes[top].layout;
+        layout.anchor_min = [0.0, 1.0];
+        layout.anchor_max = [0.0, 1.0];
+        layout.pivot = [0.0, 1.0];
+        layout.offset = [start + (n % columns) as f32 * (cell_w + space_w), -(grid.padding[2] + (n / columns) as f32 * (cell_h + space_h))];
+        layout.size_delta = [cell_w, cell_h];
+    }
+    let rows = count.div_ceil(columns);
+    let height = grid.padding[2] + grid.padding[3] + rows as f32 * (cell_h + space_h) - space_h;
+    let element = panel.nodes[content].element.unwrap_or(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+    panel.nodes[content].element = Some(trp_data::screen::Element { min: [element.min[0], height], preferred: [element.preferred[0], height], ..element });
+    // The window's least width (`_layoutElement.minWidth`): the paddings
+    // of the groups from the grid up to the window, and six slots or a
+    // third of them, whichever is more.
+    let mut padding = grid.padding[0] + grid.padding[1];
+    let mut above = panel.nodes[content].parent;
+    while let Some(index) = above {
+        padding += panel.nodes[index].group.map_or(0.0, |group| group.padding[0] + group.padding[1]);
+        above = panel.nodes[index].parent;
+    }
+    let least_columns = count.div_ceil(3).max(6) as f32;
+    let least = padding + cell_w * least_columns + space_w * (least_columns - 1.0);
+    let root = panel.nodes[0].element.unwrap_or(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+    panel.nodes[0].element = Some(trp_data::screen::Element { min: [least, root.min[1]], ..root });
+    (tops, filters)
+}
+
+/// A panel's top's size as its fitter makes it (`ContentSizeFitter`:
+/// least 1, preferred 2, by axis), else as it is kept.
+fn fitted_size(panel: &trp_data::screen::ScenePanel) -> [f32; 2] {
+    let mut size = info_size(panel);
+    if let Some(fitter) = panel.script(0, "ContentSizeFitter") {
+        for (axis, kept) in size.iter_mut().enumerate() {
+            let mode = fitter.get(4 * axis..4 * axis + 4).map_or(0, |word| u32::from_le_bytes(word.try_into().unwrap_or_default()));
+            let (least, preferred, _) = panel.asks(0, axis);
+            match mode {
+                1 => *kept = least,
+                2 => *kept = preferred,
+                _ => {}
+            }
+        }
+    }
+    size
+}
+
+/// Mathf.InverseLerp: where a figure lies between two, held within 0 and
+/// 1 (0 where they are the same).
+fn inverse_lerp(from: f32, to: f32, value: f32) -> f32 {
+    if from == to { 0.0 } else { ((value - from) / (to - from)).clamp(0.0, 1.0) }
+}
+
+/// A copy of one of the window's row templates put last under `holder`,
+/// its objects after the panel's own, numbered apart by their place; the
+/// place of the copy's top.
+fn graft_row(panel: &mut trp_data::screen::ScenePanel, drawn: &mut Drawn, (source, source_drawn): &(trp_data::screen::ScenePanel, Drawn), holder: usize) -> usize {
+    let first = panel.nodes.len();
+    let under = panel.nodes[holder].path.clone();
+    for (old, node) in source.nodes.iter().enumerate() {
+        let mut node = node.clone();
+        // Its texts' fonts and materials and its picture count in the
+        // source's table of files: put them in the panel's (a slot's
+        // template is `resources.assets`', the window `sharedassets49`'s).
+        if let Some(text) = node.text.as_mut() {
+            text.font.0 = rebase_file(panel, source, text.font.0);
+            if let Some(material) = text.material.as_mut() {
+                material.0 = rebase_file(panel, source, material.0);
+            }
+        }
+        if let Some(sprite) = node.image.as_mut().and_then(|image| image.sprite.as_mut()) {
+            sprite.0 = rebase_file(panel, source, sprite.0);
+        }
+        node.path = format!("{under}/#{first}/{}", node.path);
+        node.parent = Some(node.parent.map_or(holder, |parent| first + parent));
+        node.active |= old == 0;
+        panel.nodes.push(node);
+        drawn.shown.push(source_drawn.shown.get(old).copied().unwrap_or(Shown::Never));
+        drawn.pictures.push(source_drawn.pictures.get(old).copied().flatten());
+    }
+    first
+}
+
+/// A file's number in `source`'s table of files (0 its own, else one past
+/// its place among its outside files) as `panel` counts it, the file added
+/// to `panel`'s outside files where it has it not.
+fn rebase_file(panel: &mut trp_data::screen::ScenePanel, source: &trp_data::screen::ScenePanel, index: i32) -> i32 {
+    let Some(name) = source.file_of(index) else { return index };
+    if name == panel.file {
+        return 0;
+    }
+    if let Some(at) = panel.externals.iter().position(|outside| outside.rsplit('/').next() == Some(name.as_str())) {
+        return at as i32 + 1;
+    }
+    let full = if index == 0 { source.file.clone() } else { source.externals.get(index as usize - 1).cloned().unwrap_or(name) };
+    panel.externals.push(full);
+    panel.externals.len() as i32
+}
+
+/// The thing's figures put into the window (`ItemSpecificationPanel.
+/// RecreateAttributeBars`, `CompactCharacteristicPanel.Show` and
+/// `SetValues`, `CharacteristicPanel.SetValues`, `DurabilityPanel.
+/// SetValues`, `ProcessCompactCells`): a weapon's durability row; a bar row
+/// in the column of bars for each bar, a compact or a dropdown row in the
+/// compact grid for the rest, each with its icon at its own place (none
+/// where it has none), its name and its value at the widths their font
+/// draws them, coloured by its sign where it is so shown; each bar's fill
+/// and change; the grid in two columns, or one where a row's words would
+/// not fit its cell, filled down each column first.
+#[allow(clippy::too_many_arguments)]
+fn info_rows(look: &HealthLook, panel: &mut trp_data::screen::ScenePanel, drawn: &mut Drawn, texts: &mut HashMap<usize, String>, set: &mut HashMap<usize, bool>, colors: &mut HashMap<usize, Color>, sprites: &mut HashMap<usize, Picture>, figures: &trp_sim::item_attributes::Figures) -> Vec<(usize, usize)> {
+    let mut tips = Vec::new();
+    use trp_sim::item_attributes::Show;
+    // A text's size as its font draws it, its margins with it
+    // (`TMP_Text.preferredWidth` and `preferredHeight`), which the row's
+    // layout gives it.
+    let size_of = |panel: &trp_data::screen::ScenePanel, index: usize, said: &str| -> Option<[f32; 2]> {
+        let text = panel.nodes[index].text.as_ref()?;
+        let face = look.tmp_faces.get(&(panel.file_of(text.font.0)?, text.font.1))?;
+        Some([face.font.width(said, text.size, text.spacing, text.style & 1 != 0) + text.margin[0] + text.margin[2], face.font.height(text.size) + text.margin[1] + text.margin[3]])
+    };
+    let prefer = |panel: &mut trp_data::screen::ScenePanel, index: usize, size: [f32; 2]| {
+        let element = panel.nodes[index].element.unwrap_or(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+        panel.nodes[index].element = Some(trp_data::screen::Element { preferred: size, ..element });
+    };
+    let off = |panel: &mut trp_data::screen::ScenePanel, drawn: &mut Drawn, index: usize| {
+        panel.nodes[index].active = false;
+        drawn.shown[index] = Shown::Never;
+    };
+    // The weapon's durability row: "present/greatest (the template's)",
+    // the greatest red under 10; its fill and border in the low colour at
+    // 15% of the template's or under; its change to the greatest's share.
+    // (With none, the row and all under it are not drawn: its pieces are
+    // drawn apart, and its being off does not hide them.)
+    if let (None, Some(row)) = (figures.durability, panel.find(INFO_DURABILITY)) {
+        let path = format!("{}/", panel.nodes[row].path);
+        for index in 0..panel.nodes.len() {
+            if index == row || panel.nodes[index].path.starts_with(&path) {
+                drawn.shown[index] = Shown::Never;
+            }
+        }
+    }
+    if let (Some(durability), Some(row)) = (figures.durability, panel.find(INFO_DURABILITY)) {
+        panel.nodes[row].active = true;
+        set.insert(row, true);
+        let path = panel.nodes[row].path.clone();
+        let at = |panel: &trp_data::screen::ScenePanel, end: &str| panel.find(&format!("{path}/{end}"));
+        let round = |value: f32| ((value as f64 * 10.0).round() / 10.0) as f32;
+        let tint = if durability.most < 10.0 { "#FF0000" } else { "#FFFFFF" };
+        let said = format!("{}/<color={tint}>{}</color> ({})", round(durability.now), round(durability.most), durability.peak.round());
+        if let Some(value) = at(panel, "Value") {
+            texts.insert(value, said);
+        }
+        if let Some(name) = at(panel, "Name") {
+            texts.insert(name, figures.durability_name.clone());
+        }
+        let share = durability.now / durability.peak.max(1e-6);
+        let look_of = trp_data::screen::row_look(&panel.subtree(row), "DurabilityPanel").and_then(|look| look.bar);
+        if let Some(bars) = look_of {
+            let color = rgba(if share > 0.15 { bars.current } else { bars.low });
+            for end in ["bars/Full", "bars/Border"] {
+                if let Some(index) = at(panel, end) {
+                    colors.insert(index, color);
+                }
+            }
+        }
+        if let Some(full) = at(panel, "bars/Full") {
+            panel.nodes[full].layout.anchor_max[0] = share;
+        }
+        if let Some(delta) = at(panel, "bars/Delta") {
+            panel.nodes[delta].layout.anchor_max[0] = inverse_lerp(0.0, durability.peak, durability.most);
+        }
+        if let Some(compare) = at(panel, "bars/CompareDelta") {
+            off(panel, drawn, compare);
+        }
+    }
+    let Some(rows) = look.info_rows.as_ref() else { return tips };
+    let (Some(bars), Some(grid)) = (panel.find(INFO_BARS), panel.find(INFO_COMPACT)) else { return tips };
+    // The compact rows' widths of their words, for the columns.
+    let mut compact_widths = Vec::new();
+    let mut cells = Vec::new();
+    for (number, row) in figures.rows.iter().enumerate() {
+        let (template, row_look) = match row.show {
+            Show::Bar { .. } => (&rows.bar, &rows.bar_look),
+            Show::Compact => (&rows.compact, &rows.compact_look),
+            Show::Dropdown => (&rows.dropdown, &rows.compact_look),
+        };
+        let holder = if matches!(row.show, Show::Bar { .. }) { bars } else { grid };
+        let top = graft_row(panel, drawn, template, holder);
+        let at = |end: &str| template.0.find(end).map(|index| top + index);
+        if let (Show::Dropdown, Some(hover), false) = (&row.show, at("Hover"), row.tip.is_empty()) {
+            tips.push((hover, number));
+        }
+        let mut words_width = 0.0;
+        if let Some(name) = at("Name") {
+            let size = size_of(panel, name, &row.name).unwrap_or_default();
+            prefer(panel, name, size);
+            words_width += size[0];
+            texts.insert(name, row.name.clone());
+        }
+        if let Some(value) = at("Value") {
+            match &row.value {
+                // (`Colored`: "+" before a positive one; "-" before a
+                // negative one that has none; each its colour.)
+                Some(said) => {
+                    let mut said = said.clone();
+                    if let Some(base) = row.colored {
+                        let (good, bad) = (rgba(row_look.increasing), rgba(row_look.decreasing));
+                        if base < 0.0 {
+                            colors.insert(value, if row.less_is_good { good } else { bad });
+                            if !said.contains('-') {
+                                said.insert(0, '-');
+                            }
+                        } else if base > 0.0 {
+                            colors.insert(value, if row.less_is_good { bad } else { good });
+                            said.insert(0, '+');
+                        }
+                    }
+                    // (Measured as drawn: a colour tag takes no room.)
+                    let drawn_words = rich_spans(&said).map_or_else(|| said.clone(), |spans| spans.into_iter().map(|(words, _)| words).collect());
+                    let size = size_of(panel, value, &drawn_words).unwrap_or_default();
+                    prefer(panel, value, size);
+                    if !said.is_empty() {
+                        words_width += size[0] + 5.0;
+                    }
+                    panel.nodes[value].active = true;
+                    texts.insert(value, said);
+                }
+                _ => off(panel, drawn, value),
+            }
+        }
+        // Its icon: the attribute's, else none (`Icon.SetActive`).
+        if let Some(icon) = at("Icon") {
+            use trp_sim::item_attributes::Table;
+            let table = match row.table {
+                Table::Attribute => &look.attribute_icons,
+                Table::Health => &look.figure_icons[0],
+                Table::Damage => &look.figure_icons[1],
+                Table::Buff => &look.figure_icons[2],
+            };
+            match table.get(row.id) {
+                Some(picture) => {
+                    sprites.insert(icon, *picture);
+                }
+                None => off(panel, drawn, icon),
+            }
+        }
+        if let Show::Bar { range, base, delta } = row.show {
+            let change = base * delta;
+            let place = |value: f32| inverse_lerp(range[0], range[1], value);
+            let (total, own) = (place(base + change), place(base));
+            if let Some(full) = at("bars/Full") {
+                panel.nodes[full].layout.anchor_max[0] = total.min(own);
+            }
+            if let Some(index) = at("bars/Delta") {
+                panel.nodes[index].layout.anchor_min[0] = total.min(own);
+                panel.nodes[index].layout.anchor_max[0] = total.max(own);
+                let inverted = range[0] > range[1];
+                let lowers = (change < 0.0 && !inverted) || (change > 0.0 && inverted);
+                if let Some(picture) = if lowers { rows.sub } else { rows.add } {
+                    sprites.insert(index, picture);
+                }
+                if let Some(bar) = &row_look.bar {
+                    let better = if row.less_is_good { change <= 0.0 } else { change > 0.0 };
+                    colors.insert(index, rgba(if better { bar.add } else { bar.sub }));
+                }
+            }
+        } else {
+            if row.show == Show::Compact {
+                compact_widths.push(words_width);
+            }
+            cells.push((row.show == Show::Dropdown, top));
+        }
+    }
+    // (The dropdown rows are made after all the compact rows, and follow
+    // them in the grid.)
+    cells.sort_by_key(|(dropdown, _)| *dropdown);
+    let cells: Vec<usize> = cells.into_iter().map(|(_, top)| top).collect();
+    // The grid: its columns (`ProcessCompactCells`: two, unless 30 and a
+    // compact row's words are wider than a cell of two), each cell as wide
+    // as its columns share the grid (`FlexibleGridLayoutGroup`), the rows
+    // filled down each column first (`GridLayoutGroup`, the vertical axis
+    // first, from the top left), the grid as tall as its rows.
+    let Some(figures_of) = panel.grid(grid) else { return tips };
+    let width = panel.rect(grid, fitted_size(panel))[2];
+    let two = (width - figures_of.spacing[0] - figures_of.padding[0] - figures_of.padding[1]) / 2.0;
+    let columns = if compact_widths.iter().any(|&words| 30.0 + words > two) { 1 } else { figures_of.columns.unwrap_or(2).max(1) as usize };
+    let cell_width = (width - (columns as f32 - 1.0) * figures_of.spacing[0] - figures_of.padding[0] - figures_of.padding[1]) / columns as f32;
+    let count = cells.len();
+    let down = if count > columns { count.div_ceil(columns) } else { 1 };
+    for (n, &top) in cells.iter().enumerate() {
+        let (x, y) = if figures_of.start_axis == 1 { (n / down, n % down) } else { (n % columns, n / columns) };
+        let layout = &mut panel.nodes[top].layout;
+        layout.anchor_min = [0.0, 1.0];
+        layout.anchor_max = [0.0, 1.0];
+        layout.pivot = [0.0, 1.0];
+        layout.offset = [figures_of.padding[0] + (cell_width + figures_of.spacing[0]) * x as f32, -(figures_of.padding[2] + (figures_of.cell[1] + figures_of.spacing[1]) * y as f32)];
+        layout.size_delta = [cell_width, figures_of.cell[1]];
+    }
+    let rows_down = count.div_ceil(columns);
+    let height = figures_of.padding[2] + figures_of.padding[3] + (figures_of.cell[1] + figures_of.spacing[1]) * rows_down as f32 - figures_of.spacing[1];
+    if height > 0.0 {
+        let element = panel.nodes[grid].element.unwrap_or(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+        panel.nodes[grid].element = Some(trp_data::screen::Element { min: [element.min[0], height], preferred: [element.preferred[0], height], ..element });
+    }
+    tips
+}
+
+
+/// The edit build screen's characteristics panel laid out (`EbStatsLook`
+/// filled by `eb_stats_built`): what `draw_eb_stats` draws, its size, the
+/// places of its switcher and its INFO button (each folds or unfolds it),
+/// and each bar's comparison piece with its colour, which pulses.
+pub(crate) struct EbStatsBuilt {
+    panel: trp_data::screen::ScenePanel,
+    drawn: Drawn,
+    texts: HashMap<usize, String>,
+    set: HashMap<usize, bool>,
+    colors: HashMap<usize, Color>,
+    sprites: HashMap<usize, Picture>,
+    pub(crate) size: [f32; 2],
+    pub(crate) switches: Vec<[f32; 4]>,
+    pub(crate) pulse: Vec<(usize, Color)>,
+}
+
+/// The base the characteristics panel's pieces are numbered from.
+pub(crate) const EB_STATS: usize = 23 << 20;
+
+/// The comparison's alpha at a time (`CharacteristicPanel.Update`: 0.2 and
+/// a ping-pong of 0.4, gone through at 0.8 a second: from 0.2 to 0.6 in
+/// half a second and back in the next).
+pub(crate) fn compare_alpha(seconds: f32) -> f32 {
+    let travelled = seconds / 0.5 * 0.4;
+    let phase = travelled % 0.8;
+    0.2 + if phase < 0.4 { phase } else { 0.8 - phase }
+}
+
+/// One bar of the panel (`CharacteristicPanel.SetValues`): its fill to the
+/// lesser of the figure with and without its change, the change to the
+/// other; against the figure compared with (the build as the screen was
+/// given it, or with the part the mouse rests on in its slot), the
+/// difference drawn in the comparison's piece in the adding or the
+/// subtracting colour, and the change's difference written after the value
+/// in brackets.
+#[allow(clippy::too_many_arguments)]
+fn eb_bar(panel: &mut trp_data::screen::ScenePanel, at: &dyn Fn(&trp_data::screen::ScenePanel, &str) -> Option<usize>, (range, base, delta, less_is_good): ([f32; 2], f32, f32, bool), compare: Option<(f32, f32)>, row_look: &trp_data::screen::RowLook, (add, sub): (Option<Picture>, Option<Picture>), (colors, sprites, set): (&mut HashMap<usize, Color>, &mut HashMap<usize, Picture>, &mut HashMap<usize, bool>), pulse: &mut Vec<(usize, Color)>) -> Option<String> {
+    let place = |value: f32| inverse_lerp(range[0], range[1], value);
+    let inverted = range[0] > range[1];
+    let (own_change, (cbase, cdelta)) = (base * delta, compare.unwrap_or((base, delta)));
+    let total = base + own_change;
+    let (compare_change, compare_total) = (cbase * cdelta, cbase + cbase * cdelta);
+    let difference = compare_total - total;
+    let (n8, n9, n11, b) = (place(total), place(base), place(compare_total), place(cbase));
+    let (n10, x) = (n8.min(n9), n8.max(n9));
+    let (b2, n12) = (n11.min(b), (n11 - n8).abs());
+    let (full, delta_piece, compare_piece) = (at(panel, "bars/Full"), at(panel, "bars/Delta"), at(panel, "bars/CompareDelta"));
+    if let Some(piece) = delta_piece {
+        let lowers = (own_change < 0.0 && !inverted) || (own_change > 0.0 && inverted);
+        if let Some(picture) = if lowers { sub } else { add } {
+            sprites.insert(piece, picture);
+        }
+        if let Some(bar) = &row_look.bar {
+            let better = if less_is_good { own_change <= 0.0 } else { own_change > 0.0 };
+            colors.insert(piece, rgba(if better { bar.add } else { bar.sub }));
+        }
+    }
+    let anchor = |panel: &mut trp_data::screen::ScenePanel, piece: Option<usize>, from: Option<f32>, to: f32| {
+        if let Some(piece) = piece {
+            if let Some(from) = from {
+                panel.nodes[piece].layout.anchor_min[0] = from;
+            }
+            panel.nodes[piece].layout.anchor_max[0] = to;
+        }
+    };
+    if difference.abs() > f32::EPSILON && compare_piece.is_some() {
+        let piece = compare_piece.unwrap_or_default();
+        set.insert(piece, true);
+        if let Some(picture) = add {
+            sprites.insert(piece, picture);
+        }
+        if let Some(bar) = &row_look.bar {
+            let better = if less_is_good { difference <= 0.0 } else { difference > 0.0 };
+            let color = rgba(if better { bar.add } else { bar.sub });
+            colors.insert(piece, color.with_alpha(compare_alpha(0.0)));
+            pulse.push((piece, color));
+        }
+        if difference > 0.0 {
+            anchor(panel, full, None, n10.min(b2));
+            anchor(panel, delta_piece, Some(n10.min(b2)), n8.min(n11));
+            anchor(panel, compare_piece, Some(n8.min(n11)), n8.max(n11));
+        } else {
+            anchor(panel, full, None, n10.min(b2));
+            if compare_total < base {
+                anchor(panel, compare_piece, Some(n10.min(b2)), n10.min(b2) + n12);
+                anchor(panel, delta_piece, Some(n10.min(b2) + n12), n8.max(n11));
+            } else {
+                anchor(panel, delta_piece, Some(n10.min(b2)), n8.max(n11) - n12);
+                anchor(panel, compare_piece, Some(n8.max(n11) - n12), n8.max(n11));
+            }
+        }
+    } else {
+        if let Some(piece) = compare_piece {
+            set.insert(piece, false);
+        }
+        anchor(panel, full, None, n10);
+        anchor(panel, delta_piece, Some(n10), x);
+    }
+    let more = compare_change - own_change;
+    (more.abs() > f32::EPSILON).then(|| format!("({}{})", if more > 0.0 { "+" } else { "" }, more.round() as i64))
+}
+
+/// The edit build screen's characteristics panel for a build's figures,
+/// against those of the build it is compared with (`CharacteristicsPanel.
+/// InstantiateItemFields`): its durability row (compared with nothing), its
+/// weight (over 0 to 15 kg, less better, compared), then in one column each
+/// bar and each compact row in the figures' order; folded to its INFO
+/// button, or not (`SetState`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eb_stats_built(look: &HealthLook, figures: &trp_sim::item_attributes::Figures, compare: &trp_sim::item_attributes::Figures, (weight, compare_weight): (f32, f32), weight_name: &str, expanded: bool) -> Option<EbStatsBuilt> {
+    use trp_sim::item_attributes::{Show, Table};
+    let stats = look.edit_build.as_ref()?.stats.as_ref()?;
+    let mut panel = stats.panel.clone();
+    let mut drawn = stats.drawn.clone();
+    let (mut texts, mut set, mut colors, mut sprites, mut pulse) = (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), Vec::new());
+    let (add, sub) = look.info_rows.as_ref().map_or((None, None), |rows| (rows.add, rows.sub));
+    for (path, on) in [("CharacteristicsExpanded", expanded), ("InfoButton", !expanded)] {
+        if let Some(index) = panel.find(path) {
+            set.insert(index, on);
+            panel.nodes[index].active = on;
+        }
+    }
+    let size_of = |panel: &trp_data::screen::ScenePanel, index: usize, said: &str| -> Option<[f32; 2]> {
+        let text = panel.nodes[index].text.as_ref()?;
+        let face = look.tmp_faces.get(&(panel.file_of(text.font.0)?, text.font.1))?;
+        Some([face.font.width(said, text.size, text.spacing, text.style & 1 != 0) + text.margin[0] + text.margin[2], face.font.height(text.size) + text.margin[1] + text.margin[3]])
+    };
+    let prefer = |panel: &mut trp_data::screen::ScenePanel, index: usize, size: [f32; 2]| {
+        let element = panel.nodes[index].element.unwrap_or(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+        panel.nodes[index].element = Some(trp_data::screen::Element { preferred: size, ..element });
+    };
+    let within = |top: String| move |panel: &trp_data::screen::ScenePanel, end: &str| panel.find(&format!("{top}/{end}"));
+    // The durability row, as the inspect window's.
+    match (figures.durability, panel.find("CharacteristicsExpanded/Durability")) {
+        (Some(durability), Some(row)) => {
+            let at = within(panel.nodes[row].path.clone());
+            let round = |value: f32| ((value as f64 * 10.0).round() / 10.0) as f32;
+            let tint = if durability.most < 10.0 { "#FF0000" } else { "#FFFFFF" };
+            if let Some(value) = at(&panel, "Value") {
+                texts.insert(value, format!("{}/<color={tint}>{}</color> ({})", round(durability.now), round(durability.most), durability.peak.round()));
+            }
+            if let Some(name) = at(&panel, "Name") {
+                texts.insert(name, figures.durability_name.clone());
+            }
+            let share = durability.now / durability.peak.max(1e-6);
+            if let Some(bars) = trp_data::screen::row_look(&panel.subtree(row), "DurabilityPanel").and_then(|look| look.bar) {
+                let color = rgba(if share > 0.15 { bars.current } else { bars.low });
+                for end in ["bars/Full", "bars/Border"] {
+                    if let Some(index) = at(&panel, end) {
+                        colors.insert(index, color);
+                    }
+                }
+            }
+            if let Some(full) = at(&panel, "bars/Full") {
+                panel.nodes[full].layout.anchor_max[0] = share;
+            }
+            if let Some(delta) = at(&panel, "bars/Delta") {
+                panel.nodes[delta].layout.anchor_max[0] = inverse_lerp(0.0, durability.peak, durability.most);
+            }
+            if let Some(compare) = at(&panel, "bars/CompareDelta") {
+                set.insert(compare, false);
+            }
+        }
+        (None, Some(row)) => {
+            set.insert(row, false);
+            panel.nodes[row].active = false;
+        }
+        _ => {}
+    }
+    // The weight (`_charWeight`): to three places.
+    if let Some(row) = panel.find("CharacteristicsExpanded/Weight") {
+        let at = within(panel.nodes[row].path.clone());
+        let mut said = format!("{weight:.3}");
+        if let Some(name) = at(&panel, "Name") {
+            texts.insert(name, weight_name.to_owned());
+        }
+        // (Its change is none, so nothing is written after it.)
+        eb_bar(&mut panel, &at, ([0.0, 15.0], weight, 0.0, true), Some((compare_weight, 0.0)), &stats.weight_look, (add, sub), (&mut colors, &mut sprites, &mut set), &mut pulse);
+        if let Some(value) = at(&panel, "Value") {
+            texts.insert(value, std::mem::take(&mut said));
+        }
+    }
+    // The weight's icon, its attribute's (`Weight`).
+    if let (Some(icon), Some(picture)) = (panel.find("CharacteristicsExpanded/Weight/Icon"), look.attribute_icons.get("Weight")) {
+        sprites.insert(icon, *picture);
+    }
+    // The rows, in the container's grid (`_charPanelContainer`, a
+    // `FlexibleGridLayoutGroup`): each a cell, in the figures' order.
+    let Some(holder) = panel.find("CharacteristicsExpanded/CharsPanel") else { return None };
+    let mut cells = Vec::new();
+    for row in figures.rows.iter() {
+        let bar = matches!(row.show, Show::Bar { .. });
+        let (template, row_look) = if bar { (&stats.bar, &stats.bar_look) } else { (&stats.compact, &stats.compact_look) };
+        let top = graft_row(&mut panel, &mut drawn, template, holder);
+        cells.push(top);
+        let at = |panel: &trp_data::screen::ScenePanel, end: &str| template.0.find(end).map(|index| top + index).filter(|index| *index < panel.nodes.len());
+        if let Some(name) = at(&panel, "Name") {
+            let size = size_of(&panel, name, &row.name).unwrap_or_default();
+            prefer(&mut panel, name, size);
+            texts.insert(name, row.name.clone());
+        }
+        let mut said = row.value.clone().unwrap_or_default();
+        if let Some(base) = row.colored {
+            let (good, bad) = (rgba(row_look.increasing), rgba(row_look.decreasing));
+            if let Some(value) = at(&panel, "Value") {
+                if base < 0.0 {
+                    colors.insert(value, if row.less_is_good { good } else { bad });
+                    if !said.contains('-') {
+                        said.insert(0, '-');
+                    }
+                } else if base > 0.0 {
+                    colors.insert(value, if row.less_is_good { bad } else { good });
+                    said.insert(0, '+');
+                }
+            }
+        }
+        if let Show::Bar { range, base, delta } = row.show {
+            let compared = compare.rows.iter().find(|other| other.id == row.id).and_then(|other| match other.show {
+                Show::Bar { base, delta, .. } => Some((base, delta)),
+                _ => None,
+            });
+            if let Some(more) = eb_bar(&mut panel, &at, (range, base, delta, row.less_is_good), compared, row_look, (add, sub), (&mut colors, &mut sprites, &mut set), &mut pulse) {
+                said.push_str(&more);
+            }
+        }
+        if let Some(value) = at(&panel, "Value") {
+            let drawn_words = rich_spans(&said).map_or_else(|| said.clone(), |spans| spans.into_iter().map(|(words, _)| words).collect());
+            let size = size_of(&panel, value, &drawn_words).unwrap_or_default();
+            prefer(&mut panel, value, size);
+            panel.nodes[value].active = true;
+            texts.insert(value, said);
+        }
+        if let Some(icon) = at(&panel, "Icon") {
+            let table = match row.table {
+                Table::Attribute => &look.attribute_icons,
+                Table::Health => &look.figure_icons[0],
+                Table::Damage => &look.figure_icons[1],
+                Table::Buff => &look.figure_icons[2],
+            };
+            match table.get(row.id) {
+                Some(picture) => {
+                    sprites.insert(icon, *picture);
+                }
+                None => {
+                    set.insert(icon, false);
+                }
+            }
+        }
+    }
+    // The grid's cells: its columns (its fixed count, one where it has
+    // none), each as wide as they share it, filled down each column first
+    // where its axis is the vertical one; the grid as tall as its rows.
+    if let Some(grid) = panel.grid(holder) {
+        let width = panel.rect(holder, fitted_size(&panel))[2].max(grid.cell[0]);
+        let columns = grid.columns.unwrap_or(1).max(1) as usize;
+        let cell_width = (width - (columns as f32 - 1.0) * grid.spacing[0] - grid.padding[0] - grid.padding[1]) / columns as f32;
+        let cell_height = if grid.cell[1] > 0.0 { grid.cell[1] } else { 23.0 };
+        let down = cells.len().div_ceil(columns).max(1);
+        for (n, &top) in cells.iter().enumerate() {
+            let (x, y) = if grid.start_axis == 1 { (n / down, n % down) } else { (n % columns, n / columns) };
+            let layout = &mut panel.nodes[top].layout;
+            layout.anchor_min = [0.0, 1.0];
+            layout.anchor_max = [0.0, 1.0];
+            layout.pivot = [0.0, 1.0];
+            layout.offset = [grid.padding[0] + (cell_width + grid.spacing[0]) * x as f32, -(grid.padding[2] + (cell_height + grid.spacing[1]) * y as f32)];
+            layout.size_delta = [cell_width, cell_height];
+        }
+        let rows_down = cells.len().div_ceil(columns);
+        let height = if rows_down == 0 { 0.0 } else { grid.padding[2] + grid.padding[3] + (cell_height + grid.spacing[1]) * rows_down as f32 - grid.spacing[1] };
+        let element = panel.nodes[holder].element.unwrap_or(trp_data::screen::Element { ignore: false, min: [-1.0, -1.0], preferred: [-1.0, -1.0], flexible: [-1.0, -1.0] });
+        panel.nodes[holder].element = Some(trp_data::screen::Element { min: [element.min[0], height], preferred: [element.preferred[0], height], ..element });
+    }
+    let size = fitted_size(&panel);
+    let switches = ["CharacteristicsExpanded/Switcher", "InfoButton"].iter().zip([expanded, !expanded]).filter(|(_, on)| *on).filter_map(|(path, _)| panel.find(path).map(|index| panel.rect(index, size))).collect();
+    Some(EbStatsBuilt { panel, drawn, texts, set, colors, sprites, size, switches, pulse })
+}
+
+/// The characteristics panel as `eb_stats_built` laid it out, its top left
+/// at `origin` (units).
+pub(crate) fn draw_eb_stats(layer: &mut ChildSpawnerCommands, look: &HealthLook, said: &Words, built: &EbStatsBuilt, origin: [f32; 2], s: f32) {
+    let marks = Marks { words: Some(&built.texts), set: Some(&built.set), colors: Some(&built.colors), sprites: Some(&built.sprites), ..Marks::default() };
+    draw_nodes(layer, look, &built.panel, &built.drawn, EB_STATS, marks, said, Frame::Is(built.size), origin, s);
+}
+
+/// The window's own preferred size as made (its `LayoutElement`'s, 670 by
+/// 500), which stretching it starts from.
+pub(crate) fn info_preferred(look: &HealthLook) -> Option<[f32; 2]> {
+    look.info.as_ref()?.nodes.first()?.element.map(|element| element.preferred).filter(|size| size[0] > 0.0 && size[1] > 0.0)
+}
+
+/// The piece the `index`th window that shows a thing draws its loader as,
+/// which `info_preview` turns while it shows.
+pub(crate) fn info_loader_piece(look: &HealthLook, index: usize) -> Option<usize> {
+    look.info.as_ref()?.find(INFO_LOADER).map(|loader| INFO + (index << 12) + loader)
+}
+
+// ==== The inspect window drawn, and the menu of a right click ====
+
+/// The window that shows a thing (`InfoWindow`) as `info_built` laid it
+/// out, in a frame at its top left corner, `s` pixels to a unit, the
+/// `index`th window open. Its model is drawn by the caller into its
+/// preview's room (`InfoBuilt::preview`); its description in its box, cut
+/// to it (`Mask`; the game's scrolls, not built).
+pub fn draw_info_window(column: &mut ChildSpawnerCommands, look: &HealthLook, said: &Words, words: &InfoWords, built: &InfoBuilt, index: usize, s: f32, (opened, scrolled): (u64, f32)) {
+    let InfoBuilt { panel, drawn, texts, set, colors, sprites, groups, icons, size, .. } = built;
+    let size = *size;
+    // (The description is drawn below, and a bar's handle where it moves.)
+    let skip: Vec<usize> = panel.find(INFO_DESCRIPTION).into_iter().chain(built.scroll.as_ref().map(|scroll| scroll.handle)).collect();
+    let base = INFO + (index << 12);
+    draw_nodes(column, look, panel, drawn, base, Marks { words: Some(texts), skip: &skip, set: Some(set), colors: Some(colors), sprites: Some(sprites), groups: Some(groups), ..Marks::default() }, said, Frame::Is(size), [0.0, 0.0], s);
+    let place = |x: f32, y: f32, w: f32, h: f32| Node { position_type: PositionType::Absolute, left: Val::Px(x * s), top: Val::Px(y * s), width: Val::Px(w * s), height: Val::Px(h * s), ..default() };
+    // An empty slot's filters' marks (`filter_icon`, white: its prefab's
+    // colour not read).
+    for ([x, y, w, h], picture) in icons {
+        if let Some(sprite) = look.sprite_of(*picture, Color::WHITE) {
+            draw_sprite(column, &sprite, [x * s, y * s, w * s, h * s], s);
+        }
+    }
+    // The description's bar's handle, where it is scrolled to
+    // (`inventory_view::scroll_info_texts` moves it).
+    if let Some(scroll) = &built.scroll {
+        let [x, y, w, h] = scroll.handle_at(scrolled);
+        column.spawn((place(x, y, w, h), BackgroundColor(scroll.color), InfoScrollHandle(opened, scroll.color)));
+    }
+    let moved = if built.scroll.is_some() { -scrolled * s } else { 0.0 };
     if let (Some(scroll), Some(description)) = (panel.find(INFO_SCROLL), panel.find(INFO_DESCRIPTION)) {
         let Some(text) = panel.nodes[description].text.clone() else { return };
         let [x, y, w, h] = panel.rect(scroll, size);
@@ -1470,18 +3643,100 @@ pub fn draw_info_window(column: &mut ChildSpawnerCommands, look: &HealthLook, sa
         let effect = look.text_effect(&panel, text.font);
         let width = (w - text.margin[0] - text.margin[2]) * s;
         let tmp = look.tmp_of(&panel, &text);
-        column.spawn(Node { overflow: Overflow::clip(), ..place(x, y, w, h) }).with_children(|clip| {
-            let room = Node { margin: UiRect::new(Val::Px(text.margin[0] * s), Val::ZERO, Val::Px(text.margin[1] * s), Val::ZERO), ..default() };
-            match tmp {
-                // As the game draws it, its lines broken at the box's width.
-                Some((asset, material)) => {
-                    let run = trp_data::tmp_text::TmpRun { text: words.description.clone(), size: text.size * s, color: screen_numbers(rgba(text.color)), bold: text.style & 1 != 0 };
-                    let layout = trp_data::tmp_text::TmpLayout { em: text.size * s, spacing: text.spacing, kerning: text.kerning, wrap: Some(width), align: text.horizontal & 7 };
-                    tmp_words(clip, room, TmpText { asset, material, runs: vec![run], layout }, &mut |_| {});
+        // In its area, clipped to it, moved up as far as it is scrolled.
+        let moving = (Node { position_type: PositionType::Absolute, left: Val::Px(0.0), top: Val::Px(moved), width: Val::Percent(100.0), ..default() }, InfoScrollContent(opened));
+        column.spawn(Node { overflow: Overflow::clip(), ..place(x, y, w, h) }).with_children(|frame| {
+            frame.spawn(moving).with_children(|clip| {
+                let room = Node { margin: UiRect::new(Val::Px(text.margin[0] * s), Val::ZERO, Val::Px(text.margin[1] * s), Val::ZERO), ..default() };
+                match tmp {
+                    // As the game draws it, its lines broken at the box's width.
+                    Some((asset, material)) => {
+                        let run = trp_data::tmp_text::TmpRun { text: words.description.clone(), size: text.size * s, color: screen_numbers(rgba(text.color)), bold: text.style & 1 != 0 };
+                        let layout = trp_data::tmp_text::TmpLayout { em: text.size * s, spacing: text.spacing, kerning: text.kerning, wrap: Some(width), align: text.horizontal & 7 };
+                        tmp_words(clip, room, TmpText { asset, material, runs: vec![run], layout }, &mut |_| {});
+                    }
+                    None => effect_words(clip, Node { width: Val::Px(width), ..room }, &[(words.description.clone(), font, rgba(text.color))], effect, text.size * s, &mut |_, _, _| {}),
                 }
-                None => effect_words(clip, Node { width: Val::Px(width), ..room }, &[(words.description.clone(), font, rgba(text.color))], effect, text.size * s, &mut |_, _, _| {}),
-            }
+            });
         });
+    }
+}
+
+/// The windows of containers' grids, each window's past the one before it.
+const GRID_WINDOW: usize = 29 << 20;
+
+/// The game's window of a container's grids laid out for one container
+/// (`GridWindow`; inventory spec, "A container's window"): its panel with
+/// the caption's words asking the caption's row for their width, its size
+/// in units, each grid's place in it, the caption's words as they fit,
+/// the caption's bar (what moves it) and the cross, and whether it is the
+/// priority window.
+pub(crate) struct GridWindowBuilt {
+    panel: trp_data::screen::ScenePanel,
+    pub(crate) size: [f32; 2],
+    pub(crate) grids: Vec<[f32; 4]>,
+    caption: String,
+    pub(crate) bar: [f32; 4],
+    pub(crate) close: [f32; 4],
+    picked: bool,
+}
+
+/// The window of a container's grids for a container of that name, layout
+/// and grids (`GridWindow.Show`): the container's own layout where it has
+/// one with as many grids (`TemplatedGridsView`), else the default row
+/// (`GeneratedGridsView`), at the window's padding (5 left, 26 down); the
+/// window as large as its padding and the grids ask (`ContentSizeFitter`,
+/// preferred), at least its `LayoutElement`'s least (128 by 64). The
+/// caption is the short name as the locale has it, not in capitals (its
+/// text has no capitals' style), cut with an ellipsis where its row is
+/// narrower (`TextOverflowModes.Ellipsis`). No slots are drawn: neither
+/// view the window makes has any in a raid.
+pub(crate) fn grid_window_built(look: &HealthLook, name: &str, layout: &str, cells: &[[u32; 2]], picked: bool) -> Option<GridWindowBuilt> {
+    let window = look.grid_window.as_ref()?;
+    let mut panel = window.panel.clone();
+    let rects = container_grids(look, layout, cells);
+    let content = match look.layouts.get(layout).filter(|(_, own)| own.len() >= cells.len()) {
+        Some((own, _)) => *own,
+        None => {
+            let row = look.containers.as_ref().and_then(|views| views.grids_row).unwrap_or_default();
+            let right = rects.iter().fold(0.0f32, |most, [x, _, w, _]| most.max(x + w));
+            let bottom = rects.iter().fold(0.0f32, |most, [_, y, _, h]| most.max(y + h));
+            [right + row.padding[1], bottom + row.padding[3]]
+        }
+    };
+    let pad = panel.nodes[0].group.map_or([5.0, 4.0, 26.0, 4.0], |group| group.padding);
+    let least = panel.nodes[0].element.map_or([128.0, 64.0], |element| element.min);
+    let size = [(pad[0] + content[0] + pad[1]).max(least[0]), (pad[2] + content[1] + pad[3]).max(least[1])];
+    let grids = rects.iter().map(|[x, y, w, h]| [pad[0] + x, pad[2] + y, *w, *h]).collect();
+    // The caption asks its row for its words' own size; what it gets of the
+    // row it shows, cut to fit.
+    if let Some(asked) = text_size(look, &panel, window.caption, name) {
+        prefer_size(&mut panel, window.caption, asked);
+    }
+    let room = panel.placed(window.caption, size).rect[2];
+    let caption = match panel.nodes[window.caption].text.as_ref().and_then(|text| Some((text, look.tmp_faces.get(&(panel.file_of(text.font.0)?, text.font.1))?))) {
+        Some((text, face)) => fitted_words(&face.font, &trp_data::screen::TextLook { wraps: false, overflow: 1, ..text.clone() }, name, room),
+        None => name.to_owned(),
+    };
+    let bar = panel.placed(window.caption_panel, size).rect;
+    let close = panel.placed(window.close, size).rect;
+    Some(GridWindowBuilt { panel, size, grids, caption, bar, close, picked })
+}
+
+/// The window of a container's grids drawn, the `index`th window, at its
+/// top left corner: its frame, shadow and caption's row as the prefab has
+/// them, its icon and caption's ground in the colours of a priority window
+/// or not (`SetSelectedAsTargetVisual`), and each grid's view; the things
+/// in the grids are the caller's.
+pub(crate) fn draw_grid_window(column: &mut ChildSpawnerCommands, look: &HealthLook, said: &Words, built: &GridWindowBuilt, index: usize, s: f32) {
+    let Some(window) = look.grid_window.as_ref() else { return };
+    let words: HashMap<usize, String> = [(window.caption, built.caption.clone())].into();
+    let pick = usize::from(built.picked);
+    let colors: HashMap<usize, Color> = [(window.icon, rgba(window.icon_colors[pick])), (window.caption_panel, rgba(window.header_colors[pick]))].into();
+    let marks = Marks { words: Some(&words), colors: Some(&colors), ..Marks::default() };
+    draw_nodes(column, look, &built.panel, &look.grid_window_drawn, GRID_WINDOW + (index << 12), marks, said, Frame::Is(built.size), [0.0, 0.0], s);
+    for [x, y, w, h] in &built.grids {
+        draw_grid_view(column, look, said, [*x, *y], [*w, *h], s);
     }
 }
 
@@ -1542,10 +3797,19 @@ fn menu_line_colors(fields: &[u8]) -> Option<[Color; 2]> {
 /// (`SetUnlockStatus`), and its ground the selected colour under the mouse.
 /// None where the game's menu was not read.
 pub fn menu_layout(look: &HealthLook, lines: &[MenuLineLook]) -> Option<MenuBuilt> {
-    let source = look.menu.as_ref()?;
+    layout_menu(look, look.menu.as_ref()?, &look.menu_drawn, lines)
+}
+
+/// The menu of a line's own lines laid out the same way, from its own
+/// copy of the templates (`SubMenuTemplate`).
+pub fn submenu_layout(look: &HealthLook, lines: &[MenuLineLook]) -> Option<MenuBuilt> {
+    layout_menu(look, look.submenu.as_ref()?, &look.submenu_drawn, lines)
+}
+
+fn layout_menu(look: &HealthLook, source: &trp_data::screen::ScenePanel, source_drawn: &Drawn, lines: &[MenuLineLook]) -> Option<MenuBuilt> {
     let holder = source.find(MENU_LINES)?;
     let mut panel = source.clone();
-    let mut drawn = Drawn { shown: look.menu_drawn.shown.clone(), pictures: look.menu_drawn.pictures.clone() };
+    let mut drawn = Drawn { shown: source_drawn.shown.clone(), pictures: source_drawn.pictures.clone() };
     // The templates themselves are not drawn.
     let under = |index: usize, top: usize| {
         let mut at = Some(index);
@@ -1566,9 +3830,12 @@ pub fn menu_layout(look: &HealthLook, lines: &[MenuLineLook]) -> Option<MenuBuil
     let (mut words, mut pictures, mut groups, mut colors, mut set) = (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
     let mut tops = Vec::new();
     for line in lines {
+        // (Both menus' `SimpleSpecifiedContextButtons`: the wish list's
+        // line and its groups' in the wish list's template, Discard and
+        // Remove from Wishlist in Discard's.)
         let path = match line.name {
-            "Discard" => MENU_TEMPLATES[2],
-            "AddToWishlist" => MENU_TEMPLATES[1],
+            "Discard" | "RemoveFromWishlist" => MENU_TEMPLATES[2],
+            "AddToWishlist" | "Quests" | "Hideout" | "Trading" | "Equipment" | "Other" => MENU_TEMPLATES[1],
             _ => MENU_TEMPLATES[0],
         };
         let Some(top) = source.find(path) else { continue };
@@ -1580,8 +3847,8 @@ pub fn menu_layout(look: &HealthLook, lines: &[MenuLineLook]) -> Option<MenuBuil
             node.parent = if old == top { Some(holder) } else { node.parent.and_then(new_of) };
             node.active |= old == top;
             panel.nodes.push(node);
-            drawn.shown.push(look.menu_drawn.shown.get(old).copied().unwrap_or(Shown::Never));
-            drawn.pictures.push(look.menu_drawn.pictures.get(old).copied().flatten());
+            drawn.shown.push(source_drawn.shown.get(old).copied().unwrap_or(Shown::Never));
+            drawn.pictures.push(source_drawn.pictures.get(old).copied().flatten());
         }
         let named = |panel: &trp_data::screen::ScenePanel, name: &str| (first..panel.nodes.len()).find(|&index| panel.nodes[index].name == name);
         let copy_top = first;
@@ -1624,10 +3891,16 @@ pub fn menu_layout(look: &HealthLook, lines: &[MenuLineLook]) -> Option<MenuBuil
 
 /// Draws the menu as `menu_layout` laid it out, its top left at `origin`
 /// in units, `s` pixels to a unit.
-pub fn draw_menu(column: &mut ChildSpawnerCommands, look: &HealthLook, said: &Words, built: &MenuBuilt, origin: [f32; 2], s: f32) {
-    let marks = Marks { words: Some(&built.words), pictures: Some(&built.pictures), groups: Some(&built.groups), colors: Some(&built.colors), set: Some(&built.set), ..Marks::default() };
-    draw_nodes(column, look, &built.panel, &built.drawn, MENU, marks, said, Frame::Is(built.size), origin, s);
+/// (`sub`: the menu of a line's own lines, numbered apart from the first.)
+pub fn draw_menu(column: &mut ChildSpawnerCommands, look: &HealthLook, said: &Words, built: &MenuBuilt, origin: [f32; 2], s: f32, sub: bool) {
+    // A line's icon is only its sprite swapped (`ContextMenuButton.Show`):
+    // drawn in the icon's own 16 units square, kept to its shape.
+    let marks = Marks { words: Some(&built.words), sprites: Some(&built.pictures), groups: Some(&built.groups), colors: Some(&built.colors), set: Some(&built.set), ..Marks::default() };
+    let base = if sub { MENU + (1 << 19) } else { MENU };
+    draw_nodes(column, look, &built.panel, &built.drawn, base, marks, said, Frame::Is(built.size), origin, s);
 }
+
+// ==== Binds, item grounds and looks, the pictures, the version line ====
 
 /// The label of a thing bound to a key: its picture (the cut of its
 /// texture) at its sprite's own size, in units, and its key's words.
@@ -1678,7 +3951,17 @@ pub fn stack_color(class_names: &[String]) -> Color {
 /// Each item view's look made from its prefab, with its pictures and fonts.
 fn item_looks(look: &HealthLook) -> [Option<std::sync::Arc<ItemViewLook>>; 2] {
     let Some(items) = &look.items else { return [None, None] };
-    let make = |panel: &trp_data::screen::ScenePanel, drawn: &Drawn| -> ItemViewLook {
+    [
+        items.slot.as_ref().map(|panel| std::sync::Arc::new(item_look(look, panel, &look.slot_item))),
+        items.grid.as_ref().map(|panel| std::sync::Arc::new(item_look(look, panel, &look.grid_item))),
+    ]
+}
+
+/// A thing's view as the inventory draws it, from its prefab as a panel
+/// and its pictures (`slot_layout`, `grid_layout`, the edit build screen's
+/// `modding_selectable_layout`).
+fn item_look(look: &HealthLook, panel: &trp_data::screen::ScenePanel, drawn: &Drawn) -> ItemViewLook {
+    {
         let caption = panel.find("Info Panel/Name").or_else(|| panel.find("Info Panel/Caption"));
         let value = (0..panel.nodes.len()).find(|&index| panel.nodes[index].name == "Value" && panel.nodes[index].text.is_some());
         let font = |index: Option<usize>| index.and_then(|index| panel.nodes[index].text.as_ref()).map(|text| look.styled_font(panel, text.font, text.style)).unwrap_or_default();
@@ -1708,8 +3991,45 @@ fn item_looks(look: &HealthLook) -> [Option<std::sync::Arc<ItemViewLook>>; 2] {
         let mods = look.mod_pictures.iter().filter_map(|(key, picture)| Some((key.clone(), sprite(picture, Color::WHITE)?))).collect();
         let effect = |index: Option<usize>| index.and_then(|index| panel.nodes[index].text.as_ref()).and_then(|text| look.text_effect(panel, text.font));
         let tmp = |index: Option<usize>| index.and_then(|index| panel.nodes[index].text.as_ref()).and_then(|text| look.tmp_of(panel, text));
+        let face = |index: Option<usize>| index.and_then(|index| panel.nodes[index].text.as_ref()).and_then(|text| look.tmp_faces.get(&(panel.file_of(text.font.0)?, text.font.1)).cloned());
+        let tag = panel.find("TagPanel").zip(panel.find("TagPanel/TagName")).map(|(plate, name)| TagPlateLook {
+            plate,
+            name,
+            name_tmp: tmp(Some(name)),
+            name_font: font(Some(name)),
+            name_face: face(Some(name)),
+            caption_face: face(caption),
+        });
+        // The wish list's marks, and its column's other members' heights.
+        let wish = ends("WishlistIcon").map(|icon| {
+            let column = panel.nodes[icon].parent.unwrap_or(icon);
+            let edges = (0..panel.nodes.len())
+                .filter(|&index| panel.nodes[index].parent.is_some_and(|parent| panel.nodes[parent].name.starts_with("WishlistBorder")))
+                .filter_map(|index| Some((index, drawn_sprite(index)?)))
+                .collect();
+            let mod_height = ends("ModIconContainer").map_or(0.0, |holder| panel.asks(holder, 1).1);
+            let inscription_height = inscription
+                .filter(|&index| panel.nodes[index].parent == Some(column))
+                .and_then(|index| Some((panel.nodes[index].text.as_ref()?.size, face(Some(index))?)))
+                .map(|(size, face)| face.font.height(size));
+            let icons = look.wish_outlines.iter().filter_map(|(name, picture)| Some((*name, sprite(picture, Color::WHITE)?))).collect();
+            WishLook { glow: ends("WishlistGlow").and_then(|glow| Some((glow, drawn_sprite(glow)?))), edges, icon, column, mod_height, inscription_height, icons }
+        });
+        let spin = look.spin.as_ref().map(|panel| {
+            let piece = |end: &str| -> Option<(usize, SpinPicture)> {
+                let index = (0..panel.nodes.len()).find(|&index| panel.nodes[index].path.ends_with(end))?;
+                let picture = look.spin_drawn.pictures.get(index).copied().flatten()?;
+                let image = look.images.get(picture.texture)?.clone()?;
+                Some((index, SpinPicture { image, cut: picture.cut, covers: picture.covers }))
+            };
+            SpinLook { panel: panel.clone(), back: piece("Spinner Background"), fill: piece("Spinner Fill"), loader: piece("LoadMagazineLoader"), stop: piece("CloseImage") }
+        });
         ItemViewLook {
+            spin,
+            wish,
+            tag,
             caption_tmp: tmp(caption),
+            caption_face: face(caption),
             inscription_tmp: tmp(inscription),
             value_tmp: tmp(value),
             panel: panel.clone(),
@@ -1727,12 +4047,9 @@ fn item_looks(look: &HealthLook) -> [Option<std::sync::Arc<ItemViewLook>>; 2] {
             mastering,
             durability,
             mods,
+            loader: panel.find("Loader").and_then(|index| Some((drawn_sprite(index)?, panel.nodes[index].layout.size_delta))),
         }
-    };
-    [
-        items.slot.as_ref().map(|panel| std::sync::Arc::new(make(panel, &look.slot_item))),
-        items.grid.as_ref().map(|panel| std::sync::Arc::new(make(panel, &look.grid_item))),
-    ]
+    }
 }
 
 /// The panels' textures made images, and their fonts fonts, once, at the
@@ -1783,6 +4100,11 @@ fn make_pictures(mut look: ResMut<HealthLook>, mut images: ResMut<Assets<Image>>
         .collect();
     let looks = item_looks(&look);
     look.item_looks = looks;
+    // The edit build screen's view of a part.
+    let part_look = look.edit_build.as_ref().and_then(|eb| eb.part.as_ref()).map(|(panel, drawn)| std::sync::Arc::new(item_look(&look, panel, drawn)));
+    if let Some(eb) = look.edit_build.as_mut() {
+        eb.part_look = part_look;
+    }
 }
 
 /// The game's line of its version at the screen's foot.
@@ -1820,7 +4142,7 @@ fn show_version(mut commands: Commands, look: Res<HealthLook>, window: Query<&Wi
         ..default()
     };
     let font = TextFont { font: look.styled_font(label, text.font, text.style), font_size: text.size * s, weight: weight_of(text.style), ..default() };
-    let words = format!("TRP {}", env!("CARGO_PKG_VERSION"));
+    let words = format!("TRP {}", env!("TRP_VERSION"));
     commands.spawn((VersionLine(height), node, GlobalZIndex(30))).with_children(|line| {
         line.spawn((Text::new(words), font, TextColor(rgba(text.color)), TextLayout::new_with_no_wrap()));
     });
@@ -1831,6 +4153,137 @@ fn show_version(mut commands: Commands, look: Res<HealthLook>, window: Query<&Wi
 fn share_item_looks(look: Res<HealthLook>, mut carried: ResMut<crate::inventory_view::Carried>) {
     carried.item_looks = look.item_looks.clone();
     carried.info_size = info_places(&look).map(|places| Vec2::from(places.size));
+    carried.game_grid_window = look.grid_window.is_some();
+    carried.tag_size = tag_places(&look).map(|places| Vec2::from(places.size));
+    carried.tag_limit = if look.tag_window.is_some() { look.tag_limit } else { TAG_LIMIT };
+}
+
+/// The colours a tag may be (`EditTagWindow.GetColor`: the game's own
+/// seven, a number past them the first).
+pub const TAG_COLOURS: [[f32; 3]; 7] = [[0.4, 0.0, 1.0 / 51.0], [0.4, 0.227_450_98, 3.0 / 85.0], [24.0 / 85.0, 0.4, 1.0 / 17.0], [1.0 / 85.0, 0.4, 28.0 / 85.0], [0.168_627_46, 0.0, 20.0 / 51.0], [0.4, 0.0, 0.227_450_98], [0.4, 0.4, 0.4]];
+const TAG_COLORS: usize = TAG_COLOURS.len();
+
+// ==== Tags, the panel's pieces, the drop's glow, the effects' icons and tooltips ====
+
+/// A tag's colour by its number (`GetColor`).
+pub fn tag_colour(color: u32) -> Color {
+    let [r, g, b] = TAG_COLOURS[if (color as usize) < TAG_COLORS { color as usize } else { 0 }];
+    Color::srgb(r, g, b)
+}
+
+/// The most letters a tag has where the window's field could not be read
+/// (as the install's had it on 2026-10-17).
+pub const TAG_LIMIT: u32 = 16;
+/// A colour cell's side in the grid (`GridLayoutGroup.m_CellSize`, read
+/// 2026-10-17).
+const TAG_CELL: f32 = 25.0;
+const TAG_CAPTION: &str = "Inner/Caption Panel/Caption";
+const TAG_CAPTION_PANEL: &str = "Inner/Caption Panel";
+const TAG_CLOSE: &str = "Inner/Caption Panel/Close Button";
+const TAG_COLORS_PANEL: &str = "Inner/Contents/ColorsAndCount/Colors";
+const TAG_COUNT: &str = "Inner/Contents/ColorsAndCount/Text";
+const TAG_INPUT: &str = "Inner/Contents/TagInput";
+const TAG_TEXT: &str = "Inner/Contents/TagInput/Text Area/Text";
+const TAG_PLACEHOLDER: &str = "Inner/Contents/TagInput/Text Area/Placeholder";
+const TAG_SAVE: &str = "Inner/Contents/SaveButton";
+const TAG_SAVE_SIZE: &str = "Inner/Contents/SaveButton/SizeLabel";
+const TAG_SAVE_LABEL: &str = "Inner/Contents/SaveButton/SizeLabel/Label";
+
+/// The prefab's `n`th colour cell.
+fn tag_cell(n: usize) -> String {
+    if n == 0 { format!("{TAG_COLORS_PANEL}/ColorCell") } else { format!("{TAG_COLORS_PANEL}/ColorCell ({n})") }
+}
+
+/// A line's height as TextMeshPro asks it of a layout: the face's ascent
+/// to its descent at that size.
+fn tmp_line(font: &trp_data::screen::TmpFont, size: f32) -> f32 {
+    (font.ascent - font.descent) * size / font.point_size.max(1.0) * font.scale
+}
+
+/// The window that edits a tag as the game lays it out (`TARKOV UI`): its
+/// size, and where in it its caption bar and cross, its field, its colour
+/// cells and its button lie, in units from its top left corner.
+pub struct TagPlaces {
+    pub size: [f32; 2],
+    pub caption: [f32; 4],
+    pub close: [f32; 4],
+    pub input: [f32; 4],
+    pub cells: Vec<[f32; 4]>,
+    pub save: [f32; 4],
+}
+
+pub fn tag_places(look: &HealthLook) -> Option<TagPlaces> {
+    let panel = look.tag_window.as_ref()?;
+    let size = info_size(panel);
+    let rect = |path: &str| panel.find(path).map(|index| panel.rect(index, size));
+    let cells = (0..TAG_COLORS).filter_map(|n| rect(&tag_cell(n))).collect();
+    Some(TagPlaces { size, caption: rect(TAG_CAPTION_PANEL)?, close: rect(TAG_CLOSE)?, input: rect(TAG_INPUT)?, cells, save: rect(TAG_SAVE)? })
+}
+
+/// What the window that edits a tag shows: the name typed so far, the
+/// colour chosen, and whether its field has the keys (a caret after the
+/// name).
+pub struct TagWords<'a> {
+    pub name: &'a str,
+    pub color: u32,
+    pub focused: bool,
+}
+
+/// The window that edits a tag (`EditTagWindow`), as the game draws it with
+/// what its script writes: its caption in the install's words, the colours
+/// with the chosen one's border, the count of letters against the most
+/// (`TagTextChange`), the name or, with none, the placeholder (`container
+/// tag`), and its button's `SAVE`; in a frame at its top left corner, `s`
+/// pixels to a unit, the `index`th window open. A caret after the name
+/// while the field has the keys (`PROVISIONAL`: TextMeshPro's caret is not
+/// read: a line of the text's colour, a unit wide, not blinking).
+pub fn draw_tag_window(column: &mut ChildSpawnerCommands, look: &HealthLook, said: &Words, words: &TagWords, index: usize, s: f32) {
+    let Some(panel) = &look.tag_window else { return };
+    let size = info_size(panel);
+    let mut texts = HashMap::new();
+    let mut set = HashMap::new();
+    let say = |key: &str| said.word(key, key);
+    for (path, now) in [
+        (TAG_CAPTION, say("ADD/EDIT CONTAINER TAG")),
+        (TAG_COUNT, format!("{}/{}", words.name.chars().count(), look.tag_limit)),
+        (TAG_TEXT, words.name.to_owned()),
+        (TAG_PLACEHOLDER, say("container tag")),
+        (TAG_SAVE_LABEL, say("Save").to_uppercase()),
+        (TAG_SAVE_SIZE, say("Save").to_uppercase()),
+    ] {
+        if let Some(index) = panel.find(path) {
+            texts.insert(index, now);
+        }
+    }
+    for n in 0..TAG_COLORS {
+        if let Some(border) = panel.find(&format!("{}/Border", tag_cell(n))) {
+            set.insert(border, n as u32 == words.color);
+        }
+    }
+    let named = !words.name.is_empty();
+    for (path, on) in [(TAG_TEXT, named), (TAG_PLACEHOLDER, !named)] {
+        if let Some(index) = panel.find(path) {
+            set.insert(index, on);
+        }
+    }
+    let base = TAG_WINDOW + (index << 12);
+    draw_nodes(column, look, panel, &look.tag_window_drawn, base, Marks { words: Some(&texts), set: Some(&set), ..Marks::default() }, said, Frame::Is(size), [0.0, 0.0], s);
+    // The caret, after the name, the text's height.
+    if let (true, Some(text_index)) = (words.focused, panel.find(TAG_TEXT)) {
+        let Some(text) = panel.nodes[text_index].text.as_ref() else { return };
+        let [x, y, _, h] = panel.rect(text_index, size);
+        let width = panel.file_of(text.font.0).and_then(|file| look.tmp_faces.get(&(file, text.font.1))).map_or(0.0, |face| face.font.width(words.name, text.size, text.spacing, text.style & 1 != 0));
+        let tall = panel.file_of(text.font.0).and_then(|file| look.tmp_faces.get(&(file, text.font.1))).map_or(text.size, |face| tmp_line(&face.font, text.size));
+        let top = match text.vertical {
+            256 => y,
+            1024 => y + h - tall,
+            _ => y + (h - tall).max(0.0) / 2.0,
+        };
+        column.spawn((
+            Node { position_type: PositionType::Absolute, left: Val::Px((x + width + 1.0) * s), top: Val::Px(top * s), width: Val::Px(s.max(1.0)), height: Val::Px(tall * s), ..default() },
+            BackgroundColor(rgba(text.color)),
+        ));
+    }
 }
 
 /// One object of one of the game's panels as drawn, by its number among
@@ -1933,6 +4386,56 @@ pub struct HealthDrop(pub usize);
 /// thing leaves or is let go (`Normal`). The game's look (`TARKOV UI`)
 /// alone: the app's has no glow.
 #[allow(clippy::too_many_arguments)]
+/// The piece of the window that shows a thing, number `index` among the
+/// windows open, drawn for its panel's node `node`.
+pub(crate) fn info_piece(index: usize, node: usize) -> usize {
+    INFO + (index << 12) + node
+}
+
+/// A button of a window that shows a thing, to be lit under the mouse: its
+/// ground's piece, its colours at rest and lit, its group's alpha, and the
+/// window's layer among the covers.
+#[derive(Component)]
+pub(crate) struct InfoButtonLight {
+    pub(crate) piece: usize,
+    pub(crate) colors: [Color; 2],
+    pub(crate) alpha: f32,
+    pub(crate) layer: u8,
+}
+
+/// A window's buttons under the mouse (`SimpleContextMenuButton.
+/// OnPointerEnter`, `OnPointerExit`): the ground of the one under it, on
+/// the window on top there, in its lit colour at once, the rest in their
+/// own; one that cannot be done lights too, at its group's 0.3 (it still
+/// takes the mouse: `SetUnlockStatus`, no raycast change). Recoloured in
+/// place: a rebuild of the screen would lose the mouse for a frame.
+fn light_info_buttons(
+    controller: Res<Controller>,
+    lights: Query<(&InfoButtonLight, &RelativeCursorPosition)>,
+    covers: Query<(&crate::inventory_view::Cover, &RelativeCursorPosition)>,
+    mut pieces: Query<(Option<&Piece>, Option<&SliceOf>, &mut ImageNode)>,
+) {
+    if lights.is_empty() {
+        return;
+    }
+    let top = crate::inventory_view::cover_under(covers.iter());
+    let wanted: HashMap<usize, Color> = lights
+        .iter()
+        .map(|(light, at)| {
+            let lit = controller.inventory_open && at.cursor_over() && light.layer == top;
+            let color = light.colors[lit as usize];
+            (light.piece, color.with_alpha(color.alpha() * light.alpha))
+        })
+        .collect();
+    for (piece, slice, mut image) in &mut pieces {
+        let Some(index) = piece.map(|piece| piece.0).or(slice.map(|slice| slice.0)) else { continue };
+        let Some(want) = wanted.get(&index) else { continue };
+        if image.color != *want {
+            image.color = *want;
+        }
+    }
+}
+
 fn light_drop_glow(
     look: Res<HealthLook>,
     controller: Res<Controller>,
@@ -2010,7 +4513,14 @@ pub(crate) fn effect_icon(kind: Kind) -> Option<&'static str> {
         Kind::ChronicFatigue => "ChronicStaminaFatigue",
         Kind::Encumbered => "Encumbered",
         Kind::OverEncumbered => "OverEncumbered",
-        Kind::LowHealth | Kind::Existence | Kind::MedEffect => return None,
+        Kind::Contusion => "Contusion",
+        Kind::Stun => "Stun",
+        Kind::TunnelVision => "TunnelVision",
+        // The game shows a stimulator's buffs and its side effects by two
+        // icons (`IStimulatorBuff`, `IStimulatorDebuff`); here the buffs'
+        // alone. PROVISIONAL.
+        Kind::Stimulator => "StimulatorBuff",
+        Kind::LowHealth | Kind::Existence | Kind::MedEffect | Kind::Flash | Kind::Endurance | Kind::DamageModifier => return None,
     })
 }
 
@@ -2142,6 +4652,8 @@ fn show_effect_tooltip(
         }
     }
 }
+
+// ==== The strip, the gear, the foot, the border, the tab bar, the stash, the quick bar, the containers ====
 
 /// Draws the GEAR tab's strip of figures as the game's (`TARKOV UI`),
 /// where the game lays it out in the left panel, as `draw_panel` draws.
@@ -2405,6 +4917,12 @@ pub fn draw_stash(column: &mut ChildSpawnerCommands, look: &HealthLook, said: &W
     if let Some(text) = stash.name {
         words.insert(text, name.to_owned());
     }
+    // The header's toggle lays out its icon (`StashHeaderIcons_Off`, the
+    // loot's mark) and its word by what they ask, which the layout here
+    // does not ask of them itself: they were drawn at no size (the user's
+    // "loot icon", 2026-10-21 and 2026-10-23).
+    let top_panel = panel.find("Simple Panel/TopPanel");
+    look.ask_by_content_under(&mut panel, &look.stash_drawn, &words, top_panel);
     let over: Vec<usize> = (0..panel.nodes.len()).filter(|&index| panel.nodes[index].parent == Some(stash.simple) && ["Border"].contains(&panel.nodes[index].name.as_str())).chain(stash.filters).chain(stash.name_panel).collect();
     let marks = match layer {
         0 => Marks { set: Some(&set), words: Some(&words), within: &[stash.simple], skip: &over, fills: Some(fills), alphas: Some(&alphas), ..Marks::default() },
@@ -2679,6 +5197,8 @@ pub fn grids_after(look: &HealthLook) -> f32 {
     width + views.panel.nodes[views.template].group.map_or(7.0, |row| row.spacing)
 }
 
+// ==== Nine-slices, marks, frames, the nodes drawn, rich spans ====
+
 /// A sliced picture: its texture and cut, its border (left, bottom,
 /// right, top) in the sprite's pixels, the screen's pixels to one of
 /// them, whether its middle is drawn, and its colour.
@@ -2718,11 +5238,18 @@ fn nine_slice(frame: &mut ChildSpawnerCommands, slices: &Slices, size: [f32; 2],
     }
     let columns = [(x0, x0 + l, 0.0, left), (x0 + l, x1 - r, left, size[0] - left - right), (x1 - r, x1, size[0] - right, right)];
     let rows = [(y1 - t, y1, 0.0, top), (y0 + b, y1 - t, top, size[1] - top - bottom), (y0, y0 + b, size[1] - bottom, bottom)];
+    // A middle with no pixels of its own (a sprite all border, as the
+    // skills' bars' `level_fill_bar`, 8 by 8 with 4 all round) is the
+    // texture at the line between its borders, stretched: the engine's
+    // sliced mesh gives its middle that line's coordinates. A pixel's
+    // width about the line stands for it.
+    let widened = |a: f32, b: f32| if b - a < 1e-3 { ((a + b) / 2.0 - 0.5, (a + b) / 2.0 + 0.5) } else { (a, b) };
     for (row, (ya, yb, at_y, h)) in rows.into_iter().enumerate() {
         for (column, (xa, xb, at_x, w)) in columns.into_iter().enumerate() {
-            if (row == 1 && column == 1 && !slices.fill_center) || w <= 0.0 || h <= 0.0 || xb <= xa || yb <= ya {
+            if (row == 1 && column == 1 && !slices.fill_center) || w <= 0.0 || h <= 0.0 || xb < xa || yb < ya {
                 continue;
             }
+            let ((xa, xb), (ya, yb)) = (widened(xa, xb), widened(ya, yb));
             let at_x = if slices.flip_x { size[0] - at_x - w } else { at_x };
             let node = Node { position_type: PositionType::Absolute, left: Val::Px(at_x), top: Val::Px(at_y), width: Val::Px(w), height: Val::Px(h), ..default() };
             let mut piece = ImageNode { image: slices.image.clone(), color: slices.color, rect: Some(Rect::new(xa, ya, xb, yb)), flip_x: slices.flip_x, flip_y: true, ..default() };
@@ -2741,40 +5268,44 @@ fn nine_slice(frame: &mut ChildSpawnerCommands, slices: &Slices, size: [f32; 2],
 /// (`words`).
 #[derive(Default)]
 pub(crate) struct Marks<'a> {
-    arrows: &'a [usize],
-    glows: &'a [usize],
-    headers: &'a [usize],
-    set: Option<&'a HashMap<usize, bool>>,
-    skip: &'a [usize],
-    words: Option<&'a HashMap<usize, String>>,
+    pub(crate) arrows: &'a [usize],
+    pub(crate) glows: &'a [usize],
+    pub(crate) headers: &'a [usize],
+    pub(crate) set: Option<&'a HashMap<usize, bool>>,
+    pub(crate) skip: &'a [usize],
+    pub(crate) words: Option<&'a HashMap<usize, String>>,
     /// Only what lies in these objects (themselves among it), where any
     /// are named; and none of what lies under these.
-    within: &'a [usize],
-    skip_below: &'a [usize],
+    pub(crate) within: &'a [usize],
+    pub(crate) skip_below: &'a [usize],
     /// Pictures the caller puts on objects (a slot's empty picture), drawn
     /// at their own size about the object's middle (`Image.SetNativeSize`).
-    pictures: Option<&'a HashMap<usize, Picture>>,
+    pub(crate) pictures: Option<&'a HashMap<usize, Picture>>,
+    /// Sprites the caller swaps into objects (`Image.sprite` and no more: a
+    /// menu line's icon), drawn in the object's own rectangle, kept to the
+    /// sprite's shape where the image keeps its shape.
+    pub(crate) sprites: Option<&'a HashMap<usize, Picture>>,
     /// Images the caller has made for objects, drawn over the whole of
     /// each in place of what the object draws (a tab's fill cut to its
     /// mask, `MaskedFill`).
-    fills: Option<&'a HashMap<usize, Handle<Image>>>,
+    pub(crate) fills: Option<&'a HashMap<usize, Handle<Image>>>,
     /// The alpha a script puts on objects' pictures (`ChangeImageAlpha`: a
     /// filter that does not work at 0.15).
-    alphas: Option<&'a HashMap<usize, f32>>,
+    pub(crate) alphas: Option<&'a HashMap<usize, f32>>,
     /// The alpha a script puts on objects' groups (`CanvasGroup.alpha`: a
     /// tab that does not work at 0.3, `SetUnlockStatus`), which every
     /// picture and text in the object or under it is drawn at besides.
-    groups: Option<&'a HashMap<usize, f32>>,
+    pub(crate) groups: Option<&'a HashMap<usize, f32>>,
     /// Drawn mirrored across this line, in the panel's units before the
     /// origin is added (the app's options tab, its slanted edge to the
     /// left: the user's).
-    mirror: Option<f32>,
+    pub(crate) mirror: Option<f32>,
     /// The colour a script puts on objects' pictures or texts (a quick
     /// view's ground and caption for the thing in the hands,
     /// `QuickSlotView.SwitchVisualSelection`), and texts it sets to the
     /// normal style (`fontStyle = Normal`).
-    colors: Option<&'a HashMap<usize, Color>>,
-    unbold: &'a [usize],
+    pub(crate) colors: Option<&'a HashMap<usize, Color>>,
+    pub(crate) unbold: &'a [usize],
 }
 
 /// How a panel's top lies: by its own anchors in what it hangs from, so
@@ -2870,8 +5401,10 @@ pub(crate) fn draw_nodes(column: &mut ChildSpawnerCommands, look: &HealthLook, p
         }
         // A simple picture that keeps its sprite's shape
         // (`Image.preserveAspect`): narrowed or lowered to it, moved by the
-        // object's pivot (`PreserveSpriteAspectRatio`).
-        if let Some(picture) = node.image.filter(|image| image.preserve_aspect && image.kind == 0).and_then(|_| drawn.pictures.get(index).copied().flatten()) {
+        // object's pivot (`PreserveSpriteAspectRatio`). The sprite is the one
+        // swapped in, where one is.
+        let sprite = marks.sprites.and_then(|sprites| sprites.get(&index).copied()).or_else(|| drawn.pictures.get(index).copied().flatten());
+        if let Some(picture) = node.image.filter(|image| image.preserve_aspect && image.kind == 0).and(sprite) {
             let [x, y, w, h] = placed.rect;
             let (sprite, rect) = (picture.size[0] / picture.size[1].max(1e-3), w / h.max(1e-3));
             let pivot = node.layout.pivot;
@@ -2911,6 +5444,11 @@ pub(crate) fn draw_nodes(column: &mut ChildSpawnerCommands, look: &HealthLook, p
             placed.flip[0] = !placed.flip[0];
         }
         let [x, y, w, h] = placed.rect;
+        // Over a button of the game's the pointer takes its hover look
+        // (`cursor::point`).
+        if let Some(resets) = crate::cursor::hover_of(&node.scripts) {
+            column.spawn((crate::cursor::HoverPointer(base + index, resets), at(x, y, w, h), bevy::ui::RelativeCursorPosition::default(), visibility));
+        }
         if let Some(handle) = marks.fills.and_then(|fills| fills.get(&index)) {
             let fill = ImageNode { flip_x: placed.flip[0], ..ImageNode::new(handle.clone()).with_color(Color::WHITE.with_alpha(group)) };
             column.spawn((piece, at(x, y, w, h), EXACT, fill, visibility));
@@ -2928,9 +5466,11 @@ pub(crate) fn draw_nodes(column: &mut ChildSpawnerCommands, look: &HealthLook, p
                 color = color.with_alpha(alpha);
             }
             color = color.with_alpha(color.alpha() * group);
-            let own = marks.pictures.and_then(|pictures| pictures.get(&index).copied());
+            let own = marks.pictures.and_then(|pictures| pictures.get(&index).copied()).or_else(|| marks.sprites.and_then(|sprites| sprites.get(&index).copied()));
             let picture = own.or_else(|| drawn.pictures.get(index).copied().flatten()).and_then(|picture| Some((picture, look.images.get(picture.texture)?.clone()?)));
-            match (image.sprite, picture) {
+            // (A sprite a script puts on it counts as its own: a slot's
+            // picture on an image kept with none.)
+            match (image.sprite.or(own.map(|_| (0, 0))), picture) {
                 // No sprite: the engine's plain white, coloured.
                 (None, _) => {
                     column.spawn((piece, at(x, y, w, h), EXACT, BackgroundColor(color), visibility));
@@ -3029,19 +5569,35 @@ pub(crate) fn draw_nodes(column: &mut ChildSpawnerCommands, look: &HealthLook, p
             // As the game draws it, where its font asset is had: what a
             // script puts before the words (a figure's noughts), then the
             // words.
+            // Words with TextMeshPro's colour tags in them (`<color=#...>`,
+            // a localized format's figure) as runs of their colours.
+            let spans = rich_spans(&said_now);
             if let Some((asset, material)) = look.tmp_of(panel, text) {
                 let bold = style & 1 != 0;
                 let run = |said: String| trp_data::tmp_text::TmpRun { text: said, size, color: screen_numbers(color.0), bold };
                 let layout = trp_data::tmp_text::TmpLayout { em: text.size * s, spacing: text.spacing, kerning: text.kerning, wrap: None, align: text.horizontal & 7 };
-                let words = TmpText { asset, material, runs: vec![run(String::new()), run(said_now)], layout };
+                let runs = match spans {
+                    Some(spans) => std::iter::once(run(String::new()))
+                        .chain(spans.into_iter().map(|(said, tint)| {
+                            let tinted = tint.map_or(color.0, |c| Color::srgba(c[0], c[1], c[2], c[3] * group));
+                            trp_data::tmp_text::TmpRun { text: said, size, color: screen_numbers(tinted), bold }
+                        }))
+                        .collect(),
+                    None => vec![run(String::new()), run(said_now)],
+                };
+                let words = TmpText { asset, material, runs, layout };
                 column.spawn((piece, frame, visibility)).with_children(|frame| {
                     tmp_words(frame, Node::default(), words, &mut |entity| {
                         entity.insert(PieceText(base + index));
                     });
                 });
             } else {
+                let runs: Vec<(String, TextFont, Color)> = match spans {
+                    Some(spans) => spans.into_iter().map(|(said, tint)| (said, font.clone(), tint.map_or(color.0, |c| Color::srgba(c[0], c[1], c[2], c[3] * group)))).collect(),
+                    None => vec![(said_now, font, color.0)],
+                };
                 column.spawn((piece, frame, visibility)).with_children(|frame| {
-                    effect_words(frame, Node::default(), &[(said_now, font, color.0)], effect, size, &mut |entity, run, _| {
+                    effect_words(frame, Node::default(), &runs, effect, size, &mut |entity, run, _| {
                         match run {
                             None => entity.insert(PieceText(base + index)),
                             Some(_) => entity.insert(PieceSpan(base + index)),
@@ -3051,6 +5607,76 @@ pub(crate) fn draw_nodes(column: &mut ChildSpawnerCommands, look: &HealthLook, p
             }
         }
     }
+}
+
+/// Words with TextMeshPro's rich text in them as runs, each with the colour
+/// its `<color=#RRGGBB>` or `<color=#RRGGBBAA>` gives it (none: the text's
+/// own) up to its `</color>`, the tags of the bold, the italic and the size
+/// left out; none where the words have no colour tag, which are drawn as
+/// they are.
+pub(crate) fn rich_spans(words: &str) -> Option<Vec<(String, Option<[f32; 4]>)>> {
+    if !words.contains("<color") {
+        return None;
+    }
+    let hex = |digits: &str| -> Option<[f32; 4]> {
+        let byte = |at: usize| u8::from_str_radix(digits.get(at..at + 2)?, 16).ok().map(|b| b as f32 / 255.0);
+        match digits.len() {
+            6 => Some([byte(0)?, byte(2)?, byte(4)?, 1.0]),
+            8 => Some([byte(0)?, byte(2)?, byte(4)?, byte(6)?]),
+            _ => None,
+        }
+    };
+    let mut spans: Vec<(String, Option<[f32; 4]>)> = Vec::new();
+    let mut colours: Vec<[f32; 4]> = Vec::new();
+    let mut current = String::new();
+    let mut rest = words;
+    while let Some(open) = rest.find('<') {
+        current.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('>').map(|at| open + at) else {
+            current.push_str(&rest[open..]);
+            rest = "";
+            break;
+        };
+        let tag = &rest[open + 1..close];
+        // A colour by its figures, or by one of TextMeshPro's names for one
+        // (`TMP_Text`'s `<color=white>`: black, blue, green, orange, purple,
+        // red, white, yellow).
+        let named = |name: &str| -> Option<[f32; 4]> {
+            let figures = match name {
+                "black" => "000000",
+                "blue" => "0000FF",
+                "green" => "00FF00",
+                "orange" => "FF8000",
+                "purple" => "A020F0",
+                "red" => "FF0000",
+                "white" => "FFFFFF",
+                "yellow" => "FFFF00",
+                _ => return None,
+            };
+            hex(figures)
+        };
+        let colour = tag.strip_prefix("color=").map(|value| value.trim_matches('"')).and_then(|value| value.strip_prefix('#').map_or_else(|| named(value).or_else(|| hex(value)), hex));
+        let known = colour.is_some() || matches!(tag, "/color" | "b" | "/b" | "i" | "/i" | "u" | "/u" | "/size") || tag.starts_with("size=");
+        if !known {
+            current.push_str(&rest[open..=close]);
+        } else if colour.is_some() || tag == "/color" {
+            if !current.is_empty() {
+                spans.push((std::mem::take(&mut current), colours.last().copied()));
+            }
+            match colour {
+                Some(colour) => colours.push(colour),
+                None => {
+                    colours.pop();
+                }
+            }
+        }
+        rest = &rest[close + 1..];
+    }
+    current.push_str(rest);
+    if !current.is_empty() {
+        spans.push((current, colours.last().copied()));
+    }
+    Some(spans)
 }
 
 /// The figures of the app's own panel: each one's field on the game's
@@ -3080,6 +5706,8 @@ const FIGURE: [f32; 2] = [180.0, 46.0];
 /// top left corner, in units.
 const OWN_PARTS: [[f32; 2]; 7] = [[325.1, 65.5], [196.1, 164.1], [196.1, 243.8], [362.2, 243.8], [29.8, 243.8], [315.1, 405.8], [75.1, 405.8]];
 const OWN_FIGURES: [[f32; 2]; 6] = [[161.0, 612.0], [177.5, 729.0], [366.9, 729.0], [-14.6, 681.0], [177.5, 681.0], [366.9, 681.0]];
+
+// ==== The app's own panel, the figures, the HEALTH panel filled ====
 
 /// The app's own panel's parts: a part's figures and its bar's fill, by
 /// the part's place in `Part::ALL`; a figure's value and its rate, by its
@@ -3386,10 +6014,12 @@ fn fill_panel(
     if !added.is_empty() || now - figures.0 >= 1.0 {
         figures.0 = now;
         figures.1.clear();
-        let weight = carried.equipment.carried_weight(false);
+        // At elite Strength the elite sum, over the upper limit times the
+        // skills' carrying factor (`HealthParametersPanel`).
+        let weight = carried.equipment.carried_weight(carried.strength_elite);
         let mut rows: Vec<FigureRow> = figure_rows(health).to_vec();
         if let Some([_, upper]) = look.weight_limits {
-            rows.push(("Weight", [weight, upper], 0.0, false, 1, None));
+            rows.push(("Weight", [weight, upper * carried.carry], 0.0, false, 1, None));
         }
         let mut panels = vec![(panel, views.parameters.as_slice(), 0)];
         if let Some(strip) = &game.strip {
@@ -3419,7 +6049,7 @@ fn fill_panel(
             }
             // The weight's colour, after: the default under the lower
             // limit, the other colour under the upper, the warning over it.
-            if let (true, Some([lower, upper])) = (name == "Weight", look.weight_limits) {
+            if let (true, Some([lower, upper])) = (name == "Weight", look.weight_limits.map(|limits| limits.map(|limit| limit * carried.carry))) {
                 color = if current <= lower {
                     default
                 } else if current < upper {
@@ -3550,17 +6180,33 @@ fn fill_panel(
     }
 }
 
-/// The app's keys for trying the health out (the user, 2026-10-16: "Can we
-/// add a hurt/death trigger somewhere? a bind or an area"; not the game's):
-/// `F7` does a bullet's damage (`HURT_DAMAGE`, with the game's own chances
-/// of a bleeding and a fracture) to the next part in turn, the limbs first
-/// (`HURT_ORDER`), and `F8` kills as a bullet through the head does. The
+// ==== Damage keys, the death screen, the barbed wire ====
+
+/// The app's commands for trying the health out (the user, 2026-10-16:
+/// "Can we add a hurt/death trigger somewhere? a bind or an area"; not the
+/// game's), the debug panel's since 0.141.0: HURT THE NEXT PART does a
+/// bullet's damage (`HURT_DAMAGE`, with the game's own chances of a
+/// bleeding and a fracture) to the next part in turn, the limbs first
+/// (`HURT_ORDER`), and DIE kills as a bullet through the head does. The
 /// line under the inventory's slots says what was hurt.
-fn damage_keys(options: Res<crate::Options>, keys: Res<ButtonInput<KeyCode>>, mut controller: ResMut<Controller>, mut carried: ResMut<crate::inventory_view::Carried>, mut next: Local<usize>) {
+fn damage_keys(
+    options: Res<crate::Options>,
+    mut controller: ResMut<Controller>,
+    mut carried: ResMut<crate::inventory_view::Carried>,
+    mut next: Local<usize>,
+    mut received: MessageWriter<crate::contusion_view::Received>,
+    mut asked: MessageReader<crate::debug_menu::DebugCommand>,
+) {
+    use crate::debug_menu::DebugCommand;
+    // The debug panel's two buttons (`debug_menu`; their keys `F7` and `F8`
+    // went, the user, 2026-10-26: "just leave them as commands in the new
+    // debug menu").
+    let asked: Vec<DebugCommand> = asked.read().copied().collect();
     if !options.keys_live() {
         return;
     }
-    let (hurt, kill) = (keys.just_pressed(KeyCode::F7), keys.just_pressed(KeyCode::F8));
+    let hurt = asked.contains(&DebugCommand::HurtNext);
+    let kill = asked.contains(&DebugCommand::Die);
     if !hurt && !kill {
         return;
     }
@@ -3568,35 +6214,83 @@ fn damage_keys(options: Res<crate::Options>, keys: Res<ButtonInput<KeyCode>>, mu
     if kill {
         let left = health.part(Part::Head).current;
         health.apply_damage(Part::Head, left + 1.0, DamageKind::Bullet);
-        carried.note = "F8: killed (a bullet through the head)".to_owned();
+        // A shot: the player told of it (`ApplyShot` → `ReceiveDamage`).
+        received.write(crate::contusion_view::Received { part: Part::Head, damage: left + 1.0, absorbed: 0.0, kind: DamageKind::Bullet, burn: 0.0 });
+        carried.note = "Killed (a bullet through the head)".to_owned();
         return;
     }
     let part = HURT_ORDER[*next % HURT_ORDER.len()];
     *next += 1;
     let done = health.apply_damage(part, HURT_DAMAGE, DamageKind::Bullet);
-    carried.note = format!("F7: {} hurt by {done:.0}", part.name());
+    received.write(crate::contusion_view::Received { part, damage: HURT_DAMAGE, absorbed: 0.0, kind: DamageKind::Bullet, burn: 0.0 });
+    carried.note = format!("{} hurt by {done:.0}", part.name());
 }
 
-/// What `F7` does to a part, and the parts it goes to in turn.
+/// What HURT THE NEXT PART does to a part, and the parts it goes to in turn.
 const HURT_DAMAGE: f32 = 15.0;
 const HURT_ORDER: [Part; 7] = [Part::LeftArm, Part::RightArm, Part::LeftLeg, Part::RightLeg, Part::Stomach, Part::Chest, Part::Head];
 
 /// The damage a run nobody is at the keys of was told to do (`--damage`),
 /// on its drawn frame, counted as the taps are: a bullet's, so that the
 /// game's own chances of a bleeding or a fracture go with it.
-fn damage_asked(options: Res<crate::Options>, mut controller: ResMut<Controller>, mut frame: Local<u32>) {
+fn damage_asked(options: Res<crate::Options>, mut controller: ResMut<Controller>, mut frame: Local<u32>, mut received: MessageWriter<crate::contusion_view::Received>) {
     *frame += 1;
     if !options.unattended() {
         return;
     }
     let Some(health) = controller.health.as_mut() else { return };
-    for (_, part, amount) in options.damage.iter().filter(|(at, ..)| *at == *frame) {
-        health.apply_damage(*part, *amount, DamageKind::Bullet);
+    for (_, part, amount, burn) in options.damage.iter().filter(|(at, ..)| *at == *frame) {
+        // Nothing reaches the dead (`ApplyShot`).
+        if health.alive {
+            health.apply_damage(*part, *amount, DamageKind::Bullet);
+            received.write(crate::contusion_view::Received { part: *part, damage: *amount, absorbed: 0.0, kind: DamageKind::Bullet, burn: burn * amount });
+        }
+    }
+}
+
+/// What the armour and the backpack worn take off the speed
+/// (`Player.UpdatePenalties`, `ESpeedLimit.Armor`), worked out again
+/// whenever what is carried or the skills change: the vest skills' shares
+/// only while `SKILLS` is on (movement spec, "Speed limits").
+fn armour_slows(
+    mut controller: ResMut<Controller>,
+    carried: Res<crate::inventory_view::Carried>,
+    game: Res<crate::GameData>,
+    skills: Option<Res<crate::skills::Skills>>,
+    mut last: Local<Option<(Vec<trp_sim::armor::Worn>, trp_sim::armor::VestSkills)>>,
+) {
+    let skills_changed = skills.as_ref().is_some_and(|s| s.is_changed());
+    if !carried.is_changed() && !skills_changed {
+        return;
+    }
+    let vests = skills.as_deref().filter(|s| s.on()).map_or_else(trp_sim::armor::VestSkills::default, |s| trp_sim::armor::VestSkills::of(&s.levels));
+    let worn = crate::dummy::worn_of(&carried.equipment.item);
+    if last.as_ref().is_some_and(|(w, v)| *w == worn && *v == vests) {
+        return;
+    }
+    let penalty = trp_sim::armor::speed_penalty(&game.db, &worn, &vests);
+    if last.is_some() || penalty != 0.0 {
+        info!("armour and backpack: {penalty:+.2}% speed");
+    }
+    *last = Some((worn, vests));
+    controller.movement.set_armour_penalty(penalty);
+}
+
+/// Each hit given to the player, as the movement takes it
+/// (`Player.ApplyHitDebuff`): a weapon's caps the speed for a while by the
+/// stamina it burns, and a leg's ends a sprint (`Movement::hit`; movement
+/// spec, "Speed limits"). Nothing reaches the dead.
+fn hits_taken(mut controller: ResMut<Controller>, mut received: MessageReader<crate::contusion_view::Received>) {
+    let alive = controller.health.as_ref().is_none_or(|health| health.alive);
+    for hit in received.read() {
+        if alive {
+            controller.movement.hit(hit.burn, hit.part, hit.kind);
+        }
     }
 }
 
 /// The death screen: over everything, shown once the character is dead
-/// and its eyes have closed (`death`).
+/// and the game's black is done (`death::SCREEN_AT`).
 #[derive(Component)]
 struct DeathScreen;
 #[derive(Component)]
@@ -3678,10 +6372,11 @@ fn barbed_wire(
     bones: Query<&GlobalTransform>,
     range: Res<Range>,
     mut tallies: Local<Vec<BarbTally>>,
+    mut received: MessageWriter<crate::contusion_view::Received>,
 ) {
     let controller = &mut *controller;
     let Some(health) = controller.health.as_mut().filter(|health| health.alive) else { return };
-    let [low, high] = crate::range::BARBED_WIRE;
+    let [low, high] = crate::range::barbed_wire();
     let feet = controller.movement.position;
     let feet = Vec3::new(feet[0], feet[1], -feet[2]);
     // The capsule's footprint over the box, and the box's height over the
@@ -3711,11 +6406,18 @@ fn barbed_wire(
         }
         cut = true;
         if let Some(damage) = tally.cut(middle.to_array()) {
-            health.apply_damage(part, damage, DamageKind::Barbed);
+            // `ApplyEnvironmentalDamage` → `ApplyDamageInfo`: health's, and
+            // the player told of it, while alive.
+            if health.alive {
+                health.apply_damage(part, damage, DamageKind::Barbed);
+                received.write(crate::contusion_view::Received { part, damage, absorbed: 0.0, kind: DamageKind::Barbed, burn: 0.0 });
+            }
         }
     }
     controller.movement.set_in_barbed_wire(true, cut);
 }
+
+// ==== Tests ====
 
 #[cfg(test)]
 mod tests {
@@ -3785,4 +6487,528 @@ mod item_tests {
         assert_eq!(stack_color(&["Money".to_owned()]), Color::srgb_u8(0x8d, 0xb5, 0x00));
         assert_eq!(stack_color(&["Food".to_owned()]), Color::srgb_u8(0xb6, 0xc1, 0xc7));
     }
+}
+
+/// Where the OVERALL tab's objects are numbered among the drawn pieces, and
+/// its lists' lines, each line's past the one before it.
+const OVERALL: usize = 17 << 20;
+const OVERALL_LINES: usize = 18 << 20;
+
+// ==== The OVERALL tab: its texts and drawing ====
+
+/// What the OVERALL tab shows as it stands (`overall_view`): each
+/// dropdown's words and whether its box is lit (the mouse on it or on its
+/// list), the list open, the model's picture, and whether a suit is being
+/// read (the model's loading spinner, `PlayerModelView.Show`).
+pub struct OverallShows<'a> {
+    pub names: [&'a str; 2],
+    pub lit: [bool; 2],
+    pub open: Option<OpenList<'a>>,
+    pub figure: Option<Handle<Image>>,
+    pub loading: bool,
+}
+
+/// A dropdown's list open: which dropdown's, its lines' words, how far it
+/// is scrolled (units from its top) and its bar's handle: its place (left,
+/// top, width, height in the screen's units) and its colour as tinted.
+pub struct OpenList<'a> {
+    pub role: usize,
+    pub lines: &'a [&'a str],
+    pub scroll: f32,
+    pub handle: Option<([f32; 4], Color)>,
+}
+
+/// A text a script writes by `string.Format`, its values in its holes
+/// (`{0}`, and `{1:00}` with its noughts).
+fn format_values(template: &str, values: &[&str]) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('}').map(|at| open + at) else { break };
+        let hole = &rest[open + 1..close];
+        let (index, format) = hole.split_once(':').unwrap_or((hole, ""));
+        match index.parse::<usize>().ok().and_then(|index| values.get(index)) {
+            Some(value) => {
+                let noughts = format.len();
+                if noughts > 0 && format.chars().all(|c| c == '0') && value.len() < noughts {
+                    out.push_str(&"0".repeat(noughts - value.len()));
+                }
+                out.push_str(value);
+            }
+            None => out.push_str(&rest[open..=close]),
+        }
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The words the OVERALL tab's scripts write on it for a character with no
+/// figures of its own (no profile is kept): the install's words for its
+/// localized texts in their case; the short statistics, the dashboard's
+/// and the online time as the scripts write them with every counter at
+/// none (`ShortStatsPanel.SetStats`, `OverallStatsPanel.FillStats`: a
+/// rate with no raids `-`, the account's lifetime `-` as for another's
+/// statistics, the registration not being had); the level and the
+/// experience as at none (`PlayerLevelPanel.Set`); the nickname empty; each
+/// dropdown its suit's name.
+fn overall_texts(overall: &trp_data::screen::OverallPanel, said: &Words, names: [&str; 2]) -> HashMap<usize, String> {
+    let panel = &overall.panel;
+    let mut texts: HashMap<usize, String> = overall.localized.iter().map(|(index, key, case)| (*index, trp_data::screen::in_case(said.say(key, key), *case))).collect();
+    // The objects a script's fields end with, in their order.
+    let pointed = |path: &str, class: &str, count: usize| -> Vec<Option<usize>> {
+        let Some(fields) = panel.find(path).and_then(|object| panel.script(object, class)) else { return vec![None; count] };
+        let start = fields.len().saturating_sub(count * 12);
+        (0..count).map(|n| panel.pointer_at(fields, start + n * 12)).collect()
+    };
+    fn put(texts: &mut HashMap<usize, String>, at: Option<usize>, words: String) {
+        if let Some(at) = at {
+            texts.insert(at, words);
+        }
+    }
+    let short = pointed("LeftSide/CharacterPanel/Level Panel/Stats", "ShortStatsPanel", 6);
+    for at in short.into_iter().flatten() {
+        let template = texts.get(&at).cloned().unwrap_or_default();
+        put(&mut texts, Some(at), format_values(&template, &["0"]));
+    }
+    // `_raidsLabel` to `_kdRatioLabel`, then the online time's and the
+    // lifetime's localized texts.
+    let dashboard = pointed("RightSide/Dashboard", "OverallStatsPanel", 14);
+    let figures = ["0", "0", "0", "-", "0", "-", "0", "0", "0", "-", "0", "-"];
+    for (at, figure) in dashboard.iter().zip(figures) {
+        put(&mut texts, *at, figure.to_owned());
+    }
+    if let Some(at) = dashboard[12] {
+        let template = texts.get(&at).cloned().unwrap_or_default();
+        put(&mut texts, Some(at), format_values(&template, &["0", "0"]));
+    }
+    put(&mut texts, dashboard[13], said.say("-", "-"));
+    let level = pointed("LeftSide/CharacterPanel/Level Panel", "PlayerLevelPanel", 2);
+    put(&mut texts, level[0], OVERALL_LEVEL.to_owned());
+    // The character panel's: its nickname's and its experience's labels.
+    let window = pointed("LeftSide", "InventoryPlayerModelWithStatsWindow", 15);
+    put(&mut texts, window[0], String::new());
+    put(&mut texts, window[2], "0".to_owned());
+    for (selector, name) in OVERALL_SELECTORS.iter().zip(names) {
+        put(&mut texts, panel.find(&format!("{selector}/Text")), name.to_owned());
+    }
+    texts
+}
+
+/// Draws the game's OVERALL tab over the whole screen (`TARKOV UI`; screen
+/// units, `s` pixels to one): its objects as `draw_nodes` draws them, the
+/// model's picture in its view (drawn after what lies under the view and
+/// before what lies over it), and the list open over all of it, as the
+/// game puts it on its menus' layer (`DropDownBox.SetPanelState`): its
+/// panel, its lines from the template in its scroll area's mask, and its
+/// bar's handle.
+pub fn draw_overall(column: &mut ChildSpawnerCommands, look: &HealthLook, said: &Words, screen: [f32; 2], shows: &OverallShows, s: f32) {
+    let Some(overall) = &look.overall else {
+        column.spawn(words("The game's OVERALL tab could not be read from the install.", 12.0, FAINT));
+        return;
+    };
+    let panel = &overall.panel;
+    let find = |path: &str| panel.find(path);
+    let texts = overall_texts(overall, said, shows.names);
+    let mut set: HashMap<usize, bool> = HashMap::new();
+    let mut colors: HashMap<usize, Color> = HashMap::new();
+    for (role, selector) in OVERALL_SELECTORS.iter().enumerate() {
+        let open = shows.open.as_ref().is_some_and(|list| list.role == role);
+        for (end, on) in [("Open Panel", open), ("Button/Closed Image", !open), ("Button/Open Image", open)] {
+            if let Some(at) = find(&format!("{selector}/{end}")) {
+                set.insert(at, on);
+            }
+        }
+        // The box's ground under the mouse: its colour faded across by
+        // the highlight (`Graphic.CrossFadeColor`, alpha with it), the
+        // engine's multiply of the two.
+        if let (true, Some(ground), Some(lit)) = (shows.lit[role], find(&format!("{selector}/Background")), overall.dropdown_highlight) {
+            if let Some(image) = panel.nodes[ground].image {
+                let c = image.color;
+                colors.insert(ground, Color::srgba(c[0] * lit[0], c[1] * lit[1], c[2] * lit[2], c[3] * lit[3]));
+            }
+        }
+    }
+    if let Some(spinner) = find(&format!("{OVERALL_VIEW}/Progress Spinner")) {
+        set.insert(spinner, shows.loading);
+    }
+    let groups: HashMap<usize, f32> = OVERALL_DIMMED.iter().filter_map(|path| find(path)).map(|at| (at, OVERALL_DIM)).collect();
+    let mut sprites: HashMap<usize, Picture> = HashMap::new();
+    if let (Some(icon), Some(rank)) = (find("LeftSide/CharacterPanel/Level Panel/Level Icon"), look.overall_pictures.get("rank")) {
+        sprites.insert(icon, *rank);
+    }
+    // The side's and the prestige's at their own sizes (`SetNativeSize`).
+    let mut pictures: HashMap<usize, Picture> = HashMap::new();
+    for (path, name) in [(format!("{OVERALL_VIEW}/IconsContainer/SideImageHolder/SideImage"), "side"), (format!("{OVERALL_VIEW}/IconsContainer/PrestigeImageHolder/PrestigeImage"), "prestige")] {
+        if let (Some(at), Some(picture)) = (find(&path), look.overall_pictures.get(name)) {
+            pictures.insert(at, *picture);
+        }
+    }
+    let view = find(OVERALL_VIEW);
+    let clothing = find(OVERALL_CLOTHING);
+    let right = find("RightSide");
+    let open_panels: Vec<usize> = OVERALL_SELECTORS.iter().filter_map(|selector| find(&format!("{selector}/Open Panel"))).collect();
+    // Under the view.
+    let under: Vec<usize> = [view, clothing, right].into_iter().flatten().collect();
+    let base = Marks { set: Some(&set), words: Some(&texts), colors: Some(&colors), groups: Some(&groups), sprites: Some(&sprites), pictures: Some(&pictures), ..Marks::default() };
+    draw_nodes(column, look, panel, &look.overall_drawn, OVERALL, Marks { skip: &under, ..base }, said, Frame::In(screen), [0.0, 0.0], s);
+    // The model, drawn into its view (`CameraImage`'s picture on its
+    // `RawImage`, white).
+    if let (Some(view), Some(figure)) = (view, shows.figure.clone()) {
+        let [x, y, w, h] = panel.placed_in(view, screen).rect;
+        let at = Node { position_type: PositionType::Absolute, left: Val::Px(x * s), top: Val::Px(y * s), width: Val::Px(w * s), height: Val::Px(h * s), ..default() };
+        column.spawn((Piece(OVERALL + panel.nodes.len()), at, EXACT, ImageNode::new(figure)));
+    }
+    // Over it, and the rest; the lists apart.
+    let over: Vec<usize> = [view, clothing, right].into_iter().flatten().collect();
+    let base = Marks { set: Some(&set), words: Some(&texts), colors: Some(&colors), groups: Some(&groups), sprites: Some(&sprites), pictures: Some(&pictures), ..Marks::default() };
+    draw_nodes(column, look, panel, &look.overall_drawn, OVERALL, Marks { within: &over, skip: &open_panels, ..base }, said, Frame::In(screen), [0.0, 0.0], s);
+    let Some(list) = &shows.open else { return };
+    let selector = OVERALL_SELECTORS[list.role];
+    let (Some(open), Some(area)) = (find(&format!("{selector}/Open Panel")), find(&format!("{selector}/Open Panel/Scroll Area"))) else { return };
+    let handle = find(&format!("{selector}/Open Panel/Scrollbar/Sliding Area/Handle"));
+    let skip: Vec<usize> = handle.into_iter().collect();
+    let base = Marks { set: Some(&set), words: Some(&texts), ..Marks::default() };
+    draw_nodes(column, look, panel, &look.overall_drawn, OVERALL, Marks { within: &[open], skip: &skip, ..base }, said, Frame::In(screen), [0.0, 0.0], s);
+    // The lines in the scroll area's mask: laid out in its content's column
+    // (`VerticalLayoutGroup`: its padding and spacing, each line as wide as
+    // the column leaves and as high as it asks), from the scroll's place.
+    let [ax, ay, aw, ah] = panel.placed_in(area, screen).rect;
+    let clip = Node { position_type: PositionType::Absolute, left: Val::Px(ax * s), top: Val::Px(ay * s), width: Val::Px(aw * s), height: Val::Px(ah * s), overflow: Overflow::clip(), ..default() };
+    let content = find(&format!("{selector}/Open Panel/Scroll Area/Content"));
+    let row = content.and_then(|content| panel.nodes[content].group).unwrap_or_default();
+    let [cx, cy, cw, _] = content.map_or([ax, ay, aw, ah], |content| panel.placed_in(content, screen).rect);
+    let line_height = overall.line.as_ref().map_or(28.0, |line| line.asks(0, 1).0.max(1.0));
+    let width = cw - row.padding[0] - row.padding[1];
+    if let Some(line) = &overall.line {
+        let text = (0..line.nodes.len()).find(|&index| line.nodes[index].text.is_some());
+        column.spawn((clip, Visibility::Inherited)).with_children(|clip| {
+            for (n, words) in list.lines.iter().enumerate() {
+                let top = cy - ay + row.padding[2] + n as f32 * (line_height + row.spacing) - list.scroll;
+                if top + line_height < 0.0 || top > ah {
+                    continue;
+                }
+                let said_line: HashMap<usize, String> = text.map(|text| (text, (*words).to_owned())).into_iter().collect();
+                let marks = Marks { words: Some(&said_line), ..Marks::default() };
+                draw_nodes(clip, look, line, &look.line_drawn, OVERALL_LINES + (n << 8), marks, said, Frame::Is([width, line_height]), [cx - ax + row.padding[0], top], s);
+            }
+        });
+    }
+    if let Some(([x, y, w, h], color)) = list.handle {
+        let at = Node { position_type: PositionType::Absolute, left: Val::Px(x * s), top: Val::Px(y * s), width: Val::Px(w * s), height: Val::Px(h * s), ..default() };
+        column.spawn((at, EXACT, BackgroundColor(color)));
+    }
+}
+
+#[cfg(test)]
+mod overall_tests {
+    use super::{format_values, rich_spans};
+
+    /// A localized text's holes filled as `string.Format` fills them: the
+    /// online time's `{0}h{1:00}m` with none of either.
+    #[test]
+    fn a_format_s_holes_are_filled() {
+        assert_eq!(format_values("{0}h{1:00}m", &["0", "0"]), "0h00m");
+        assert_eq!(format_values("R: {0}", &["12"]), "R: 12");
+        assert_eq!(format_values("{1:00}", &["0", "123"]), "123");
+        assert_eq!(format_values("{3} left", &["0"]), "{3} left");
+    }
+
+    /// TextMeshPro's colour tags as runs of their colours, the others left
+    /// out; words without one as they are.
+    #[test]
+    fn colour_tags_are_runs() {
+        assert_eq!(rich_spans("Raids"), None);
+        let spans = rich_spans("R: <color=#C5C3B2>0</color>").expect("tagged");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0], ("R: ".to_owned(), None));
+        assert_eq!(spans[1].0, "0");
+        let colour = spans[1].1.expect("its colour");
+        assert!((colour[0] - 0xC5 as f32 / 255.0).abs() < 1e-6 && colour[3] == 1.0);
+        let spans = rich_spans("<b>a</b><color=#00000080>b</color>c").expect("tagged");
+        assert_eq!(spans.iter().map(|(words, _)| words.as_str()).collect::<String>(), "abc");
+        assert!((spans[1].1.expect("b's")[3] - 128.0 / 255.0).abs() < 1e-6);
+        assert_eq!(spans[2].1, None);
+        // A colour by its name (the repair window's `<color=white>`).
+        let spans = rich_spans("60/100<color=white> (100)</color>").expect("tagged");
+        assert_eq!(spans[1], (" (100)".to_owned(), Some([1.0, 1.0, 1.0, 1.0])));
+    }
+}
+
+// ==== The repair window ====
+
+/// The repair windows' pieces, each window's past the one before it.
+const REPAIR_WINDOW: usize = 30 << 20;
+const REPAIR_STATUS: &str = "Inner/Contents/PreviewWarningPanel/RepairStatusPanel";
+/// Its warnings' templates in `RepairWarningStatusPanel`'s order: an
+/// error's, a warning's, an information's, a common buff's, a rare buff's.
+const REPAIR_TEMPLATES: [&str; 5] = [
+    "Inner/Contents/PreviewWarningPanel/RepairStatusPanel/RepairErrorPanelTemplate",
+    "Inner/Contents/PreviewWarningPanel/RepairStatusPanel/RepairWarningPanelTemplate",
+    "Inner/Contents/PreviewWarningPanel/RepairStatusPanel/RepairInfoPanelTemplate",
+    "Inner/Contents/PreviewWarningPanel/RepairStatusPanel/CommonBuffPanelTemplate",
+    "Inner/Contents/PreviewWarningPanel/RepairStatusPanel/RareBuffPanelTemplate",
+];
+const REPAIR_PREVIEW: &str = "Inner/Contents/PreviewWarningPanel/Preview Panel/Camera Image";
+const REPAIR_LOADER: &str = "Inner/Contents/PreviewWarningPanel/Preview Panel/Loader";
+const REPAIR_PROCESS: &str = "Inner/Contents/PreviewWarningPanel/Preview Panel/RepairProcess";
+const REPAIR_MASTERING: &str = "Inner/Contents/PreviewWarningPanel/Preview Panel/MasteringText";
+const REPAIR_AVATAR: &str = "Inner/Contents/RepairerPanel/SelectRepairerPanel/Repairer/RepairerAvatarPanel/Avatar";
+const REPAIR_RANK: &str = "Inner/Contents/RepairerPanel/SelectRepairerPanel/Repairer/RepairerAvatarPanel/Rank Panel";
+const REPAIR_CHARGE: &str = "Inner/Contents/RepairerPanel/SelectRepairerPanel/Repairer/RepairerAvatarPanel/RepairKitChargeText";
+const REPAIR_DROPDOWN: &str = "Inner/Contents/RepairerPanel/SelectRepairerPanel/Repairer/RepairerOptionsPanel/TraderDropdown/Text";
+const REPAIR_PRICE_RATE: &str = "Inner/Contents/RepairerPanel/SelectRepairerPanel/Repairer/RepairerOptionsPanel/Standing/RepairPriceRate/Text";
+const REPAIR_LINES: [&str; 4] = [
+    "Inner/Contents/RepairerPanel/SelectRepairerPanel/Qualities/RepairerQualitiesPanel/RepairSpeedLabel",
+    "Inner/Contents/RepairerPanel/SelectRepairerPanel/Qualities/RepairerQualitiesPanel/RepairQualityLabel",
+    "Inner/Contents/RepairerPanel/SelectRepairerPanel/Qualities/RepairerQualitiesPanel/Repairability",
+    "Inner/Contents/RepairerPanel/SelectRepairerPanel/Qualities/RepairerQualitiesPanel/EnhancementChance",
+];
+const REPAIR_SLIDER: &str = "Inner/Contents/RepairerPanel/ExceptionItemGroup/ConditionPanel/ConditionSlider";
+const REPAIR_SUMS: &str = "Inner/Contents/RepairerPanel/ExceptionItemGroup/RepairSumPanel";
+const REPAIR_BUTTON: &str = "Inner/Contents/ButtonsContainer/RepairButton";
+/// What its scripts show and hide, besides the templates.
+const REPAIR_SCRIPTED: [&str; 6] = [REPAIR_LOADER, REPAIR_PROCESS, REPAIR_MASTERING, REPAIR_RANK, "Inner/Contents/RepairerPanel/SelectRepairerPanel/Repairer/RepairerOptionsPanel/Standing/Standing", "Inner/Contents/RepairerPanel/ExceptionItemGroup/ConditionPanel/ConditionSlider/bars/Slider"];
+
+/// The condition's bar as `ConditionCharacteristicsSlider.SetSliderValues`
+/// lays it out: fractions of the template durability (the current, the
+/// greatest, the slider's top and its value), the degradation's range in
+/// points, and the template durability.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct RepairCondition {
+    pub current: f32,
+    pub max: f32,
+    pub top: f32,
+    pub selected: f32,
+    pub range: [f32; 2],
+    pub template: f32,
+}
+
+/// What the repair window says and shows, as its scripts write it for a
+/// kit (`RepairWindow`, `RepairerParametersPanel`, `RepairWarningStatusPanel`,
+/// `ConditionCharacteristicsSlider`), worked out by `repair_view`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RepairWords {
+    pub caption: String,
+    pub kind: String,
+    pub weight: String,
+    pub mastering: Option<String>,
+    pub loading: bool,
+    pub repairing: bool,
+    /// The warnings shown, each its template (by `REPAIR_TEMPLATES`' order)
+    /// and its words.
+    pub warnings: Vec<(usize, String)>,
+    pub dropdown: String,
+    pub charge: String,
+    pub price_rate: String,
+    pub lines: [String; 4],
+    /// The texts the install's words fill (`LocalizedText`), by their paths.
+    pub labels: Vec<(String, String)>,
+    pub condition: RepairCondition,
+    pub durability: String,
+    pub repair_time: String,
+    pub repair_dp: String,
+    pub in_stash: String,
+    pub to_pay: String,
+    pub to_pay_critical: bool,
+    pub broken: bool,
+    pub interactable: bool,
+}
+
+/// The repair window laid out for a thing: its panel with what its scripts
+/// write, its size, and the places of what is clicked or drawn over it: the
+/// preview, the kit's picture (the repairer's avatar), the slider's track
+/// and the button to its top, the repair button, the caption and the cross.
+pub(crate) struct RepairBuilt {
+    panel: trp_data::screen::ScenePanel,
+    drawn: Drawn,
+    texts: HashMap<usize, String>,
+    set: HashMap<usize, bool>,
+    colors: HashMap<usize, Color>,
+    sprites: HashMap<usize, Picture>,
+    groups: HashMap<usize, f32>,
+    pub(crate) size: [f32; 2],
+    pub(crate) preview: [f32; 4],
+    pub(crate) avatar: [f32; 4],
+    pub(crate) slider: Option<[f32; 4]>,
+    pub(crate) top_button: Option<[f32; 4]>,
+    pub(crate) button: [f32; 4],
+    pub(crate) caption: [f32; 4],
+    pub(crate) close: [f32; 4],
+}
+
+/// The repair window laid out (`TARKOV UI`): the game's window with what its
+/// scripts write (`RepairWords`), each text that sizes itself at its font's
+/// size, a copy of a template for each warning in its panel, the condition's
+/// bar's pieces at their fractions.
+pub(crate) fn repair_built(look: &HealthLook, words: &RepairWords) -> Option<RepairBuilt> {
+    let mut panel = look.repair.clone()?;
+    let mut drawn = look.repair_drawn.clone();
+    let mut texts = HashMap::new();
+    let mut set = HashMap::new();
+    let mut colors = HashMap::new();
+    let mut sprites = HashMap::new();
+    let mut groups = HashMap::new();
+    let find = |panel: &trp_data::screen::ScenePanel, path: &str| panel.find(path);
+    // A text that sizes itself: its preferred size its words' at its font.
+    let sized = |panel: &mut trp_data::screen::ScenePanel, texts: &mut HashMap<usize, String>, index: usize, said: &str| {
+        let plain = rich_spans(said).map_or_else(|| said.to_owned(), |spans| spans.into_iter().map(|(words, _)| words).collect());
+        if let Some(size) = text_size(look, panel, index, &plain) {
+            prefer_size(panel, index, size);
+        }
+        texts.insert(index, said.to_owned());
+    };
+    // The caption's row (`ItemInfoWindowLabels`), the weight sized to its words.
+    for (path, said) in [("Inner/Caption Panel/Caption", &words.caption), ("Inner/Caption Panel/Item Type", &words.kind)] {
+        if let Some(index) = find(&panel, path) {
+            texts.insert(index, said.clone());
+        }
+    }
+    if let Some(mass) = find(&panel, "Inner/Caption Panel/MassText") {
+        if let Some([w, _]) = text_size(look, &panel, mass, &words.weight) {
+            panel.nodes[mass].layout.size_delta[0] = w;
+        }
+        texts.insert(mass, words.weight.clone());
+    }
+    // The preview's loader, the repair's progress, a weapon's mastering.
+    for (path, on) in [(REPAIR_LOADER, words.loading), (REPAIR_PROCESS, words.repairing), (REPAIR_MASTERING, words.mastering.is_some())] {
+        if let Some(index) = find(&panel, path) {
+            set.insert(index, on);
+            panel.nodes[index].active |= on;
+        }
+    }
+    if let (Some(level), Some(index)) = (&words.mastering, find(&panel, REPAIR_MASTERING)) {
+        if let Some([w, _]) = text_size(look, &panel, index, level) {
+            panel.nodes[index].layout.size_delta[0] = w;
+        }
+        texts.insert(index, level.clone());
+    }
+    // A kit is no trader: no rank, no standing (`TraderSelected`).
+    for index in find(&panel, REPAIR_RANK).into_iter().chain(look.repair_figures.standing) {
+        set.insert(index, false);
+        panel.nodes[index].active = false;
+    }
+    for (path, said) in [(REPAIR_DROPDOWN, &words.dropdown), (REPAIR_CHARGE, &words.charge)] {
+        if let Some(index) = find(&panel, path) {
+            texts.insert(index, said.clone());
+        }
+    }
+    if let Some(index) = find(&panel, REPAIR_PRICE_RATE) {
+        sized(&mut panel, &mut texts, index, &words.price_rate);
+    }
+    for (path, said) in REPAIR_LINES.iter().zip(&words.lines) {
+        if let Some(index) = find(&panel, path) {
+            sized(&mut panel, &mut texts, index, said);
+        }
+    }
+    for (path, said) in &words.labels {
+        if let Some(index) = find(&panel, path) {
+            sized(&mut panel, &mut texts, index, said);
+        }
+    }
+    // The sums' figures, and the kit's points' icons in the cash's place.
+    for (end, said) in [("RepairTime/Value", &words.repair_time), ("RepairDP/Value", &words.repair_dp), ("CashInStash/Value", &words.in_stash), ("TotalSum/Value", &words.to_pay)] {
+        if let Some(index) = find(&panel, &format!("{REPAIR_SUMS}/{end}")) {
+            sized(&mut panel, &mut texts, index, said);
+        }
+    }
+    let [critical, default] = look.repair_figures.sum_colors;
+    if let Some(index) = find(&panel, &format!("{REPAIR_SUMS}/TotalSum/Value")) {
+        colors.insert(index, rgba(if words.to_pay_critical { critical } else { default }));
+    }
+    for (end, icon) in [("CashInStash/Icon", look.repair_icons[0]), ("TotalSum/Icon", look.repair_icons[1])] {
+        if let (Some(index), Some(picture)) = (find(&panel, &format!("{REPAIR_SUMS}/{end}")), icon) {
+            sprites.insert(index, picture);
+        }
+    }
+    // The warnings, each a copy of its template under the panel.
+    if let Some(status) = find(&panel, REPAIR_STATUS) {
+        for (template, said) in &words.warnings {
+            let Some(top) = REPAIR_TEMPLATES.get(*template).and_then(|path| find(&panel, path)) else { continue };
+            let copy = copy_within(&mut panel, &mut drawn, top, status);
+            set.insert(copy, true);
+            texts.insert(copy + 1, said.clone());
+        }
+    }
+    // The condition's bar (`SetSliderValues`), its border and its current
+    // durability in the colour broken or not (`SetSliderActive`).
+    let c = words.condition;
+    let template = c.template.max(1.0);
+    let bar = |end: &str| format!("{REPAIR_SLIDER}/bars/{end}");
+    let anchor = |panel: &mut trp_data::screen::ScenePanel, end: &str, from: Option<f32>, to: Option<f32>| {
+        if let Some(index) = panel.find(&bar(end)) {
+            if let Some(from) = from {
+                panel.nodes[index].layout.anchor_min[0] = from;
+            }
+            if let Some(to) = to {
+                panel.nodes[index].layout.anchor_max[0] = to;
+            }
+        }
+    };
+    let lowest = (c.max - c.range[0] / template).clamp(0.0, 1.0);
+    anchor(&mut panel, "CurrentDurability", None, Some(c.current));
+    anchor(&mut panel, "MaximumDurability", None, Some(c.max));
+    anchor(&mut panel, "MaxDegradation", Some((c.max - c.range[1] / template).clamp(0.0, 1.0)), Some(lowest));
+    anchor(&mut panel, "Slider", Some(0.01 + c.current), Some(c.max - c.range[0] / template));
+    anchor(&mut panel, "MaximumRemovedDurability", Some(c.current + c.top), Some(c.max));
+    // (The game's quirk: the selection's start a fraction over the template
+    // again, so from about nought, under the current durability's.)
+    anchor(&mut panel, "SelectedDurability", Some(c.current / template), Some(c.current + c.selected));
+    let shown = c.top >= 0.001;
+    if let Some(slider) = panel.find(&bar("Slider")) {
+        set.insert(slider, shown);
+        panel.nodes[slider].active = shown;
+    }
+    let value = if shown { ((c.selected - 0.001) / (c.top - 0.001).max(1e-6)).clamp(0.0, 1.0) } else { 0.0 };
+    if let Some(handle) = panel.find(&bar("Slider/Handle Slide Area/Handle")) {
+        panel.nodes[handle].layout.anchor_min = [value, 0.0];
+        panel.nodes[handle].layout.anchor_max = [value, 1.0];
+    }
+    let [slider_critical, slider_default] = look.repair_figures.slider_colors;
+    let tint = rgba(if words.broken { slider_critical } else { slider_default });
+    for end in ["Border", "CurrentDurability"] {
+        if let Some(index) = panel.find(&bar(end)) {
+            colors.insert(index, tint);
+        }
+    }
+    if let Some(index) = panel.find(&format!("{REPAIR_SLIDER}/Durability")) {
+        texts.insert(index, words.durability.clone());
+        colors.insert(index, Color::WHITE);
+    }
+    // The button, dim where it cannot be pressed (`PROVISIONAL`: the
+    // button's own disabled look, `DefaultUIButtonAnimation`, not read).
+    if let Some(button) = panel.find(REPAIR_BUTTON) {
+        if !words.interactable {
+            groups.insert(button, 0.5);
+        }
+    }
+    let size = fitted_size(&panel);
+    let rect = |path: &str| panel.find(path).map(|index| panel.rect(index, size));
+    Some(RepairBuilt {
+        preview: rect(REPAIR_PREVIEW).unwrap_or([0.0; 4]),
+        avatar: rect(REPAIR_AVATAR).unwrap_or([0.0; 4]),
+        slider: shown.then(|| rect(&bar("Slider/Handle Slide Area"))).flatten(),
+        top_button: shown.then(|| rect(&bar("Slider/MaximumDurabilityButton"))).flatten(),
+        button: rect(REPAIR_BUTTON).unwrap_or([0.0; 4]),
+        caption: rect("Inner/Caption Panel").unwrap_or([0.0; 4]),
+        close: rect("Inner/Caption Panel/Close Button").unwrap_or([0.0; 4]),
+        panel,
+        drawn,
+        texts,
+        set,
+        colors,
+        sprites,
+        groups,
+        size,
+    })
+}
+
+/// The repair window drawn as built, its pieces numbered past the windows
+/// before it.
+pub(crate) fn draw_repair_window(column: &mut ChildSpawnerCommands, look: &HealthLook, said: &Words, built: &RepairBuilt, index: usize, s: f32) {
+    let RepairBuilt { panel, drawn, texts, set, colors, sprites, groups, size, .. } = built;
+    let base = REPAIR_WINDOW + (index << 12);
+    let marks = Marks { words: Some(texts), set: Some(set), colors: Some(colors), sprites: Some(sprites), groups: Some(groups), ..Marks::default() };
+    draw_nodes(column, look, panel, drawn, base, marks, said, Frame::Is(*size), [0.0, 0.0], s);
 }

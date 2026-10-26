@@ -374,6 +374,14 @@ impl Vaulting {
         self.obstacle = obstacle;
     }
 
+    /// Where the heaviest top point of the last measurement lies, in the
+    /// world's axes (`MaxWeightPointPosition`): what the vault's sounds
+    /// cast down onto for the obstacle's surface. None after a measurement
+    /// handed in from a recording.
+    pub fn heaviest_point(&self) -> Option<[f32; 3]> {
+        self.heaviest.map(|point| point.world)
+    }
+
     /// Whether the character stood on stairs at the last measurement.
     pub fn on_stairs(&self) -> bool {
         self.stairs

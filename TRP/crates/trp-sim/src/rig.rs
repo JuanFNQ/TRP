@@ -63,69 +63,32 @@ impl ArmNodes {
 /// (`ProceduralWeaponAnimation.FindAimTransforms`, `method_15`;
 /// weapon-handling spec, "The sights"): the weapon's own bone, in which
 /// the rest are measured; the aim bone of the sight in use; the two points
-/// of the iron sights' line, rear and front, where the weapon has both;
-/// and the muzzle, about which the weapon is turned to level that line.
+/// of the iron sights' line, rear and front, where the game takes one for
+/// that sight; and the muzzle, about which the weapon is turned to level
+/// that line. Which sight is in use is `crate::sights`'. `own` says the aim
+/// bone is the weapon's own `aim_camera` (`crate::sights::Sight::own`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SightNodes {
     pub weapon: usize,
     pub bone: usize,
     pub line: Option<[usize; 2]>,
     pub muzzle: Option<usize>,
+    pub own: bool,
 }
 
-/// The name of a sight's own aim bone, and of the weapon's own, which is
-/// used where the build has no sight with one.
-const SIGHT_AIM_BONE: &str = "mod_aim_camera";
-const WEAPON_AIM_BONE: &str = "aim_camera";
-/// How far from straight back a sight's aim bone may be turned and still
-/// be used, in degrees (`ScopeRotationWithinLimits`).
-const SIGHT_TURN_LIMIT: f32 = 55.0;
-
 impl SightNodes {
-    /// Finds them in an assembled weapon. For a build whose sights are
-    /// iron sights, or none: the first sight's aim bone that is not turned
-    /// too far aside, else the weapon's own; and for the line the deepest
-    /// bone named for the rear sight's point and the deepest named for the
-    /// front's. (A build with an optic or a collimator has an aim bone for
-    /// each, chosen between by a key: not read here.)
+    /// A weapon's for the sight it is first aimed by
+    /// (`crate::sights::Sights`): the build's sight parts and the rule the
+    /// game picks by.
+    pub fn of_weapon(weapon: &trp_data::weapon::Weapon) -> Option<Self> {
+        crate::sights::Sights::of_weapon(weapon).map(|sights| sights.nodes())
+    }
+
+    /// A rig's with no sight parts known (the empty hands', an item's): the
+    /// first sight's aim bone on it that is not turned too far aside, else
+    /// its own `aim_camera`; and the iron sights' line where it has one.
     pub fn find(hierarchy: &Hierarchy) -> Option<Self> {
-        let nodes = &hierarchy.nodes;
-        let weapon = (0..nodes.len()).find(|&i| hierarchy.path(i) == format!("{MOVED_BONE}/weapon"))?;
-        let rig = WeaponRig::new(hierarchy);
-        let below = |mut index: usize| {
-            let mut depth = 0;
-            while let Some(parent) = nodes[index].parent {
-                if parent == weapon {
-                    return Some(depth);
-                }
-                (depth, index) = (depth + 1, parent);
-            }
-            None
-        };
-        // Turned about the weapon's upright axis by no more than the limit
-        // from a half turn, as the weapon has it.
-        let straight = |index: usize| {
-            let (_, weapon_turn) = rig.placed(weapon);
-            let (_, turn) = rig.placed(index);
-            let back = [-weapon_turn[0], -weapon_turn[1], -weapon_turn[2], weapon_turn[3]];
-            let about_y = crate::math::quat_to_euler(quat_mul(back, turn))[1].rem_euclid(360.0);
-            (180.0 - about_y).abs() < SIGHT_TURN_LIMIT
-        };
-        let named = |name: &str| -> Vec<usize> { (0..nodes.len()).filter(|&i| nodes[i].name == name && below(i).is_some()).collect() };
-        let bone = named(SIGHT_AIM_BONE).into_iter().find(|&i| straight(i)).or_else(|| named(WEAPON_AIM_BONE).into_iter().next())?;
-        let deepest = |part: &str| {
-            let mut found: Option<(usize, usize)> = None;
-            for index in (0..nodes.len()).filter(|&i| nodes[i].name.contains(part)) {
-                let Some(depth) = below(index) else { continue };
-                if found.is_none_or(|(_, best)| depth > best) {
-                    found = Some((index, depth));
-                }
-            }
-            found.map(|(index, _)| index)
-        };
-        let line = deepest("mod_align_rear").zip(deepest("mod_align_front")).map(|(rear, front)| [rear, front]);
-        let muzzle = (0..nodes.len()).find(|&i| nodes[i].name == "fireport");
-        Some(Self { weapon, bone, line, muzzle })
+        crate::sights::Sights::new(hierarchy, Vec::new(), &[], crate::sights::AimPlanes::default()).map(|sights| sights.nodes())
     }
 
     /// A bone's place in the weapon's own bone, as the rig is posed.
@@ -161,6 +124,61 @@ impl SightNodes {
         })
     }
 
+    /// The point the iron sights aim at for the shot's direction
+    /// (`ProceduralWeaponAnimation.method_14`), as the rig is posed: in the
+    /// weapon's own bone, the front sight plus `range` (at least 25 m) of a
+    /// way made of the line's rise and run (`(0, rise, run)` made a unit, as
+    /// the game makes it), less the muzzle. None without both sights or a
+    /// muzzle.
+    pub fn iron_point(&self, rig: &WeaponRig, range: i32) -> Option<[f32; 3]> {
+        iron_point(self.iron_points(rig)?, range)
+    }
+
+    /// The rear sight, the front sight and the muzzle in the weapon's own
+    /// bone, as the rig is posed.
+    pub fn iron_points(&self, rig: &WeaponRig) -> Option<[[f32; 3]; 3]> {
+        let [rear, front] = self.line?;
+        Some([self.on_weapon(rig, rear), self.on_weapon(rig, front), self.on_weapon(rig, self.muzzle?)])
+    }
+}
+
+/// The iron sights' aim point from their rear, front and the muzzle in the
+/// weapon's own bone (`SightNodes::iron_point`).
+pub fn iron_point([rear, front, muzzle]: [[f32; 3]; 3], range: i32) -> Option<[f32; 3]> {
+    {
+        let (rise, run) = (front[2] - rear[2], -front[1] + rear[1]);
+        let size = (rise * rise + run * run).sqrt();
+        if size < 1e-5 {
+            return None;
+        }
+        let reach = range.max(25) as f32;
+        let way = [0.0, rise / size, run / size];
+        Some(std::array::from_fn(|k| front[k] + way[k] * reach - muzzle[k]))
+    }
+}
+
+impl SightNodes {
+    /// The way the eye looks along the aim bone, in the axes of the bone
+    /// the procedural motion moves, as the rig is posed: the bone's -z
+    /// (`-forward`), or its -y (`-up`) where it is the weapon's own
+    /// `aim_camera` (`ProceduralWeaponAnimation`, the camera's target in
+    /// automatic fire; weapon-handling spec, "Camera"). Its turn alone, as
+    /// the game takes a direction.
+    pub fn line_in_moved(&self, rig: &WeaponRig) -> Option<[f32; 3]> {
+        let turn = rig.placed(rig.moved_bone()?).1;
+        let back = [-turn[0], -turn[1], -turn[2], turn[3]];
+        let way = if self.own { [0.0, -1.0, 0.0] } else { [0.0, 0.0, -1.0] };
+        Some(quat_rotate(quat_mul(back, rig.placed(self.bone).1), way))
+    }
+
+    /// The same in the weapon's own bone.
+    pub fn line_on_weapon(&self, rig: &WeaponRig) -> [f32; 3] {
+        let turn = rig.placed(self.weapon).1;
+        let back = [-turn[0], -turn[1], -turn[2], turn[3]];
+        let way = if self.own { [0.0, -1.0, 0.0] } else { [0.0, 0.0, -1.0] };
+        quat_rotate(quat_mul(back, rig.placed(self.bone).1), way)
+    }
+
     /// The aim bone and the muzzle in the axes of the bone the procedural
     /// motion moves, as the rig is posed.
     pub fn in_moved(&self, rig: &WeaponRig) -> Option<([f32; 3], Option<[f32; 3]>)> {
@@ -184,6 +202,7 @@ impl SightNodes {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct WeaponRig {
     parents: Vec<Option<usize>>,
     local: Vec<Local>,
@@ -201,6 +220,15 @@ impl WeaponRig {
         }
     }
 
+    /// How many bones it has.
+    pub fn len(&self) -> usize {
+        self.local.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.local.is_empty()
+    }
+
     /// A bone by its path below the rig's root.
     pub fn bone(&self, path: &str) -> Option<usize> {
         self.by_path.get(path).copied()
@@ -209,6 +237,11 @@ impl WeaponRig {
     /// The bone the procedural motion moves.
     pub fn moved_bone(&self) -> Option<usize> {
         self.bone(MOVED_BONE)
+    }
+
+    /// A bone's parent, none for the root.
+    pub fn parent(&self, bone: usize) -> Option<usize> {
+        self.parents.get(bone).copied().flatten()
     }
 
     /// A bone in its parent.

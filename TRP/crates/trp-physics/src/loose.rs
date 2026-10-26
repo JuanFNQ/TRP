@@ -299,4 +299,29 @@ mod tests {
         let (at, _) = world.pose(body);
         assert!(at[2] > 0.5 && at[1] < 0.2, "{at:?} after {frames} frames");
     }
+
+    /// A body that reports its touches is told of the ground as it first
+    /// meets it, at a point on the ground with the ground's normal; a body
+    /// that does not ask is not reported.
+    #[test]
+    fn a_thing_landing_reports_the_ground() {
+        let mut world = World::new(Settings::game());
+        world.add_ground(0.0, Material::default(), 11);
+        let mut dice = Dice::new(7);
+        let by = Thrower { yaw: 0.0, pitch: 0.0, chest: [0.0, 1.04, 0.0], velocity: [0.0; 3], dt: 1.0 / 60.0, weapon_root: [0.0, 0.0, 0.0, 1.0] };
+        let collider = Collider { shape: Shape::Box { half: [0.05, 0.1, 0.03] }, at: [0.0; 3], turn: [0.0, 0.0, 0.0, 1.0], material: Material::default() };
+        let (heard, _) = add(&mut world, vec![collider.clone()], 0.5, &thrown(&by, false, &mut dice), SWEPT_UNDER, 15);
+        let (_, _) = add(&mut world, vec![collider], 0.5, &thrown(&by, true, &mut dice), SWEPT_UNDER, 15);
+        world.report_touches(heard);
+        let mut touches = Vec::new();
+        for _ in 0..120 {
+            world.step(1.0 / 60.0);
+            touches.extend(world.take_touches());
+        }
+        // Both set off from the same place: they touch each other first.
+        assert!(touches.iter().all(|t| t.body == heard), "{touches:?}");
+        let ground = touches.iter().find(|t| t.other == crate::Met::Still(0)).expect("the ground reported");
+        let (point, normal) = ground.contact.expect("a point of contact");
+        assert!(point[1].abs() < 0.02 && normal[1] > 0.99, "{point:?} {normal:?}");
+    }
 }

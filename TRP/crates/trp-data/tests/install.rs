@@ -22,6 +22,445 @@ fn akm() -> Option<(Assets, Weapon)> {
     Some((assets, weapon))
 }
 
+/// The AKM's muzzle flash (firing spec, "The muzzle flash"): its manager's
+/// figures, its material's, and its jets on the muzzle device.
+#[test]
+fn the_akm_s_muzzle_flash_is_read() {
+    let Some((_assets, weapon)) = akm() else { return };
+    let muzzle = weapon.muzzle.as_ref().expect("the AKM's muzzle flash");
+    let m = &muzzle.material;
+    println!(
+        "{} s, atlas {:?}, under {:?}; material tint {:?}, window {}, phase {}, HDR {}, z {}, picture {} {}x{} format {}; jets {:?}",
+        muzzle.shot_length,
+        muzzle.atlas,
+        weapon.hierarchy.nodes[muzzle.mesh_parent].name,
+        m.tint,
+        m.inv_window,
+        m.randomize_phase,
+        m.hdr,
+        m.z_shift,
+        m.texture.name,
+        m.texture.width,
+        m.texture.height,
+        m.texture.format,
+        muzzle.jets.iter().map(|jet| (weapon.hierarchy.path(jet.node), jet.particles.len(), jet.bounds, jet.chance)).collect::<Vec<_>>()
+    );
+    let level = trp_data::unity::texture::mips(&m.texture).expect("its level")[0];
+    let pixels = trp_data::unity::texture::decode_rgba(&m.texture, level).expect("decoded");
+    let mut stats = [(255u8, 0u8, 0u64); 4];
+    for px in pixels.chunks_exact(4) {
+        for c in 0..4 {
+            stats[c] = (stats[c].0.min(px[c]), stats[c].1.max(px[c]), stats[c].2 + px[c] as u64);
+        }
+    }
+    let n = (pixels.len() / 4) as u64;
+    println!("the jets' picture (least, most, mean): {:?}, sRGB {}; its first quarter's middle {:?}", stats.map(|(a, b, s)| (a, b, s / n)), m.texture.srgb, &pixels[(256 * 1024 + 256) * 4..][..4]);
+    for smoke in &muzzle.smokes {
+        println!("smoke on {}: end {}, brake {}, drag {}, gravity {}, length {} + {}, by shot {}, drop {}; material width {}, uv {}, diffusion {}, fades {} {} {}, picture {} {}x{}", weapon.hierarchy.nodes[smoke.node].name, smoke.smoke_end, smoke.brake_distance, smoke.drag, smoke.gravity, smoke.smoke_length, smoke.smoke_length_randomness, smoke.increasing_by_shot, smoke.drop_time, smoke.material.width, smoke.material.uv_y_scale, smoke.material.diffusion_strength, smoke.material.start_fade, smoke.material.end, smoke.material.end_fade, smoke.material.texture.name, smoke.material.texture.width, smoke.material.texture.height);
+    }
+    assert_eq!(muzzle.smokes.len(), 1);
+    println!("the jets' material's render queue: {}", m.render_queue);
+    assert_eq!((muzzle.shot_length, muzzle.atlas), (0.12, [2, 2]));
+    assert_eq!(weapon.hierarchy.nodes[muzzle.mesh_parent].name, "weapon");
+    assert!(!muzzle.jets.is_empty() && muzzle.jets.iter().all(|jet| !jet.particles.is_empty()));
+    // Its fumes: three on its muzzle device and the one of its ejection
+    // port (`extractor_smoke`); the first one puff a shot of 0.4 at 5 for
+    // 0.2 s (firing spec, "The muzzle's fumes").
+    for fume in &muzzle.fumes {
+        println!("fume on {}: start {}, radius {}, cone {}, count {} + {}, size {} ± {}, speed {}, life {}", weapon.hierarchy.path(fume.node), fume.start_pos, fume.emitter_radius, fume.conus_size, fume.count_min, fume.count_range, fume.size, fume.sizes_rnd, fume.speed, fume.lifetime);
+    }
+    let names: Vec<&str> = muzzle.fumes.iter().map(|fume| weapon.hierarchy.nodes[fume.node].name.as_str()).collect();
+    assert_eq!(names.iter().filter(|name| name.starts_with("muzzleflash_")).count(), 3, "{names:?}");
+    assert!(names.contains(&"extractor_smoke"), "{names:?}");
+    let first = &muzzle.fumes[0];
+    assert_eq!((first.count_min, first.count_range, first.size, first.speed, first.lifetime), (1, 1, 0.4, 5.0, 0.2));
+    assert_eq!(first.color.alphas.len(), 3);
+    // Its sparks: on `muzzleflash_000` and the port's, their tables of 128
+    // kept with them (firing spec, "The muzzle's sparks").
+    for s in &muzzle.sparks {
+        println!("sparks on {}: count {} + {}, radius {}, cone {}, shift {}, life {:?}.., speed {:?}.., size {:?}..", weapon.hierarchy.nodes[s.node].name, s.count_min, s.count_range, s.emitter_radius, s.conus_size, s.emission_time_shift, &s.lifetime[..3], &s.speed[..3], &s.size[..3]);
+    }
+    assert_eq!(muzzle.sparks.len(), 2);
+    assert!(muzzle.sparks.iter().all(|s| [s.lifetime.len(), s.speed.len(), s.gravity.len(), s.drag.len(), s.emission.len(), s.size.len(), s.turbulence.len(), s.frequency.len()] == [128; 8]));
+    assert_eq!((muzzle.sparks[0].count_min, muzzle.sparks[0].count_range), (-2, 5));
+}
+
+/// The muzzles' heat haze: the shared system and its material, the AKM's
+/// two emitters, and the camera's distortion it is drawn into (firing
+/// spec, "The muzzle's heat haze").
+#[test]
+fn the_muzzles_heat_haze_is_read() {
+    let Some((_assets, weapon)) = akm() else { return };
+    let install = Install::locate().expect("install");
+    let mut assets = Assets::new(install.clone()).expect("manifest");
+    let haze = trp_data::particles::muzzle_heat_haze_system(&mut assets).expect("the haze system");
+    let m = &haze.renderer.material;
+    println!(
+        "{}: world {}, most {}, size {:?}, colour {:?}; most size {}; material {} with {} ({:?}; {:?}; {:?}; {:?})",
+        haze.name,
+        haze.world_space,
+        haze.max_particles,
+        haze.size_over_lifetime.as_ref().map(|c| (c.mode, c.max_curve.keys.iter().map(|k| (k.time, k.value)).collect::<Vec<_>>())),
+        haze.color_over_lifetime.as_ref().map(|g| (g.mode, &g.max_gradient.colors, &g.max_gradient.alphas)),
+        haze.renderer.max_size,
+        m.name,
+        m.shader,
+        m.textures.iter().map(|(n, t)| (n, &t.name, t.width, t.height, t.format, t.clamp)).collect::<Vec<_>>(),
+        m.floats,
+        m.colors,
+        m.scales
+    );
+    assert_eq!((haze.name.as_str(), haze.world_space, haze.max_particles), ("HeatHazeEffect", false, 12));
+    assert!(haze.unbuilt.is_empty(), "{:?}", haze.unbuilt);
+    assert_eq!(m.shader, "Particles/DistortAndBlur");
+    assert!(m.texture("_DistortTex").is_some() && m.texture("_AlphaTex").is_some() && m.scale("_DistortTex").is_some());
+    assert_eq!((m.float("_InvFade"), m.color("_TextureMovement")), (Some(88.0), Some([0.4, 0.4, -0.4, -0.4])));
+    let muzzle = weapon.muzzle.as_ref().expect("the AKM's muzzle");
+    for h in &muzzle.hazes {
+        println!("haze on {}: {:?}", weapon.hierarchy.nodes[h.node].name, h);
+    }
+    assert_eq!(muzzle.hazes.len(), 2);
+    // One with every shot, one with a quarter of them.
+    let mut chances: Vec<f32> = muzzle.hazes.iter().map(|h| h.chance).collect();
+    chances.sort_by(f32::total_cmp);
+    assert_eq!(chances, vec![0.25, 1.0]);
+    assert!(muzzle.hazes.iter().all(|h| (h.count, h.delay) == (3, 0.15)));
+    let d = trp_data::camera_effects::read_distortion(&install).expect("the camera's distortion");
+    println!("the camera's distortion: {d:?}");
+    assert_eq!((d.pixels, d.blur_iterations), (8.0, 1));
+}
+
+/// A grenade's explosion (`Effects`' `Grenade_new`, the F-1's): every one of
+/// its systems read, each one's figures printed (firing spec, "A grenade's
+/// explosion").
+/// The body armour repair kit's shadow meshes cast their shadow alone
+/// (`m_CastShadows` 3), its model's own do not: drawn, the shadow meshes
+/// cover the kit in white (0.143.1).
+#[test]
+fn a_shadow_mesh_is_read_as_shadows_only() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let mut assets = Assets::new(install).expect("manifest");
+    let key = "assets/content/items/spec/item_spec_armorrepair/item_spec_armorrepair.bundle";
+    let (hierarchy, _) = trp_data::icon::model_of(&mut assets, key).expect("the kit's model");
+    let shadows_only = |name: &str| hierarchy.nodes.iter().find(|node| node.name == name).and_then(|node| node.renderer.as_ref()).map(|renderer| renderer.shadows_only);
+    assert_eq!(shadows_only("shadow_LOD0"), Some(true));
+    assert_eq!(shadows_only("item_spec_armorrepair_LOD0"), Some(false));
+}
+
+#[test]
+fn a_grenade_s_explosion_is_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let mut assets = Assets::new(install).expect("manifest");
+    let effect = trp_data::particles::named_effect(&mut assets, "Grenade_new").expect("the explosion");
+    let c = |m: &trp_data::particles::MinMaxCurve| match m.mode {
+        0 => format!("{}", m.scalar),
+        3 => format!("{}..{}", m.min_scalar, m.scalar),
+        mode => format!("m{mode}×{}", m.scalar),
+    };
+    for s in &effect.systems {
+        let d = &s.data;
+        let r = &d.renderer;
+        println!(
+            "{}{} at {:?} turn {:?}: {} s{} delay {}, life {}, speed {}, size {}, turn {}, gravity {}, most {}, {}; shape {:?}; emission {:?}; sheet {:?}; force {}; size/life {}, colour/life {}, limit {}, turn/speed {}; unbuilt {:?}; drawn {} (v {}, l {}, fudge {}) with {} {:?} {:?}",
+            "  ".repeat(s.depth),
+            d.name,
+            s.position,
+            s.rotation,
+            d.duration,
+            if d.looping { " looping" } else { "" },
+            c(&d.start_delay),
+            c(&d.start_lifetime),
+            c(&d.start_speed),
+            c(&d.start_size),
+            c(&d.start_rotation),
+            c(&d.gravity_modifier),
+            d.max_particles,
+            if d.world_space { "world" } else { "local" },
+            d.shape.as_ref().map(|s| (s.kind, s.radius, s.radius_thickness, s.angle, s.arc, s.rotation, s.random_direction, s.spherical_direction)),
+            d.emission.as_ref().map(|e| (c(&e.rate_over_time), e.bursts.iter().map(|b| (b.time, c(&b.count), b.cycles, b.interval, b.probability)).collect::<Vec<_>>())),
+            d.texture_sheet.as_ref().map(|t| (t.tiles, t.single_row, t.random_row, c(&t.frame_over_time), c(&t.start_frame), t.cycles)),
+            d.force.as_ref().map_or("-".into(), |f| format!("{} {} {} {}", c(&f.x), c(&f.y), c(&f.z), if f.world_space { "world" } else { "local" })),
+            d.size_over_lifetime.as_ref().map_or("-".into(), c),
+            d.color_over_lifetime.as_ref().map_or("-".into(), |g| format!("m{}", g.mode)),
+            d.limit_velocity.as_ref().map_or("-".into(), |l| format!("{} d{} drag {}", c(&l.magnitude), l.dampen, c(&l.drag))),
+            d.rotation_by_speed.as_ref().map_or("-".into(), |t| format!("{} {:?}", c(&t.curve), t.range)),
+            d.unbuilt,
+            r.render_mode,
+            r.velocity_scale,
+            r.length_scale,
+            r.sorting_fudge,
+            r.material.shader,
+            r.material.floats,
+            r.material.textures.iter().map(|(n, t)| (n.as_str(), t.name.as_str(), t.width)).collect::<Vec<_>>()
+        );
+        println!("    queue {}, keywords {:?}, sort {}", r.material.render_queue, r.material.keywords, r.sort_mode);
+    }
+    for l in &effect.lights {
+        println!("light {} at {:?}: kind {}, colour {:?}, intensity {}, range {}, on {}", l.name, l.position, l.kind, l.color, l.intensity, l.range, l.enabled);
+    }
+    assert_eq!(effect.systems.len(), 17);
+    // Its mediator's five copies, played in turn.
+    assert_eq!(effect.copies, 5);
+    // The dust a piece of concrete raises where it lands: set off by it, not
+    // played with the rest.
+    assert_eq!(effect.systems.iter().filter(|s| s.sub_emitter).map(|s| s.data.name.as_str()).collect::<Vec<_>>(), ["drop_dust"]);
+    assert!(effect.systems.iter().all(|s| s.data.emission.as_ref().is_some_and(|e| !e.bursts.is_empty())));
+    // The shock wave's mesh: Unity's own sphere, read from the install's
+    // copy of the engine's resources (515 corners, half a metre out).
+    let wave = effect.systems.iter().find(|s| s.data.name == "DistortionWave").expect("the shock wave");
+    let mesh = wave.data.renderer.mesh.as_ref().expect("the shock wave's mesh");
+    let farthest = mesh.positions.iter().map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt()).fold(0.0f32, f32::max);
+    println!("the shock wave's mesh {}: {} corners, {} triangles, {} normals, out to {farthest}", mesh.name, mesh.positions.len(), mesh.submeshes.iter().map(Vec::len).sum::<usize>() / 3, mesh.normals.len());
+    assert_eq!((mesh.name.as_str(), mesh.positions.len(), mesh.normals.len()), ("Sphere", 515, 515));
+    assert!((farthest - 0.5).abs() < 1e-3, "{farthest}");
+}
+
+/// The muzzles' shared blasts (the RShG-2's): the front's and the back's,
+/// each a tree of systems; the back's light driven by its fire; the front's
+/// fragments with trails and a trail material.
+#[test]
+fn the_muzzle_blasts_are_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let mut assets = Assets::new(install).expect("manifest");
+    let blasts = trp_data::particles::muzzle_blasts(&mut assets).expect("the muzzles' blasts");
+    for (pivot, effect) in &blasts {
+        println!("pivot {pivot}: {}", effect.name);
+        for s in &effect.systems {
+            let d = &s.data;
+            let r = &d.renderer;
+            println!(
+                "  {}{} at {:?}: {} s delay {:?} life {:?} speed {:?} size {:?}, most {}, {}; emission {:?}; trails {:?}; unbuilt {:?}; drawn {} {} (fudge {}, sort {}) by {} queue {} {:?} {:?}; trail by {:?}",
+                "  ".repeat(s.depth),
+                d.name,
+                s.position,
+                d.duration,
+                (d.start_delay.min_scalar, d.start_delay.scalar),
+                (d.start_lifetime.min_scalar, d.start_lifetime.scalar),
+                (d.start_speed.min_scalar, d.start_speed.scalar),
+                (d.start_size.min_scalar, d.start_size.scalar),
+                d.max_particles,
+                if d.world_space { "world" } else { "local" },
+                d.emission.as_ref().map(|e| (e.rate_over_time.scalar, e.bursts.iter().map(|b| (b.time, b.count.min_scalar, b.count.scalar)).collect::<Vec<_>>())),
+                d.trails.as_ref().map(|t| (t.mode, t.ratio, t.lifetime.scalar, t.min_vertex_distance, t.texture_mode, t.world_space, t.size_affects_width, t.inherit_particle_color, t.width_over_trail.scalar)),
+                d.unbuilt,
+                r.render_mode,
+                r.enabled,
+                r.sorting_fudge,
+                r.sort_mode,
+                r.material.shader,
+                r.material.render_queue,
+                r.material.floats,
+                r.material.textures.iter().map(|(n, t)| (n.as_str(), t.name.as_str(), t.width)).collect::<Vec<_>>(),
+                r.trail_material.as_ref().map(|m| (m.shader.clone(), m.floats.clone(), m.colors.clone()))
+            );
+        }
+        for l in &effect.lights {
+            println!("  light {} at {:?}: kind {}, colour {:?}, intensity {}, range {}, on {}, driven {:?}", l.name, l.position, l.kind, l.color, l.intensity, l.range, l.enabled, l.driver);
+        }
+    }
+    assert_eq!(blasts.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [0, 1]);
+    let back = &blasts[1].1;
+    assert!(back.lights.iter().any(|l| l.driver.is_some_and(|d| d.min_max == [0.0, 4.0] && d.time == 5.0)));
+    let front = &blasts[0].1;
+    assert!(front.systems.iter().any(|s| s.data.trails.is_some() && s.data.renderer.trail_material.is_some()));
+    // The roots draw nothing.
+    assert!(blasts.iter().all(|(_, e)| !e.systems[0].data.renderer.enabled));
+}
+
+/// The flashbang's effect: no mediator, seven older emitters (six onto
+/// particle systems, one onto the shared sparks) and the pool's light.
+#[test]
+fn a_flashbang_s_effect_is_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let mut assets = Assets::new(install).expect("manifest");
+    let entry = trp_data::particles::effect_entry(&mut assets, "Flashbang").expect("the flashbang's entry");
+    for e in &entry.emitters {
+        match &e.kind {
+            trp_data::particles::EmitterKind::System(a) => {
+                let d = &a.data;
+                let m = &d.renderer.material;
+                println!(
+                    "{}: within {:?} m, way {}, {} + <{}, scale {:?}; life {:?}, speed {:?}, size {:?}, turn {} {}, colour {:?}; {} s, most {}, {}; size/life {}, colour/life {}, limit {}, collision {}; unbuilt {:?}; drawn {} (fudge {}, sort {}) with {} queue {} {:?} {:?} {:?}",
+                    d.name,
+                    e.distance,
+                    e.way,
+                    e.min_count,
+                    e.count_range,
+                    e.random_scale,
+                    a.lifetime,
+                    a.speed,
+                    a.size,
+                    a.rotation_random,
+                    a.rotation,
+                    a.color,
+                    d.duration,
+                    d.max_particles,
+                    if d.world_space { "world" } else { "local" },
+                    d.size_over_lifetime.is_some(),
+                    d.color_over_lifetime.is_some(),
+                    d.limit_velocity.is_some(),
+                    d.collision.is_some(),
+                    d.unbuilt,
+                    d.renderer.render_mode,
+                    d.renderer.sorting_fudge,
+                    d.renderer.sort_mode,
+                    m.shader,
+                    m.render_queue,
+                    m.floats,
+                    m.colors,
+                    m.textures.iter().map(|(n, t)| (n.as_str(), t.name.as_str(), t.width)).collect::<Vec<_>>()
+                );
+            }
+            trp_data::particles::EmitterKind::Sparks(s) => {
+                println!("sparks: within {:?} m, way {}, {} + <{}, scale {:?}; {} places, lifetime {}..{}, speed {}..{}, time shift {}", e.distance, e.way, e.min_count, e.count_range, e.random_scale, s.lifetime.len(), s.lifetime[0], s.lifetime[127], s.speed[0], s.speed[127], s.time_shift);
+            }
+        }
+    }
+    println!("light {:?}, shift {}", entry.light, entry.particles_shift);
+    assert_eq!(entry.emitters.len(), 7);
+    assert_eq!(entry.emitters.iter().filter(|e| matches!(e.kind, trp_data::particles::EmitterKind::Sparks(_))).count(), 1);
+    let light = entry.light.expect("the pool's light");
+    assert_eq!((light.range, light.intensity, light.time, light.max_distance, light.shadows), (35.0, 12.0, 1.0, 350.0, true));
+}
+
+/// The game's own renderer all the muzzles' sparks are emitted into
+/// (`SimpleSparksRenderer`; firing spec, "The muzzle's sparks").
+#[test]
+fn the_muzzles_sparks_renderer_is_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let mut assets = Assets::new(install).expect("manifest");
+    let s = trp_data::particles::muzzle_sparks_renderer(&mut assets).expect("the sparks' renderer");
+    println!("{} segments, {} sparks, {}; size {}, fade {}, turbulence {:?}, tint {:?}, picture {} {}x{}", s.segments, s.count, s.shader, s.size, s.fade_out, s.turbulence, s.tint, s.texture.name, s.texture.width, s.texture.height);
+    assert_eq!((s.segments, s.count, s.shader.as_str()), (12, 700, "Custom/SimpleParticleMoveAdd"));
+    assert_eq!((s.size, s.fade_out, s.turbulence), (0.04, 8.0, Some([8.0, 5.0, 30.0, 1.0])));
+    assert_eq!(s.tint[0], 2.0);
+}
+
+/// Every clothing suit of the install, of every side, with its parts'
+/// bundles, each of which reads (inventory spec, "The OVERALL tab").
+#[test]
+fn every_suit_and_its_parts_are_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let suits = trp_data::suits::suits(&install, "en").expect("the suits");
+    let (upper, lower): (Vec<_>, Vec<_>) = suits.iter().partition(|suit| suit.upper);
+    println!("{} upper suits, {} lower", upper.len(), lower.len());
+    assert!(upper.len() >= 90 && lower.len() >= 60);
+    let bear = upper.iter().find(|suit| suit.id == "5cd945d71388ce000a659dfb").expect("the BEAR's own upper suit");
+    assert_eq!(bear.name, "BEAR Standard");
+    assert_eq!(bear.body.as_deref(), Some("assets/content/characters/character/prefabs/tshirt_bear_turtleneck.bundle"));
+    assert_eq!(bear.hands.as_deref(), Some("assets/content/hands/bear/bear_hands_skin.bundle"));
+    let mut assets = Assets::new(install.clone()).expect("manifest");
+    let (mut torsos, mut whole) = (0, 0);
+    for key in suits.iter().flat_map(|suit| [&suit.body, &suit.feet].into_iter().flatten()) {
+        let part = trp_data::arms::load(&mut assets, key).unwrap_or_else(|e| panic!("{key}: {e:#}"));
+        torsos += usize::from(part.torso.is_some());
+        if part.torso.is_some() {
+            let suit = suits.iter().find(|suit| suit.body.as_ref() == Some(key) || suit.feet.as_ref() == Some(key)).expect("its suit");
+            println!("a torso of the newer kind: {} {} {:?}", suit.id, suit.name, suit.sides);
+        }
+        whole += usize::from(part.torso.is_some_and(|torso| torso.armor.is_some() && torso.vest.is_some()));
+    }
+    println!("{torsos} torsos of the newer kind, {whole} with all three meshes");
+    assert!(torsos > 0);
+    // Every bone a suit's part hangs on is one of the player's skeleton's,
+    // which the body's animator poses.
+    let mut paths: Vec<String> = Vec::new();
+    for key in suits.iter().flat_map(|suit| [&suit.body, &suit.feet].into_iter().flatten()) {
+        let part = trp_data::arms::load(&mut assets, key).expect("read above");
+        paths.extend(part.bone_paths.into_iter().filter(|path| !paths.contains(path)).collect::<Vec<_>>());
+    }
+    let wanted: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let bones = trp_data::body::bones(&mut assets, &wanted).expect("every suit's bone on the player's skeleton");
+    println!("{} bones under the suits' bodies and legs", bones.len());
+    // And every suit's hands on the bones a weapon's rig has, as the
+    // default hands are (`arms_bind_to_bones_the_weapon_has`).
+    if let Some((mut assets, weapon)) = akm() {
+        let rig: Vec<String> = (0..weapon.hierarchy.nodes.len()).map(|i| weapon.hierarchy.path(i)).collect();
+        for key in suits.iter().filter_map(|suit| suit.hands.as_ref()) {
+            let hands = trp_data::arms::load(&mut assets, key).unwrap_or_else(|e| panic!("{key}: {e:#}"));
+            for path in hands.weapon_bone_paths() {
+                assert!(rig.iter().any(|p| p == path), "{key}: the weapon has no bone {path}");
+            }
+        }
+    }
+    // The OVERALL tab's own figures, as the inventory's scene has them.
+    let overall = trp_data::screen::OverallPanel::load(&install, "level44").expect("the OVERALL panel");
+    let camera = overall.camera.expect("the model view's camera");
+    println!("the OVERALL tab: camera {camera:?}, turn {:?}, most seen {:?}, highlight {:?}, line tints {:?}, sides {:?}", overall.turn_a_pixel, overall.dropdown_most_seen, overall.dropdown_highlight, overall.line_tints, overall.side_sprites);
+    assert_eq!((camera.fov, camera.near, camera.far), (28.0, 0.3, 25.0));
+    assert!((camera.place[1] + 0.2).abs() < 1e-3 && (camera.place[2] - 0.49).abs() < 1e-3);
+    assert_eq!(overall.turn_a_pixel, Some(0.3));
+    assert_eq!(overall.dropdown_most_seen, Some(120.0));
+    assert!(overall.side_sprites.iter().all(Option::is_some));
+    for (index, key, case) in &overall.localized {
+        println!("localized {}: {key:?} case {case}, text {:?}", overall.panel.nodes[*index].path, overall.panel.nodes[*index].text.as_ref().map(|t| (&t.text, t.color, t.size)));
+    }
+}
+
+/// The particle system all the muzzles' fumes are emitted into, as the
+/// install has it (firing spec, "The muzzle's fumes"; particles spec).
+#[test]
+fn the_muzzles_fume_system_is_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let mut assets = Assets::new(install).expect("manifest");
+    let fume = trp_data::particles::muzzle_fume_system(&mut assets).expect("the fume system");
+    let r = &fume.renderer;
+    println!(
+        "{}: world {}, most {}, size {:?}, turn {:?}, colour {:?}, limit {:?}; drawn {} aligned {} sorted {} sizes {}..{}, material {} with {} ({:?}; {:?}; {:?})",
+        fume.name,
+        fume.world_space,
+        fume.max_particles,
+        fume.size_over_lifetime.as_ref().map(|c| c.max_curve.keys.iter().map(|k| (k.time, k.value)).collect::<Vec<_>>()),
+        fume.rotation_over_lifetime.as_ref().map(|c| (c.mode, c.min_scalar, c.scalar)),
+        fume.color_over_lifetime.as_ref().map(|g| (&g.max_gradient.colors, &g.max_gradient.alphas)),
+        fume.limit_velocity.as_ref().map(|l| (l.magnitude.scalar, l.dampen, l.drag.scalar)),
+        r.render_mode,
+        r.alignment,
+        r.sort_mode,
+        r.min_size,
+        r.max_size,
+        r.material.name,
+        r.material.shader,
+        r.material.textures.iter().map(|(n, t)| (n, &t.name, t.width, t.height, t.format, t.clamp)).collect::<Vec<_>>(),
+        r.material.floats,
+        r.material.colors
+    );
+    assert_eq!((fume.name.as_str(), fume.world_space, fume.max_particles), ("Effect Muzzle Smoke", true, 100));
+    assert!(fume.unbuilt.is_empty(), "{:?}", fume.unbuilt);
+    let turn = fume.rotation_over_lifetime.as_ref().expect("its turning");
+    assert_eq!(turn.mode, 3);
+    assert!((turn.scalar - 5f32.to_radians()).abs() < 1e-4 && (turn.min_scalar + 5f32.to_radians()).abs() < 1e-4);
+    let colour = &fume.color_over_lifetime.as_ref().expect("its colour").max_gradient;
+    assert_eq!((colour.colors.len(), colour.alphas.len()), (2, 4));
+    assert!((colour.alphas[1].0 - 7710.0 / 65535.0).abs() < 1e-6);
+    assert_eq!(fume.limit_velocity.as_ref().map(|l| (l.magnitude.scalar, l.dampen)), Some((0.0, 0.2)));
+    assert_eq!((r.render_mode, r.alignment, r.sort_mode), (0, 0, 0));
+    assert_eq!(r.material.shader, "Particles/Smoke Distorted");
+    assert!(r.material.texture("_MainTex").is_some() && r.material.texture("_NoiseTex").is_some());
+    assert_eq!((r.material.float("_AnimationSpeed"), r.material.float("_InvFade")), (Some(6.0), Some(3.0)));
+}
+
 #[test]
 fn stock_akm_assembles_with_every_part() {
     let Some((assets, weapon)) = akm() else { return };
@@ -1063,4 +1502,465 @@ fn a_weapon_s_shots_are_read() {
     assert_eq!(mp43.bank("Doublet").expect("both barrels").lists[0].len(), 2);
     let silenced = trp_data::weapon::assemble(&mut assets, &db, "59d6088586f774275f37482f").expect("the AKM").silenced;
     assert!(!silenced, "the stock AKM has no silencer");
+}
+
+/// A helmet's face shield and hinge (`ObjectsFactory.AttachMods`,
+/// `HelmetDress`): the ZSh-1-2M's shield hangs on its `mod_equipment`,
+/// hidden until fitted; its armour plates have no model and are not hung;
+/// its hinge is the object its dress names, with the turns and curves it
+/// keeps.
+#[test]
+fn a_helmet_s_face_shield_and_hinge_are_read() {
+    use trp_data::dress::{head_model, load, Under, Worn};
+    const ZSH: &str = "5aa7e454e5b5b0214e506fa2";
+    const SHIELD: &str = "5aa7e3abe5b5b000171d064d";
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let db = Database::load(&install).expect("database");
+    let mut assets = Assets::new(install).expect("manifest");
+    let key = db.items[ZSH].prefab_key().expect("its prefab").to_owned();
+    let Worn::Rigid(model) = load(&mut assets, &key, Under::default()).expect("the helmet") else { panic!("a helmet is a model") };
+    let (model, parts, hinges) = head_model(&mut assets, &db, ZSH, model, &|_| true);
+    assert_eq!(parts.len(), 1, "{parts:?}");
+    assert_eq!(parts[0].path, vec![("mod_equipment".to_owned(), SHIELD.to_owned())]);
+    let shield = &model.nodes[parts[0].root];
+    assert!(!shield.active);
+    assert_eq!(hinges.len(), 1, "the helmet's, and none on its shield");
+    let hinge = &hinges[0];
+    assert!(hinge.owner.is_empty(), "the helmet's own");
+    let on = model.nodes[parts[0].root].parent.expect("hung");
+    println!(
+        "hinge {} (rest {:?}), the shield on {}; off {:?} on {:?}; forward {:?}; backward {:?}",
+        model.nodes[hinge.node].name, model.nodes[hinge.node].rotation, model.nodes[on].name, hinge.off, hinge.on, hinge.forward.keys, hinge.backward.keys
+    );
+    assert!(hinge.forward.keys.len() >= 2 && hinge.backward.keys.len() >= 2);
+
+    // The Ops-Core FAST's visor carries its own hinge (its bundle's
+    // `HelmetDress`), the helmet none: it is read on the visor's model,
+    // below where the visor hangs.
+    const FAST: &str = "5a154d5cfcdbcb001a3b00da";
+    const VISOR: &str = "5a16b672fcdbcb001912fa83";
+    let key = db.items[FAST].prefab_key().expect("its prefab").to_owned();
+    let Worn::Rigid(model) = load(&mut assets, &key, Under::default()).expect("the FAST") else { panic!("a helmet is a model") };
+    let (model, parts, hinges) = head_model(&mut assets, &db, FAST, model, &|part| part == VISOR);
+    let visor = parts.iter().find(|part| part.path.last().is_some_and(|(_, of)| of == VISOR)).expect("the visor hung");
+    assert_eq!(hinges.len(), 1, "{hinges:?}");
+    assert_eq!(hinges[0].owner, visor.path, "the visor's own");
+    let mut at = Some(hinges[0].node);
+    while at.is_some_and(|node| node != visor.root) {
+        at = model.nodes[at.unwrap()].parent;
+    }
+    assert_eq!(at, Some(visor.root), "the hinge is in the visor's model");
+    println!("the FAST's visor: its hinge {} on {:?}", model.nodes[hinges[0].node].name, visor.path);
+}
+
+/// The wish list's menu and icons (`InteractionButtonsContainer.
+/// SubMenuTemplate`, `StaticIcons.WishlistSprites`, `WishlistSpritesOutline`):
+/// the item's menu's menu of lines found with its three templates, and the
+/// five groups' icons twice over, the outlined ones others.
+#[test]
+fn the_wish_list_s_menu_and_icons_are_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let sub = trp_data::screen::context_submenu(&install).expect("the menu of lines");
+    for template in ["Button Template", "Wishlist Template", "Dispose Template"] {
+        assert!(sub.find(&format!("InteractionButtonsContainer/{template}")).is_some(), "{template}");
+    }
+    let [plain, outlined] = trp_data::screen::wishlist_icons(&install).expect("the icons");
+    println!("plain {plain:?}\noutlined {outlined:?}");
+    assert_eq!((plain.len(), outlined.len()), (5, 5));
+    assert!(plain.iter().zip(&outlined).all(|((a, at), (b, bt))| a == b && at != bt));
+}
+
+/// A spent case's figures (`ShellExtractionData`, `shellport`,
+/// `AmmoPoolObject._caliber`): the AKM throws its cases by its shot
+/// settings from a shell port of its own; its 5.45 BP round is of the
+/// 5.56 mm class.
+#[test]
+fn a_weapon_s_case_throw_and_a_round_s_calibre_are_read() {
+    let Some((mut assets, akm)) = akm() else { return };
+    let extraction = akm.extraction.expect("the AKM's shell extraction");
+    let port = akm.shell_port.expect("the AKM's shell port");
+    println!("extraction {extraction:?}, shell port {} at {:?}", akm.hierarchy.nodes[port].name, akm.hierarchy.nodes[port].translation);
+    assert!(extraction.force.iter().any(|range| range[0] != 0.0 || range[1] != 0.0));
+    let files = assets.load("assets/content/items/ammo/patrons/patron_545x39_bp.bundle").expect("the round");
+    assert_eq!(trp_data::weapon::round_caliber(&assets, &files), Some(2));
+}
+
+/// The eyes' burn's figures and pictures (`Cam2`'s `EyeBurn`): three spots
+/// and a trail, 0.2 to 1.1 in size, 100 s at most.
+#[test]
+fn the_eyes_burn_is_read() {
+    let Ok(install) = Install::locate() else { return };
+    let burn = trp_data::eye_burn::read(&install).expect("the eyes' burn");
+    println!(
+        "spots {:?}, trail {:?}, scale {:?}, {} s, a trail spot each {} of the turn shifted {}, at most {}; trail curve {:?}; scale curve {:?}",
+        burn.spots.iter().map(|t| (t.width, t.height, t.format)).collect::<Vec<_>>(),
+        burn.trail.iter().map(|t| (t.width, t.height, t.format)).collect::<Vec<_>>(),
+        burn.scale,
+        burn.max_time,
+        burn.trail_every,
+        burn.trail_shift,
+        burn.max_trail,
+        burn.trail_curve.keys.iter().map(|k| (k.time, k.value)).collect::<Vec<_>>(),
+        burn.scale_curve.keys.iter().map(|k| (k.time, k.value)).collect::<Vec<_>>()
+    );
+    assert_eq!((burn.spots.len(), burn.trail.len()), (3, 1));
+    assert_eq!(burn.scale, [0.2, 1.1]);
+    assert_eq!(burn.max_time, 100.0);
+}
+
+/// Health's screen effects' figures and near death's picture are read from
+/// the camera and its effects prefab.
+#[test]
+fn the_camera_effects_are_read() {
+    let Ok(install) = Install::locate() else { return };
+    let read = trp_data::camera_effects::read(&install).expect("the camera's effects");
+    let h = &read.health;
+    let keys = |c: &trp_data::curve::Curve| c.keys.iter().map(|k| (k.time, k.value, k.in_slope, k.out_slope)).collect::<Vec<_>>();
+    println!(
+        "hit: {} s over {:?}, squares {:?}, {} passes; radial {} at {:?}; vignette at {:?}, sharpness {}, darkness {}, flicker {:?}; near death {} ({}x{} {:?})",
+        h.hit_time,
+        keys(&h.hit_curve),
+        h.hit_squares,
+        h.hit_passes,
+        h.radial_most,
+        h.radial_center,
+        h.vignette_center,
+        h.vignette_sharpness,
+        h.vignette_darkness,
+        keys(&h.flicker),
+        h.near_death_most,
+        read.near_death.width,
+        read.near_death.height,
+        read.near_death.format
+    );
+    assert_eq!((h.hit_time, h.hit_squares, h.hit_passes), (0.65, [1024, 512], 3));
+    // The sharpening and its desaturation, as the recorded camera has them
+    // (`courses6\0-medical`'s first frame: 0.6, 0.406, on; no offset; the
+    // ring from 0.325 to 1, its falloff 0.425).
+    let level = trp_data::tod::TimeOfDayLevel::customs(&install).expect("Customs");
+    let file = level.file_of(level.settings.camera).expect("the camera's file");
+    let s = &trp_data::camera_effects::SharpenData::of_camera(&install, &file, level.settings.camera.1).expect("the level camera's sharpening");
+    println!("sharpen {} clamp {} desaturate {}; ramp {}x{} {:?}; offset {:?}; radius {:?} falloff {}", s.strength, s.clamp, s.desaturate, s.ramp.width, s.ramp.height, s.ramp.format, s.ramp_offset, s.min_max_radius, s.radius_falloff);
+    assert_eq!((s.clamp, s.desaturate), (0.406, true));
+    assert_eq!((s.ramp_offset, s.min_max_radius, s.radius_falloff), ([0.0; 3], [0.325, 1.0], 0.425));
+    assert_eq!((h.radial_most, h.vignette_darkness, h.near_death_most), (0.035, 74.9, 1.0));
+    assert_eq!((read.near_death.width, read.near_death.height), (1920, 1080));
+    // Near death's picture decoded: its middle and its corner.
+    let level = trp_data::unity::texture::mips(&read.near_death).expect("its level")[0];
+    let pixels = trp_data::unity::texture::decode_rgba(&read.near_death, level).expect("decoded");
+    let at = |x: usize, y: usize| &pixels[(y * 1920 + x) * 4..][..4];
+    println!(
+        "near death: middle {:?}, a corner {:?}, the left edge's middle {:?}, the first rows' middle {:?}, the last rows' {:?}, sRGB {}",
+        at(960, 540),
+        at(0, 0),
+        at(0, 540),
+        at(960, 100),
+        at(960, 980),
+        read.near_death.srgb
+    );
+    assert_eq!(read.eye_burn.spots.len(), 3);
+    let b = &read.blood;
+    println!("blood: {b:?}; the drop {} ({}x{} format {} sRGB {})", read.blood_drop.name, read.blood_drop.width, read.blood_drop.height, read.blood_drop.format, read.blood_drop.srgb);
+    assert_eq!((b.refraction, b.downsampling, b.max_time, b.initial_drops, b.dimension), (0.046, 3, 8.0, 4, 11));
+    assert_eq!(b.levels[0], [48.0 / 255.0, 48.0 / 255.0, 48.0 / 255.0, 1.0]);
+    let level = trp_data::unity::texture::mips(&read.blood_drop).expect("its level")[0];
+    let pixels = trp_data::unity::texture::decode_rgba(&read.blood_drop, level).expect("decoded");
+    let mut stats = [(255u8, 0u8, 0u64); 4];
+    for px in pixels.chunks_exact(4) {
+        for c in 0..4 {
+            stats[c] = (stats[c].0.min(px[c]), stats[c].1.max(px[c]), stats[c].2 + px[c] as u64);
+        }
+    }
+    let n = (pixels.len() / 4) as u64;
+    println!("the drop's channels (least, most, mean): {:?}; its middle {:?}", stats.map(|(a, b, s)| (a, b, s / n)), &pixels[(128 * 256 + 128) * 4..][..4]);
+    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("the hard settings");
+    println!("bleeding centres {:?}", hard.vec3s("BleedingCenters").expect("the bleeding centres"));
+}
+
+/// A contusion's ringing (`Sounds.TinnitusSound`) is read whole.
+#[test]
+fn the_tinnitus_sound_is_read() {
+    let Ok(install) = Install::locate() else { return };
+    let clip = trp_data::sound::tinnitus_sound(&install).expect("the tinnitus");
+    println!("{}: {} channels at {} Hz, {:.2} s", clip.name, clip.channels, clip.frequency, clip.samples.len() as f32 / clip.channels as f32 / clip.frequency as f32);
+    assert!(clip.samples.len() > clip.frequency as usize / 2);
+}
+
+/// Every grenade's blast's sound (`ExplosionEffectType`'s effect's bank):
+/// the F-1's `Grenade_new` has one, with clips.
+#[test]
+fn the_grenades_blasts_sounds_are_read() {
+    let Ok(install) = Install::locate() else { return };
+    let db = trp_data::Database::load(&install).expect("database");
+    let mut names: Vec<String> = db.items.values().filter_map(|item| item.props.get("ExplosionEffectType")?.as_str().map(str::to_owned)).filter(|name| !name.is_empty()).collect();
+    names.sort();
+    names.dedup();
+    let sounds = trp_data::sound::effect_sounds(&install, &names, false).expect("the effects' sounds");
+    for (name, at) in &sounds.effects {
+        match at.map(|at| &sounds.banks[at]) {
+            Some(bank) => println!(
+                "{name}: {} volume {} -{} pitch {} ±{} rolloff {} source {} physical {} limited {} blend {:?} clips {:?}",
+                bank.name,
+                bank.base_volume,
+                bank.delta_volume,
+                bank.base_pitch,
+                bank.delta_pitch,
+                bank.rolloff,
+                bank.source_type,
+                bank.physical,
+                bank.limited,
+                bank.blend,
+                bank.lists.iter().map(|list| list.iter().map(|&clip| sounds.clips[clip].0.as_str()).collect::<Vec<_>>()).collect::<Vec<_>>()
+            ),
+            None => println!("{name}: no sound"),
+        }
+    }
+    let f1 = sounds.bank("Grenade_new").expect("the F-1's blast's bank");
+    assert!(f1.lists.iter().any(|list| !list.is_empty()));
+}
+
+/// The spent cases' sounds: a bank for every calibre's class and surface,
+/// each with clips.
+#[test]
+fn the_spent_cases_sounds_are_read() {
+    let Ok(install) = Install::locate() else { return };
+    let sounds = trp_data::sound::shell_sounds(&install, false).expect("the spent cases' sounds");
+    for (c, caliber) in trp_data::sound::SHELL_CALIBERS.iter().enumerate() {
+        for (s, surface) in trp_data::sound::SHELL_SURFACES.iter().enumerate() {
+            let bank = &sounds.banks[sounds.bank(c as u8, s).unwrap_or_else(|| panic!("no bank for {caliber} on {surface}"))];
+            println!(
+                "{caliber} {surface}: {} volume {} -{} pitch {} ±{} rolloff {} source {} blend {:?} clips {:?}",
+                bank.name,
+                bank.base_volume,
+                bank.delta_volume,
+                bank.base_pitch,
+                bank.delta_pitch,
+                bank.rolloff,
+                bank.source_type,
+                bank.blend,
+                bank.lists.iter().map(Vec::len).collect::<Vec<_>>()
+            );
+            assert!(bank.lists.iter().any(|list| !list.is_empty()));
+        }
+    }
+}
+
+/// The ballistic presets (`ColliderPresets`) are read, each by its
+/// material's number, and the terrain's give what Customs' ground was
+/// recorded with (`courses3`, `2-surfaces`: soil, asphalt, gravel and tall
+/// grass, which the terrain takes from the presets).
+#[test]
+fn the_ballistic_presets_are_read() {
+    let Ok(install) = Install::locate() else { return };
+    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("the hard settings");
+    let presets = hard.ballistic_presets().expect("the presets");
+    for (at, p) in presets.iter().enumerate() {
+        println!("{at:2} {:16} material {:2} {:?} by scale {} ({} keys)", p.name, p.material, p.figures, p.depend_on_scale, p.scale_curve.keys.len());
+    }
+    let recorded: [(i32, [f32; 6]); 4] = [
+        (22, [100.0, 0.0, 0.125, 0.06, 0.14, 0.013]),
+        (1, [100.0, 0.0, 0.32, 0.17, 0.18, 0.038]),
+        (15, [69.0, 0.35, 0.31, 0.1, 0.11, 0.027]),
+        (13, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    ];
+    for (material, figures) in recorded {
+        let preset = &presets[material as usize];
+        assert_eq!(preset.material, material, "{}", preset.name);
+        for k in 0..6 {
+            assert!((preset.figures[k] - figures[k]).abs() < 1e-4, "{}: {:?}", preset.name, preset.figures);
+        }
+    }
+    println!("decal shift {}", hard.float("DECAL_SHIFT").expect("the decal shift"));
+}
+
+/// The impacts' entries by material and what each plays (ballistics spec,
+/// "What a hit shows and sounds"), the bullets' decals, and the effects'
+/// sounds for them with the ricochet's.
+#[test]
+fn the_impacts_are_read() {
+    let Ok(install) = Install::locate() else { return };
+    let mut assets = trp_data::unity::Assets::new(install.clone()).expect("the assets");
+    let entries = trp_data::particles::material_entries(&mut assets).expect("the entries");
+    for e in &entries {
+        let read = trp_data::particles::effect_entry(&mut assets, &e.name).expect("the entry");
+        let systems: Vec<String> = read
+            .emitters
+            .iter()
+            .map(|em| match &em.kind {
+                trp_data::particles::EmitterKind::System(a) => format!("{} ({}, way {}, {}+{}, within {:?} m)", a.data.name, a.data.renderer.material.shader, em.way, em.min_count, em.count_range, em.distance),
+                trp_data::particles::EmitterKind::Sparks(_) => format!("sparks (way {}, {}+{}, within {:?} m)", em.way, em.min_count, em.count_range, em.distance),
+            })
+            .collect();
+        println!("{} {:?}: deferred {}, old {}, light {:?}, shift {}\n  {}", e.name, e.materials, e.deferred_decal, e.old_decal, read.light, read.particles_shift, systems.join("\n  "));
+    }
+    // Rubber, generic soft, fabric, cardboard and snow are the first's.
+    assert_eq!(entries[0].materials, vec![30, 9, 6, 3, 38]);
+    assert!(entries.iter().any(|e| e.name == "Concrete" && e.materials == vec![1, 5, 21] && e.deferred_decal));
+    let decals = trp_data::particles::deferred_bullet_decals(&mut assets).expect("the decals");
+    for (materials, d) in decals.by_material.iter().map(|(m, d)| (m.clone(), d)).chain([(Vec::new(), &decals.generic)]) {
+        println!("decal {materials:?}: {} {}x{} by {}, {}x{} tiles, sizes {:?}, turned {}, colour {:?}, specular {:?}, normals {}, {} m deep, at most {}", d.picture.name, d.picture.width, d.picture.height, d.shader, d.columns, d.rows, d.sizes, d.randomize_rotation, d.color, d.specular_color, d.normal_power, d.projector_height, d.max_decals);
+    }
+    assert_eq!(decals.by_material.len(), 6);
+    let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+    let sounds = trp_data::sound::effect_sounds(&install, &names, false).expect("the sounds");
+    for (name, at) in &sounds.effects {
+        if let Some(b) = at.map(|at| &sounds.banks[at]) {
+            println!("sound {name}: {} rolloff {} physical {} limited {} clip length {} source {}", b.name, b.rolloff, b.physical, b.limited, b.clip_length, b.source_type);
+        }
+    }
+    let ricochet = sounds.additional.first().copied().flatten().map(|at| &sounds.banks[at]).expect("the ricochet's bank");
+    println!("ricochet: {} rolloff {} clip length {} source {}", ricochet.name, ricochet.rolloff, ricochet.clip_length, ricochet.source_type);
+}
+
+/// The impacts' systems drawn by shaders not yet ported, as read: render
+/// mode, mesh, the material's figures (for the ports).
+#[test]
+fn the_impacts_unported_systems() {
+    let Ok(install) = Install::locate() else { return };
+    let mut assets = trp_data::unity::Assets::new(install.clone()).expect("the assets");
+    for name in ["Concrete", "Wood", "Plastic", "Glass", "Soil"] {
+        let read = trp_data::particles::effect_entry(&mut assets, name).expect("the entry");
+        for em in &read.emitters {
+            let trp_data::particles::EmitterKind::System(a) = &em.kind else { continue };
+            let r = &a.data.renderer;
+            let m = &r.material;
+            if !matches!(m.shader.as_str(), "Standard" | "Legacy Shaders/Transparent/Diffuse" | "EFT/BumpedGlass") {
+                continue;
+            }
+            println!(
+                "{name}: {} by {} (mode {}, normals {}, mesh {:?}, queue {}), keywords {:?}\n  floats {:?}\n  colors {:?}\n  textures {:?}\n  unbuilt {:?}",
+                a.data.name,
+                m.shader,
+                r.render_mode,
+                r.normal_direction,
+                r.mesh.as_ref().map(|mesh| (mesh.name.clone(), mesh.positions.len())),
+                m.render_queue,
+                m.keywords,
+                m.floats,
+                m.colors,
+                m.textures.iter().map(|(n, t)| (n.clone(), t.name.clone(), t.width, t.height, t.faces, t.format, t.mip_count, t.data.len())).collect::<Vec<_>>(),
+                a.data.unbuilt
+            );
+        }
+    }
+}
+
+/// The velocity-over-lifetime modules of the impacts' systems, raw.
+#[test]
+fn the_impacts_velocity_modules() {
+    let Ok(install) = Install::locate() else { return };
+    let mut assets = trp_data::unity::Assets::new(install.clone()).expect("the assets");
+    let entries = trp_data::particles::material_entries(&mut assets).expect("the entries");
+    for e in &entries {
+        let read = trp_data::particles::effect_entry(&mut assets, &e.name).expect("the entry");
+        for em in &read.emitters {
+            let trp_data::particles::EmitterKind::System(a) = &em.kind else { continue };
+            if !a.data.unbuilt.iter().any(|m| m == "VelocityModule") {
+                continue;
+            }
+            let raw = assets.read(a.system).expect("the system");
+            let m = raw.get("VelocityModule").expect("the module");
+            println!("{} / {}: world {:?}", e.name, a.data.name, m.get("inWorldSpace"));
+            for field in ["x", "y", "z", "orbitalX", "orbitalY", "orbitalZ", "orbitalOffsetX", "orbitalOffsetY", "orbitalOffsetZ", "radial", "speedModifier"] {
+                if let Some(v) = m.get(field) {
+                    println!("  {field}: {:?}", trp_data::particles::MinMaxCurve::read(v).ok());
+                }
+            }
+        }
+    }
+}
+
+/// The inspect window's rows (inspect-window spec, "A row"): its three
+/// templates, by its script's pointers, and the attributes' icons.
+#[test]
+fn the_inspect_window_s_rows_and_icons_are_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let window = trp_data::screen::info_window(&install).expect("the window");
+    let rows = trp_data::screen::info_rows(&install, &window).expect("its rows");
+    for (panel, parts) in [(&rows.bar, ["Icon", "Name", "Value", "bars/Full"]), (&rows.compact, ["Icon", "Name", "Value", "Icon"]), (&rows.dropdown, ["Icon", "Name", "Hover", "Hover/Arrow"])] {
+        for part in parts {
+            assert!(panel.find(part).is_some(), "{part}");
+        }
+    }
+    let icons = trp_data::screen::attribute_icons(&install).expect("the icons");
+    for id in ["Ergonomics", "CenterOfImpact", "RecoilUp", "Velocity", "ArmorClass", "ArmorPoints", "MaxAmmoDamage", "AmmoPenetrationPower"] {
+        assert!(icons.iter().any(|(key, _)| key == id), "{id}");
+    }
+    // Its parts' panel's slot, from another file, 64 square with its name,
+    // its picture and its filters' row; how far it stretches; the slots'
+    // pictures by their names.
+    let slot = rows.mod_slot.as_ref().expect("the parts' slot");
+    for part in ["CanvasGroup/Background Image", "CanvasGroup/Text", "CanvasGroup/filters", "CanvasGroup/Full Border", "CanvasGroup/Empty Border"] {
+        assert!(slot.find(part).is_some(), "{part}");
+    }
+    let limit = trp_data::screen::stretch_limit(&window).expect("its stretch limit");
+    println!("the window stretches to {limit:?}; its slot is in {}", slot.file);
+    assert!(limit[0] >= 670.0 && limit[1] >= 500.0, "{limit:?}");
+    // The armour classes' marks a text names (`<sprite name="armor_classes_N">`),
+    // each the engine's sprite its glyph points to: class 1 the first glyph's
+    // (`armor_classes_0`), class 5 the third's.
+    let classes = trp_data::screen::tmp_sprite_names(&install, "Sprite Assets/armor_classes").expect("the classes' marks");
+    let of = |name: &str| classes.iter().find(|(own, _)| own == name).map(|(_, (_, id))| *id);
+    assert_eq!(classes.len(), 6, "{classes:?}");
+    assert!(of("armor_classes_1").is_some() && of("armor_classes_5").is_some() && of("armor_classes_1") != of("armor_classes_5"), "{classes:?}");
+    let sprites = trp_data::screen::resource_sprites(&install, "Slots/").expect("the slots' pictures");
+    for name in ["mod_magazine", "mod_muzzle", "mod_stock", "patron_in_weapon", "armor_plate"] {
+        assert!(sprites.iter().any(|(path, _)| path == name), "{name} among {} pictures", sprites.len());
+    }
+}
+
+/// The rows' colours and pictures from their scripts.
+#[test]
+fn the_inspect_window_s_rows_colours_are_read() {
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let window = trp_data::screen::info_window(&install).expect("the window");
+    let rows = trp_data::screen::info_rows(&install, &window).expect("its rows");
+    let bar = trp_data::screen::row_look(&rows.bar, "CharacteristicPanel").expect("the bar's look");
+    let figures = bar.bar.expect("a bar's own");
+    assert!((figures.sub[0] - 0.758).abs() < 0.01 && (figures.add[2] - 0.622).abs() < 0.01, "{figures:?}");
+    assert!(figures.add_sprite.is_some() && figures.sub_sprite.is_some());
+    let compact = trp_data::screen::row_look(&rows.compact, "CompactCharacteristicPanel").expect("the compact row's look");
+    assert!(compact.bar.is_none() && (compact.decreasing[0] - 0.769).abs() < 0.01, "{compact:?}");
+}
+
+/// The face shield's mask (`VisorEffect` on `Cam2`, and the camera's
+/// `HysteresisFilter`): the figures as read by hand in session 126
+/// (`local\visor_shader_s126.md`), the three kinds' masks, and the four
+/// pictures read.
+#[test]
+fn the_face_shield_s_mask_is_read() {
+    use trp_data::visor::MaskKind;
+    let Ok(install) = Install::locate() else {
+        eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+        return;
+    };
+    let visor = trp_data::visor::read(&install).expect("the visor's mask");
+    assert!((visor.scratches_intensity - 0.45).abs() < 1e-6 && (visor.min_light - 0.6).abs() < 1e-6 && !visor.affected_by_light);
+    assert_eq!((visor.downsample, visor.blur_iterations), (1, 2));
+    assert!((visor.blur_size - 1.5).abs() < 1e-6 && (visor.distort_intensity - 0.0075).abs() < 1e-6);
+    assert_eq!(visor.edge_fade.keys.len(), 4);
+    assert_eq!((visor.dx.keys.len(), visor.dy.keys.len(), visor.walk_rotation.keys.len()), (9, 9, 6));
+    let kinds: Vec<(MaskKind, bool)> = visor.masks.iter().map(|(kind, picture)| (*kind, picture.is_some())).collect();
+    assert_eq!(kinds, [(MaskKind::Wide, true), (MaskKind::Narrow, true), (MaskKind::None, false)]);
+    assert!(visor.mask_of(MaskKind::None).is_none(), "no frame without a mask");
+    assert_eq!((visor.mask.width, visor.mask.height), (512, 256));
+    assert_eq!((visor.scratches.width, visor.scratches.height), (2048, 1024));
+    // The camera's filter: down over 0.2 s after 0.6 s, the forward
+    // curve's last key at 0.8017 s.
+    let last = visor.forward.keys.last().expect("its keys").time;
+    assert!((last - 0.80171776).abs() < 1e-5, "{last}");
+    assert!(visor.forward.evaluate(0.5) == 0.0 && (visor.forward.evaluate(0.70171777) - 0.5).abs() < 0.01);
+    println!("the visor: edge fade {:?}; forward {:?}; backward {:?}", visor.edge_fade.keys, visor.forward.keys, visor.backward.keys);
 }

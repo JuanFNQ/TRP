@@ -10,9 +10,9 @@
 //! beside four recorded deaths). The weapon in hand is let go a moment
 //! later, a body of its own on the corpse's sling (`Player.DropItemDead`,
 //! `CorpseRagdoll.AttachWeapon`). The view rides the chest, where the
-//! camera's place hangs (`Cam`, under the spine). The picture fades and
-//! the eyes close (the camera's `DeathFade`), and then the death screen
-//! (`health_view`). `Enter` there begins the run again where it began, in
+//! camera's place hangs (`Cam`, under the spine). The picture fades (the
+//! camera's `DeathFade`) as the raid's end blacks it out over a second,
+//! and then the death screen (`health_view`). `Enter` there begins the run again where it began, in
 //! place: what the run started with is put back (`StartOfRun`).
 //!
 //! The engine works in the game's axes (z ahead): what goes in is turned
@@ -47,22 +47,31 @@ const EYES_DELAY: f32 = 1.8;
 const EYES_TIME: f32 = 0.25;
 const FADE_SHARE: f32 = 1.0 / 1.5;
 const EYES_SHARE: f32 = 0.5;
-/// The death screen comes when the eyes are shut (the app's).
-pub const SCREEN_AT: f32 = EYES_DELAY + EYES_TIME;
+/// The raid's end (`BaseLocalGame.InitiateGameStopping`, `Stop`; health
+/// spec, "How soon the raid ends"): a black image over everything, its
+/// opacity raised by each frame's length from the frame of the death
+/// (`PreloaderUI.StartBlackScreenShow(1, 1, …)`, `Co_ShowBlackImage`), whole
+/// after a second, until it is 0.05 past whole; then the raid is let go.
+/// Recorded: `courses2`'s deaths end 1.04 s after the death.
+const BLACK_STEP: f32 = 1.0;
+const BLACK_DONE: f32 = 1.05;
+/// The death screen (the app's, which the game has not) comes when the
+/// game's black is done and its raid would end.
+pub const SCREEN_AT: f32 = BLACK_DONE / BLACK_STEP;
 /// The weapon let go (`CorpseRagdoll.AttachWeapon`, health spec, "Death"):
 /// a body of 1 kg, or 2 kg for a pistol, which is held fast to the right
 /// forearm; anything else hangs from the pelvis on a spring (33, damped by
 /// 3, its tolerance Unity's 0.025) between a point by the right palm in the
 /// weapon's axes and a point of the pelvis, in the game's axes. Each joint
 /// with its mass scale, the connected body's mass over the weapon's.
-const WEAPON_MASS: f32 = 1.0;
+pub(crate) const WEAPON_MASS: f32 = 1.0;
 const PISTOL_MASS: f32 = 2.0;
-const STRAP_SPRING: f32 = 33.0;
-const STRAP_DAMPER: f32 = 3.0;
-const STRAP_BY_PALM: [f32; 3] = [0.0, 0.1, -0.1];
-const STRAP_ON_PELVIS: [f32; 3] = [-0.215, 0.164, -0.159];
+pub(crate) const STRAP_SPRING: f32 = 33.0;
+pub(crate) const STRAP_DAMPER: f32 = 3.0;
+pub(crate) const STRAP_BY_PALM: [f32; 3] = [0.0, 0.1, -0.1];
+pub(crate) const STRAP_ON_PELVIS: [f32; 3] = [-0.215, 0.164, -0.159];
 /// A new Rigidbody's angular drag, Unity's default (the weapon's).
-const UNITY_ANGULAR_DRAG: f32 = 0.05;
+pub(crate) const UNITY_ANGULAR_DRAG: f32 = 0.05;
 
 pub struct DeathPlugin;
 
@@ -176,6 +185,10 @@ pub struct Death {
     weapon_rest: Option<(Entity, Transform)>,
     /// The game's engine with the corpse in it.
     engine: World,
+    /// The weapon heard as it lands (`landing_sound`), and each body's
+    /// surface (its bone's hit collider's `SurfaceSound`).
+    landing: trp_sim::landing::Landing,
+    surfaces: std::collections::HashMap<Body, u8>,
 }
 
 
@@ -227,10 +240,11 @@ pub fn die(
     (ragdoll, outfit_on, range): (Res<Ragdoll>, Res<OutfitOn>, Res<Range>),
     helper: TransformHelper,
     (parents, children, meshes, eye, locals_of): (Query<&ChildOf>, Query<&Children>, Query<&Aabb, (With<Mesh3d>, Without<SkinnedMesh>)>, Query<Entity, With<Eye>>, Query<&Transform>),
-    originals: Query<&Visibility, Without<CorpseTwin>>,
-    mut twins: Query<(&CorpseTwin, &mut Visibility)>,
+    originals: Query<&Visibility, (Without<CorpseTwin>, crate::park::EvenParked)>,
+    mut twins: Query<(&CorpseTwin, &mut Visibility), crate::park::EvenParked>,
     (mut clock, time): (ResMut<PhysicsClock>, Res<Time>),
     (node_colliders, seen): (Query<&crate::weapon::NodeColliders>, Query<&InheritedVisibility>),
+    (hands_held, carried, game): (Res<crate::inventory_view::HandsHeld>, Res<crate::inventory_view::Carried>, Res<crate::GameData>),
 ) {
     // Every frame counts towards the step, as the game's average does.
     let clock = &mut *clock;
@@ -391,6 +405,7 @@ pub fn die(
                     _ => {}
                 }
                 info!("the weapon let go on {count} colliders");
+                engine.report_touches(body);
                 held = Some((body, weapon_root));
                 weapon_rest = locals_of.get(weapon_root).ok().map(|local| (weapon_root, *local));
             }
@@ -413,7 +428,18 @@ pub fn die(
     commands.entity(body.root()).insert(Visibility::Hidden);
     let outfit = outfit_on.item.as_ref().filter(|_| outfit_on.body).and_then(|item| corpse.outfits.iter().position(|outfit| &outfit.item == item));
     info!("dead: {} bodies and {} joints in PhysX, the weapon {}; a step of {:.4} s a frame", bodies.len(), data.joints.len(), if held.is_some() { "let go" } else { "none" }, clock.now);
-    dying.0 = Some(Death { since: 0.0, locals, moved, outfit, eyes, weapon: held, weapon_rest, engine });
+    // Its landing: the weapon in hand's sound, a body of the weapon's mass,
+    // counted from the world's nought (`DropItemDead` keeps no place).
+    let kind = hands_held
+        .item
+        .and_then(|id| carried.find(id))
+        .and_then(|item| game.db.items.get(&item.kind.template))
+        .and_then(|t| t.props.get("DropSoundType")?.as_str().map(trp_data::sound::drop_kind))
+        .unwrap_or(0);
+    let mass = if weapon.kind == trp_sim::body::hands_kind::PISTOL { PISTOL_MASS } else { WEAPON_MASS };
+    let landing = trp_sim::landing::Landing::new(kind, mass, 0.0);
+    let surfaces = bodies.iter().filter_map(|(bone, body)| Some((*body, data.bodies.iter().find(|b| &b.bone == bone)?.colliders.first()?.surface))).collect();
+    dying.0 = Some(Death { since: 0.0, locals, moved, outfit, eyes, weapon: held, weapon_rest, engine, landing, surfaces });
 }
 
 /// While dying: the engine stepped as the game steps it, each moved bone of
@@ -430,11 +456,17 @@ pub fn follow(
     mut transforms: ParamSet<(TransformHelper, Query<&mut Transform>)>,
     camera: Query<Entity, With<MainCamera>>,
     mut hands: Query<&mut Visibility, Or<(With<FirstPersonHands>, With<OutfitArms>)>>,
-    mut head: Query<&mut crate::shadow_only::ShadowOnly, With<CorpseHead>>,
+    mut head: Query<&mut crate::shadow_only::ShadowOnly, (With<CorpseHead>, crate::park::EvenParked)>,
+    (range, mut landed): (Res<Range>, MessageWriter<crate::landing_sound::Landed>),
 ) {
     let (Some(death), Some(corpse)) = (dying.0.as_mut(), corpse) else { return };
     death.since += time.delta_secs();
     death.engine.step(clock.now);
+    // The weapon's touches heard (a body of the corpse by its surface).
+    if let Some((body, _)) = death.weapon {
+        let surfaces = &death.surfaces;
+        landed.write_batch(crate::landing_sound::hear(&mut death.engine, body, &mut death.landing, death.since, &range, |met| surfaces.get(&met).copied()));
+    }
     let wish = crate::shadow_only::ShadowOnly(*view == View::FirstPerson);
     for mut shadow_only in &mut head {
         if *shadow_only != wish {
@@ -530,8 +562,17 @@ pub fn follow(
 /// its look `PROVISIONAL` (the game's shader is not read: here the colour
 /// drained by its strength), and the eyes as two lids of the shader's
 /// colour, black, meeting in the middle at full strength (`PROVISIONAL`
-/// likewise).
-pub fn fade(mut commands: Commands, dying: Res<Dying>, mut grading: Query<(Entity, Option<&mut bevy::render::view::ColorGrading>), With<MainCamera>>, mut lids: Query<(&Lid, &mut Node, &mut Visibility)>, mut made: Local<bool>) {
+/// likewise). Over all of it the raid's end blacks the screen out (`Black`),
+/// whole after a second: the eyes' closing, from 1.8 s, is under it.
+#[allow(clippy::type_complexity)]
+pub fn fade(
+    mut commands: Commands,
+    dying: Res<Dying>,
+    mut grading: Query<(Entity, Option<&mut bevy::render::view::ColorGrading>), With<MainCamera>>,
+    mut lids: Query<(&Lid, &mut Node, &mut Visibility), Without<Black>>,
+    mut black: Query<(&mut BackgroundColor, &mut Visibility), (With<Black>, Without<Lid>)>,
+    mut made: Local<bool>,
+) {
     if !*made {
         *made = true;
         for top in [true, false] {
@@ -541,7 +582,20 @@ pub fn fade(mut commands: Commands, dying: Res<Dying>, mut grading: Query<(Entit
             } else {
                 node.bottom = Val::Px(0.0);
             }
-            commands.spawn((Lid, node, BackgroundColor(Color::BLACK), GlobalZIndex(39), Visibility::Hidden));
+            commands.spawn((Lid, node, BackgroundColor(Color::BLACK), GlobalZIndex(38), Visibility::Hidden));
+        }
+        let whole = Node { position_type: PositionType::Absolute, left: Val::Px(0.0), top: Val::Px(0.0), width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() };
+        commands.spawn((Black, whole, BackgroundColor(Color::NONE), GlobalZIndex(39), Visibility::Hidden));
+    }
+    let opacity = dying.since().map_or(0.0, |since| (since * BLACK_STEP).min(1.0));
+    for (mut ground, mut visibility) in &mut black {
+        let wanted = Color::srgba(0.0, 0.0, 0.0, opacity);
+        if ground.0 != wanted {
+            ground.0 = wanted;
+        }
+        let shown = if opacity > 0.0 { Visibility::Inherited } else { Visibility::Hidden };
+        if *visibility != shown {
+            *visibility = shown;
         }
     }
     let since = dying.since();
@@ -580,11 +634,19 @@ pub fn fade(mut commands: Commands, dying: Res<Dying>, mut grading: Query<(Entit
 #[derive(Component)]
 pub struct Lid;
 
+/// The black the raid's end lays over everything (`PreloaderUI`'s
+/// `_overlapBlackImage`).
+#[derive(Component)]
+pub struct Black;
+
 /// Dead, with the death screen up, `Enter` begins the run again where it
 /// began (the user, 2026-10-14, night, then 2026-10-14, late: "When dying
 /// and pressing enter, the run should reset in place"): the controller as
 /// the run made it, the inventory's things and the range as they were; the
-/// corpse, its physics and the fade gone, and the living body back.
+/// corpse, its physics and the fade gone, and the living body back. Either
+/// Enter, the main one or the keypad's, as the inventory's windows take
+/// either (the keypad's alone did nothing until 0.101.1: "I cannot respawn
+/// once dead").
 #[allow(clippy::too_many_arguments)]
 pub fn begin_again(
     mut commands: Commands,
@@ -600,7 +662,7 @@ pub fn begin_again(
     mut again: MessageWriter<BeginAgain>,
 ) {
     let ready = dying.since().is_some_and(|since| since >= SCREEN_AT);
-    if !ready || !keys.just_pressed(KeyCode::Enter) {
+    if !ready || !keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter]) {
         return;
     }
     let Some(start) = start else { return };

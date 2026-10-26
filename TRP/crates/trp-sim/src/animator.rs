@@ -473,6 +473,26 @@ struct Share {
     previous: f32,
     now: f32,
     offset: f32,
+    /// The state plays at a negative speed: its time runs on as any
+    /// state's, and its clip is taken from its end (recorded 2026-10-24,
+    /// the body's `LS_idle_aim_0 0` at speed -1: its normalized time 0.1
+    /// to 0.9 over 0.4 s as its clip's `Leftstance_curve` went 0.9 to 0.1).
+    reversed: bool,
+}
+
+impl Share {
+    /// Where in its clip, as a share of the clip's length, the share is
+    /// at a time of its state (whole cycles and all): looped or held at
+    /// the ends, and taken from the end where the state plays backwards.
+    fn clip_share(&self, looping: bool, cycles: f32) -> f32 {
+        let t = cycles + self.offset;
+        let t = if looping { t.rem_euclid(1.0) } else { t.clamp(0.0, 1.0) };
+        if self.reversed {
+            1.0 - t
+        } else {
+            t
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -509,6 +529,26 @@ pub struct Animator {
 }
 
 impl Animator {
+    /// Takes another animator's running state, its parameters, its
+    /// machines' states and times and its layers' weights, where both run
+    /// machines of the same shape (a weapon built anew with another part:
+    /// the same controller bound to another tree). The pose follows at the
+    /// next update. Whether it could.
+    pub fn take_state(&mut self, from: &Animator) -> bool {
+        let same = self.values.len() == from.values.len() && self.machines.len() == from.machines.len() && self.weights.len() == from.weights.len();
+        if !same {
+            return false;
+        }
+        self.values.clone_from(&from.values);
+        self.machines.clone_from(&from.machines);
+        self.weights.clone_from(&from.weights);
+        (self.root_delta, self.root_turn, self.step) = (from.root_delta, from.root_turn, from.step);
+        self.events.clone_from(&from.events);
+        self.passed.clone_from(&from.passed);
+        self.asked.clone_from(&from.asked);
+        true
+    }
+
     pub fn new(controller: Arc<Controller>) -> Self {
         let values = controller.parameters.iter().map(|p| p.default).collect();
         let machines = controller
@@ -961,12 +1001,15 @@ impl Animator {
     /// as it is, and a share of the state as that share of the state
     /// being left as it now plays.
     ///
-    /// PROVISIONAL, for a blend out of states held still: the share is
-    /// then of the state being *entered*, over the pace the held state was
-    /// playing at. Recorded twice (the walk entered out of a vault and out
-    /// of a sprint's vault, both held at 1.25 times the clips' pace: the
-    /// blend's weight is the walk's own progress over 0.08, for a share of
-    /// 0.1), and what the engine really goes by is not known.
+    /// For a blend out of states held still the share is of the state being
+    /// *entered*, over the pace the held state was playing at. Recorded
+    /// twice (the walk entered out of a vault and out of a sprint's vault,
+    /// both held at 1.25 times the clips' pace: the blend's weight is the
+    /// walk's own progress over 0.08, for a share of 0.1), and the engine's
+    /// own rule since 2026-10-18 (`EvaluateStateMachine`, `EvaluateState`:
+    /// the duration over the entered state's length by the held state's
+    /// speed; `findings.md`, "the engine's checks"); it stood `PROVISIONAL`
+    /// until then.
     fn blend_length(&self, machine: usize, blend: &Blend) -> f32 {
         let controller = &self.controller;
         let (def, state) = (&controller.machines[machine], &self.machines[machine]);
@@ -1204,6 +1247,7 @@ impl Animator {
             let Some(tree) = s.trees.get(layer.slot).and_then(Option::as_ref) else { continue };
             let mut leaves = Vec::new();
             self.leaves(tree, 0, 1.0, 1.0, &mut leaves);
+            let reversed = s.speed * s.speed_parameter.map_or(1.0, |p| self.values[p]) < 0.0;
             for (clip, leaf_weight, _, offset) in leaves {
                 out.push(Share {
                     clip,
@@ -1211,6 +1255,7 @@ impl Animator {
                     previous: playing.previous,
                     now: playing.time,
                     offset: offset + s.cycle_offset,
+                    reversed,
                 });
             }
         }
@@ -1275,8 +1320,7 @@ impl Animator {
             for share in &shares {
                 let def = &controller.clips[share.clip];
                 let length = def.clip.duration();
-                let t = share.now + share.offset;
-                def.clip.sample(if def.clip.looping { t.rem_euclid(1.0) * length } else { t.clamp(0.0, 1.0) * length }, &mut samples);
+                def.clip.sample(share.clip_share(def.clip.looping, share.now) * length, &mut samples);
                 let reference = &def.clip.reference_pose;
                 for (j, i) in controller.scaled.iter().enumerate() {
                     if !layer.moves[*i] {
@@ -1351,7 +1395,9 @@ impl Animator {
                 if !smooth && share.weight > 0.0 && length > 0.0 && share.now > share.previous {
                     let (from, to) = (share.previous + share.offset, share.now + share.offset);
                     for (n, event) in def.clip.events.iter().enumerate() {
-                        let at = event.time / length;
+                        // (Played backwards, an event is met where the
+                        // state's time reaches its place from the end.)
+                        let at = if share.reversed { 1.0 - event.time / length } else { event.time / length };
                         let passed = if def.clip.looping {
                             (to - at).floor() > (from - at).floor()
                         } else {
@@ -1362,19 +1408,16 @@ impl Animator {
                         }
                     }
                 }
-                let at = |cycles: f32| {
-                    let t = cycles + share.offset;
-                    if def.clip.looping { t.rem_euclid(1.0) * length } else { t.clamp(0.0, 1.0) * length }
-                };
-                if let (true, Some(path)) = (moves_root, def.root_path) {
+                let at = |cycles: f32| share.clip_share(def.clip.looping, cycles) * length;
+                // (The pose for drawing is the pose alone: its root motion is
+                // never read, and is not worked out.)
+                if let (true, false, Some(path)) = (moves_root, smooth, def.root_path) {
                     // Whole cycles count by the clip's start-to-end
                     // displacement; the rest by the path between the two times.
-                    let value = |samples: &mut Vec<f32>, time: f32| -> [f32; 3] {
-                        def.clip.sample(time, samples);
-                        path.map(|c| samples[c])
-                    };
-                    let (first, last) = (value(&mut samples, 0.0), value(&mut samples, length));
-                    let (from, to) = (value(&mut samples, at(share.previous)), value(&mut samples, at(share.now)));
+                    // (Its three curves alone are sampled.)
+                    let value = |time: f32| -> [f32; 3] { path.map(|c| def.clip.sample_curve(time, c)) };
+                    let (first, last) = (value(0.0), value(length));
+                    let (from, to) = (value(at(share.previous)), value(at(share.now)));
                     let cycles = if def.clip.looping {
                         (share.now + share.offset).floor() - (share.previous + share.offset).floor()
                     } else {
@@ -1386,12 +1429,9 @@ impl Animator {
                         }
                     }
                 }
-                if let (true, Some(curves)) = (moves_root, def.root_turn) {
+                if let (true, false, Some(curves)) = (moves_root, smooth, def.root_turn) {
                     // The root's turning about the vertical, the same way.
-                    let mut bearing = |time: f32| -> f32 {
-                        def.clip.sample(time, &mut samples);
-                        2.0 * samples[curves[1]].atan2(samples[curves[3]]).to_degrees()
-                    };
+                    let bearing = |time: f32| -> f32 { 2.0 * def.clip.sample_curve(time, curves[1]).atan2(def.clip.sample_curve(time, curves[3])).to_degrees() };
                     let whole = bearing(length) - bearing(0.0);
                     let cycles = if def.clip.looping {
                         (share.now + share.offset).floor() - (share.previous + share.offset).floor()

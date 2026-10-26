@@ -25,11 +25,17 @@ pub struct MeshData {
     pub submeshes: Vec<Vec<u32>>,
     /// Inverse bind matrices, one per bone, each as rows `e00..e33`.
     pub bind_poses: Vec<[f32; 16]>,
+    /// The vertices' colours, where the mesh has them, 0 to 1.
+    pub colors: Vec<[f32; 4]>,
+    /// Its first blend shape's full frame, each vertex's move, where it has
+    /// one (a variable scope's reticle: optics spec, "The lens").
+    pub shape: Option<Vec<[f32; 3]>>,
 }
 
 const CHANNEL_POSITION: usize = 0;
 const CHANNEL_NORMAL: usize = 1;
 const CHANNEL_TANGENT: usize = 2;
+const CHANNEL_COLOR: usize = 3;
 const CHANNEL_UV0: usize = 4;
 const CHANNEL_BLEND_WEIGHT: usize = 12;
 const CHANNEL_BLEND_INDICES: usize = 13;
@@ -122,6 +128,24 @@ impl VertexBuffer<'_> {
 
 pub fn read_mesh(assets: &Assets, obj: ObjRef) -> Result<MeshData> {
     let v = assets.read(obj)?;
+    mesh_of(&v, Some(assets))
+}
+
+/// A mesh from its object as read (by its own tree or one borrowed); its
+/// vertices streamed from a resource file where it keeps them so, which
+/// needs the assets.
+pub fn mesh_of(v: &Value, assets: Option<&Assets>) -> Result<MeshData> {
+    mesh_streamed(v, &|name: &str, path: &str, offset: usize, size: usize| match assets {
+        Some(assets) => Ok(assets.resource(path, offset, size)?.to_vec()),
+        None => bail!("mesh {name:?} streams its vertices from a resource, which needs its bundle"),
+    })
+}
+
+/// A mesh from its object as read, its vertices streamed where it keeps
+/// them so by `stream` (the mesh's name, the resource's path, the offset
+/// and the size): from a bundle's resource, or a file of the build's own
+/// beside a scene (`scene_props`).
+pub fn mesh_streamed(v: &Value, stream: &dyn Fn(&str, &str, usize, usize) -> Result<Vec<u8>>) -> Result<MeshData> {
     let name = v.req("m_Name")?.as_str().unwrap_or("").to_owned();
     if v.at("m_MeshCompression").and_then(Value::as_i64).unwrap_or(0) != 0 {
         bail!("mesh {name:?} uses packed compression, which is not supported");
@@ -153,19 +177,17 @@ pub fn read_mesh(assets: &Assets, obj: ObjRef) -> Result<MeshData> {
     }
 
     let inline = vd.req("m_DataSize")?.as_bytes().unwrap_or(&[]);
+    let streamed;
     let data: &[u8] = if !inline.is_empty() {
         inline
     } else {
-        let stream = v.req("m_StreamData")?;
-        let size = stream.req("size")?.as_usize().unwrap_or(0);
+        let streamed_data = v.req("m_StreamData")?;
+        let size = streamed_data.req("size")?.as_usize().unwrap_or(0);
         if size == 0 {
             &[]
         } else {
-            assets.resource(
-                stream.req("path")?.as_str().unwrap_or(""),
-                stream.req("offset")?.as_usize().unwrap_or(0),
-                size,
-            )?
+            streamed = stream(&name, streamed_data.req("path")?.as_str().unwrap_or(""), streamed_data.req("offset")?.as_usize().unwrap_or(0), size)?;
+            &streamed
         }
     };
     let vb = VertexBuffer { data, count, channels, streams };
@@ -178,20 +200,26 @@ pub fn read_mesh(assets: &Assets, obj: ObjRef) -> Result<MeshData> {
         let first = sm.req("firstByte")?.as_usize().unwrap_or(0);
         let index_count = sm.req("indexCount")?.as_usize().unwrap_or(0);
         let base_vertex = sm.req("baseVertex")?.as_i64().unwrap_or(0) as u32;
-        let is_triangles = sm.req("topology")?.as_i64().unwrap_or(0) == 0;
+        // Triangles (0), or quads (2: `MeshTopology.Quads`, each drawn as
+        // two triangles on its first corner, the RGO's parts); lines and
+        // points are not drawn.
+        let topology = sm.req("topology")?.as_i64().unwrap_or(0);
         let mut indices = Vec::new();
-        if is_triangles {
+        if topology == 0 || topology == 2 {
             let Some(bytes) = index_bytes.get(first..first + index_count * index_size) else {
                 bail!("submesh of {name:?} runs past the index buffer");
             };
-            indices.reserve(index_count);
-            for chunk in bytes.chunks_exact(index_size) {
-                let i = if wide {
-                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                } else {
-                    u16::from_le_bytes([chunk[0], chunk[1]]) as u32
-                };
-                indices.push(i + base_vertex);
+            let read: Vec<u32> = bytes
+                .chunks_exact(index_size)
+                .map(|chunk| if wide { u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) } else { u16::from_le_bytes([chunk[0], chunk[1]]) as u32 } + base_vertex)
+                .collect();
+            if topology == 0 {
+                indices = read;
+            } else {
+                indices.reserve(read.len() / 4 * 6);
+                for [a, b, c, d] in read.chunks_exact(4).map(|quad| [quad[0], quad[1], quad[2], quad[3]]) {
+                    indices.extend([a, b, c, a, c, d]);
+                }
             }
         }
         submeshes.push(indices);
@@ -208,12 +236,37 @@ pub fn read_mesh(assets: &Assets, obj: ObjRef) -> Result<MeshData> {
     }
 
     let joints: Vec<[f32; 4]> = vb.read(CHANNEL_BLEND_INDICES)?;
+    // Bones with no weights: one bone a vertex, all of it on that bone (a
+    // vertex's weights add up to one). The F-1's tripwire peg is kept so:
+    // a bone's index for each vertex, one bind pose, and no weights.
+    let mut weights: Vec<[f32; 4]> = vb.read(CHANNEL_BLEND_WEIGHT)?;
+    if weights.is_empty() && !joints.is_empty() {
+        weights = vec![[1.0, 0.0, 0.0, 0.0]; joints.len()];
+    }
+    // The first blend shape's full frame, as each vertex's move.
+    let shape = v.get("m_Shapes").and_then(|shapes| {
+        let channel = shapes.get("channels")?.as_array()?.first()?;
+        let frame = channel.get("frameIndex")?.as_usize()? + channel.get("frameCount")?.as_usize()?.checked_sub(1)?;
+        let piece = shapes.get("shapes")?.as_array()?.get(frame)?;
+        let (first, n) = (piece.get("firstVertex")?.as_usize()?, piece.get("vertexCount")?.as_usize()?);
+        let moves = shapes.get("vertices")?.as_array()?;
+        let mut out = vec![[0.0f32; 3]; count];
+        for m in moves.get(first..first + n)? {
+            let index = m.get("index")?.as_usize()?;
+            if let Some(slot) = out.get_mut(index) {
+                *slot = m.get("vertex")?.as_vec3()?;
+            }
+        }
+        Some(out)
+    });
     Ok(MeshData {
         positions: vb.read(CHANNEL_POSITION)?,
         normals: vb.read(CHANNEL_NORMAL)?,
         tangents: vb.read(CHANNEL_TANGENT)?,
         uv0: vb.read(CHANNEL_UV0)?,
-        weights: vb.read(CHANNEL_BLEND_WEIGHT)?,
+        colors: vb.read(CHANNEL_COLOR)?,
+        shape,
+        weights,
         joints: joints.iter().map(|j| j.map(|c| c as u16)).collect(),
         submeshes,
         bind_poses,
@@ -244,6 +297,7 @@ mod tests {
             active: true,
             renderer: None,
             scripts: Vec::new(),
+            script_objects: Vec::new(),
             grip: None,
             placer: None,
             transform: ObjRef { file: 0, path_id: 0 },
@@ -302,6 +356,9 @@ pub struct TextureData {
     /// 1), not repeated: sampled at an edge it gives its own edge, not the
     /// far side's.
     pub clamp: [bool; 2],
+    /// How many pictures it holds one after another (`m_ImageCount`: a
+    /// cube's six faces, each with all its levels), 1 for a plain one.
+    pub faces: u32,
 }
 
 /// A texture's wrap modes across and up as clamped or not
@@ -347,6 +404,7 @@ pub fn texture_header(v: &Value) -> Result<TextureData> {
         streaming_mipmaps: v.get("m_StreamingMipmaps").and_then(|streamed| streamed.as_bool()).unwrap_or(false),
         point: v.get("m_TextureSettings").and_then(|settings| settings.get("m_FilterMode")).and_then(|mode| mode.as_i64()) == Some(0),
         clamp: clamps(v),
+        faces: v.get("m_ImageCount").and_then(Value::as_u32).unwrap_or(1).max(1),
     })
 }
 
@@ -400,6 +458,10 @@ pub struct Renderer {
     /// For skinned meshes: node index of each bone, in bind pose order.
     pub bones: Vec<Option<usize>>,
     pub skinned: bool,
+    /// It casts a shadow and draws nothing (`m_CastShadows` 3,
+    /// `ShadowCastingMode.ShadowsOnly`): an item's shadow mesh, as the
+    /// repair kits' `shadow_LOD0`.
+    pub shadows_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +475,9 @@ pub struct Node {
     pub renderer: Option<Renderer>,
     /// Class names of the scripts on this object.
     pub scripts: Vec<String>,
+    /// Those scripts' own objects, in the same order (their fields read
+    /// where wanted: the muzzle's, `crate::muzzle`).
+    pub script_objects: Vec<ObjRef>,
     /// Set on a part's marker for where a hand holds it.
     pub grip: Option<Grip>,
     /// Set on a part that says for itself where it goes on its bone.
@@ -631,6 +696,7 @@ pub fn read_hierarchy(assets: &Assets, game_object: ObjRef) -> Result<Hierarchy>
         let mut mesh = None;
         let mut renderer = None;
         let mut scripts = Vec::new();
+        let mut script_objects = Vec::new();
         let mut grip = None;
         let mut placer = None;
         let mut colliders = Vec::new();
@@ -647,7 +713,7 @@ pub fn read_hierarchy(assets: &Assets, game_object: ObjRef) -> Result<Hierarchy>
                 Some(class::MESH_RENDERER) => {
                     let c = assets.read(comp)?;
                     if c.req("m_Enabled")?.as_bool().unwrap_or(true) {
-                        renderer = Some((comp, materials(assets, comp, &c)?, None));
+                        renderer = Some((comp, materials(assets, comp, &c)?, None, shadows_only(&c)));
                     }
                 }
                 Some(class::SKINNED_MESH_RENDERER) => {
@@ -663,7 +729,7 @@ pub fn read_hierarchy(assets: &Assets, game_object: ObjRef) -> Result<Hierarchy>
                             .map(|b| b.as_pptr().and_then(|p| assets.resolve_loaded(comp.file, p)))
                             .collect();
                         pending_bones.push((index, bones));
-                        renderer = Some((comp, materials(assets, comp, &c)?, skinned_mesh));
+                        renderer = Some((comp, materials(assets, comp, &c)?, skinned_mesh, shadows_only(&c)));
                     }
                 }
                 Some(class::LOD_GROUP) => {
@@ -707,16 +773,19 @@ pub fn read_hierarchy(assets: &Assets, game_object: ObjRef) -> Result<Hierarchy>
                             scale: c.req("ModScale")?.as_vec3().context("ModScale")?,
                         });
                     }
-                    scripts.extend(class_name);
+                    if let Some(class_name) = class_name {
+                        scripts.push(class_name);
+                        script_objects.push(comp);
+                    }
                 }
                 _ => {}
             }
         }
-        let renderer = renderer.and_then(|(comp, materials, skinned_mesh)| {
+        let renderer = renderer.and_then(|(comp, materials, skinned_mesh, shadows_only)| {
             let skinned = skinned_mesh.is_some();
             let mesh = skinned_mesh.or(mesh)?;
             renderer_objects.push((index, comp));
-            Some(Renderer { mesh, materials, bones: Vec::new(), skinned })
+            Some(Renderer { mesh, materials, bones: Vec::new(), skinned, shadows_only })
         });
 
         nodes.push(Node {
@@ -728,6 +797,7 @@ pub fn read_hierarchy(assets: &Assets, game_object: ObjRef) -> Result<Hierarchy>
             active: go.req("m_IsActive")?.as_bool().unwrap_or(true),
             renderer,
             scripts,
+            script_objects,
             grip,
             placer,
             transform,
@@ -754,7 +824,39 @@ pub fn read_hierarchy(assets: &Assets, game_object: ObjRef) -> Result<Hierarchy>
     Ok(Hierarchy { nodes })
 }
 
-fn components(assets: &Assets, owner: ObjRef, go: &Value) -> Vec<ObjRef> {
+/// A rigid body as Unity keeps one (`Rigidbody`): its mass, drag and
+/// angular drag, and whether it is swept against fast motion
+/// (`m_CollisionDetection`: 0 discrete, 1 continuous, 2 continuous
+/// dynamic, 3 speculative).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RigidbodyData {
+    pub mass: f32,
+    pub drag: f32,
+    pub angular_drag: f32,
+    pub collision_detection: i64,
+    pub use_gravity: bool,
+    pub kinematic: bool,
+}
+
+const RIGIDBODY: i32 = 54;
+
+/// The rigid body on a GameObject, if it has one.
+pub fn rigidbody_of(assets: &Assets, game_object: ObjRef) -> Result<Option<RigidbodyData>> {
+    let go = assets.read(game_object)?;
+    let Some(comp) = components(assets, game_object, &go).into_iter().find(|c| assets.class_id(*c) == Some(RIGIDBODY)) else { return Ok(None) };
+    let c = assets.read(comp)?;
+    let float = |name: &str| -> Result<f32> { c.req(name)?.as_f32().with_context(|| format!("{name} is not a number")) };
+    Ok(Some(RigidbodyData {
+        mass: float("m_Mass")?,
+        drag: float("m_Drag")?,
+        angular_drag: float("m_AngularDrag")?,
+        collision_detection: c.get("m_CollisionDetection").and_then(Value::as_i64).unwrap_or(0),
+        use_gravity: c.get("m_UseGravity").and_then(Value::as_bool).unwrap_or(true),
+        kinematic: c.get("m_IsKinematic").and_then(Value::as_bool).unwrap_or(false),
+    }))
+}
+
+pub(crate) fn components(assets: &Assets, owner: ObjRef, go: &Value) -> Vec<ObjRef> {
     go.get("m_Component")
         .and_then(Value::as_array)
         .unwrap_or(&[])
@@ -762,6 +864,11 @@ fn components(assets: &Assets, owner: ObjRef, go: &Value) -> Vec<ObjRef> {
         .filter_map(|c| c.get("component")?.as_pptr())
         .filter_map(|p| assets.resolve_loaded(owner.file, p))
         .collect()
+}
+
+/// A renderer set to cast its shadow and draw nothing (`m_CastShadows` 3).
+fn shadows_only(renderer: &Value) -> bool {
+    renderer.get("m_CastShadows").and_then(Value::as_i64) == Some(3)
 }
 
 fn materials(assets: &Assets, comp: ObjRef, renderer: &Value) -> Result<Vec<Option<ObjRef>>> {

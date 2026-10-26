@@ -11,18 +11,20 @@
 //! organized pop-up. (Debug/FPS information included only show when f1 is
 //! pressed, hidden when closed)"): **the frame rate**, **the debug
 //! figures** (what the movement and the thing in hand are doing just now)
-//! and **the guide to the keys**, read off the bindings as they stand.
-//! `F1` shows it and hides it; hidden as a run begins (`--fps on` starts
-//! with it shown), and while the inventory screen is open.
+//! and **the commands** (`debug_menu`; the guide to the keys that stood
+//! there went, the user, 2026-10-26: "get rid of all the controls"; the
+//! keys are the options' CONTROLS tab's). `F1` shows it and hides it, the
+//! mouse freed while it is shown; hidden as a run begins (`--fps on`
+//! starts with it shown), and while the inventory screen is open.
 
 use bevy::prelude::*;
 
 use crate::animation::ClipPlayer;
 use crate::controller::Controller;
-use crate::inventory_view::{words, BACK, FAINT, LINE, PANEL, WORDS};
-use crate::keys::Bindings;
+use crate::inventory_view::{words, BACK, FAINT, LINE, WORDS};
+
 use crate::weapon::HandsRig;
-use crate::{Options, View};
+use crate::Options;
 
 /// The game's panel has a notch every twentieth of the top speed and one
 /// at the top.
@@ -100,10 +102,8 @@ struct DebugPopup;
 /// on the top right").
 #[derive(Component)]
 struct DebugTag;
-#[derive(Component)]
-struct GuideBody;
 #[derive(Resource)]
-pub struct GuideShown(bool);
+pub struct GuideShown(pub bool);
 
 pub struct HudPlugin;
 
@@ -174,9 +174,8 @@ fn spawn_top(mut commands: Commands, options: Res<Options>) {
                 });
             }
         });
-        section(popup, "CONTROLS");
-        // Drawn afresh when the bindings or the view change.
-        popup.spawn((GuideBody, Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(4.0), ..default() }));
+        section(popup, "COMMANDS");
+        crate::debug_menu::spawn_commands(popup);
     });
 }
 
@@ -201,7 +200,7 @@ fn hide_over_screen(
 ) {
     let battle = look.tarkov_ui && look.battle.is_some();
     for (mut node, meters) in &mut row {
-        let display = if (controller.inventory_open && features.tarkov_ui) || (meters && battle) { Display::None } else { Display::Flex };
+        let display = if (controller.inventory_open && features.tarkov_ui) || controller.edit_build || (meters && battle) { Display::None } else { Display::Flex };
         if node.display != display {
             node.display = display;
         }
@@ -283,46 +282,21 @@ pub fn debug(
     }
 }
 
-/// The app's own keys, which are not bindings.
-const APP_KEYS: [(&str, &str); 5] = [
-    ("F1", "This panel"),
-    ("F4", "Free camera"),
-    ("F5", "Watched from outside, or back"),
-    ("F7", "Hurt the next part (a bullet)"),
-    ("F8", "Die (a bullet through the head)"),
-];
-/// The free camera's, shown in place of the character's while it flies.
-const CAMERA_KEYS: [(&str, &str); 6] = [
-    ("RMB (hold)", "Look"),
-    ("W A S D", "Fly"),
-    ("Q / E", "Down / up"),
-    ("L SHIFT", "Faster"),
-    ("F4", "Back to first person"),
-    ("F5", "Play, watched from here"),
-];
-
-/// Keeps the panel at the top right: `F1` shows it and hides it, it stands
-/// back while the inventory screen is open, and its guide to the keys is
-/// drawn afresh when the bindings have been changed or the view has.
-#[allow(clippy::too_many_arguments)]
+/// Keeps the panel at the top right: `F1` shows it and hides it, and it
+/// stands back while the inventory screen or the edit build screen is open.
 fn guide(
-    mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
-    bindings: Res<Bindings>,
-    view: Res<View>,
     controller: Res<Controller>,
     mut shown: ResMut<GuideShown>,
     mut popup: Query<&mut Node, (With<DebugPopup>, Without<DebugTag>)>,
-    body: Query<Entity, With<GuideBody>>,
-    mut drawn: Local<Option<(u32, View)>>,
     (look, window, mut tag): (Res<crate::health_view::HealthLook>, Query<&Window, With<bevy::window::PrimaryWindow>>, Query<&mut Node, With<DebugTag>>),
 ) {
     let _clock = crate::render_timing::Clock::new("hud guide");
-    let (Ok(mut node), Ok(panel)) = (popup.single_mut(), body.single()) else { return };
+    let Ok(mut node) = popup.single_mut() else { return };
     if keys.just_pressed(KeyCode::F1) {
         shown.0 = !shown.0;
     }
-    let display = if shown.0 && !controller.inventory_open { Display::Flex } else { Display::None };
+    let display = if shown.0 && !controller.inventory_open && !controller.edit_build { Display::Flex } else { Display::None };
     if node.display != display {
         node.display = display;
     }
@@ -341,7 +315,7 @@ fn guide(
     }
     // The tag where the panel would be, while the panel is shut.
     for mut tag in &mut tag {
-        let display = if !shown.0 && !controller.inventory_open { Display::Flex } else { Display::None };
+        let display = if !shown.0 && !controller.inventory_open && !controller.edit_build { Display::Flex } else { Display::None };
         if tag.display != display {
             tag.display = display;
         }
@@ -349,58 +323,12 @@ fn guide(
             tag.top = top;
         }
     }
-    // Hidden, the guide is not kept: Bevy lays out every node there is,
-    // shown or not, each frame (`findings.md`). It is drawn afresh as the
-    // panel shows.
-    if display == Display::None {
-        if drawn.take().is_some() {
-            commands.entity(panel).despawn_related::<Children>();
-        }
-        return;
-    }
-    if *drawn == Some((bindings.version, *view)) {
-        return;
-    }
-    *drawn = Some((bindings.version, *view));
-    // The sections side by side in two columns: the character's own and
-    // the world's to the left, the weapon's and the app's to the right.
-    let own = |lines: &[(&str, &str)]| -> Vec<(String, String)> { lines.iter().map(|(keys, does)| ((*keys).to_owned(), (*does).to_owned())).collect() };
-    let columns: Vec<Vec<(&str, Vec<(String, String)>)>> = match *view {
-        View::FirstPerson | View::Watched => {
-            let (mut right, mut left): (Vec<_>, Vec<_>) = bindings.guide().into_iter().partition(|(name, _)| *name == "WEAPON");
-            right.push(("APP", own(&APP_KEYS)));
-            vec![std::mem::take(&mut left), right]
-        }
-        View::Free => vec![vec![("FREE CAMERA", own(&CAMERA_KEYS))]],
-    };
-    // The keys' cell is as wide as the longest of a column's keys needs.
-    let width = |sections: &[(&str, Vec<(String, String)>)]| {
-        let longest = sections.iter().flat_map(|(_, lines)| lines).map(|(keys, _)| keys.chars().count()).max().unwrap_or(0);
-        longest as f32 * 6.7 + 14.0
-    };
-    commands.entity(panel).despawn_related::<Children>().with_children(|guide| {
-        guide.spawn(Node { column_gap: Val::Px(18.0), align_items: AlignItems::FlexStart, ..default() }).with_children(|body| {
-            for sections in &columns {
-                let keys_wide = width(sections);
-                body.spawn(Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0), ..default() }).with_children(|column| {
-                    for (name, lines) in sections {
-                        column.spawn((Node { margin: UiRect::top(Val::Px(5.0)), ..default() }, words(*name, 10.0, FAINT)));
-                        for (keys, does) in lines {
-                            column.spawn(Node { column_gap: Val::Px(8.0), align_items: AlignItems::Center, ..default() }).with_children(|line| {
-                                // A key as the options tab draws a key's cell.
-                                let cell = Node { width: Val::Px(keys_wide), height: Val::Px(18.0), padding: UiRect::horizontal(Val::Px(6.0)), align_items: AlignItems::Center, flex_shrink: 0.0, ..default() };
-                                let unbound = keys == "-";
-                                line.spawn((cell, BackgroundColor(PANEL))).with_children(|inside| {
-                                    inside.spawn((words(keys.clone(), 11.0, if unbound { FAINT } else { WORDS }), TextLayout::new_with_no_wrap()));
-                                });
-                                line.spawn((words(does.clone(), 11.0, if unbound { FAINT } else { WORDS }), TextLayout::new_with_no_wrap()));
-                            });
-                        }
-                    }
-                });
-            }
-        });
-    });
+}
+
+/// Whether the panel is open over play now (shown, and no screen over it):
+/// the mouse is then the panel's (`cursor::hold`, `keys::hear`).
+pub fn panel_open(shown: Option<&GuideShown>, controller: &Controller) -> bool {
+    shown.is_some_and(|shown| shown.0) && !controller.inventory_open && !controller.edit_build
 }
 
 fn label(text: &str) -> impl Bundle {

@@ -58,7 +58,7 @@ As `firing.md` and `shotgun.md` have them, by this animator's states: `OUT TO ID
 
 **Courses 3 and 4, by hand** (2026-10-16; `local\traces\courses1\3-sv-98`, `4-model-700`, `byhand`): **the SV-98 and the Model 700 on the game's states and times on every frame** (3,896 and 5,176 frames), the shots, the bolt worked, the Model 700's magazine filled.
 
-Before that, with nothing: tried against the install's own controller (`cargo test -p trp-sim --test install the_model_700 -- --nocapture`), which is what the timings below are:
+Before that, with nothing: tried against the install's own controller (`cargo test -p trp-sim --test sim the_model_700 -- --nocapture`), which is what the timings below are:
 
 | What | The simulation |
 |---|---|

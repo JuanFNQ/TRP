@@ -1,5 +1,6 @@
 //! Texture formats: where each mip level sits in the data, and decoding of
-//! the block-compressed formats the weapons use.
+//! the block-compressed formats the weapons use, and of Unity's crunched
+//! ones (`texture2ddecoder`'s port of Unity's crunch).
 
 use anyhow::{bail, Result};
 
@@ -18,6 +19,8 @@ pub mod format {
     pub const BC7: i32 = 25;
     pub const BC4: i32 = 26;
     pub const BC5: i32 = 27;
+    pub const DXT1_CRUNCHED: i32 = 28;
+    pub const DXT5_CRUNCHED: i32 = 29;
     pub const R8: i32 = 63;
 }
 
@@ -42,7 +45,11 @@ fn unit_size(fmt: i32) -> Result<(usize, bool)> {
 }
 
 /// Location of every mip level in `tex.data`. Stops early if the data is short.
+/// A crunched picture is one piece, its first level alone decoded from it.
 pub fn mips(tex: &TextureData) -> Result<Vec<Mip>> {
+    if crunched(tex.format) {
+        return Ok(vec![Mip { offset: 0, size: tex.data.len(), width: tex.width.max(1), height: tex.height.max(1) }]);
+    }
     let (unit, blocks) = unit_size(tex.format)?;
     let mut out = Vec::new();
     let (mut w, mut h, mut offset) = (tex.width.max(1), tex.height.max(1), 0usize);
@@ -66,13 +73,34 @@ pub fn mips(tex: &TextureData) -> Result<Vec<Mip>> {
     Ok(out)
 }
 
+/// A format Unity crunches (`DXT1Crunched`, `DXT5Crunched`).
+pub fn crunched(fmt: i32) -> bool {
+    matches!(fmt, format::DXT1_CRUNCHED | format::DXT5_CRUNCHED)
+}
+
 /// Decodes one mip level to RGBA8.
 pub fn decode_rgba(tex: &TextureData, mip: Mip) -> Result<Vec<u8>> {
     let src = &tex.data[mip.offset..mip.offset + mip.size];
     let (w, h) = (mip.width as usize, mip.height as usize);
     let mut out = vec![255u8; w * h * 4];
     match tex.format {
+        format::DXT1_CRUNCHED | format::DXT5_CRUNCHED => {
+            // Each pixel as the decoder packs it: blue, green, red, alpha.
+            let mut pixels = vec![0u32; w * h];
+            texture2ddecoder::decode_unity_crunch(src, w, h, &mut pixels).map_err(|e| anyhow::anyhow!("texture {:?}: {e}", tex.name))?;
+            for (dst, pixel) in out.chunks_exact_mut(4).zip(&pixels) {
+                let [b, g, r, a] = pixel.to_le_bytes();
+                dst.copy_from_slice(&[r, g, b, a]);
+            }
+        }
         format::RGBA32 => out.copy_from_slice(src),
+        // A mask of alpha alone (the scopes' shadows, `opticsightsmasks`):
+        // white, by its alpha.
+        format::ALPHA8 => {
+            for (dst, &a) in out.chunks_exact_mut(4).zip(src) {
+                dst[3] = a;
+            }
+        }
         format::ARGB32 => {
             for (dst, s) in out.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
                 dst.copy_from_slice(&[s[1], s[2], s[3], s[0]]);
@@ -358,7 +386,7 @@ mod tests {
     }
 
     fn texture(fmt: i32, width: u32, height: u32, mip_count: u32, data: Vec<u8>) -> TextureData {
-        TextureData { name: String::new(), width, height, format: fmt, mip_count, srgb: false, data, streaming_mipmaps: false, point: false, clamp: [false; 2] }
+        TextureData { name: String::new(), width, height, format: fmt, mip_count, srgb: false, data, streaming_mipmaps: false, point: false, clamp: [false; 2], faces: 1 }
     }
 
     #[test]

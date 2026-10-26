@@ -37,11 +37,23 @@ pub struct Systems {
     pub weapon_motion: bool,
     /// The recoil: off, a shot kicks neither the weapon nor the camera.
     pub recoil: bool,
+    /// Blind fire (`docs/spec/blind-fire.md`): off, its keys are not heard
+    /// and it never starts. It is a system of its own: the movement's
+    /// switch off leaves it be.
+    pub blind_fire: bool,
+    /// Mounting and the bipod (`docs/spec/mounting.md`): off, the mount's
+    /// key is not heard and no mount starts (a host does not toggle the
+    /// bipod either). A system of its own, as blind fire is.
+    pub mounting: bool,
+    /// The left shoulder (`docs/spec/left-shoulder.md`): off, its key is not
+    /// heard and the weapon never goes to the left side. A system of its
+    /// own, as blind fire is.
+    pub left_shoulder: bool,
 }
 
 impl Default for Systems {
     fn default() -> Self {
-        Self { movement: true, vaulting: true, stamina: true, weight: true, exhaustion: true, weapon_motion: true, recoil: true }
+        Self { movement: true, vaulting: true, stamina: true, weight: true, exhaustion: true, weapon_motion: true, recoil: true, blind_fire: true, mounting: true, left_shoulder: true }
     }
 }
 
@@ -52,8 +64,17 @@ impl Systems {
         if !self.vaulting {
             heard.vault = false;
         }
+        if !self.blind_fire {
+            (heard.blind_toggle, heard.blind_end) = (0, false);
+        }
+        if !self.mounting {
+            heard.mount = false;
+        }
+        if !self.left_shoulder {
+            heard.left_stance = false;
+        }
         if !self.movement {
-            let Input { look_delta, aiming, reloading, hands_busy, hands_idle, hands_in_inventory, hold_breath, breath_end, weapon_occupied, free_look, screen, inventory, head_look, head_reset, camera_pitch, .. } = *input;
+            let Input { look_delta, aiming, reloading, hands_busy, hands_idle, hands_in_inventory, hold_breath, breath_end, weapon_occupied, free_look, screen, inventory, head_look, head_reset, camera_pitch, blind_toggle, blind_end, blind_firearm, blind_may_start, mount, mount_may, overlap_depth, left_stance, left_stance_may, .. } = heard;
             heard = Input {
                 look_delta,
                 aiming,
@@ -70,6 +91,15 @@ impl Systems {
                 head_look,
                 head_reset,
                 camera_pitch,
+                blind_toggle,
+                blind_end,
+                blind_firearm,
+                blind_may_start,
+                mount,
+                mount_may,
+                overlap_depth,
+                left_stance,
+                left_stance_may,
                 ..Input::default()
             };
         }
@@ -92,5 +122,15 @@ mod tests {
         let heard = Systems { movement: false, ..all }.heard(&input);
         assert!(!heard.vault && !heard.jump && !heard.sprint_toggle && heard.move_dir == [0.0, 0.0]);
         assert!(heard.look_delta == [2.0, 1.0] && heard.hold_breath && heard.aiming);
+    }
+
+    #[test]
+    fn blind_fire_is_a_system_of_its_own() {
+        let input = Input { blind_toggle: 1, blind_end: true, blind_firearm: true, move_dir: [0.0, 1.0], ..Input::default() };
+        let all = Systems::default();
+        let heard = Systems { movement: false, ..all }.heard(&input);
+        assert!(heard.blind_toggle == 1 && heard.blind_end && heard.move_dir == [0.0, 0.0]);
+        let heard = Systems { blind_fire: false, ..all }.heard(&input);
+        assert!(heard.blind_toggle == 0 && !heard.blind_end && heard.move_dir == [0.0, 1.0]);
     }
 }

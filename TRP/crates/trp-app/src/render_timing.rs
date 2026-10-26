@@ -250,3 +250,147 @@ pub fn add(renderer: &mut SubApp) {
     );
 }
 
+
+/// What the world holds at one frame of the main world's (`TRP_CENSUS=<frame>`):
+/// its entities, those placed in it, the meshes (seen, hidden, skinned,
+/// casting shadows, by their material), the distinct meshes and standard
+/// materials drawn, the interface's nodes and the lights, and the groups
+/// at the top of the hierarchy that hold the most meshes. What the
+/// engine's per-entity work each frame goes over. Nothing is changed by it.
+pub fn add_census(app: &mut App) {
+    let Some(at) = std::env::var("TRP_CENSUS").ok().and_then(|value| value.parse::<u64>().ok()) else { return };
+    app.insert_resource(Census { at, frame: 0 }).add_systems(Last, census);
+}
+
+#[derive(Resource)]
+struct Census {
+    at: u64,
+    frame: u64,
+}
+
+fn census(world: &mut World) {
+    use bevy::camera::visibility::{InheritedVisibility, ViewVisibility};
+    use bevy::light::NotShadowCaster;
+    use bevy::mesh::skinning::SkinnedMesh;
+    use std::collections::{HashMap, HashSet};
+    let mut census = world.resource_mut::<Census>();
+    census.frame += 1;
+    if census.frame != census.at {
+        return;
+    }
+    let frame = census.frame;
+    let entities = world.entities().len();
+    let placed = world.query::<&GlobalTransform>().iter(world).count();
+    let meshes: Vec<(Entity, AssetId<Mesh>, bool, bool)> = world
+        .query::<(Entity, &Mesh3d, Option<&ViewVisibility>, Option<&InheritedVisibility>)>()
+        .iter(world)
+        .map(|(entity, mesh, seen, inherited)| (entity, mesh.id(), seen.is_some_and(|s| s.get()), inherited.is_some_and(|i| i.get())))
+        .collect();
+    let seen = meshes.iter().filter(|m| m.2).count();
+    let hidden = meshes.iter().filter(|m| !m.3).count();
+    let skinned = world.query_filtered::<(), (With<Mesh3d>, With<SkinnedMesh>)>().iter(world).count();
+    let casters = world.query_filtered::<(), (With<Mesh3d>, Without<NotShadowCaster>)>().iter(world).count();
+    let standard: Vec<AssetId<StandardMaterial>> = world.query::<&MeshMaterial3d<StandardMaterial>>().iter(world).map(|m| m.id()).collect();
+    let shadow_only = world.query_filtered::<(), With<MeshMaterial3d<crate::shadow_only::ShadowOnlyMaterial>>>().iter(world).count();
+    let grid = world.query_filtered::<(), With<MeshMaterial3d<crate::grid::GridMaterial>>>().iter(world).count();
+    let distinct_meshes: HashSet<_> = meshes.iter().map(|m| m.1).collect();
+    let distinct_materials: HashSet<_> = standard.iter().collect();
+    let nodes = world.query_filtered::<(), With<Node>>().iter(world).count();
+    let points = world.query_filtered::<(), With<PointLight>>().iter(world).count();
+    let spots = world.query_filtered::<(), With<SpotLight>>().iter(world).count();
+    let suns = world.query_filtered::<(), With<DirectionalLight>>().iter(world).count();
+    info!(
+        "census at frame {frame}: {entities} entities, {placed} placed; {} meshes ({seen} seen by a camera, {hidden} hidden, {skinned} skinned, {casters} casting shadows; {} standard, {shadow_only} shadow-only, {grid} grid), {} distinct meshes, {} distinct standard materials; {nodes} interface nodes; lights: {suns} sun, {spots} spot, {points} point",
+        meshes.len(),
+        standard.len(),
+        distinct_meshes.len(),
+        distinct_materials.len()
+    );
+    // The groups at the top of the hierarchy by the meshes under them.
+    let mut groups: HashMap<String, [usize; 2]> = HashMap::new();
+    for (entity, _, seen, _) in &meshes {
+        let mut top = *entity;
+        while let Some(parent) = world.get::<ChildOf>(top) {
+            top = parent.parent();
+        }
+        let name = world.get::<Name>(top).map_or_else(|| format!("{top} (no name)"), |name| name.as_str().to_owned());
+        let count = groups.entry(name).or_default();
+        count[0] += 1;
+        count[1] += usize::from(*seen);
+    }
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+    for (name, [all, seen]) in groups.iter().take(25) {
+        info!("census:   {all:5} meshes ({seen} seen) under {name}");
+    }
+    info!("census:   {} groups in all", groups.len());
+    // Under the largest group, its meshes by the name of their nearest
+    // named owner below the top (the parts, pieces of clothing, gear).
+    let depth = std::env::var("TRP_CENSUS_DEPTH").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(2);
+    if let Some((top_name, _)) = groups.first() {
+        let mut parts: HashMap<String, [usize; 2]> = HashMap::new();
+        for (entity, _, seen, _) in &meshes {
+            let mut at = *entity;
+            let mut path = Vec::new();
+            while let Some(parent) = world.get::<ChildOf>(at) {
+                if let Some(name) = world.get::<Name>(at) {
+                    path.push(name.as_str().to_owned());
+                }
+                at = parent.parent();
+            }
+            if world.get::<Name>(at).map(|n| n.as_str()) != Some(top_name.as_str()) {
+                continue;
+            }
+            // The two names nearest the top.
+            let key = path.iter().rev().take(depth).cloned().collect::<Vec<_>>().join(" / ");
+            let count = parts.entry(key).or_default();
+            count[0] += 1;
+            count[1] += usize::from(*seen);
+        }
+        let mut parts: Vec<_> = parts.into_iter().collect();
+        parts.sort_by(|a, b| b.1[0].cmp(&a.1[0]));
+        for (name, [all, seen]) in parts.iter().take(30) {
+            info!("census:   {top_name}: {all:5} meshes ({seen} seen) under {name}");
+        }
+        info!("census:   {top_name}: {} owners in all", parts.len());
+    }
+}
+
+/// An experiment, not a feature (`TRP_DROP_HIDDEN=<frame>`): at that frame
+/// every mesh hidden by its visibility is despawned, to measure what the
+/// engine's per-entity work over them costs a frame. What is drawn after
+/// is wrong wherever one of them would have been shown.
+pub fn add_drop_hidden(app: &mut App) {
+    let Some(at) = std::env::var("TRP_DROP_HIDDEN").ok().and_then(|value| value.parse::<u64>().ok()) else { return };
+    app.insert_resource(DropHidden { at, frame: 0 }).add_systems(Last, drop_hidden);
+}
+
+#[derive(Resource)]
+struct DropHidden {
+    at: u64,
+    frame: u64,
+}
+
+fn drop_hidden(mut commands: Commands, mut drop: ResMut<DropHidden>, meshes: Query<(Entity, &bevy::camera::visibility::InheritedVisibility), With<Mesh3d>>, parents: Query<&ChildOf>, names: Query<&Name>) {
+    drop.frame += 1;
+    if drop.frame != drop.at {
+        return;
+    }
+    // `TRP_DROP_GROUP=<name>`: only those under the top of that name.
+    let group = std::env::var("TRP_DROP_GROUP").ok().map(|group| group.replace('_', " "));
+    let mut n = 0;
+    for (entity, inherited) in &meshes {
+        let mut top = entity;
+        while let Ok(parent) = parents.get(top) {
+            top = parent.parent();
+        }
+        if group.as_deref().is_some_and(|group| names.get(top).map(|n| n.as_str()) != Ok(group)) {
+            continue;
+        }
+        if !inherited.get() || group.as_deref() == Some("Character model") {
+            commands.entity(entity).despawn();
+            n += 1;
+        }
+    }
+    info!("experiment: {n} hidden meshes despawned at frame {}", drop.frame);
+}

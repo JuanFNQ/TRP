@@ -46,6 +46,25 @@ pub enum How {
     /// The magazine a quick reload lets go, where the weapon has it
     /// (`DropMod`).
     LetFall,
+    /// A grenade thrown from the hand, from below or not
+    /// (`BaseGrenadeHandsController.Throw`; grenades-and-knife spec, "The
+    /// throw"): from the hand's grenade, with the throw's force, on its own
+    /// body, until its fuse.
+    Grenade { low: bool },
+}
+
+/// A thrown grenade's own body (`GrenadeItself`'s rigid body and colliders,
+/// read from the install), and its fuse's time.
+#[derive(Clone)]
+struct GrenadeBody {
+    mass: f32,
+    drag: f32,
+    angular_drag: f32,
+    continuous: bool,
+    colliders: Vec<Collider>,
+    fuse: f32,
+    /// Its item's template, which its blast goes by.
+    item: String,
 }
 
 /// A model come from the thread: what it draws and its colliders, in the
@@ -54,13 +73,28 @@ struct Prepared {
     template: String,
     model: Model,
     colliders: Vec<Collider>,
+    caliber: Option<u8>,
 }
 
 /// A model as the frame keeps it: each node's parent, own transform and
-/// whether it is on; what each draws; and its colliders.
-struct Ready {
-    nodes: Vec<(Option<usize>, Transform, bool)>,
-    drawn: Vec<(usize, Handle<Mesh>, Handle<StandardMaterial>)>,
+/// whether it is on, and its name; what each draws; its colliders; and
+/// for a round its calibre's class (`AmmoPoolObject._caliber`).
+pub(crate) struct Ready {
+    pub(crate) nodes: Vec<(Option<usize>, Transform, bool)>,
+    pub(crate) names: Vec<String>,
+    pub(crate) drawn: Vec<(usize, Handle<Mesh>, Handle<StandardMaterial>)>,
+    /// What casts its shadow alone, as `drawn` (`icons::Model::shadows`):
+    /// only the thing on the ground has it.
+    pub(crate) shadows: Vec<(usize, Handle<Mesh>, Handle<StandardMaterial>)>,
+    /// Beside `drawn`, the sights' own shader each piece is drawn with in
+    /// the game, where it is one (`PreparedLooks::lens`).
+    pub(crate) lens: Vec<Option<&'static str>>,
+    pub(crate) caliber: Option<u8>,
+    /// A magazine's `patron_` points in it, by node and number, breadth
+    /// first from the magazine's own object (its first object for a
+    /// magazine, the first under its magazine's slot for a weapon:
+    /// `magazine_rounds`); none for anything else.
+    pub(crate) points: Vec<(usize, u32)>,
     colliders: Vec<Collider>,
     /// The marks of the pictures it shares with the rigs and the rest
     /// (`render_data::SharedPictures`), to let go of when nothing on the
@@ -93,6 +127,12 @@ struct Flight {
     /// its model was still to come.
     missed: Vec<(f32, f32)>,
     moving: Option<Moving>,
+    /// A thrown grenade's own body: it is not watched to a stop, and is
+    /// gone at its fuse.
+    grenade: Option<GrenadeBody>,
+    /// A weapon thrown from the inventory sounds as it lands
+    /// (`landing_sound`): its rule, from where it set off.
+    landing: Option<trp_sim::landing::Landing>,
 }
 
 struct Moving {
@@ -127,6 +167,19 @@ pub struct Loose {
     dice: Dice,
     /// Every loose thing's place, by item, once it has one.
     pub places: HashMap<Id, Place>,
+    /// Grenades whose fuse has run out, to be taken off the ground.
+    blown: Vec<Id>,
+    /// Models kept for something else of the world (`model_for`).
+    kept: Vec<String>,
+    /// The thread's reader kept with nothing to read, for a screen that
+    /// asks for models one after another (the edit build screen, while it
+    /// is open).
+    pub keep_reader: bool,
+    /// `EFTHardSettings.GrenadeForce`, which a throw goes by.
+    grenade_force: f32,
+    /// The model of the grenade in hand, asked for as it is drawn and kept
+    /// while it is held, for it to be there as it leaves the hand.
+    held: Option<String>,
 }
 
 impl Loose {
@@ -149,6 +202,11 @@ impl Loose {
             flights: Vec::new(),
             dice: Dice::new(seed ^ 0x6c6f_6f73_6521),
             places: HashMap::new(),
+            blown: Vec::new(),
+            kept: Vec::new(),
+            keep_reader: false,
+            grenade_force: figure("GrenadeForce", 11.55),
+            held: None,
         }
     }
 
@@ -162,6 +220,32 @@ impl Loose {
         if !self.models.contains_key(template) {
             self.models.insert(template.to_owned(), Asked::Waiting);
             self.queue.push_back(template.to_owned());
+        }
+    }
+
+    /// A model asked for by something else of the world (a round for its
+    /// spent case, `cases`, or for a magazine, `magazine_rounds`), kept
+    /// while it is asked for, and had once read.
+    /// The game's physics settings, where they could be read.
+    pub fn physics(&self) -> Option<&PhysicsSettings> {
+        self.physics.as_ref()
+    }
+
+    /// A model asked for by `model_for` that is no longer wanted there (the
+    /// window that showed it shut): let go of once nothing else draws
+    /// with it.
+    pub fn let_go(&mut self, template: &str) {
+        self.kept.retain(|kept| kept != template);
+    }
+
+    pub fn model_for(&mut self, template: &str) -> Option<Arc<Ready>> {
+        if !self.kept.iter().any(|kept| kept == template) {
+            self.kept.push(template.to_owned());
+        }
+        self.ask(template);
+        match self.models.get(template) {
+            Some(Asked::Ready(ready)) => Some(ready.clone()),
+            _ => None,
         }
     }
 }
@@ -180,7 +264,35 @@ pub fn range_world(physics: &PhysicsSettings, range: &Range) -> World {
     world
 }
 
+/// A grenade's blast (`Grenade.Explosion`): its item and the grenade's
+/// place at its fuse, in the game's axes (`blast_view`).
+#[derive(Message, Clone)]
+pub struct Blasted {
+    pub template: String,
+    pub at: [f32; 3],
+}
+
 /// A place and turn of the game's as Bevy's.
+/// Whether a model's piece drawn with the sights' own shader `lens` is left
+/// out: drawn as a plain material it would be an opaque pane of its colour
+/// (a red dot's window white, its dot red). In the inspect window's preview
+/// (`preview`; `CameraImage` turns the `WeaponPreview` keyword on) the
+/// game's optic lens draws nothing; everywhere a collimator's mark seen
+/// from off its line falls outside its picture, and the glasses add only a
+/// faint glint (`inspect-window.md`, "The scopes' glass"). An optic's lens
+/// in the world stays (the game draws it dark), and so does a back lens
+/// (black). `ESTIMATE`: the glasses' glint left out for nought.
+/// `PROVISIONAL`: the edit build screen is given the preview's rule, where
+/// the game draws an optic's lens dark there (its camera has no
+/// `CameraImage`).
+pub(crate) fn left_out(lens: Option<&str>, preview: bool) -> bool {
+    match lens {
+        Some("CW FX/Collimator" | "Custom/OpticGlass" | "EFT/CollimatorGlass") => true,
+        Some("CW FX/OpticSight") => preview,
+        _ => false,
+    }
+}
+
 fn drawn(at: V3, turn: [f32; 4]) -> Transform {
     Transform { translation: convert::position(at), rotation: convert::rotation(turn), ..default() }
 }
@@ -196,11 +308,14 @@ pub fn read_models(
     // A model nothing on the ground draws with, and none on its way, is let
     // go of: its materials, its meshes and its share of the pictures.
     if loose.models.values().any(|asked| matches!(asked, Asked::Ready(_))) {
+        let lying: Vec<String> = carried.ground.iter().filter(|(item, _)| loose.places.contains_key(&item.id)).map(|(item, _)| trp_sim::inventory::rig_key(item)).collect();
         let in_use: std::collections::HashSet<&str> = loose
             .flights
             .iter()
             .map(|f| f.template.as_str())
-            .chain(carried.ground.iter().filter(|(item, _)| loose.places.contains_key(&item.id)).map(|(item, _)| item.kind.template.as_str()))
+            .chain(lying.iter().map(String::as_str))
+            .chain(loose.held.as_deref())
+            .chain(loose.kept.iter().map(String::as_str))
             .collect();
         let unused: Vec<String> = loose.models.iter().filter(|(template, asked)| matches!(asked, Asked::Ready(_)) && !in_use.contains(template.as_str())).map(|(template, _)| template.clone()).collect();
         for template in unused {
@@ -215,9 +330,19 @@ pub fn read_models(
         loose.task = None;
         loose.worker = worker;
         let asked = match made {
-            Ok(Prepared { template, model, colliders }) => {
-                let Model { hierarchy, looks, parts, extra, .. } = model;
+            Ok(Prepared { template, model, colliders, caliber }) => {
+                let Model { hierarchy, looks, parts, extra, shadows, .. } = model;
+                let names: Vec<String> = hierarchy.nodes.iter().map(|node| node.name.clone()).collect();
+                let magazine = hierarchy
+                    .nodes
+                    .iter()
+                    .position(|node| node.name == "mod_magazine")
+                    .and_then(|slot| hierarchy.nodes.iter().position(|node| node.parent == Some(slot)))
+                    .unwrap_or(0);
+                let points = trp_sim::magazine_view::points(hierarchy.nodes.iter().map(|node| (node.parent, node.name.as_str())), magazine);
                 let bytes = looks.picture_bytes();
+                let mut lens: Vec<Option<&'static str>> = parts.iter().flat_map(|own| own.iter().map(|(_, material)| looks.lens(*material))).collect();
+                lens.extend(extra.iter().map(|_| None));
                 let (mesh_handles, material_handles, _, kept) = looks.add_sharing(&mut meshes, &mut images, &mut materials, Some(&mut shared));
                 let nodes = hierarchy
                     .nodes
@@ -235,6 +360,7 @@ pub fn read_models(
                     drawn.extend(own.iter().map(|(mesh, material)| (index, mesh_handles[*mesh].clone(), material_handles[*material].clone())));
                 }
                 drawn.extend(extra.iter().map(|(node, mesh, material)| (*node, mesh_handles[*mesh].clone(), material_handles[*material].clone())));
+                let shadows = shadows.iter().map(|(node, mesh, material)| (*node, mesh_handles[*mesh].clone(), material_handles[*material].clone())).collect();
                 info!(
                     "the model of {template} for the world: {} colliders, {} materials, {} of {} pictures already on the card; {:.1} MB of pictures sent",
                     colliders.len(),
@@ -243,7 +369,7 @@ pub fn read_models(
                     kept.marks.len(),
                     bytes.saturating_sub(kept.bytes_spared) as f64 / 1e6
                 );
-                Asked::Ready(Arc::new(Ready { nodes, drawn, colliders, marks: kept.marks }))
+                Asked::Ready(Arc::new(Ready { nodes, names, drawn, shadows, lens, caliber, points, colliders, marks: kept.marks }))
             }
             Err(e) => {
                 info!("{template} lies as a box: its model could not be had: {e:#}");
@@ -254,9 +380,14 @@ pub fn read_models(
     }
     let Some(template) = loose.queue.pop_front() else {
         // Nothing left to read: the thread's reader goes, away from the
-        // frame (as the icons' does).
-        if let Some(worker) = loose.worker.take() {
-            AsyncComputeTaskPool::get().spawn(async move { drop(worker) }).detach();
+        // frame (as the icons' does); but not while a screen that asks for
+        // one model after another is open (`keep_reader`: the edit build
+        // screen). Made again, the reader took 0.43 s of a pick's 0.70 s
+        // there (the AKM's stock), the model itself 0.27 s.
+        if !loose.keep_reader {
+            if let Some(worker) = loose.worker.take() {
+                AsyncComputeTaskPool::get().spawn(async move { drop(worker) }).detach();
+            }
         }
         return;
     };
@@ -274,8 +405,23 @@ pub fn read_models(
 /// A thing's model for the world, and its colliders: its prefab's; or, for
 /// a model with none (an outfit of the other game's), the box its meshes
 /// fill (`PROVISIONAL`).
+/// The key a thrown grenade's model is asked by: its own object's
+/// (`GrenadeItself`), not its item's.
+const GRENADE_MODEL: &str = "thrown grenade ";
+/// The key a spent case's model is asked by: its round's, with the round's
+/// `shell` objects on and its `full` ones off (`AmmoPoolObject.SetUsed`).
+pub(crate) const CASE_MODEL: &str = "spent case ";
+/// The key a round's model in a magazine is asked by: its round's, with
+/// its `full` objects on and its `shell` ones off (`SetUsed(false)`).
+pub(crate) const ROUND_MODEL: &str = "round in a magazine ";
+
 fn prepare(worker: &mut Worker, template: &str) -> anyhow::Result<Prepared> {
-    let mut model = worker.model(template)?;
+    let mut model = match (template.strip_prefix(GRENADE_MODEL), template.strip_prefix(CASE_MODEL), template.strip_prefix(ROUND_MODEL)) {
+        (Some(item), ..) => worker.thrown_grenade(item)?.0,
+        (_, Some(round), _) => worker.round_model(round, true)?,
+        (.., Some(round)) => worker.round_model(round, false)?,
+        _ => worker.model(template, false, &[])?,
+    };
     model.looks.unskinned();
     // Marked, to draw with a picture already on the card where it is the
     // same (a rig's, or another thing's).
@@ -305,7 +451,8 @@ fn prepare(worker: &mut Worker, template: &str) -> anyhow::Result<Prepared> {
         let (centre, half) = ((low + high) / 2.0, ((high - low) / 2.0).max(Vec3::splat(0.005)));
         colliders.push(Collider { shape: Shape::Box { half: half.to_array() }, at: [centre.x, centre.y, -centre.z], turn: [0.0, 0.0, 0.0, 1.0], material: Material::default() });
     }
-    Ok(Prepared { template: template.to_owned(), model, colliders })
+    let caliber = worker.round_caliber(template.strip_prefix(CASE_MODEL).unwrap_or(template));
+    Ok(Prepared { template: template.to_owned(), model, colliders, caliber })
 }
 
 /// What the inventory has let go this frame is set going as the game sets
@@ -320,11 +467,18 @@ pub fn set_going(
     mut controller: ResMut<Controller>,
     time: Res<Time>,
     weapon: Option<Res<WeaponRig>>,
+    (hands, game, skills): (Option<Res<crate::weapon::HandsRig>>, Res<crate::GameData>, Option<Res<crate::skills::Skills>>),
     helper: TransformHelper,
     (names, children, models): (Query<&Name>, Query<&Children>, Query<(Entity, &LooseModel)>),
     mut again: MessageReader<crate::death::BeginAgain>,
 ) {
+    let buffs = skills.map(|skills| skills.buffs()).unwrap_or_default();
     let loose = &mut *loose;
+    // Grenades gone at their fuse leave the ground.
+    if !loose.blown.is_empty() {
+        let blown = std::mem::take(&mut loose.blown);
+        carried.ground.retain(|(item, _)| !blown.contains(&item.id));
+    }
     // A run begun again puts back what lay on the ground at its start, each
     // set down afresh.
     if again.read().count() > 0 {
@@ -381,23 +535,97 @@ pub fn set_going(
         weapon_root: weapon_root.unwrap_or_else(|| loose::euler(m.pitch, m.yaw, 0.0)),
     };
     let magazine_at = magazine.and_then(|entity| unsqueezed(entity));
+    // The hand's grenade (`ThrowingParts[0]`), found under the weapon's root
+    // as the game finds it, with what a throw goes by.
+    let thrown_data = hands.as_ref().and_then(|hands| hands.thrown.as_ref()).map(|(_, data)| data.clone());
+    // The grenade in hand's flying model, read before it is thrown.
+    loose.held = hands.as_ref().and_then(|hands| hands.thrown.as_ref()).map(|(template, _)| format!("{GRENADE_MODEL}{template}"));
+    if let Some(held) = loose.held.clone() {
+        loose.ask(&held);
+    }
+    let grenade_at = thrown_data.as_ref().and_then(|data| {
+        let name = data.throwing_parts.first()?;
+        let mut stack = vec![weapon.as_ref()?.weapon_root?];
+        while let Some(entity) = stack.pop() {
+            if names.get(entity).is_ok_and(|n| n.as_str() == name) {
+                return unsqueezed(entity);
+            }
+            stack.extend(children.get(entity).into_iter().flatten());
+        }
+        None
+    });
     // (Taken without telling of a change to what is carried: the screen
     // is drawn afresh on one.)
     let thrown = if carried.thrown.is_empty() { Vec::new() } else { std::mem::take(&mut carried.bypass_change_detection().thrown) };
     for (id, how) in thrown {
         let Some((item, at)) = carried.ground.iter().find(|(item, _)| item.id == id) else { continue };
+        let mut grenade = None;
+        // A weapon's model is its build's (`trp_sim::inventory::rig_key`).
+        let mut template = trp_sim::inventory::rig_key(item);
         let start = match (how, magazine_at) {
             (How::LetFall, Some((at, turn))) => loose::let_fall(at, turn, &mut loose.dice),
             // No weapon to let it fall from: where it would lie.
             (How::LetFall, None) => loose::let_fall([at.x, at.y + 1.0, -at.z], [0.0, 0.0, 0.0, 1.0], &mut loose.dice),
             (How::Thrown, _) => loose::thrown(&by, false, &mut loose.dice),
+            (How::Grenade { low }, _) => match (thrown_data.as_ref(), grenade_at) {
+                (Some(data), Some((hand_at, hand_turn))) => {
+                    // Where it leaves: the hand's grenade and the offset in
+                    // its axes; turned as that grenade is. The line back to
+                    // the body's front is not tried against the world
+                    // (`CheckHandsToBodyObstacles`: PROVISIONAL).
+                    let offset = trp_physics::rotate(hand_turn, data.offset);
+                    let leaves = [hand_at[0] + offset[0], hand_at[1] + offset[1], hand_at[2] + offset[2]];
+                    // A direction on the unit sphere for the throw's wobble.
+                    let (z, around) = (loose.dice.range(-1.0, 1.0), loose.dice.range(0.0, std::f32::consts::TAU));
+                    let across = (1.0 - z * z).max(0.0).sqrt();
+                    let input = trp_sim::grenade_hands::ThrowInput {
+                        force: loose.grenade_force,
+                        low,
+                        // Strength's throw (a high throw's strength) and
+                        // Throwing's elite (`skills`).
+                        strength_buff: buffs.strength_throw,
+                        elite: buffs.throwing_elite,
+                        hands_stamina: controller.movement.stamina.arms.level(),
+                        drop_up: trp_physics::rotate(by.weapon_root, [0.0, 1.0, 0.0]),
+                        random: [across * around.cos(), across * around.sin(), z],
+                        velocity: controller.movement.velocity,
+                    };
+                    let force = trp_sim::grenade_hands::throw_force(&input);
+                    let body = data.body;
+                    // Its fuse from its item (`explDelay`, the field the
+                    // game reads), with no time spent on it: the player's
+                    // throw.
+                    let fuse = game.db.items.get(&template).and_then(|item| item.props["explDelay"].as_f64()).unwrap_or(0.0) as f32;
+                    grenade = Some(GrenadeBody {
+                        mass: body.mass,
+                        drag: body.drag,
+                        angular_drag: body.angular_drag,
+                        continuous: body.collision_detection != 0,
+                        colliders: loose::colliders(&data.thrown, &mut |_| None),
+                        fuse,
+                        item: template.clone(),
+                    });
+                    template = format!("{GRENADE_MODEL}{template}");
+                    info!("a grenade thrown ({}): force {force:?}, fuse {fuse} s", if low { "from below" } else { "from above" });
+                    Start { at: leaves, turn: hand_turn, velocity: force.map(|f| f / body.mass.max(1e-6)), spin: [0.0; 3] }
+                }
+                _ => {
+                    warn!("{template}: no grenade in the hand to throw from; it is put down instead");
+                    loose::thrown(&by, false, &mut loose.dice)
+                }
+            },
         };
         let hidden_for = if how == How::Thrown { loose.hidden_for } else { 0.0 };
-        let (template, mass) = (item.kind.template.clone(), item.weight());
+        let mass = item.weight();
+        // Its landing sound by its template (`DropSoundType`), counted from
+        // where it sets off (`ThrowItem`'s `CacheParameters`); its body's
+        // mass is the thing's whole weight (`CreateLootWithRigidbody`).
+        let kind = game.db.items.get(&item.kind.template).and_then(|t| t.props.get("DropSoundType")?.as_str().map(trp_data::sound::drop_kind)).unwrap_or(0);
+        let landing = (kind != 0 && grenade.is_none()).then(|| trp_sim::landing::Landing::new(kind, mass, start.at[1]));
         loose.flights.retain(|f| f.id != id);
         loose.places.remove(&id);
         info!("{template} set going ({how:?}) at {:?}, turned {:?}, at {:?} m/s; the character at {:?}", start.at, start.turn, start.velocity, controller.movement.position);
-        loose.flights.push(Flight { id, template: template.clone(), mass, start, placed: false, hidden_for, since: 0.0, missed: Vec::new(), moving: None });
+        loose.flights.push(Flight { id, template: template.clone(), mass, start, placed: false, hidden_for, since: 0.0, missed: Vec::new(), moving: None, grenade, landing });
         loose.ask(&template);
     }
     // Set down: the rest of what lies on the ground with nowhere yet.
@@ -405,14 +633,16 @@ pub fn set_going(
         .ground
         .iter()
         .filter(|(item, _)| !loose.places.contains_key(&item.id) && !loose.flights.iter().any(|f| f.id == item.id))
-        .map(|(item, at)| (item.id, item.kind.template.clone(), item.weight(), *at))
+        .map(|(item, at)| (item.id, trp_sim::inventory::rig_key(item), item.weight(), *at))
         .collect();
     for (id, template, mass, at) in unplaced {
         if matches!(loose.models.get(&template), Some(Asked::Failed)) {
             continue;
         }
         let start = Start { at: [at.x, at.y, -at.z], turn: [0.0, 0.0, 0.0, 1.0], velocity: [0.0; 3], spin: [0.0; 3] };
-        loose.flights.push(Flight { id, template: template.clone(), mass, start, placed: true, hidden_for: 0.0, since: 0.0, missed: Vec::new(), moving: None });
+        // Set down by this work's layout: not a fall of the game's, and
+        // not heard.
+        loose.flights.push(Flight { id, template: template.clone(), mass, start, placed: true, hidden_for: 0.0, since: 0.0, missed: Vec::new(), moving: None, grenade: None, landing: None });
         loose.ask(&template);
     }
     // Taken up, or gone with a restart: its flight, place and model go.
@@ -439,12 +669,15 @@ pub fn fly(
     time: Res<Time>,
     range: Res<Range>,
     mut models: Query<(&LooseModel, &mut Transform, &mut Visibility)>,
+    mut blasts: MessageWriter<Blasted>,
+    mut landed: MessageWriter<crate::landing_sound::Landed>,
 ) {
     let loose = &mut *loose;
     let Some(physics) = loose.physics.clone() else { return };
     let (step, frame) = (clock.now(), time.delta_secs());
     let layer = physics.layer("Loot").unwrap_or(15);
     let mut done = Vec::new();
+    let mut blown = Vec::new();
     for (index, flight) in loose.flights.iter_mut().enumerate() {
         flight.since += frame;
         let ready = match loose.models.get(&flight.template) {
@@ -467,14 +700,46 @@ pub fn fly(
                 let lowest = loose::bounds(&ready.colliders).map_or(0.0, |(low, _)| low[1]);
                 start.at[1] += 0.01 - lowest;
             }
-            let (body, _) = loose::add(&mut world, ready.colliders.clone(), flight.mass, &start, loose.swept_under, layer);
-            let swept = loose::bounds(&ready.colliders).is_some_and(|(low, high)| (high[0] - low[0]) * (high[1] - low[1]) * (high[2] - low[2]) <= loose.swept_under);
+            let (body, swept) = match &flight.grenade {
+                // A thrown grenade on its own body, on the `Default` layer
+                // (`GrenadeFactory.Create`), set going by the throw's impulse.
+                Some(grenade) => {
+                    let desc = trp_physics::BodyDesc {
+                        at: start.at,
+                        turn: start.turn,
+                        colliders: grenade.colliders.clone(),
+                        mass: grenade.mass,
+                        drag: grenade.drag,
+                        angular_drag: grenade.angular_drag,
+                        velocity: start.velocity,
+                        spin: start.spin,
+                        max_depenetration: world.settings().max_depenetration,
+                        continuous: grenade.continuous,
+                        layer: physics.layer("Default").unwrap_or(0),
+                    };
+                    (world.add_body(&desc), true)
+                }
+                None => {
+                    let (body, _) = loose::add(&mut world, ready.colliders.clone(), flight.mass, &start, loose.swept_under, layer);
+                    (body, loose::bounds(&ready.colliders).is_some_and(|(low, high)| (high[0] - low[0]) * (high[1] - low[1]) * (high[2] - low[2]) <= loose.swept_under))
+                }
+            };
+            if flight.landing.is_some() {
+                world.report_touches(body);
+            }
             let mut moving = Moving { world, body, swept, watch: Watch::default() };
-            // What it missed while its model was read.
+            // What it missed while its model was read, heard as it would
+            // have been. (A grenade is not watched to a stop: it flies on
+            // to its fuse.)
             let mut stopped = false;
+            let mut then = 0.0;
             for (missed, frame) in std::mem::take(&mut flight.missed) {
                 moving.world.step(missed);
-                if moving.watch.frame(&moving.world, moving.body, moving.swept, frame) {
+                then += frame;
+                if let Some(landing) = flight.landing.as_mut() {
+                    landed.write_batch(crate::landing_sound::hear(&mut moving.world, moving.body, landing, then, &range, |_| None));
+                }
+                if flight.grenade.is_none() && moving.watch.frame(&moving.world, moving.body, moving.swept, frame) {
                     stopped = true;
                     break;
                 }
@@ -491,9 +756,21 @@ pub fn fly(
                 commands.entity(parent.map_or(root, |p| entities[p])).add_child(entity);
                 entities.push(entity);
             }
-            for (node, mesh, material) in &ready.drawn {
+            for (k, (node, mesh, material)) in ready.drawn.iter().enumerate() {
+                if left_out(ready.lens.get(k).copied().flatten(), false) {
+                    continue;
+                }
                 let part = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), Transform::default())).id();
                 commands.entity(entities[*node]).add_child(part);
+            }
+            for (node, mesh, material) in &ready.shadows {
+                let part = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), Transform::default(), crate::shadow_only::ShadowOnly(true))).id();
+                commands.entity(entities[*node]).add_child(part);
+            }
+            // A magazine's points, for its rounds (`magazine_rounds`).
+            if !ready.points.is_empty() {
+                let points = ready.points.iter().map(|&(node, number)| (entities[node], number)).collect();
+                commands.entity(root).insert(crate::magazine_rounds::MagazinePoints::new(crate::magazine_rounds::Owner::Ground(id), points));
             }
             let centre = place_of(&moving.world, moving.body);
             loose.places.insert(id, Place { centre });
@@ -505,7 +782,24 @@ pub fn fly(
         }
         let moving = flight.moving.as_mut().expect("moving");
         moving.world.step(step);
-        let stop = moving.watch.frame(&moving.world, moving.body, moving.swept, frame);
+        if let Some(landing) = flight.landing.as_mut() {
+            landed.write_batch(crate::landing_sound::hear(&mut moving.world, moving.body, landing, flight.since, &range, |_| None));
+        }
+        // A grenade is gone at its fuse; anything else when the game's
+        // watch on loot would take its body away.
+        let stop = match &flight.grenade {
+            Some(grenade) => {
+                let fused = flight.since >= grenade.fuse;
+                if fused {
+                    blown.push(flight.id);
+                    let at = moving.world.pose(moving.body).0;
+                    info!("a grenade's fuse ran out {:.3} s after the throw, at {at:?}", flight.since);
+                    blasts.write(Blasted { template: grenade.item.clone(), at });
+                }
+                fused
+            }
+            None => moving.watch.frame(&moving.world, moving.body, moving.swept, frame),
+        };
         let (at, turn) = moving.world.pose(moving.body);
         let object = drawn(at, turn);
         loose.places.insert(flight.id, Place { centre: place_of(&moving.world, moving.body) });
@@ -521,6 +815,7 @@ pub fn fly(
             done.push(index);
         }
     }
+    loose.blown.extend(blown);
     for index in done.into_iter().rev() {
         let flight = loose.flights.remove(index);
         if flight.moving.is_some() {

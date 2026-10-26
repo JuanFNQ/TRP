@@ -18,7 +18,7 @@ use trp_data::engine::EngineSettings;
 use trp_data::hard_settings::HardSettings;
 use trp_data::player::{HandsData, LimbData};
 use trp_data::unity::anim::path_hash;
-use trp_data::unity::extract::Hierarchy;
+
 use trp_data::unity::Assets;
 use trp_data::{Database, Install};
 use trp_sim::arms;
@@ -89,6 +89,7 @@ fn state_number(state: State) -> f32 {
         State::VaultLanding => 15.0,
         State::Approach => 16.0,
         State::Breach => 17.0,
+        State::BlindFire => 18.0,
     }
 }
 
@@ -127,6 +128,7 @@ fn recorded_state_number(name: &str) -> Option<f32> {
         "VaultingLanding" => 15.0,
         "Approach" => 16.0,
         "BreachDoor" => 17.0,
+        "BlindFire" => 18.0,
         _ => return None,
     })
 }
@@ -138,6 +140,8 @@ struct Geometry {
     /// moves, and the aim bone on it. The weapon's clips move the first.
     weapon_bone: ([f32; 3], [f32; 4]),
     aim_bone: [f32; 3],
+    /// The way the eye looks along the aim bone, on the weapon's own bone.
+    aim_line: [f32; 3],
     camera_bone: [f32; 4],
     /// The marker for the right hand, in that bone's axes.
     right_hand: ([f32; 3], [f32; 4]),
@@ -147,10 +151,11 @@ struct Geometry {
 
 impl Geometry {
     fn of(
-        hierarchy: &Hierarchy,
+        built: &trp_data::weapon::Weapon,
         right_hand: ([f32; 3], [f32; 4]),
         camera_box: trp_data::player::CameraBoxData,
     ) -> Result<Self> {
+        let hierarchy = &built.hierarchy;
         let node = |path: &str| {
             (0..hierarchy.nodes.len())
                 .find(|&i| hierarchy.path(i) == path)
@@ -159,15 +164,15 @@ impl Geometry {
         };
         let root = node("Weapon_root")?;
         let weapon = node("Weapon_root/Weapon_root_anim/weapon")?;
-        // The aim bone of the sight the game aims by: an iron sight's own
-        // where the build has one, else the weapon's (weapon-handling
-        // spec, "The sights").
-        let sights = trp_sim::rig::SightNodes::find(hierarchy).context("the weapon has no aim bone")?;
+        // The aim bone of the sight the game aims by first (optics spec,
+        // "The sights a weapon has"; weapon-handling spec, "The sights").
+        let sights = trp_sim::rig::SightNodes::of_weapon(built).context("the weapon has no aim bone")?;
         let aim = sights.bone_on_weapon(&WeaponRig::new(hierarchy));
         Ok(Self {
             weapon_root: (root.translation, root.rotation),
             weapon_bone: (weapon.translation, weapon.rotation),
             aim_bone: aim,
+            aim_line: sights.line_on_weapon(&WeaponRig::new(hierarchy)),
             camera_bone: node("Camera_animated").map_or(quat_euler([-90.0, 0.0, 0.0]), |n| n.rotation),
             right_hand,
             camera_box,
@@ -190,6 +195,7 @@ impl Geometry {
             bone: std::array::from_fn(|i| origin[i] + bone[i]),
             origin,
             barrel: quat_rotate(turn, [0.0, -1.0, 0.0]),
+            line: quat_rotate(turn, quat_rotate(weapon_rotation, self.aim_line)),
         }
     }
 }
@@ -198,6 +204,14 @@ struct Rig {
     movement: Movement,
     hands: Hands,
     firearm: Firearm,
+    /// The rounds of the magazine a reload takes, as the recorded
+    /// equipment has it, for a reload whose frames give none.
+    next_rounds: Option<u32>,
+    /// The recorded equipment was read and has no magazine within reach
+    /// for the weapon: the reload key does nothing (`ReloadMagNotFound`),
+    /// unless the frames show one fitted (course 8's `03`: the MDR's key at
+    /// 17.0 s found none, and blind fire was then taken at 17.5 s).
+    no_magazine: bool,
 }
 
 /// The weapon's own rig as its animator poses it, for the arms' hold on
@@ -229,7 +243,7 @@ impl Holding {
             moved: rig.moved_bone().context("the weapon has no bone for the procedural motion")?,
             weapon: rig.bone("Weapon_root/Weapon_root_anim/weapon").context("the weapon has no bone of its own")?,
             ends: trp_sim::weapon_line_ends(weapon)?,
-            sights: trp_sim::rig::SightNodes::find(&weapon.hierarchy),
+            sights: trp_sim::rig::SightNodes::of_weapon(weapon),
             arms: [arm(true)?, arm(false)?],
             limbs,
             vest: rig
@@ -263,6 +277,8 @@ struct Frame {
     /// The rounds in a magazine the recording shows being fitted on this
     /// frame.
     fitted: Option<u32>,
+    /// The aim sway's direction as the game drew it (recorder 0.12.0 on).
+    aim_sway: Option<[f32; 3]>,
     /// How many rounds of the weapon's kind the character had outside the
     /// weapon, as the recording last listed what was carried (recorder
     /// 0.6.2 on): what a tube is filled from.
@@ -282,6 +298,12 @@ struct Frame {
     /// How well fed and how well watered the character was on this frame,
     /// 1 for full, where a recording has them (recorder 0.4.7 on).
     condition: Option<[f32; 2]>,
+    /// The recoil's three processes as the recording has them on this
+    /// frame (the weapon's turn, its push, the camera's kick), with
+    /// `--recorded-recoil`: put on the simulation's before the frame's
+    /// late update, so that what follows a shot compares frame for frame
+    /// apart from the game's random draws.
+    recoil: Option<[[f32; 3]; 3]>,
     /// What the game's own grid measured ahead of the character, where a
     /// recording has it (recorder 0.4.8 on): on the frame the game raised
     /// the flag for a vault or a climb, the obstacle it chose by and the
@@ -642,6 +664,43 @@ struct Ground {
     /// plane above, for a recording made over something: a wall to vault,
     /// a ledge to fall from.
     profile: Option<Profile>,
+    /// A sill the recording was made at (`mount.txt`, `recorded_mount`):
+    /// what a mount's search meets besides the terrain.
+    sill: Option<trp_sim::collision::Block>,
+    /// The floor a mount's target place stands on, where the folder gives it
+    /// (`mount.txt`, `floor`): the static layer's rays down meet it there.
+    floor: Option<f32>,
+}
+
+/// What a recording's folder says of a mount the recorder could not see
+/// the world of (`mount.txt`): a sill, `sill <x> <z> <yaw> <top> [<width>
+/// <depth>]`, the middle of its face (x and z from where the character stood at
+/// the trace's start), the way the character looked at it (degrees), its top's
+/// height over the feet at the start, and its size along the face and
+/// back from it (2 and 0.4 m), from the terrain up; and `blocked`, the walk's
+/// lock on at the start (movement spec, "Stopped by what stands in the way":
+/// a character that has walked into the sill and stands, which the trace
+/// begins after). Read off what the game's mount found, not measured.
+fn recorded_mount(traces: Option<&Path>) -> (Option<([f32; 2], f32, f32, [f32; 2])>, bool, Option<f32>) {
+    let text = traces.and_then(|dir| std::fs::read_to_string(dir.join("mount.txt")).ok()).unwrap_or_default();
+    let mut sill = None;
+    let mut blocked = false;
+    let mut floor = None;
+    for line in text.lines().filter(|line| !line.trim_start().starts_with('#')) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let numbers: Vec<f32> = words.iter().skip(1).filter_map(|word| word.parse().ok()).collect();
+        match words.first() {
+            Some(&"sill") if numbers.len() >= 4 => {
+                let size = if numbers.len() >= 6 { [numbers[4], numbers[5]] } else { [2.0, 0.4] };
+                sill = Some(([numbers[0], numbers[1]], numbers[2], numbers[3], size));
+            }
+            Some(&"blocked") => blocked = true,
+            // The floor under the target place, from the feet at the start.
+            Some(&"floor") if !numbers.is_empty() => floor = Some(numbers[0]),
+            _ => {}
+        }
+    }
+    (sill, blocked, floor)
 }
 
 /// What a recorded path shows of the ground under it (recorder 0.4.3 on,
@@ -748,9 +807,74 @@ impl World for Ground {
         Terrain(self).line(from, to)
     }
 
+    /// A mount's rays meet the sill where there is one, and the terrain.
+    fn ray(&self, from: [f32; 3], direction: [f32; 3], length: f32, layer: trp_sim::mounting::Layer) -> Option<trp_sim::mounting::Hit> {
+        let mut terrain = Terrain(self).ray(from, direction, length, layer);
+        // The target place's floor, where the folder gives it.
+        if let (Some(floor), trp_sim::mounting::Layer::Static) = (self.floor.map(|f| f + self.height), layer) {
+            if direction[1] < 0.0 && from[1] >= floor && from[1] + direction[1] * length < floor {
+                let distance = (from[1] - floor) / -direction[1];
+                terrain = Some(trp_sim::mounting::Hit { distance, point: std::array::from_fn(|k| from[k] + direction[k] * distance), normal: [0.0, 1.0, 0.0] });
+            }
+        }
+        let to: [f32; 3] = std::array::from_fn(|k| from[k] + direction[k] * length);
+        let sill = self.sill.as_ref().and_then(|block| block.entered_face(from, to)).map(|(share, normal)| {
+            let distance = share * length;
+            trp_sim::mounting::Hit { distance, point: std::array::from_fn(|k| from[k] + direction[k] * distance), normal }
+        });
+        match (sill, terrain) {
+            (Some(s), Some(t)) => Some(if s.distance <= t.distance { s } else { t }),
+            (s, t) => s.or(t),
+        }
+    }
+
+    fn sphere_clear(&self, centre: [f32; 3], radius: f32, layer: trp_sim::mounting::Layer) -> bool {
+        Terrain(self).sphere_clear(centre, radius, layer) && !self.sill.as_ref().is_some_and(|block| block.sphere_overlaps(centre, radius))
+    }
+
+    /// The way to a mount's place against the sill, the box tried every 5 cm.
+    fn box_sweep(&self, from: [f32; 3], half: [f32; 3], yaw: f32, direction: [f32; 3], length: f32, _layer: trp_sim::mounting::Layer) -> bool {
+        let Some(block) = &self.sill else { return false };
+        let tries = (length / 0.05).ceil().max(1.0) as usize;
+        (0..=tries).any(|i| {
+            let along = length * i as f32 / tries as f32;
+            block.upright_box_overlaps(std::array::from_fn(|k| from[k] + direction[k] * along), half, yaw)
+        })
+    }
+
     fn push_out(&self, centre: [f32; 3], half: [f32; 3], turn: [f32; 4], margin: f32) -> [f32; 3] {
         Terrain(self).push_out(centre, half, turn, margin)
     }
+
+    /// The head's capsule: out of the terrain, and out of the sill where
+    /// the folder gives one, each lengthened by a millimetre.
+    fn capsule_push(&self, ends: [[f32; 3]; 2], radius: f32) -> [f32; 3] {
+        let mut push = Terrain(self).capsule_push(ends, radius);
+        if let Some((way, depth)) = self.sill.as_ref().and_then(|block| block.capsule_push(ends, radius)) {
+            for k in 0..3 {
+                push[k] += way[k] * (depth + trp_sim::movement::pom::MARGIN);
+            }
+        }
+        push
+    }
+}
+
+/// A recording's kit (`equipment`: each thing with its parent's id and the
+/// slot it is in, under the one with no parent) as a tree for the armour.
+fn recorded_kit(equipment: &[Json]) -> Vec<trp_sim::armor::Worn> {
+    fn under(equipment: &[Json], parent: &str) -> Vec<trp_sim::armor::Worn> {
+        equipment
+            .iter()
+            .filter(|e| e.get("in").and_then(Json::as_str) == Some(parent))
+            .map(|e| trp_sim::armor::Worn {
+                template: e.get("tpl").and_then(Json::as_str).unwrap_or("").to_owned(),
+                slot: e.get("at").and_then(Json::as_str).unwrap_or("").to_owned(),
+                children: under(equipment, e.get("id").and_then(Json::as_str).unwrap_or("")),
+            })
+            .collect()
+    }
+    let root = equipment.iter().find(|e| e.get("in").is_none()).and_then(|e| e.get("id")).and_then(Json::as_str).unwrap_or("");
+    under(equipment, root)
 }
 
 /// The terrain under the ground the character rides on.
@@ -835,6 +959,39 @@ fn recorded_weapon(traces: Option<&Path>) -> Option<String> {
     std::io::BufReader::new(std::fs::File::open(files.first()?).ok()?).read_line(&mut line).ok()?;
     let header: Json = serde_json::from_str(&line).ok()?;
     header.get("weapon").and_then(Json::as_str).filter(|id| !id.is_empty()).map(str::to_owned)
+}
+
+/// The weapon in hand as the recording's equipment has it (recorder 0.11.0
+/// on: every item with its parent and slot), as a build: the first item of
+/// the weapon's template in a weapon slot, and every part below it but the
+/// rounds. `None` where the first trace's header lists no such item.
+fn recorded_build(traces: Option<&Path>, weapon: &str) -> Option<trp_data::database::Preset> {
+    use std::io::BufRead;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(traces?).ok()?.filter_map(|e| Some(e.ok()?.path())).filter(|p| p.extension().is_some_and(|e| e == "jsonl")).collect();
+    files.sort();
+    let mut line = String::new();
+    std::io::BufReader::new(std::fs::File::open(files.first()?).ok()?).read_line(&mut line).ok()?;
+    let header: Json = serde_json::from_str(&line).ok()?;
+    let items = header.get("equipment")?.as_array()?;
+    let text = |item: &Json, key: &str| item.get(key).and_then(Json::as_str).map(str::to_owned);
+    let root = items.iter().find(|item| {
+        text(item, "tpl").as_deref() == Some(weapon) && matches!(text(item, "at").as_deref(), Some("FirstPrimaryWeapon" | "SecondPrimaryWeapon" | "Holster"))
+    })?;
+    let root_id = text(root, "id")?;
+    let mut build = vec![trp_data::database::PresetItem { id: root_id.clone(), template: weapon.to_owned(), parent: None, slot: None }];
+    let mut wanted = vec![root_id.clone()];
+    while let Some(parent) = wanted.pop() {
+        for item in items.iter().filter(|item| text(item, "in").as_deref() == Some(parent.as_str())) {
+            let slot = text(item, "at")?;
+            if slot == "cartridges" || slot == "patron_in_weapon" {
+                continue;
+            }
+            let id = text(item, "id")?;
+            build.push(trp_data::database::PresetItem { id: id.clone(), template: text(item, "tpl")?, parent: Some(parent.clone()), slot: Some(slot) });
+            wanted.push(id);
+        }
+    }
+    Some(trp_data::database::Preset { id: "recorded".into(), name: "recorded".into(), root: root_id, items: build, encyclopedia: None })
 }
 
 fn recorded_line(traces: Option<&Path>) -> Option<f32> {
@@ -930,12 +1087,15 @@ fn replay(
     own_view: bool,
     holding: &mut Holding,
 ) -> (Vec<(f32, Sample)>, Option<[f32; 2]>) {
-    let Rig { movement, hands, firearm } = rig;
+    let Rig { movement, hands, firearm, next_rounds, no_magazine } = rig;
     let outside = hands.point_of_view() == PointOfView::ThirdPerson;
     let mut out = Vec::new();
     let mut leftover = None;
     let mut pressed = vec![false; scenario.presses.len()];
     let mut aim_key = false;
+    // How deep the weapon last stuck into something, and what the mount did.
+    let mut last_overlap = 0.0f32;
+    let mut mount_events: Vec<(f32, trp_sim::mounting::MountEvent)> = Vec::new();
     // The replay faces the way the recording did. The bearing matters:
     // coming out of a sprint the game starts the walk's speed vector
     // pointing along the world's z axis, whichever way the player faces.
@@ -999,6 +1159,10 @@ fn replay(
                 }
             }
         }
+        // The aim sway's direction as the game drew it, where recorded.
+        if let Some(direction) = frame.aim_sway {
+            hands.aim_sway_override = Some(direction);
+        }
         let mut keys: Vec<&str> = Vec::new();
         for (press, (key, at)) in scenario.presses.iter().enumerate() {
             if time >= *at && !std::mem::replace(&mut pressed[press], true) {
@@ -1020,8 +1184,9 @@ fn replay(
                 "reload" if firearm.settings.internal_magazine => firearm.reload_shells(frame.reach.unwrap_or(u32::MAX / 2)),
                 "reload" => {
                     let near = &frames[index.saturating_sub(1)..(index + 4).min(frames.len())];
-                    match near.iter().find_map(|f| f.fitted) {
+                    match near.iter().find_map(|f| f.fitted).or(*next_rounds) {
                         Some(rounds) => firearm.reload_with(rounds),
+                        None if *no_magazine => {}
                         None => firearm.reload(),
                     }
                 }
@@ -1032,11 +1197,47 @@ fn replay(
                 "auto" => _ = firearm.set_fire_mode(FireMode::FullAuto),
                 "single" => _ = firearm.set_fire_mode(FireMode::Single),
                 "semiauto" => _ = firearm.set_fire_mode(FireMode::SemiAuto),
-                "check_magazine" => firearm.check_magazine(),
+                "check_magazine" => _ = firearm.check_magazine(),
                 "check_chamber" => firearm.check_chamber(),
+                // Recorder 0.12.0: the selector's look and the fire mode key,
+                // the sights' keys and zeroing, as the app plays them.
+                "check_fire_mode" => _ = firearm.check_fire_mode(),
+                "fire_mode_next" => firearm.next_fire_mode(),
+                "sight_next" => _ = hands.change_aim_scope(movement.mounted()),
+                "magnification" => {
+                    if hands.change_magnification() {
+                        firearm.mod_switch();
+                    }
+                }
+                "zero_up" => _ = hands.step_zeroing(true),
+                "zero_down" => _ = hands.step_zeroing(false),
+                // Recorder 0.13.0: blind fire's commands as the game's input
+                // root gives them (`cmd:`; blind-fire spec, "The keys").
+                "cmd:ToggleBlindAbove" => input.blind_toggle = 1,
+                "cmd:ToggleBlindRight" => input.blind_toggle = -1,
+                "cmd:BlindShootEnd" => input.blind_end = true,
+                // The mount's and the bipod's (mounting spec, "The keys").
+                "cmd:WeaponMounting" => input.mount = true,
+                // The left shoulder's (left-shoulder spec, "The key").
+                "cmd:LeftStanceToggle" => input.left_stance = true,
+                "cmd:ToggleBipods" => {
+
+                    if firearm.toggle_bipod(movement.mounted(), movement.sprinting, movement.gesture_free()) {
+                        if let (Some(out), Some(forward)) = (firearm.bipod(), firearm.settings.bipod) {
+                            movement.bipod_gesture(out, forward);
+                            hands.set_bipod(out);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
+        // The weapon's mount figures and its bipod, for the movement's mount.
+        movement.set_mount_weapon(Some(hands.settings.mount), firearm.bipod().unwrap_or(false));
+        (input.mount_may, input.overlap_depth) = (firearm.may_mount(), last_overlap);
+        // What the weapon in hand says to blind fire's gate.
+        (input.blind_firearm, input.blind_may_start) = (true, firearm.can_set_blind_fire());
+        input.left_stance_may = firearm.may_toggle_left_stance();
         // The aim key asks; the weapon's logic and the movement state
         // decide. The sprint switching on puts the sights down, and so
         // does entering a state that does not allow aiming.
@@ -1048,16 +1249,38 @@ fn replay(
         // movement state the frame began in, like the aim key.
         let can_fire = movement.can_press_trigger();
         input.aiming = firearm.aiming();
+        // The weapon's motion takes the aim as the key changed it, on this
+        // frame, whether a physics step comes in it or not.
+        hands.aim_changed(firearm.aiming());
         // A reload begun this frame is one the body's animator sees this
         // frame; one that ends in the weapon's step below, the next.
         input.reloading = firearm.reloading();
         input.hands_busy = firearm.hands_busy();
+        // Whether the hands' animator is at rest, which a gesture of the
+        // hands waits for (the bipod's).
+        input.hands_idle = firearm.animator_idling();
         input.weapon_occupied = firearm.occupied();
         // What stands ahead is as the game's own grid measured it.
         if frame.vault.is_some() {
             movement.vault_given = frame.vault;
         }
         movement.step_on_clock(frame.dt, frame.player_dt, &input, ground);
+        // What blind fire's gate took goes to the weapon and its motion.
+        trp_sim::blind_fire::tell(movement, Some(&mut *firearm), Some(&mut *hands));
+        // And what the mount did (`trp_sim::mounting::tell`): untrained, no
+        // skill's gain.
+        for event in trp_sim::mounting::tell(movement, Some(&mut *firearm), Some(&mut *hands), [0.0; 2]) {
+            if let (trp_sim::mounting::MountEvent::Entered { .. }, Some(data)) = (event, movement.last_mount_data()) {
+                println!("  mount data at {time:.3} s: point {:?} target {:?} body yaw {:.4} pose limits {:?} pitch limits {:?} yaw limits {:?} approach {:.5}; stance {:.6}", data.point.at, data.target, data.body_yaw, data.pose_limit, data.pitch_limit, data.yaw_limit, data.approach, movement.pose_level);
+            }
+            mount_events.push((time, event));
+        }
+        // The bipod's gesture past its mark ends the weapon's toggle.
+        for acted in movement.take_acted() {
+            if acted == trp_sim::Acted::BipodToggled {
+                firearm.bipod_toggled();
+            }
+        }
         if movement.take_sprint_started() {
             firearm.sprint_started();
         }
@@ -1100,7 +1323,7 @@ fn replay(
                     sprinting: m.state == State::Sprint,
                     idle: m.state == State::Idle,
                     footstep,
-                    tilt: m.smoothed_tilt,
+                    tilt: if m.mounted() { m.weapon_tilt() } else { m.smoothed_tilt },
                     tilt_target: m.tilt,
                     pose_level: m.pose_level,
                     smoothed_pose_level: m.smoothed_pose_level,
@@ -1126,8 +1349,21 @@ fn replay(
                 // The body's part in the weapon leaving and coming to the
                 // hands, told whoever is looking (third-person spec).
                 FirearmEvent::BodyAction(action) => movement.body.set_weapon_action(action),
+                // An operation that ends blind fire has begun.
+                FirearmEvent::BlindFireEnded => trp_sim::blind_fire::ended(movement, Some(&mut *hands)),
+                // And one that ends a mount.
+                FirearmEvent::LeaveMount { at_once } => movement.leave_mount(at_once),
+                // And what the left shoulder hears of the hands.
+                FirearmEvent::LeftStance(call) => movement.left_stance_call(call),
                 _ => {}
             }
+        }
+        // With `--recorded-recoil`, the recoil as the game had it on this
+        // frame, before anything is placed by it.
+        if let Some([turn, push, kick]) = frame.recoil {
+            hands.recoil.hand_rotation.current = turn;
+            hands.recoil.hand_position.current = push;
+            hands.recoil.camera_rotation.current = kick;
         }
         // A reload handing over takes stock of the weapon: its length
         // for the line that feels for obstacles is measured afresh, in the
@@ -1169,18 +1405,47 @@ fn replay(
             hands.note_sights(sights.line(&holding.rig), sights.in_moved(&holding.rig).and_then(|(_, muzzle)| muzzle));
         }
         // The frame's share of any first-person pose, before the weapon
-        // is placed.
-        hands.blend_poses(frame.dt);
+        // is placed, on the player's clock.
+        hands.blend_poses(frame.player_dt);
         // Where the body carries the weapon, if it does, and its right
         // hand where that has the weapon.
         let marker = frame.right_marker.unwrap_or(geometry.right_hand);
-        let (weapon_position, weapon_rotation) = hands.weapon_transform_carried(geometry.weapon_root, m.carried(), m.held(), marker);
+        // With the left shoulder's part (`PlayerBones.ShiftWeaponRoot`).
+        let left = trp_sim::hands::LeftShoulder {
+            curve: m.body.left_stance_curve(),
+            sprinting: m.state == State::Sprint,
+            anim_value: m.left_stance().last_anim,
+            aiming: hands.is_aiming(),
+            forward: m.forward_input(),
+            dt: frame.player_dt,
+            ribcage_local: m.body.ribcage_local(),
+        };
+        let shifted = hands.weapon_transform_shifted(geometry.weapon_root, m.body.weapon_root_third(m.body_in_view()), m.held(), marker, left);
+        let (weapon_position, weapon_rotation) = shifted.held;
         // The camera takes the sight's place off the weapon where the
         // procedural motion put it: the game works the camera out before
-        // the body takes the weapon.
-        let (placed_position, placed_rotation) = hands.weapon_transform();
+        // the body takes the weapon; with the left shoulder's curve up, late
+        // in the frame, from where the shoulder put it (`LateTransformations`).
+        let (placed_position, placed_rotation) = if hands.left_shoulder_curve() > 0.0 { shifted.held } else { hands.weapon_transform() };
         let aim = geometry.aim_point(placed_position, placed_rotation, frame.weapon_bone);
         hands.body_camera = Some(m.body.camera_bone());
+        // On a mount the rig is moved onto its point, and the mount's camera
+        // follows it from the camera's own object (`MountingRotationFunction`).
+        let rig_apart = match m.mount_view() {
+            Some(view) => {
+                let pivot = hands.settings.mount.pivot_for(view.side != trp_sim::mounting::Side::Forward, view.on_bipod);
+                let (root_at, root_turn) = geometry.weapon_root;
+                let turned = quat_rotate(root_turn, pivot);
+                m.mounted_rig_apart(std::array::from_fn(|k| root_at[k] + turned[k]))
+            }
+            None => [0.0; 3],
+        };
+        let camera_apart = {
+            let (container, ribcage) = (m.camera_container(), m.ribcage());
+            let look = quat_mul(quat_axis(1, m.yaw - m.body_yaw), quat_axis(0, m.pitch));
+            quat_rotate([-look[0], -look[1], -look[2], look[3]], std::array::from_fn(|i| container[i] - ribcage[i]))
+        };
+        hands.set_rig_shift(std::array::from_fn(|k| rig_apart[k] - camera_apart[k]));
         // The camera is moved for the character's own eyes only: seen from
         // outside it is left where it stood
         // (`ThirdPersonStrategy.ApplyCameraTransformations`), and what the
@@ -1188,9 +1453,9 @@ fn replay(
         let mut camera = trp_sim::CameraPose { position: [0.0; 3], rotation: [0.0, 0.0, 0.0, 1.0], field_of_view: hands.settings.field_of_view };
         let mut push = [0.0; 3];
         if outside {
-            hands.frame_outside();
+            hands.frame_outside(frame.dt);
         } else {
-            camera = hands.frame(frame.dt, geometry.camera_bone, Some(aim));
+            camera = hands.frame_on_clock(frame.dt, frame.player_dt, geometry.camera_bone, Some(aim));
             // Last of all in the game's frame, the camera's box is pushed
             // out of the world, and the camera with it.
             let shape = &geometry.camera_box;
@@ -1225,14 +1490,24 @@ fn replay(
         put("recoil_pos", &hands.recoil.hand_position.current);
         put("recoil_cam", &hands.recoil.camera_rotation.current);
         // The weapon's moved bone as the camera sees it: through the rig,
-        // which is squeezed along the view, from a camera that is not.
+        // which is squeezed along the view, from a camera that is not. The
+        // camera hangs in its own object, which a clip may leave apart from
+        // the ribcage the rig hangs from (`Movement::camera_container`).
+        let apart = {
+            let (container, ribcage) = (m.camera_container(), m.ribcage());
+            let look = quat_mul(quat_axis(1, m.yaw - m.body_yaw), quat_axis(0, m.pitch));
+            let back = [-look[0], -look[1], -look[2], look[3]];
+            quat_rotate(back, std::array::from_fn(|i| container[i] - ribcage[i]))
+        };
         let seen = |position: [f32; 3]| {
             let (root_position, root_rotation) = geometry.weapon_root;
             let hanging = quat_rotate(root_rotation, position);
             let mut at: [f32; 3] = std::array::from_fn(|i| root_position[i] + hanging[i]);
             at[2] *= squeeze(hands);
+            // (A mount's move of the rig is not squeezed: it is the root's own place.)
+            at = std::array::from_fn(|i| at[i] + rig_apart[i]);
             let back = [-camera.rotation[0], -camera.rotation[1], -camera.rotation[2], camera.rotation[3]];
-            quat_rotate(back, std::array::from_fn(|i| at[i] - camera.position[i]))
+            quat_rotate(back, std::array::from_fn(|i| at[i] - camera.position[i] - apart[i]))
         };
         put("weapon_pos", &weapon_position);
         put("weapon_rot", &rotation_vector(&weapon_rotation));
@@ -1244,8 +1519,11 @@ fn replay(
         let look = quat_mul(quat_axis(1, m.yaw - m.body_yaw), quat_axis(0, m.pitch));
         let beside = quat_rotate(look, camera.position);
         let ribcage = m.ribcage();
+        // The camera hangs in its own object beside the ribcage
+        // (`Movement::camera_container`).
+        let container = m.camera_container();
         if !outside {
-            put("eye", &[ribcage[0] + beside[0], ribcage[1] + beside[1], ribcage[2] + beside[2]]);
+            put("eye", &[container[0] + beside[0], container[1] + beside[1], container[2] + beside[2]]);
         }
         put("ribcage", &ribcage);
         // The body's own bones, where a recording has them (recorder 0.3.0
@@ -1279,7 +1557,7 @@ fn replay(
         // body's own by as much as its animation claims them. The weapon's
         // bone is where the body's carrying left it; the hand-over to the
         // body's palm comes after the arms are solved.
-        let carried_only = hands.weapon_transform_carried(geometry.weapon_root, m.carried(), None, marker);
+        let carried_only = shifted.carried;
         holding.rig.set_local(holding.moved, carried_only);
         // From the frame the rig hangs in to the player's axes. The
         // recorder reads as the frame is drawn, when the game has turned
@@ -1345,8 +1623,13 @@ fn replay(
         // Last in the frame, as in the game: how deep the weapon would
         // stick into the ground. The next physics steps turn it away by
         // that, and past a limit the sights come down until it is clear.
-        let depth = m.weapon_overlap(ground, hands.weapon_line());
+        let left_wanted = m.left_stance().wanted;
+        let (depth, measured) = hands.measure_overlap_shoulder(left_wanted, |line| m.weapon_overlap(ground, line));
+        let clear_left = !left_wanted || m.weapon_overlap(ground, hands.shoulder_line(0.2)) <= 0.0;
         hands.set_overlap(depth);
+        last_overlap = depth;
+        movement.left_stance_overlap(depth, measured, || clear_left, frame.dt);
+        let m = &*movement;
         firearm.overlap(depth, hands.turn_away_value(), m.can_aim());
         // Sights the obstacle put down or gave back are so from here on,
         // not from the next physics step.
@@ -1428,9 +1711,49 @@ fn replay(
         put("p_DoClimb", &[do_climb as u8 as f32]);
         put("p_IsVaulting", &[m.is_vaulting as u8 as f32]);
         put("capsule", &m.capsule_figures());
+        // The head's push as the last limit found it (`head_push`, the
+        // recorder's `POM.GetOffset`).
+        put("head_push", &m.head_push());
         put("grounded", &[m.grounded as u8 as f32]);
         put("pos", &m.position);
         put("movement_state", &[state_number(m.state)]);
+        // Blind fire as the recorder has it (`blind`: the movement's figure
+        // and the blender's value), the body's two parameters, and the
+        // camera rotation spring's rest.
+        let (blind_value, _) = hands.blind_fire();
+        put("blind", &[m.blind_fire() as f32, blind_value]);
+        let (blind_shown, blind_float) = m.blind_fire_animator();
+        put("p_BlindFire", &[blind_shown]);
+        put("p_BlindFireFloat", &[blind_float]);
+        // Mounting as the recorder has it (`mount`: mounted, the weapon's
+        // motion told it, at a side, the bipod used, a bipod at all), the
+        // mount's data and figures, the lean, the body's `Tilt` and
+        // `ProneBipodsOn`, the gesture shown, the rig moved onto the point.
+        let (hands_mount, _) = hands.mounting();
+        let side = m.mount_view().is_some_and(|view| view.side != trp_sim::mounting::Side::Forward);
+        put("mount", &[m.mounted() as u8 as f32, hands_mount.is_some() as u8 as f32, side as u8 as f32, firearm.bipod().unwrap_or(false) as u8 as f32, firearm.bipod().is_some() as u8 as f32]);
+        if let (Some((data, [offset, mounted_tilt, camera_tilt, timer])), Some(view)) = (m.mount_figures(), m.mount_view()) {
+            put("mount_target", &data.target);
+            put("mount_point", &view.point);
+            put("mount_limits", &[data.pose_limit[0], data.pose_limit[1], data.pitch_limit[0], data.pitch_limit[1], data.yaw_limit[0], data.yaw_limit[1]]);
+            put("mount_approach", &[data.approach]);
+            put("mount_transition", &[view.moving as u8 as f32, view.progress]);
+            put("mount_figures", &[offset, mounted_tilt, camera_tilt, timer]);
+        }
+        put("tilt", &[m.tilt]);
+        put("p_Tilt", &[m.body_tilt_shown()]);
+        put("p_ProneBipodsOn", &[(m.mounted() && m.prone) as u8 as f32]);
+        // The left shoulder (left-shoulder spec): the animator's flags and
+        // the curve its clips give.
+        put("p_LeftStance", &[m.left_stance().animator as u8 as f32]);
+        put("p_ForceLeftStanceInOneFrame", &[m.left_stance().force_one_frame as u8 as f32]);
+        put("p_Leftstance_curve", &[m.body.left_stance_curve()]);
+        // (Not under the animator's name: its parameter keeps the last
+        // gesture's number, where this is the one shown now.)
+        put("interaction_shown", &[m.shown_interaction().map_or(0.0, f32::from)]);
+        put("rig_apart", &rig_apart);
+        put("bipod_operation", &[firearm.toggling_bipod() as u8 as f32]);
+        put("cam_rot_zero", &hands.camera_rotation.zero);
         if !outside {
             put("camera_pos", &camera.position);
             put("camera_rot", &rotation_vector(&camera.rotation));
@@ -1448,6 +1771,9 @@ fn replay(
         put("tactical_reload", &[firearm.tactical_reload()]);
         put("magazine", &[firearm.magazine.unwrap_or(0) as f32]);
         out.push((frame.time, sample));
+    }
+    for (at, event) in &mount_events {
+        println!("  mount at {at:.3} s: {event:?}");
     }
     (out, leftover)
 }
@@ -1509,6 +1835,23 @@ fn read_trace(path: &Path) -> Result<(Json, Vec<(f32, Sample)>)> {
         let Some(object) = v.as_object() else { continue };
         let mut sample = Sample::new();
         for (name, value) in object {
+            // Recorder 0.12.0: the aim sway's direction, drawn at random as
+            // the sights came up (`sight.aim_sway`: strength, direction, left).
+            if name == "sight" {
+                if let Some(direction) = value.get("aim_sway").and_then(|a| a.get(1)).and_then(Json::as_array) {
+                    sample.insert("aim_sway_direction".into(), direction.iter().filter_map(|x| x.as_f64().map(|x| x as f32)).collect());
+                }
+                continue;
+            }
+            // Recorder 0.13.0: the body's parameters as they change (`bp`),
+            // of which the replay sets blind fire's beside its own
+            // (`BlindFire`, carried from frame to frame).
+            if name == "bp" {
+                if let Some(blind) = value.get("BlindFire").and_then(Json::as_f64) {
+                    standing.insert("p_BlindFire".into(), vec![blind as f32]);
+                }
+                continue;
+            }
             let numbers: Vec<f32> = match value {
                 Json::Array(_) if name == "equipment" => {
                     standing.insert("rounds_in_reach".into(), vec![rounds_in_reach(value) as f32]);
@@ -1716,6 +2059,9 @@ fn main() -> Result<()> {
     let mut line: Option<f32> = None;
     let mut seed: Option<u64> = None;
     let mut endurance: Option<f32> = None;
+    let mut recorded = false;
+    let mut recorded_recoil = false;
+    let mut aim_sway: Option<[f32; 3]> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1738,6 +2084,21 @@ fn main() -> Result<()> {
             // the spread of many runs, not with any one.
             "--seed" => seed = Some(args.next().and_then(|v| v.parse().ok()).context("--seed needs a number")?),
             "--endurance" => endurance = Some(args.next().and_then(|v| v.parse().ok()).context("--endurance needs a level")?),
+            // The weapon built as the recording's equipment has it, its
+            // parts as they were (a user's own build), not its stock one.
+            "--recorded-build" => recorded = true,
+            // The recoil's processes taken from the recording each frame
+            // (`recoil_rot`, `recoil_pos`, `recoil_cam`), so that the
+            // camera's follow and the weapon's pose under fire compare
+            // with the game's apart from its random draws.
+            "--recorded-recoil" => recorded_recoil = true,
+            // A heavy weapon's aim sway in this direction each time the
+            // sights come up (`_aimSwayDirection`, as the game draws it at
+            // random): a recording before recorder 0.12.0 does not hold it.
+            "--aim-sway" => {
+                let parts: Vec<f32> = args.next().context("--aim-sway needs x,y,z")?.split(',').filter_map(|v| v.parse().ok()).collect();
+                aim_sway = Some(parts.try_into().map_err(|_| anyhow::anyhow!("--aim-sway needs three numbers"))?);
+            }
             name => wanted.push(name.to_owned()),
         }
     }
@@ -1752,15 +2113,30 @@ fn main() -> Result<()> {
     let hard = HardSettings::load(&install)?;
     let engine = EngineSettings::load(&install)?;
     let mut assets = Assets::new(install)?;
-    let weapon = trp_data::weapon::assemble(&mut assets, &db, &weapon_id)?;
+    let build = if recorded { Some(recorded_build(traces_dir.as_deref(), &weapon_id).context("--recorded-build: the first trace's equipment has no such weapon in a weapon slot")?) } else { None };
+    let weapon = match &build {
+        Some(preset) => {
+            let weapon = trp_data::weapon::assemble_preset(&mut assets, &db, preset)?;
+            println!("the weapon as recorded: {} parts", preset.items.len());
+            if let Some(bipod) = &weapon.bipod {
+                println!("  its bipod: {} (folds {})", bipod.template, if bipod.forward { "forward" } else { "backward" });
+            }
+            for skipped in &weapon.skipped {
+                println!("  part not placed: {skipped}");
+            }
+            weapon
+        }
+        None => trp_data::weapon::assemble(&mut assets, &db, &weapon_id)?,
+    };
     println!("the weapon: {} ({weapon_id})", weapon.name);
     // Every round its chamber takes, by the chamber's own filter.
     let chamber = trp_sim::inventory::Kind::of(&db, &weapon_id)?.slots.into_iter().find(|slot| slot.name == "patron_in_weapon");
     let takes: Vec<String> = chamber.map_or_else(Vec::new, |slot| db.items.keys().filter(|id| db.classes(id).iter().any(|class| slot.takes.contains(class))).cloned().collect());
     let _ = CHAMBER_TAKES.set(takes);
     let camera_box = trp_data::player::CameraBoxData::load(&mut assets)?;
-    let geometry = Geometry::of(&weapon.hierarchy, trp_sim::right_hand_marker(&assets, &weapon)?, camera_box)?;
+    let geometry = Geometry::of(&weapon, trp_sim::right_hand_marker(&assets, &weapon)?, camera_box)?;
     let (slope, stood_over) = recorded_slope(traces_dir.as_deref());
+    let mount_note = recorded_mount(traces_dir.as_deref());
     let profiled = recorded_profile(traces_dir.as_deref());
     // The character's capsule, for a ground with something standing on it.
     let capsule_radius = trp_data::player::CapsuleData::load(&mut assets)?.radius;
@@ -1948,6 +2324,9 @@ fn main() -> Result<()> {
             ..defaults
         };
         let mut hands_settings = trp_sim::hands_settings(hands_data.clone(), &db, &hard, &engine, &weapon, view)?;
+        if hands_settings.mount.mountable {
+            println!("  its mount: pivot {:?}, the bipod's {:?}", hands_settings.mount.pivot, hands_settings.mount.bipod_pivot);
+        }
         if let Some(loaded) = header_number("weapon_weight") {
             hands_settings.weapon_weight = loaded;
         }
@@ -1975,7 +2354,19 @@ fn main() -> Result<()> {
             hands_settings.aim_speed_bonus = speed / base - 1.0;
         }
         let mut firearm_settings = firearm_settings.clone();
-        let round = header("ammo").and_then(Json::as_str).and_then(|id| db.items.get(id));
+        // A weapon with no chamber records no round (the recorder reads
+        // the first chamber's): its fitted magazine's top round, as the
+        // recorded equipment has it (the last stack's).
+        let round = header("ammo")
+            .and_then(Json::as_str)
+            .or_else(|| {
+                let equipment = header("equipment")?.as_array()?;
+                let under = |item: &Json, slot: &str, parent: &str| item["at"].as_str() == Some(slot) && item["in"].as_str() == Some(parent);
+                let gun = equipment.iter().find(|item| item["tpl"].as_str() == Some(weapon_id.as_str()))?["id"].as_str()?;
+                let magazine = equipment.iter().find(|item| under(item, "mod_magazine", gun))?["id"].as_str()?;
+                equipment.iter().filter(|item| under(item, "cartridges", magazine)).last()?["tpl"].as_str()
+            })
+            .and_then(|id| db.items.get(id));
         if let Some(round) = round {
             firearm_settings.shot_strength = 1.0 + round.prop_f32("ammoRec").unwrap_or(0.0) / 100.0;
         }
@@ -1988,6 +2379,28 @@ fn main() -> Result<()> {
         if let (Some(magazine), Some(chamber)) = (first("magazine"), first("chamber")) {
             firearm.magazine = Some(magazine as u32);
             firearm.chamber = chamber > 0.0;
+        }
+        // The magazines' clips (`magAnimationIndex`) as the recorded
+        // equipment has them: the weapon's fitted one's, and the one a
+        // reload takes (`FindSuitableMagazine`: the fullest within reach),
+        // with its rounds.
+        let mut next_rounds = None;
+        let mut no_magazine = false;
+        if let Some(list) = header("equipment") {
+            if let Ok((equipment, ..)) = trp_sim::inventory::Equipment::of_recording(&db, list) {
+                let gun = ["FirstPrimaryWeapon", "SecondPrimaryWeapon", "Holster"].into_iter().filter_map(|slot| equipment.item.in_slot(slot)).find(|gun| gun.kind.template == weapon_id);
+                if let Some(gun) = gun {
+                    if let Some(fitted) = gun.in_slot(trp_sim::inventory::MAGAZINE_SLOT) {
+                        firearm.set_magazine_variant(fitted.kind.magazine_animation);
+                    }
+                    if let Some(next) = trp_sim::inventory::magazine_for(&equipment.item, gun).and_then(|id| equipment.item.find(id)) {
+                        firearm.next_magazine_variant(next.kind.magazine_animation);
+                        next_rounds = Some(trp_sim::inventory::magazine_rounds(next));
+                    } else {
+                        no_magazine = true;
+                    }
+                }
+            }
         }
         // The fire mode the last scenario left it in (recorder 0.6.2 on).
         let mode = first("fire_mode").and_then(|number| {
@@ -2007,6 +2420,18 @@ fn main() -> Result<()> {
             }
         }
         let mut movement = Movement::new(movement_settings, Body::new(&body_data, weapon.cell_width as f32));
+        // The armour and backpack the recording's kit had slow the
+        // character as the game's did (`Player.UpdatePenalties`; movement
+        // spec, "Speed limits"), by the recorded vest skills.
+        if let Some(equipment) = header("equipment").and_then(Json::as_array) {
+            let level = |name: &str| -> u32 {
+                header("skills").and_then(Json::as_array).and_then(|all| {
+                    all.iter().find(|s| s.get(0).and_then(Json::as_str) == Some(name)).and_then(|s| s.get(1)).and_then(Json::as_f64)
+                }).unwrap_or(0.0) as u32
+            };
+            let penalty = trp_sim::armor::speed_penalty(&db, &recorded_kit(equipment), &trp_sim::armor::VestSkills::of_levels(level));
+            movement.set_armour_penalty(penalty);
+        }
         // The recording runs its scenarios back to back, so each starts
         // with the wheel and stance the last one left.
         if let (Some(speed), Some(smoothed)) = (first("speed"), first("smoothed_speed")) {
@@ -2085,6 +2510,7 @@ fn main() -> Result<()> {
         }
         let mut hands = Hands::new(hands_settings);
         hands.weapon_flip_speed = movement.settings.weapon_flip_speed;
+        hands.aim_sway_override = aim_sway;
         // The bob keeps the tempo of the last footstep, which in a
         // recording was taken in the scenario before.
         if let Some(tempo) = first("step_frequency") {
@@ -2113,7 +2539,12 @@ fn main() -> Result<()> {
         if let Some(reach) = first("possible_tilt") {
             hands.possible_tilt = reach;
         }
-        let mut rig = Rig { movement, hands, firearm };
+        // The walk's lock on at the start, where the folder says so.
+        let mut movement = movement;
+        if mount_note.1 {
+            movement.set_blocked([0.0, 1.0]);
+        }
+        let mut rig = Rig { movement, hands, firearm, next_rounds, no_magazine };
         // A recording made from outside (recorder 0.7.0 on) is set beside
         // the character as others see it (third-person spec).
         if header("point_of_view").and_then(Json::as_str) == Some("ThirdPerson") {
@@ -2151,6 +2582,7 @@ fn main() -> Result<()> {
                             _ => None,
                         },
                         fitted: fitted_magazine(frames, index),
+                        aim_sway: sample.get("aim_sway_direction").and_then(|d| <[f32; 3]>::try_from(d.as_slice()).ok()),
                         reach: number("rounds_in_reach").map(|rounds| rounds as u32),
                         weapon_bone: recorded_bone(sample, "weapon_bone"),
                         right_marker: recorded_bone(sample, "right_marker"),
@@ -2158,6 +2590,12 @@ fn main() -> Result<()> {
                         floor_key: None,
                         condition: sample.get("energy").zip(sample.get("hydration")).and_then(|(e, h)| Some([*e.first()?, *h.first()?])),
                         vault: obstacles[index],
+                        recoil: ["recoil_rot", "recoil_pos", "recoil_cam"]
+                            .map(|name| sample.get(name).and_then(|v| <[f32; 3]>::try_from(v.as_slice()).ok()))
+                            .into_iter()
+                            .collect::<Option<Vec<_>>>()
+                            .filter(|_| recorded_recoil)
+                            .map(|v| [v[0], v[1], v[2]]),
                     }
                 })
                 .collect(),
@@ -2172,6 +2610,7 @@ fn main() -> Result<()> {
                     look: None,
                     asked: None,
                     fitted: None,
+                    aim_sway: None,
                     reach: None,
                     weapon_bone: None,
                     right_marker: None,
@@ -2179,6 +2618,7 @@ fn main() -> Result<()> {
                     floor_key: None,
                     condition: None,
                     vault: None,
+                    recoil: None,
                 })
                 .collect(),
         };
@@ -2252,7 +2692,14 @@ fn main() -> Result<()> {
             None if found.is_none() && reach >= stood_over => stood_over,
             None => 0.0,
         };
-        let ground = Ground { height: ground, slope, below, profile };
+        // A sill set down from the recording's mount, from the terrain up.
+        let sill = mount_note.0.map(|([x, z], yaw, top, [width, depth])| {
+            let (s, c) = yaw.to_radians().sin_cos();
+            let floor = ground - below;
+            let foot = [x + s * depth / 2.0, floor, z + c * depth / 2.0];
+            trp_sim::collision::Block::turned(foot, [width, ground + top - floor, depth], [c, 0.0, -s])
+        });
+        let ground = Ground { height: ground, slope, below, profile, sill, floor: mount_note.2 };
         let mut holding = Holding::new(&weapon, limbs)?;
         let (samples, leftover) =
             replay(&scenario, &mut rig, &frames, first_walk, &geometry, &ground, show_layers, own_view, &mut holding);

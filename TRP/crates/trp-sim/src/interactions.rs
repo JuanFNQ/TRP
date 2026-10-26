@@ -12,12 +12,21 @@
 use std::collections::VecDeque;
 
 /// An interaction the body's animator has a state for, by the game's own
-/// names (`EInteraction`). The player's hand signs, the things done to
-/// headgear and the bipod's are left out: nothing here starts them.
+/// names (`EInteraction`). The player's hand signs and the bipod's are left
+/// out: nothing here starts them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interaction {
     TakeItem,
     DropBackpack,
+    /// A switch on the head turned on or off: night vision, a face shield
+    /// (inventory spec, "A switch on the head").
+    NightVisionOnGear,
+    NightVisionOffGear,
+    FaceshieldOnGear,
+    FaceshieldOffGear,
+    /// The hand to the helmet's rail as a head light is switched
+    /// (`HelmetRailGear`; tactical-devices spec, "The head light").
+    HelmetRailGear,
     PushHingeLeft,
     PullHingeLeft,
     PushHingeRight,
@@ -34,6 +43,12 @@ pub enum Interaction {
     ContainerCloseDefault,
     ContainerHingeUpOpen,
     ContainerHingeUpClose,
+    /// The bipod put out or folded, forward (the Harris and Atlas kinds) or
+    /// backward (the rest): mounting spec, "The bipod".
+    BipodForwardOn,
+    BipodForwardOff,
+    BipodBackwardOn,
+    BipodBackwardOff,
 }
 
 /// How the model is to treat one interaction when it is asked for.
@@ -57,6 +72,11 @@ impl Interaction {
         match self {
             TakeItem => 8,
             DropBackpack => 10,
+            NightVisionOnGear => 11,
+            NightVisionOffGear => 12,
+            FaceshieldOnGear => 13,
+            FaceshieldOffGear => 14,
+            HelmetRailGear => 15,
             PushHingeLeft => 16,
             PullHingeLeft => 17,
             PushHingeRight => 18,
@@ -72,7 +92,22 @@ impl Interaction {
             ContainerCloseDefault => 28,
             ContainerHingeUpOpen => 29,
             ContainerHingeUpClose => 30,
+            BipodForwardOn => 31,
+            BipodForwardOff => 32,
+            BipodBackwardOn => 33,
+            BipodBackwardOff => 34,
             DoorCardOpen => 35,
+        }
+    }
+
+    /// The bipod's gesture for putting it out or folding it, by the way it
+    /// folds (`ToggleBipodOperation.Start`).
+    pub fn bipod(out: bool, forward: bool) -> Self {
+        match (forward, out) {
+            (true, true) => Interaction::BipodForwardOn,
+            (true, false) => Interaction::BipodForwardOff,
+            (false, true) => Interaction::BipodBackwardOn,
+            (false, false) => Interaction::BipodBackwardOff,
         }
     }
 
@@ -85,6 +120,11 @@ impl Interaction {
             TakeItem => 8,
             DropBackpack => 22,
             DoorCardOpen => 38,
+            // The bipod's run 18 to 21 in the game's enum (recorded: the
+            // M60E6's `BipodBackwardOn`, 20, played the animator's 33).
+            BipodForwardOn | BipodForwardOff | BipodBackwardOn | BipodBackwardOff => self.index() - 13,
+            // The headgear's are numbered alike in both.
+            NightVisionOnGear | NightVisionOffGear | FaceshieldOnGear | FaceshieldOffGear | HelmetRailGear => self.index(),
             // The doors' and the containers' run in the same order seven
             // above the animator's (the game's enum against the animator's
             // states, recorded for nine of them).
@@ -97,9 +137,18 @@ impl Interaction {
         Self::ALL.into_iter().find(|interaction| interaction.game_number() == number)
     }
 
-    const ALL: [Interaction; 18] = [
+    const ALL: [Interaction; 27] = [
+        Interaction::BipodForwardOn,
+        Interaction::BipodForwardOff,
+        Interaction::BipodBackwardOn,
+        Interaction::BipodBackwardOff,
         Interaction::TakeItem,
         Interaction::DropBackpack,
+        Interaction::NightVisionOnGear,
+        Interaction::NightVisionOffGear,
+        Interaction::FaceshieldOnGear,
+        Interaction::FaceshieldOffGear,
+        Interaction::HelmetRailGear,
         Interaction::PushHingeLeft,
         Interaction::PullHingeLeft,
         Interaction::PushHingeRight,
@@ -134,7 +183,12 @@ impl Interaction {
     /// Whether it goes with something done to the inventory (the state's
     /// own word for it, which the queue and a forced stop go by).
     fn is_operation(self) -> bool {
-        matches!(self, Interaction::TakeItem | Interaction::DropBackpack)
+        matches!(self, Interaction::TakeItem | Interaction::DropBackpack) || self.is_bipod()
+    }
+
+    fn is_bipod(self) -> bool {
+        use Interaction::*;
+        matches!(self, BipodForwardOn | BipodForwardOff | BipodBackwardOn | BipodBackwardOff)
     }
 
     /// The instruction it is asked for with. A door's comes from the
@@ -144,6 +198,8 @@ impl Interaction {
         match self {
             Interaction::TakeItem => Instruction { operation: true, reset_queue: true, deny_schedule: true, ..Instruction::default() },
             Interaction::DropBackpack => Instruction { operation: true, reset_queue: true, forced: true, ..Instruction::default() },
+            // `BipodOnInteractionState`, `BipodOffInteractionState`.
+            bipod if bipod.is_bipod() => Instruction { operation: true, reset_queue: true, forced: true, ..Instruction::default() },
             door if door.is_door() => Instruction { reset_queue: true, deny_schedule: true, ..Instruction::default() },
             _ => Instruction { reset_queue: true, forced: true, ..Instruction::default() },
         }
@@ -177,6 +233,12 @@ impl Default for AnimatedInteractions {
 }
 
 impl AnimatedInteractions {
+    /// Whether the queue takes no more until it has run empty
+    /// (`IsScheduleDenied`).
+    pub fn schedule_denied(&self) -> bool {
+        self.schedule_denied
+    }
+
     /// Whether nothing is playing, so that one asked for plays at once.
     pub fn can_interact(&self) -> bool {
         self.can_interact

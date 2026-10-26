@@ -4,7 +4,7 @@
 //! cells and its weight, and the carried weight the controller goes by.
 //! No engine types; a host fills it and reads it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -55,6 +55,9 @@ pub struct Kind {
     pub cells: [u32; 2],
     /// The cells it adds to what it is a part of: left, right, up, down.
     pub extra: [u32; 4],
+    /// Whether those cells are added beside its fellow parts' rather than
+    /// only where they reach further (`ExtraSizeForceAdd`).
+    pub forced_extra: bool,
     /// Whether its parts' extra cells count toward its size.
     pub merges: bool,
     pub slots: Vec<Holder>,
@@ -89,6 +92,25 @@ pub struct Kind {
     /// How many rounds a magazine or a box of rounds holds (its
     /// `Cartridges` or `StackSlots`' `_max_count`); 0 for anything else.
     pub capacity: u32,
+    /// A repair kit's: the classes of what it mends (`TargetItemFilter`),
+    /// and the resource it is made with (`MaxRepairResource`); empty and
+    /// naught for anything else.
+    pub repair_targets: Vec<String>,
+    pub repair_resource: f32,
+    /// A magazine's share, in per cent, added to the time a round takes to
+    /// load or unload (`LoadUnloadModifier`; inventory spec, "Loading and
+    /// unloading a magazine").
+    pub load_unload_modifier: f32,
+    /// The same added to the time it takes to check (`CheckTimeModifier`;
+    /// inventory spec, "Checking a magazine").
+    pub check_modifier: f32,
+    /// How well a look at it in the hands tells its count at the least
+    /// (`CheckOverride`, held within 0 and 2; inventory spec, "What the
+    /// ammunition's panel says"): 1 on 51 magazines of the install.
+    pub check_override: u32,
+    /// A magazine's `magAnimationIndex`: which of a weapon's reload and look
+    /// clips it plays (firing spec, "Which magazine"); 0 for anything else.
+    pub magazine_animation: i32,
     /// Not shown in the slot it is in (`NotShownInSlot`: the pockets).
     pub not_shown_in_slot: bool,
     /// Its sounds' group (`ItemSound`: `weap_ar`, `gear_generic`), which
@@ -104,21 +126,63 @@ pub struct Kind {
     pub quest: bool,
     pub hinge: bool,
     pub face_shield: bool,
+    /// A face shield's mask over the first person's view
+    /// (`FaceShieldMask`; `visor`).
+    pub face_shield_mask: trp_data::visor::MaskKind,
     pub foldable: bool,
     pub folded_slot: String,
+    /// The cells a fold takes off the right (`SizeReduceRight`), and
+    /// whether, fitted to a weapon, it keeps the weapon from folding
+    /// (`BlocksFolding`).
+    pub fold_reduce: u32,
+    pub blocks_folding: bool,
+    /// For a magazine whose rounds are drawn in its model
+    /// (`SpringMagazineVisual`: neither a belt's nor a stationary
+    /// weapon's), its template's visible ranges (`magazine_view`); empty
+    /// for anything else. Whether a picture leaves its contents out
+    /// (`HideEntrails`).
+    pub visible_rounds: Vec<[u32; 2]>,
+    pub hide_entrails: bool,
+    /// How much of a flash it keeps from the eyes (`BlindnessProtection`:
+    /// a face shield, a visor), 0 to 1.
+    pub blindness_protection: f32,
+    /// Its armour class (`armorClass`, a number or its words), 0 for a
+    /// thing of none: a plate's mark on its view goes by it (`ItemViewStats.
+    /// GetArmorPlateClassIconName`).
+    pub armor_class: u32,
+    /// For a weapon of the install with a stock build, that build's key
+    /// (`trp_data::weapon::build_key`): a weapon so built is asked for by
+    /// its template alone (`rig_key`). None for anything else, and for a
+    /// weapon of one's own, whose parts are never drawn.
+    pub stock_key: Option<String>,
+    /// The templates it cannot be on a weapon with (`ConflictingItems`;
+    /// `Slot.CheckConflictingItems`).
+    pub conflicting: Vec<String>,
+    /// Whether it is an item the game makes, not a class of them (`_type`
+    /// `Item`, not `Node`).
+    pub is_item: bool,
+    /// A tactical device's modes (`LightComponent`, on a `Flashlight`, a
+    /// `TacticalCombo` or a `LightLaser`: its template's `ModesCount`);
+    /// none for a thing that carries no light (tactical-devices spec, "The
+    /// items").
+    pub light_modes: Option<u32>,
 }
 
 impl Kind {
     pub fn of(db: &Database, template: &str) -> Result<Self> {
         let item = db.items.get(template).ok_or_else(|| anyhow!("the database has no item {template}"))?;
+        let flag = |name: &str| item.props.get(name).and_then(|on| on.as_bool()).unwrap_or(false);
+        let class_names = db.class_names(template);
+        let class = |name: &str| class_names.iter().any(|class| class == name);
         Ok(Self {
             template: item.id.clone(),
             name: item.name.clone(),
             classes: db.classes(template),
-            class_names: db.class_names(template),
+            class_names: class_names.clone(),
             weight: item.prop_f32("Weight").unwrap_or(0.0),
             cells: item.cells(),
             extra: item.extra_cells(),
+            forced_extra: flag("ExtraSizeForceAdd"),
             merges: item.merges_with_parts(),
             slots: item.slots(),
             grids: item.grids(),
@@ -134,23 +198,52 @@ impl Kind {
             key_uses: item.prop_f32("MaximumNumberOfUsage").unwrap_or(0.0).max(0.0) as u32,
             caliber: item.props.get("ammoCaliber").and_then(|caliber| caliber.as_str()).unwrap_or_default().to_owned(),
             durability: [item.prop_f32("Durability").unwrap_or(0.0), item.prop_f32("MaxDurability").unwrap_or(0.0)],
+            repair_targets: item
+                .props
+                .get("TargetItemFilter")
+                .and_then(|list| list.as_array())
+                .map(|list| list.iter().filter_map(|class| class.as_str().map(str::to_owned)).collect())
+                .unwrap_or_default(),
+            repair_resource: item.prop_f32("MaxRepairResource").unwrap_or(0.0),
             capacity: ["Cartridges", "StackSlots"]
                 .iter()
                 .find_map(|list| item.props.get(*list)?.get(0)?.get("_max_count")?.as_u64())
                 .unwrap_or(0) as u32,
+            load_unload_modifier: item.prop_f32("LoadUnloadModifier").unwrap_or(0.0),
+            check_modifier: item.prop_f32("CheckTimeModifier").unwrap_or(0.0),
+            check_override: item.prop_f32("CheckOverride").unwrap_or(0.0).clamp(0.0, 2.0) as u32,
+            magazine_animation: item.props.get("magAnimationIndex").and_then(|index| index.as_i64()).unwrap_or(0) as i32,
             not_shown_in_slot: item.props.get("NotShownInSlot").and_then(|shown| shown.as_bool()).unwrap_or(false),
             sound: item.props.get("ItemSound").and_then(|sound| sound.as_str()).unwrap_or_default().to_owned(),
             reload_mode: item.props.get("ReloadMode").and_then(|mode| mode.as_str()).unwrap_or_default().to_owned(),
             quest: item.props.get("QuestItem").and_then(|quest| quest.as_bool()).unwrap_or(false),
             hinge: item.props.get("HasHinge").and_then(|hinge| hinge.as_bool()).unwrap_or(false),
             face_shield: item.props.get("FaceShieldComponent").and_then(|shield| shield.as_bool()).unwrap_or(false),
-            foldable: ["Foldable", "Retractable"].iter().any(|name| item.props.get(*name).and_then(|on| on.as_bool()).unwrap_or(false)),
+            face_shield_mask: item.props.get("FaceShieldMask").and_then(|mask| mask.as_str()).and_then(trp_data::visor::MaskKind::of_word).unwrap_or_default(),
+            // A weapon folds or slides in by its own word, a stock only
+            // by `Foldable` (`Weapon`, `Stock`: the only two that are made
+            // with a `FoldableComponent`).
+            foldable: if class("Weapon") { flag("Foldable") || flag("Retractable") } else { class("Stock") && flag("Foldable") },
             folded_slot: item.props.get("FoldedSlot").and_then(|slot| slot.as_str()).unwrap_or_default().to_owned(),
+            fold_reduce: item.prop_f32("SizeReduceRight").unwrap_or(0.0).max(0.0) as u32,
+            blocks_folding: flag("BlocksFolding"),
+            visible_rounds: if class("Magazine") && !flag("MagazineWithBelt") && !flag("IsMagazineForStationaryWeapon") {
+                crate::magazine_view::visible_ranges(item.props.get("VisibleAmmoRangesString").and_then(|ranges| ranges.as_str()))
+            } else {
+                Vec::new()
+            },
+            hide_entrails: flag("HideEntrails"),
+            blindness_protection: item.prop_f32("BlindnessProtection").unwrap_or(0.0),
+            armor_class: item.props.get("armorClass").and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(0.0).max(0.0) as u32,
+            stock_key: if class("Weapon") && !db.custom.contains_key(template) { db.default_preset(template).ok().map(trp_data::weapon::build_key) } else { None },
+            conflicting: item.props.get("ConflictingItems").and_then(|list| list.as_array()).into_iter().flatten().filter_map(|id| id.as_str().map(str::to_owned)).collect(),
+            is_item: item.node_type == "Item",
+            light_modes: trp_data::tactical::DeviceClass::of(db, template).map(|_| trp_data::tactical::modes_of(db, template)),
         })
     }
 
     /// Whether a filter's list names this kind or a class of it.
-    fn among(&self, list: &[String]) -> bool {
+    pub fn among(&self, list: &[String]) -> bool {
         list.iter().any(|id| self.classes.contains(id))
     }
 }
@@ -199,6 +292,13 @@ pub enum Refusal {
     KeptOn(String),
     /// Nothing can be done with the one on the other.
     NoAction,
+    /// The weapon in hand cannot have its parts moved now: its hands are
+    /// busy (`FirearmController.CanExecute`: only while its logic idles),
+    /// or would not take a round into its chamber (`Rules::chamber_closed`).
+    HandsBusy,
+    /// The weapon has a malfunction that keeps it (`ItemManipulator.MalfunctionError`,
+    /// "You must fix malfunctions first": `Weapon.IncompatibleByMalfunction`).
+    Malfunction,
 }
 
 /// One item, with everything in it.
@@ -218,12 +318,104 @@ pub struct Item {
     /// What a medkit, food or drink has left once it has been used
     /// (health's `Event::Resource`); none while it is as new.
     pub resource: Option<f32>,
+    /// A switch's state, on a part that has one (`TogglableComponent.On`:
+    /// a face shield down, night or thermal vision on); off as made.
+    pub on: bool,
+    /// A fold's state, on a weapon or a stock that folds
+    /// (`FoldableComponent.Folded`); unfolded as made.
+    pub folded: bool,
+    /// Its tag, on a thing that takes one (`TagComponent`: a magazine, a
+    /// lockable or simple container): no name, none shown.
+    pub tag: Tag,
+    /// A tactical device's state (`LightComponent`): off, in its first
+    /// mode, as made.
+    pub light: Light,
+    /// Its wear (`RepairableComponent`): its durability and its greatest
+    /// durability now (`Durability`, `MaxDurability`), for a thing that
+    /// wears (a template's `MaxDurability` above 0: a weapon, armour, a
+    /// helmet, a knife); as its template makes it.
+    pub repairable: Option<Repairable>,
+    /// Its malfunction, on a weapon (`Weapon.MalfState`, saved with it:
+    /// `MalfunctionDescriptor`): the kind and what the shooter knows of
+    /// it, the last shot's heat and its time on the raid's clock, the
+    /// slide the heat holds; none, and cold, as made.
+    pub malfunction: crate::malfunction::State,
+    /// The round a failure to feed took out of its magazine
+    /// (`MalfState.MalfunctionedAmmo`), which the repair throws out onto
+    /// the ground.
+    pub fed_round: Option<Arc<Kind>>,
+}
+
+/// A thing's wear as its item keeps it (`RepairableComponent`): the
+/// durability now, at most the greatest durability, which repairs lower.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Repairable {
+    pub durability: f32,
+    pub max_durability: f32,
+}
+
+/// A tactical device's state as its item keeps it (`LightComponent`'s
+/// `IsActive` and `SelectedMode`; saved with the item, no battery, no
+/// timer).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Light {
+    pub on: bool,
+    pub mode: u32,
+}
+
+/// A thing's tag (`TagComponent`): its name and its colour's number in
+/// the game's seven (`EditTagWindow.GetColor`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tag {
+    pub name: String,
+    pub color: u32,
+}
+
+/// Whether a thing takes a tag (`TagComponent`, made with a magazine, a
+/// lockable container and a simple container).
+pub fn takes_tag(item: &Item) -> bool {
+    is(item, "Magazine") || is(item, "LockableContainer") || is(item, "SimpleContainer")
+}
+
+/// Sets the tag of the thing of that number wherever it lies in `root`
+/// (`TagComponent.Set`; an empty name with colour 0 is no tag). Whether it
+/// takes one there.
+pub fn set_tag(root: &mut Item, id: Id, name: &str, color: u32) -> bool {
+    match root.find_mut(id).filter(|item| takes_tag(item)) {
+        Some(item) => {
+            item.tag = Tag { name: name.to_owned(), color };
+            true
+        }
+        None => false,
+    }
 }
 
 impl Item {
     pub fn new(kind: Arc<Kind>) -> Self {
         let (slots, grids) = (vec![None; kind.slots.len()], vec![Vec::new(); kind.grids.len()]);
-        Self { id: next_id(), kind, count: 1, slots, grids, loose: Vec::new(), resource: None }
+        let repairable = (kind.durability[1] > 0.0).then(|| Repairable { durability: kind.durability[0].min(kind.durability[1]), max_durability: kind.durability[1] });
+        Self {
+            id: next_id(),
+            kind,
+            count: 1,
+            slots,
+            grids,
+            loose: Vec::new(),
+            resource: None,
+            on: false,
+            folded: false,
+            tag: Tag::default(),
+            light: Light::default(),
+            repairable,
+            malfunction: crate::malfunction::State::default(),
+            fed_round: None,
+        }
+    }
+
+    /// Its durability and its greatest durability now: its own wear's where
+    /// it wears (`repairable`), else its template's.
+    pub fn durability(&self) -> [f32; 2] {
+        self.repairable.map_or(self.kind.durability, |wear| [wear.durability, wear.max_durability])
     }
 
     /// Everything directly in it.
@@ -238,24 +430,47 @@ impl Item {
         (self.kind.weight + self.contents().map(Item::weight).sum::<f32>()) * self.count.max(1) as f32
     }
 
-    /// The extra cells its parts give it, largest on each side.
-    fn extra(&self) -> [u32; 4] {
-        let mut most = [0; 4];
-        for (part, slot) in self.slots.iter().zip(&self.kind.slots) {
-            // A slot counts if it says so itself, or else if its item
-            // does; the round in the chamber never does.
-            let counts = !is_chamber(&slot.name) && (slot.merges == Some(true) || self.kind.merges);
-            let Some(part) = part.as_ref().filter(|_| counts) else { continue };
-            let (own, deeper) = (part.kind.extra, part.extra());
-            most = std::array::from_fn(|side| most[side].max(own[side]).max(deeper[side]));
+    /// The extra cells its parts give it on each side, left, right, up and
+    /// down, as the game sums them (`CompoundItem.CalculateExtraSize`): of
+    /// every part, and every part's parts, the largest on each side, and
+    /// beside that the forced ones added up. Only a thing that merges with
+    /// its parts looks into its places, and then into every place but the
+    /// chamber's, and a folded one not into its folded slot. A fold takes
+    /// its reduction off the right: a part's own, or as a forced cell off
+    /// the thing itself.
+    fn extra(&self) -> [i32; 4] {
+        let (mut most, mut forced) = ([0i32; 4], [0i32; 4]);
+        let mut waiting = vec![(self, true)];
+        while let Some((item, top)) = waiting.pop() {
+            let extra = if top { [0; 4] } else { item.kind.extra.map(|cells| cells as i32) };
+            let (mut own, mut own_forced) = if item.kind.forced_extra { ([0; 4], extra) } else { (extra, [0; 4]) };
+            let folded = item.kind.foldable && item.folded;
+            if folded {
+                let reduce = item.kind.fold_reduce as i32;
+                if top { own_forced[1] -= reduce } else { own[1] -= reduce }
+            }
+            most = std::array::from_fn(|side| most[side].max(own[side]));
+            forced = std::array::from_fn(|side| forced[side] + own_forced[side]);
+            if !item.kind.merges {
+                continue;
+            }
+            let folded_slot = folded.then_some(item.kind.folded_slot.as_str()).filter(|slot| !slot.is_empty());
+            for (part, slot) in item.slots.iter().zip(&item.kind.slots) {
+                if let Some(part) = part.as_ref().filter(|_| merges(item, slot) && Some(slot.name.as_str()) != folded_slot) {
+                    waiting.push((part, false));
+                }
+            }
+            waiting.extend(item.grids.iter().flatten().map(|(_, part)| (part, false)));
         }
-        most
+        std::array::from_fn(|side| most[side] + forced[side])
     }
 
-    /// Width and height in cells as it lies, with its parts on.
+    /// Width and height in cells as it lies, with its parts on (never
+    /// less than a cell: the install has no thing that would be).
     pub fn cells(&self) -> [u32; 2] {
         let [left, right, up, down] = self.extra();
-        [self.kind.cells[0] + left + right, self.kind.cells[1] + up + down]
+        let [width, height] = self.kind.cells.map(|cells| cells as i32);
+        [(width + left + right).max(1) as u32, (height + up + down).max(1) as u32]
     }
 
     fn cells_at(&self, place: Place) -> [u32; 2] {
@@ -445,6 +660,7 @@ impl Item {
         for entry in loadout.items.iter().rev() {
             let mut item = built.remove(entry.id.as_str()).unwrap_or(Item::new(kind(&entry.template)?));
             item.count = entry.count.max(1);
+            item.folded = entry.folded && item.kind.foldable;
             let Some(parent) = entry.parent.as_deref().filter(|_| entry.id != loadout.equipment) else {
                 built.insert(entry.id.as_str(), item);
                 continue;
@@ -557,6 +773,14 @@ fn is_chamber(slot: &str) -> bool {
     slot.starts_with(CHAMBER)
 }
 
+/// Whether a thing's place counts its contents as part of the thing
+/// (`ContainerExtensions.MergesWithChildren`): a place that says so
+/// itself, or else the thing's own word; the chamber of a single barrel
+/// never (`SlotSerializer`: `patron_in_weapon` alone).
+fn merges(holder: &Item, slot: &Holder) -> bool {
+    slot.name != CHAMBER && (slot.merges == Some(true) || holder.kind.merges)
+}
+
 /// What a weapon's loose rounds are tested against when its reload key
 /// looks for them (`FirearmHandsInputTranslator`): its chamber
 /// (`ReloadWithAmmo`), the first of its barrels (`ReloadBarrels`), or for
@@ -612,6 +836,18 @@ pub struct Rules {
     /// How many backpacks deep one may lie in another
     /// (`MaxBackpackInserting` in the game's settings); 0 for no limit.
     pub backpacks_deep: u32,
+    /// A weapon in hand whose hands cannot take a move of its parts now
+    /// (firing spec, "A magazine taken out or put in from the inventory"):
+    /// nothing is moved out of it or into it.
+    pub busy_weapon: Option<Id>,
+    /// The weapon in hand whose hands would not take a round into its
+    /// chamber now (`Firearm::can_load_chamber`): nothing goes into its
+    /// chamber.
+    pub chamber_closed: Option<Id>,
+    /// The weapon in hand whose hands would not let the round out of its
+    /// chamber now (`Firearm::can_discharge`: a magazine in, or the logic
+    /// busy): its chambered round stays.
+    pub chamber_held: Option<Id>,
 }
 
 impl Rules {
@@ -624,7 +860,7 @@ impl Rules {
                 _ => None,
             }
         }
-        Self { in_raid: true, backpacks_deep: named(&db.config, "MaxBackpackInserting").unwrap_or(0) as u32 }
+        Self { in_raid: true, backpacks_deep: named(&db.config, "MaxBackpackInserting").unwrap_or(0) as u32, busy_weapon: None, chamber_closed: None, chamber_held: None }
     }
 }
 
@@ -653,7 +889,7 @@ impl Item {
         self.slots.iter_mut().flatten().chain(in_grids).chain(self.loose.iter_mut())
     }
 
-    fn find_mut(&mut self, id: Id) -> Option<&mut Item> {
+    pub fn find_mut(&mut self, id: Id) -> Option<&mut Item> {
         if self.id == id {
             return Some(self);
         }
@@ -762,6 +998,9 @@ fn root_of(roots: &[&mut Item], id: Id) -> Result<usize, Refusal> {
 /// equipment, whatever is open beside it. Refused, nothing has changed.
 pub fn move_item(roots: &mut [&mut Item], id: Id, into: Id, spot: Spot, rules: &Rules) -> Result<(), Refusal> {
     let (from, to) = (root_of(roots, id)?, root_of(roots, into)?);
+    if chamber_held(roots[from], id, rules) {
+        return Err(Refusal::HandsBusy);
+    }
     // Something that stands by itself is not moved.
     let (holder, was) = roots[from].holder_of(id).ok_or(Refusal::NoSuchPlace)?;
     if holder == into && was == spot {
@@ -793,6 +1032,22 @@ pub fn move_item(roots: &mut [&mut Item], id: Id, into: Id, spot: Spot, rules: &
     }
     if item.find(into).is_some() {
         return Err(Refusal::Cycle);
+    }
+    // A weapon in hand whose hands are busy keeps its parts.
+    if let Some(weapon) = rules.busy_weapon {
+        let within = |root: &Item, holder: Id| root.find(weapon).is_some_and(|weapon| weapon.find(holder).is_some());
+        if within(roots[from], holder) || within(roots[to], into) {
+            return Err(Refusal::HandsBusy);
+        }
+    }
+    if chamber_closed(target, spot, rules) {
+        return Err(Refusal::HandsBusy);
+    }
+    // A malfunctioned weapon's slots neither take nor give up its magazine
+    // or its rounds where the malfunction keeps them (`Slot.CheckCompatibility`,
+    // `Slot.CanRemove`).
+    if (enters.is_some() && malfunction_refuses(roots[to], into, &item.kind)) || (leaves.is_some() && malfunction_refuses(roots[from], holder, &item.kind)) {
+        return Err(Refusal::Malfunction);
     }
     if rules.backpacks_deep > 0 && item.is_backpack() {
         let above = roots[to].chain(into).iter().filter(|holder| holder.is_backpack()).count() as u32;
@@ -846,7 +1101,76 @@ fn may_leave(roots: &[&mut Item], from: usize, id: Id, rules: &Rules) -> Result<
 pub fn take_out(roots: &mut [&mut Item], id: Id, rules: &Rules) -> Result<Item, Refusal> {
     let from = root_of(roots, id)?;
     may_leave(roots, from, id, rules)?;
+    if chamber_held(roots[from], id, rules) {
+        return Err(Refusal::HandsBusy);
+    }
+    if let (Some((holder, Spot::Slot(_))), Some(item)) = (roots[from].holder_of(id), roots[from].find(id)) {
+        if malfunction_refuses(roots[from], holder, &item.kind) {
+            return Err(Refusal::Malfunction);
+        }
+    }
     roots[from].take(id).ok_or(Refusal::NoSuchPlace)
+}
+
+/// The weapon a holder's slots are part of (`Slot.ParentItem.GetRootItem()`):
+/// the holder itself, or the weapon it is fitted to through slots that
+/// merge with their item.
+fn weapon_of(root: &Item, holder: Id) -> Option<&Item> {
+    let mut at = holder;
+    loop {
+        let item = root.find(at)?;
+        if is(item, "Weapon") {
+            return Some(item);
+        }
+        let (up, Spot::Slot(slot)) = root.holder_of(at)? else { return None };
+        let held_by = root.find(up)?;
+        if !held_by.kind.slots.get(slot).is_some_and(|slot| merges(held_by, slot)) {
+            return None;
+        }
+        at = up;
+    }
+}
+
+/// The weapon a thing is fitted to, through slots that merge: a magazine's,
+/// a chamber's round's (`GetRootItem`); none for a weapon itself.
+pub fn weapon_fitted_with(root: &Item, id: Id) -> Option<&Item> {
+    let (holder, spot) = root.holder_of(id)?;
+    match spot {
+        Spot::Slot(_) => weapon_of(root, holder),
+        // A round in a magazine: the magazine's weapon.
+        Spot::Loose => weapon_fitted_with(root, holder),
+        Spot::Cell(..) => None,
+    }
+}
+
+/// Whether a thing is drawn as unusable by a malfunction the shooter knows
+/// of (`GridItemView.UnusableDueToMalfunction`): a weapon with one, its
+/// magazine with a failure to feed (`IsFailedToFeedMagazine`), a round in
+/// it with any (`IsFailedToFeedAmmo`).
+pub fn unusable_by_malfunction(root: &Item, item: &Item) -> bool {
+    let known = |weapon: &Item| weapon.malfunction.malf != crate::malfunction::Malf::None && weapon.malfunction.known;
+    if is(item, "Weapon") {
+        return known(item);
+    }
+    let Some(weapon) = weapon_fitted_with(root, item.id) else { return false };
+    if is(item, "Magazine") {
+        return weapon.malfunction.malf == crate::malfunction::Malf::Feed && known(weapon);
+    }
+    is(item, "Ammo") && known(weapon)
+}
+
+/// Whether a weapon's malfunction keeps a thing out of, or in, a slot of
+/// `holder` (`Weapon.IncompatibleByMalfunction`): a magazine with a failure
+/// to feed (or any malfunction on a weapon that also loads its chamber
+/// alone, `ExternalMagazineWithInternalReloadSupport`), a round with any.
+fn malfunction_refuses(root: &Item, holder: Id, kind: &Kind) -> bool {
+    let Some(weapon) = weapon_of(root, holder) else { return false };
+    let malf = weapon.malfunction.malf;
+    let class = |name: &str| kind.class_names.iter().any(|class| class == name);
+    if class("Magazine") {
+        return malf == crate::malfunction::Malf::Feed || (malf != crate::malfunction::Malf::None && weapon.kind.reload_mode == "ExternalMagazineWithInternalReloadSupport");
+    }
+    class("Ammo") && malf != crate::malfunction::Malf::None
 }
 
 /// What a medkit, food or drink in here holds now, as its use left it
@@ -965,6 +1289,14 @@ impl Order {
     pub const OTHER_SIDE: Self = Self { wear: false, own_holder: true, one_by_one: true };
     /// A thing taken up off the ground (`PickUp`).
     pub const PICK_UP: Self = Self { wear: true, own_holder: false, one_by_one: false };
+    /// A weapon's magazine taken out by its menu's Unload (`UnloadWeapon`:
+    /// each target by itself, no stack to merge with).
+    pub const UNLOAD_WEAPON: Self = Self { wear: false, own_holder: false, one_by_one: true };
+    /// A round unloaded from a magazine (`UnloadAmmo`). The game's order
+    /// looks in the round's own holder first, the magazine; a round is not
+    /// put back into the magazine it came out of here (`PROVISIONAL`: the
+    /// game's look into it is not followed through).
+    pub const UNLOAD_AMMO: Self = Self { wear: false, own_holder: false, one_by_one: true };
 }
 
 /// The things Ctrl and a click looks in for a place for an item, in order
@@ -991,7 +1323,7 @@ fn unmerged_holder(root: &Item, id: Id) -> Option<Id> {
     let (holder, spot) = root.holder_of(id)?;
     let held_by = root.find(holder)?;
     let merged = match spot {
-        Spot::Slot(slot) => held_by.kind.slots.get(slot).is_some_and(|slot| !is_chamber(&slot.name) && (slot.merges == Some(true) || held_by.kind.merges)),
+        Spot::Slot(slot) => held_by.kind.slots.get(slot).is_some_and(|slot| merges(held_by, slot)),
         _ => false,
     };
     if merged { unmerged_holder(root, holder) } else { Some(holder) }
@@ -1250,12 +1582,22 @@ pub fn rounds_in_reach(equipment: &Item, weapon: Id) -> u32 {
 /// Takes so many of those rounds for the weapon, the first stack first
 /// (`AmmoPack.LoadAmmo`); a stack used up is gone. How many were taken.
 pub fn take_rounds(equipment: &mut Item, weapon: Id, count: u32) -> u32 {
+    take_rounds_of_kinds(equipment, weapon, count).iter().map(|(_, taken)| taken).sum()
+}
+
+/// The same, saying what was taken: each kind and how many of it, in the
+/// order taken.
+pub fn take_rounds_of_kinds(equipment: &mut Item, weapon: Id, count: u32) -> Vec<(Arc<Kind>, u32)> {
     let mut left = count;
+    let mut taken_all = Vec::new();
     for id in rounds_within_reach(equipment, weapon) {
         let Some(stack) = equipment.find_mut(id) else { continue };
         let taken = stack.count.min(left);
         stack.count -= taken;
         left -= taken;
+        if taken > 0 {
+            taken_all.push((stack.kind.clone(), taken));
+        }
         if stack.count == 0 {
             equipment.take(id);
         }
@@ -1263,7 +1605,25 @@ pub fn take_rounds(equipment: &mut Item, weapon: Id, count: u32) -> u32 {
             break;
         }
     }
-    count - left
+    taken_all
+}
+
+/// Puts rounds onto the top of the magazine of that number wherever it
+/// lies in `root`, in the order given: onto its top stack where they are
+/// of its kind, else as a stack of their own. Whether it was there.
+pub fn put_rounds_into(root: &mut Item, magazine: Id, rounds: &[(Arc<Kind>, u32)]) -> bool {
+    let Some(magazine) = root.find_mut(magazine) else { return false };
+    for (kind, count) in rounds {
+        match magazine.loose.last_mut().filter(|top| top.kind.template == kind.template) {
+            Some(top) => top.count += count,
+            None => {
+                let mut stack = Item::new(kind.clone());
+                stack.count = *count;
+                magazine.loose.push(stack);
+            }
+        }
+    }
+    true
 }
 
 /// A weapon's slot for its magazine.
@@ -1272,6 +1632,78 @@ pub const MAGAZINE_SLOT: &str = "mod_magazine";
 /// The rounds a magazine holds.
 pub fn magazine_rounds(magazine: &Item) -> u32 {
     magazine.loose.iter().map(|stack| stack.count).sum()
+}
+
+/// What the ammunition's panel says of a magazine looked at in the hands
+/// (`AmmoCountPanel.GetAmmoCountByLevel`; inventory spec, "What the
+/// ammunition's panel says").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmmoWords {
+    Full,
+    Empty,
+    /// The count itself.
+    Count(u32),
+    /// "Approx." and the count to the nearest five.
+    About(u32),
+    FewerThanFive,
+    AlmostEmpty,
+    LessThanHalf,
+    AboutHalf,
+    AlmostFull,
+}
+
+impl AmmoWords {
+    /// The game's key for its words (each looked up in the install's), and
+    /// the number said after it, where one is.
+    pub fn key(self) -> (&'static str, Option<u32>) {
+        match self {
+            Self::Full => ("Full", None),
+            Self::Empty => ("Empty", None),
+            Self::Count(n) => ("", Some(n)),
+            Self::About(n) => ("Approx.", Some(n)),
+            Self::FewerThanFive => ("Less than 5", None),
+            Self::AlmostEmpty => ("Almost empty", None),
+            Self::LessThanHalf => ("Less than half", None),
+            Self::AboutHalf => ("About half", None),
+            Self::AlmostFull => ("Almost full", None),
+        }
+    }
+}
+
+/// The words for `count` rounds of `max` at the look's `level` (Mag
+/// Drills' level over 10, at least the magazine's `CheckOverride`): one
+/// short of full or more is full, none is empty; at level 0 one of four by
+/// `(int)(3.33 count / max + 0.5)`, at 1 the count where the magazine holds
+/// 10 or fewer, else to the nearest five from 5 on, below that "fewer than
+/// 5"; from 2 on the count. A weapon of a cylinder or several chambers
+/// (`GetAmmoCountByLevelForFoldingMechanismWeapon`): full only at `max`,
+/// empty at none, else the count.
+pub fn ammo_words(count: u32, max: u32, level: u32, folding: bool) -> AmmoWords {
+    if folding {
+        return if count >= max {
+            AmmoWords::Full
+        } else if count == 0 {
+            AmmoWords::Empty
+        } else {
+            AmmoWords::Count(count)
+        };
+    }
+    if i64::from(count) >= i64::from(max) - 1 {
+        return AmmoWords::Full;
+    }
+    if count == 0 {
+        return AmmoWords::Empty;
+    }
+    match level {
+        0 => {
+            let at = (3.33f32 * count as f32 / max as f32 + 0.5) as usize;
+            [AmmoWords::AlmostEmpty, AmmoWords::LessThanHalf, AmmoWords::AboutHalf, AmmoWords::AlmostFull][at.min(3)]
+        }
+        1 if max <= 10 => AmmoWords::Count(count),
+        1 if count >= 5 => AmmoWords::About((count as f32 / 5.0 + 0.5) as u32 * 5),
+        1 => AmmoWords::FewerThanFive,
+        _ => AmmoWords::Count(count),
+    }
 }
 
 /// Leaves a magazine holding `count` rounds, the last stack losing its
@@ -1296,6 +1728,349 @@ pub fn set_magazine_rounds(magazine: &mut Item, count: u32) {
     }
 }
 
+/// Whether a thing has a switch of its own (`TogglableComponent`:
+/// armoured equipment on a hinge, night and thermal vision; inventory spec,
+/// "A switch on the head").
+pub fn has_switch(item: &Item) -> bool {
+    item.kind.hinge || is(item, "NightVision") || is(item, "ThermalVision")
+}
+
+/// A thing's switch: the first of it and its parts, itself first, each
+/// part before the parts fitted to it (`GetItemComponentsInChildren`).
+pub fn switched_part(item: &Item) -> Option<&Item> {
+    if has_switch(item) {
+        return Some(item);
+    }
+    item.slots.iter().flatten().find_map(switched_part)
+}
+
+/// The first face shield of a thing, itself first, each part before the
+/// parts fitted to it (`GetItemComponentsInChildren<FaceShieldComponent>`).
+pub fn face_shield(item: &Item) -> Option<&Item> {
+    with_parts(item).find(|part| part.kind.face_shield)
+}
+
+/// How long a flash blinds, as a share (`Player.BlindnessDuration`; grenade
+/// spec, "A flash"): nothing with thermal vision on; else one less the
+/// protection of each of a face shield on the head that is down (or has no
+/// switch), a visor in the eyewear slot and a face cover's face shield
+/// that is down, multiplied.
+pub fn blindness_duration(equipment: &Equipment) -> f32 {
+    let worn = |slot: &str| equipment.worn(slot);
+    let thermal_on = WORN.iter().filter_map(|slot| worn(slot)).flat_map(with_parts).any(|part| is(part, "ThermalVision") && part.on);
+    if thermal_on {
+        return 0.0;
+    }
+    let shield_down = |shield: &Item| !has_switch(shield) || shield.on;
+    let head = worn("Headwear").and_then(face_shield).filter(|shield| shield_down(shield)).map_or(1.0, |shield| 1.0 - shield.kind.blindness_protection);
+    let eyes = worn("Eyewear").filter(|item| is(item, "Visors")).map_or(1.0, |visor| 1.0 - visor.kind.blindness_protection);
+    let face = worn("FaceCover").and_then(face_shield).filter(|shield| shield_down(shield)).map_or(1.0, |shield| 1.0 - shield.kind.blindness_protection);
+    head * eyes * face
+}
+
+/// Whether the character wears glasses (`Player.TryFindGlasses`): the
+/// eyewear's thing, else the headwear's, a visor.
+pub fn has_glasses(equipment: &Equipment) -> bool {
+    ["Eyewear", "Headwear"].iter().filter_map(|slot| equipment.worn(slot)).any(|item| is(item, "Visors"))
+}
+
+/// What the head's slots hold (the eyewear's, the headwear's and the face
+/// cover's things and all fitted to them, by number): a change in it is a
+/// thing put on or taken off there (`Player.OnItemAddedOrRemoved` for
+/// those slots).
+pub fn head_things(equipment: &Equipment) -> Vec<Id> {
+    ["Eyewear", "Headwear", "FaceCover"].iter().filter_map(|slot| equipment.worn(slot)).flat_map(with_parts).map(|item| item.id).collect()
+}
+
+/// Whether a helmet's hinge is to be down (`HelmetDress.OnFaceShieldChanged`):
+/// its face shield's switch on, or a face shield with no switch, or none.
+pub fn hinge_down(helmet: &Item) -> bool {
+    face_shield(helmet).is_none_or(|shield| !has_switch(shield) || shield.on)
+}
+
+/// Flips the switch of the thing of that number, wherever it lies in
+/// `root` (`TogglableComponent.Set`): the part switched and how it stands
+/// now; none if the thing has no switch.
+pub fn toggle(root: &mut Item, id: Id) -> Option<(Id, bool)> {
+    let part = switched_part(root.find(id)?)?.id;
+    let part = root.find_mut(part)?;
+    part.on = !part.on;
+    Some((part.id, part.on))
+}
+
+/// The first thing in it that folds, itself first, each part before the
+/// parts fitted to it, through the places that merge
+/// (`GetItemComponentsInChildren<FoldableComponent>`).
+pub fn folding_part(item: &Item) -> Option<&Item> {
+    if item.kind.foldable {
+        return Some(item);
+    }
+    item.slots.iter().zip(&item.kind.slots).filter(|(_, slot)| merges(item, slot)).find_map(|(part, _)| part.as_ref().and_then(folding_part))
+}
+
+/// Whether the thing's fold can be turned at all (`FoldableComponent.
+/// CanBeFolded`: its folded slot, where it names one, holds something).
+pub fn can_be_folded(item: &Item) -> bool {
+    folding_part(item).is_some_and(|part| {
+        let slot = &part.kind.folded_slot;
+        slot.is_empty() || part.kind.slots.iter().zip(&part.slots).any(|(holder, held)| holder.name == *slot && held.is_some())
+    })
+}
+
+/// Whether the thing can be folded or unfolded (`ItemManipulator.
+/// CanFold`): its fold can be turned, and on a weapon no part blocks it
+/// (`BlocksFolding`).
+pub fn can_fold(item: &Item) -> bool {
+    can_be_folded(item) && (!is(item, "Weapon") || !item.slots.iter().flatten().any(|part| with_parts(part).any(|part| part.kind.blocks_folding)))
+}
+
+/// A thing and everything fitted to it.
+pub(crate) fn with_parts(item: &Item) -> Box<dyn Iterator<Item = &Item> + '_> {
+    Box::new(std::iter::once(item).chain(item.slots.iter().flatten().flat_map(with_parts)))
+}
+
+/// Folds or unfolds the thing of that number, wherever it lies in the roots
+/// (`ItemManipulator.Fold`, `Resize_Helper`): its folding part turned the
+/// other way, and from that part up each weapon or part that lies in a
+/// grid made its new size where it lies, which is refused where the grid
+/// has no room for it so (`Grid.Resize`: the same corner, the same turn).
+/// The part folded and how it stands now; nothing changed if refused.
+pub fn fold(roots: &mut [&mut Item], id: Id) -> Result<(Id, bool), Refusal> {
+    let root = roots.iter_mut().find(|root| root.find(id).is_some()).ok_or(Refusal::NoSuchPlace)?;
+    let thing = root.find(id).ok_or(Refusal::NoSuchPlace)?;
+    if !can_fold(thing) {
+        return Err(Refusal::NoAction);
+    }
+    let part = folding_part(thing).ok_or(Refusal::NoAction)?.id;
+    let turn = |root: &mut Item| root.find_mut(part).map(|part| { part.folded = !part.folded; part.folded });
+    let to = turn(root).ok_or(Refusal::NoSuchPlace)?;
+    let chain: Vec<Id> = root.chain(part).iter().map(|item| item.id).collect();
+    for pair in chain.windows(2).rev() {
+        let (Some(holder), Some(item)) = (root.find(pair[0]), root.find(pair[1])) else { break };
+        if !is(item, "Weapon") && !is(item, "Mod") {
+            break;
+        }
+        if let Some((_, Spot::Cell(grid, place))) = holder.holder_of(item.id) {
+            if holder.grid_takes(grid, item, place).is_err() {
+                turn(root);
+                return Err(Refusal::NoRoom);
+            }
+        }
+    }
+    Ok((part, to))
+}
+
+/// Whether a magazine takes a round of this kind (its cartridges' filter)
+/// and has room for one more.
+pub fn takes_round(magazine: &Item, round: &Kind) -> bool {
+    let fits = magazine.kind.cartridges.first().is_some_and(|holder| round.among(&holder.takes) && !round.among(&holder.refuses));
+    fits && magazine_rounds(magazine) < magazine.kind.capacity
+}
+
+/// How many rounds of a stack a drop on a magazine loads
+/// (`GridView.AcceptItem`): as many as the magazine has room for, up to
+/// the stack.
+pub fn rounds_to_load(magazine: &Item, stack: &Item) -> u32 {
+    magazine.kind.capacity.saturating_sub(magazine_rounds(magazine)).min(stack.count)
+}
+
+/// One round from a stack onto the top of a magazine's rounds
+/// (`LoadMagazineProcess`, a magazine's `Apply` of one): onto its top stack
+/// where that is the same round, else as a stack of its own; the stack it
+/// came from gone when empty.
+pub fn load_round(roots: &mut [&mut Item], source: Id, magazine: Id) -> Result<(), Refusal> {
+    let kind = roots.iter().find_map(|root| root.find(source)).ok_or(Refusal::NoSuchPlace)?.kind.clone();
+    // Not into a magazine fitted to a weapon with a malfunction
+    // (`Magazine.Apply`'s `IncompatibleByMalfunction`).
+    let fitted = roots.iter().find_map(|root| match root.holder_of(magazine) {
+        Some((holder, Spot::Slot(_))) => Some(malfunction_refuses(root, holder, &kind)),
+        _ => None,
+    });
+    if fitted == Some(true) {
+        return Err(Refusal::Malfunction);
+    }
+    let target = roots.iter().find_map(|root| root.find(magazine)).ok_or(Refusal::NoSuchPlace)?;
+    if !takes_round(target, &kind) {
+        return Err(if target.kind.cartridges.is_empty() {
+            Refusal::NoAction
+        } else if magazine_rounds(target) >= target.kind.capacity {
+            Refusal::NoRoom
+        } else {
+            Refusal::Filter
+        });
+    }
+    let from = root_of(roots, source)?;
+    let stack = roots[from].find_mut(source).ok_or(Refusal::NoSuchPlace)?;
+    stack.count -= 1;
+    if stack.count == 0 {
+        roots[from].take(source);
+    }
+    let to = root_of(roots, magazine)?;
+    let target = roots[to].find_mut(magazine).ok_or(Refusal::NoSuchPlace)?;
+    match target.loose.last_mut() {
+        Some(top) if top.kind.template == kind.template => top.count += 1,
+        _ => target.loose.push(Item::new(kind)),
+    }
+    Ok(())
+}
+
+/// The top round of a magazine out (`UnloadMagazineProcess`), found a
+/// place among the equipment's containers as the order `UnloadAmmo` has
+/// it: onto a stack of the round with room for one, else the first free
+/// cell, the vest first. Where it went; refused, it stays in the magazine.
+pub fn unload_round(roots: &mut [&mut Item], magazine: Id, equipment: Id, rules: &Rules) -> Result<(Id, Applied), Refusal> {
+    let at = root_of(roots, magazine)?;
+    let target = roots[at].find_mut(magazine).ok_or(Refusal::NoSuchPlace)?;
+    let top = target.loose.last_mut().ok_or(Refusal::NoAction)?;
+    let kind = top.kind.clone();
+    top.count -= 1;
+    if top.count == 0 {
+        target.loose.pop();
+    }
+    // The round in a hand of its own while a place is found for it.
+    let round = Item::new(kind.clone());
+    let id = round.id;
+    let mut hand = Item::new(Arc::new(Kind::default()));
+    hand.loose.push(round);
+    let done = {
+        let mut all: Vec<&mut Item> = roots.iter_mut().map(|root| &mut **root).collect();
+        all.push(&mut hand);
+        quick_find(&mut all, id, &[equipment], Order::UNLOAD_AMMO, rules)
+    };
+    if done.is_err() {
+        if let Some(target) = roots[at].find_mut(magazine) {
+            match target.loose.last_mut() {
+                Some(top) if top.kind.template == kind.template => top.count += 1,
+                _ => target.loose.push(Item::new(kind)),
+            }
+        }
+    }
+    done
+}
+
+/// Takes a weapon apart as far as it may come apart where it lies
+/// (`ItemUiContext.Disassemble`): each part fitted to the weapon itself, in
+/// its slots' order and with whatever is fitted to it, is found a place as
+/// Ctrl and a click finds one (`QuickFindAppropriatePlace` in the order
+/// asked, among `targets`); one that finds none, or may not come off here
+/// (a raid's vital or fixed part), stays. Each part tried, and what came of
+/// it.
+pub fn disassemble(roots: &mut [&mut Item], weapon: Id, targets: &[Id], order: Order, rules: &Rules) -> Vec<(Id, Result<(Id, Applied), Refusal>)> {
+    let parts: Vec<Id> = roots
+        .iter()
+        .find_map(|root| root.find(weapon))
+        .map(|gun| gun.slots.iter().flatten().filter(|part| is(part, "Mod")).map(|part| part.id).collect())
+        .unwrap_or_default();
+    parts.into_iter().map(|part| (part, quick_find(roots, part, targets, order, rules))).collect()
+}
+
+/// Whether a weapon's rig, picture and model on the ground are made from
+/// its own parts (the options' `ADVANCED ATTACHMENT SYSTEM`, set once as
+/// the run begins); off, every weapon is its stock build.
+static BUILDS: AtomicBool = AtomicBool::new(true);
+
+/// Sets whether weapons are made from their own parts (`ADVANCED
+/// ATTACHMENT SYSTEM`).
+pub fn set_builds(on: bool) {
+    BUILDS.store(on, Ordering::Relaxed);
+}
+
+/// Whether weapons are made from their own parts.
+pub fn builds() -> bool {
+    BUILDS.load(Ordering::Relaxed)
+}
+
+/// A weapon's build as a list (`trp_data::database::Preset`): itself and
+/// every part fitted to it, at any depth, each with the slot of its parent
+/// it is in; the rounds in its chambers and magazines are no part of it
+/// (`EditBuildScreen.GetItemsInBuild`: what is a `Mod`). Items by their
+/// numbers.
+pub fn build_of(weapon: &Item) -> trp_data::database::Preset {
+    use trp_data::database::{Preset, PresetItem};
+    fn parts(item: &Item, items: &mut Vec<PresetItem>) {
+        for (part, slot) in item.slots.iter().zip(&item.kind.slots) {
+            let Some(part) = part.as_ref().filter(|part| is(part, "Mod")) else { continue };
+            items.push(PresetItem { id: part.id.to_string(), template: part.kind.template.clone(), parent: Some(item.id.to_string()), slot: Some(slot.name.clone()) });
+            parts(part, items);
+        }
+    }
+    let mut items = vec![PresetItem { id: weapon.id.to_string(), template: weapon.kind.template.clone(), parent: None, slot: None }];
+    parts(weapon, &mut items);
+    Preset { id: weapon.id.to_string(), name: String::new(), root: weapon.id.to_string(), items, encyclopedia: None }
+}
+
+/// What a rig of the hands, a thing's picture or its model on the ground
+/// is asked for by: a weapon of the install built otherwise than its stock
+/// build, its build's key (`trp_data::weapon::build_key`); anything else,
+/// and a weapon as its stock build has it, its template. With weapons
+/// made from their own parts switched off (`set_builds`), a template.
+pub fn rig_key(item: &Item) -> String {
+    let Some(stock) = item.kind.stock_key.as_deref().filter(|_| builds() && is(item, "Weapon")) else {
+        return item.kind.template.clone();
+    };
+    let key = trp_data::weapon::build_key(&build_of(item));
+    if key == stock { item.kind.template.clone() } else { key }
+}
+
+/// The template a rig's key is of: the key itself for a template, its
+/// first part for a build's.
+pub fn key_template(key: &str) -> &str {
+    key.split('[').next().unwrap_or(key)
+}
+
+/// The place of a weapon's chamber of its own, where it has one
+/// (`patron_in_weapon`; not a cylinder's nor barrels').
+pub fn chamber_slot(weapon: &Item) -> Option<usize> {
+    weapon.slot_index(CHAMBER)
+}
+
+/// The round in a weapon's chamber of its own.
+pub fn chambered(weapon: &Item) -> Option<&Item> {
+    weapon.slots.get(chamber_slot(weapon)?)?.as_ref()
+}
+
+/// Puts a round of that kind into the chamber of the weapon of that number
+/// wherever it lies in `root`, or empties it (none). Whether it has one.
+pub fn set_chambered(root: &mut Item, weapon: Id, round: Option<Arc<Kind>>) -> bool {
+    let Some(gun) = root.find_mut(weapon) else { return false };
+    let Some(slot) = chamber_slot(gun) else { return false };
+    gun.slots[slot] = round.map(Item::new);
+    true
+}
+
+/// The kind of a magazine's round so many down from its top (0 the top:
+/// the last stack's).
+pub fn magazine_round_at(magazine: &Item, from_top: u32) -> Option<Arc<Kind>> {
+    let mut left = from_top;
+    for stack in magazine.loose.iter().rev() {
+        if left < stack.count {
+            return Some(stack.kind.clone());
+        }
+        left -= stack.count;
+    }
+    None
+}
+
+/// Whether a magazine's count is known once a round has gone in or out
+/// (`CheckMagazineAmmoDepend`): left empty or full it is; otherwise it is
+/// as it was, unless a shot took the round and the install unknows a
+/// magazine on a shot (`UncheckOnShot`: `shot`), when it is not.
+pub fn known_after(count: u32, capacity: u32, known: bool, shot: bool) -> bool {
+    count == 0 || count >= capacity || (known && !shot)
+}
+
+/// Leaves the magazine of that number, wherever it lies in `root`,
+/// holding `count` rounds (`set_magazine_rounds`). Whether it was there.
+pub fn set_rounds_of(root: &mut Item, id: Id, count: u32) -> bool {
+    match root.find_mut(id) {
+        Some(magazine) => {
+            set_magazine_rounds(magazine, count);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Fills a magazine with `count` rounds of one kind, what it held gone.
 pub fn fill_magazine(magazine: &mut Item, round: Arc<Kind>, count: u32) {
     magazine.loose.clear();
@@ -1314,7 +2089,12 @@ pub fn fill_magazine(magazine: &mut Item, round: Arc<Kind>, count: u32) {
 /// takes. Of two that hold the same, the one met first (`PROVISIONAL`:
 /// the game's sort keeps no order between them).
 pub fn next_magazine(equipment: &Item, weapon: Id) -> Option<Id> {
-    let weapon = equipment.find(weapon)?;
+    magazine_for(equipment, equipment.find(weapon)?)
+}
+
+/// The same for a weapon wherever it lies (the menu's Load and Reload:
+/// `ItemUiContext.FindSuitableMagazine`, the magazines within reach).
+pub fn magazine_for(equipment: &Item, weapon: &Item) -> Option<Id> {
     let takes = &weapon.kind.slots.get(weapon.slot_index(MAGAZINE_SLOT)?)?.takes;
     let worn = WITHIN_REACH.iter().filter_map(|slot| equipment.in_slot(slot));
     let mut found: Vec<&Item> = worn
@@ -1332,7 +2112,14 @@ pub fn next_magazine(equipment: &Item, weapon: Id) -> Option<Id> {
 /// smallest grid first; the backpack is not among them. The holder, the
 /// grid and the place.
 fn unloaded_place(equipment: &Item, magazine: &Item) -> Option<(Id, usize, Place)> {
-    let holders = ["TacticalVest", "Pockets"].into_iter().filter_map(|slot| equipment.in_slot(slot));
+    unloaded_place_of(equipment, magazine, false)
+}
+
+/// The same, with the backpack's grids after the pockets' when asked
+/// (`backpackIncluded`: the menu's Reload).
+fn unloaded_place_of(equipment: &Item, magazine: &Item, backpack: bool) -> Option<(Id, usize, Place)> {
+    let slots: &[&str] = if backpack { &["TacticalVest", "Pockets", "Backpack"] } else { &["TacticalVest", "Pockets"] };
+    let holders = slots.iter().filter_map(|slot| equipment.in_slot(slot));
     let mut grids: Vec<(&Item, usize)> = holders.flat_map(|holder| (0..holder.grids.len()).map(move |grid| (holder, grid))).collect();
     grids.sort_by_key(|(holder, grid)| holder.kind.grids[*grid].cells[0] * holder.kind.grids[*grid].cells[1]);
     grids.into_iter().find_map(|(holder, grid)| holder.find_room(grid, magazine).map(|place| (holder.id, grid, place)))
@@ -1379,21 +2166,126 @@ pub fn swap_magazine(equipment: &mut Item, weapon: Id, next: Option<Id>, left: O
     falls
 }
 
+/// What the menu's Reload on a weapon comes to (`ItemUiContext.
+/// ReloadWeapon`; firing spec, "A magazine taken out or put in from the
+/// inventory").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuReload {
+    /// The fitted magazine (the first) swapped for the found one (the
+    /// second) at once: two things moved, the hands not asked.
+    Swapped(Id, Id),
+    /// No magazine fitted: the found one is to be moved into the slot (a
+    /// move of one thing, the hands' if the weapon is in hand).
+    Fit(Id),
+}
+
+/// The menu's Reload on a weapon lying in `roots`: the fullest magazine
+/// within reach of the character (`equipment`) that the weapon's slot
+/// takes; with one fitted, the two swapped, the old one to the first free
+/// place of the smallest grid of the vest, the pockets and the backpack
+/// that has one. Refused with no magazine to take (`NoAction`), and with
+/// nowhere for the old one (`NoRoom`: the game then throws it down, which
+/// is not built).
+pub fn menu_reload(equipment: &mut Item, weapon: Id) -> Result<MenuReload, Refusal> {
+    let gun = equipment.find(weapon).ok_or(Refusal::NoSuchPlace)?;
+    let next = magazine_for(equipment, gun).ok_or(Refusal::NoAction)?;
+    let slot = gun.slot_index(MAGAZINE_SLOT).ok_or(Refusal::NoSuchPlace)?;
+    let Some(old) = gun.slots[slot].as_ref() else { return Ok(MenuReload::Fit(next)) };
+    let old_id = old.id;
+    // The place is found with the old one still in the weapon, as the game
+    // finds it.
+    let (holder, grid, place) = unloaded_place_of(equipment, old, true).ok_or(Refusal::NoRoom)?;
+    let new = equipment.take(next).ok_or(Refusal::NoSuchPlace)?;
+    let old = equipment.find_mut(weapon).ok_or(Refusal::NoSuchPlace)?.slots[slot].replace(new).ok_or(Refusal::NoSuchPlace)?;
+    equipment.find_mut(holder).ok_or(Refusal::NoSuchPlace)?.grids[grid].push((place, old));
+    Ok(MenuReload::Swapped(old_id, next))
+}
+
+/// What the menu's Install on a magazine comes to (`ItemUiContext.
+/// InstallMod`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuInstall {
+    /// Swapped at once for the magazine the weapon had (the hands not
+    /// asked): the weapon, and the old magazine.
+    Swapped(Id, Id),
+    /// To be moved into the weapon's empty slot (the hands' if the weapon
+    /// is in hand): the weapon and the slot.
+    Fit(Id, usize),
+}
+
+/// The menu's Install on a magazine the character has: into the magazine
+/// slot of the weapon in hand if it takes the magazine, else of the first
+/// weapon carried whose slot does (`GetSuitableWeapons`); a slot holding
+/// another has the two swapped, the old one to the first free place for it
+/// in the equipment's containers in the order for loot (`QuickFind`,
+/// `GetPrioritizedGridsForLoot`). Refused with no such weapon
+/// (`NoAction`) or nowhere for the old one (`NoRoom`).
+pub fn menu_install(equipment: &mut Item, magazine: Id, in_hand: Option<Id>) -> Result<MenuInstall, Refusal> {
+    let item = equipment.find(magazine).ok_or(Refusal::NoSuchPlace)?;
+    let accepts = |weapon: &Item| {
+        let slot = weapon.slot_index(MAGAZINE_SLOT)?;
+        (is(weapon, "Weapon") && item.kind.among(&weapon.kind.slots[slot].takes)).then_some((weapon.id, slot))
+    };
+    fn all(item: &Item) -> Vec<&Item> {
+        item.contents().flat_map(|inside| std::iter::once(inside).chain(all(inside))).collect()
+    }
+    let found = in_hand.and_then(|id| equipment.find(id)).and_then(|weapon| accepts(weapon)).or_else(|| all(equipment).into_iter().find_map(|weapon| accepts(weapon)));
+    let (weapon, slot) = found.ok_or(Refusal::NoAction)?;
+    let gun = equipment.find(weapon).ok_or(Refusal::NoSuchPlace)?;
+    let Some(old) = gun.slots[slot].as_ref() else { return Ok(MenuInstall::Fit(weapon, slot)) };
+    if old.id == magazine {
+        return Err(Refusal::AlreadyThere);
+    }
+    let old_id = old.id;
+    let (holder, grid, place) = loot_place(equipment, old).ok_or(Refusal::NoRoom)?;
+    let new = equipment.take(magazine).ok_or(Refusal::NoSuchPlace)?;
+    let old = equipment.find_mut(weapon).ok_or(Refusal::NoSuchPlace)?.slots[slot].replace(new).ok_or(Refusal::NoSuchPlace)?;
+    equipment.find_mut(holder).ok_or(Refusal::NoSuchPlace)?.grids[grid].push((place, old));
+    Ok(MenuInstall::Swapped(weapon, old_id))
+}
+
+/// The first free place for a thing in the equipment's four containers
+/// in the order for its kind (`GetPrioritizedGridsForLoot`,
+/// `FindLocationForItem`): the holder, the grid and the place.
+fn loot_place(equipment: &Item, item: &Item) -> Option<(Id, usize, Place)> {
+    loot_order(item).iter().filter_map(|slot| equipment.in_slot(slot)).find_map(|holder| (0..holder.grids.len()).find_map(|grid| holder.find_room(grid, item).map(|place| (holder.id, grid, place))))
+}
+
 /// The slots a weapon is taken in hand from, in the order the game looks
 /// through them for something to hold (`Player._slotPriority`).
 pub const HAND_SLOTS: [&str; 4] = ["FirstPrimaryWeapon", "SecondPrimaryWeapon", "Holster", "Scabbard"];
 
+/// Whether a thing is the round in the chamber of the weapon in hand whose
+/// hands would not let it out now (`Rules::chamber_held`; `Idling.Execute`
+/// refuses the move: "Can't perform operation while mag in the weapon").
+fn chamber_held(root: &Item, id: Id, rules: &Rules) -> bool {
+    let Some(weapon) = rules.chamber_held else { return false };
+    let Some((holder, Spot::Slot(slot))) = root.holder_of(id) else { return false };
+    holder == weapon && root.find(holder).and_then(|gun| gun.kind.slots.get(slot)).is_some_and(|slot| is_chamber(&slot.name))
+}
+
+/// Whether a place is the chamber of the weapon in hand whose hands would
+/// not take a round into it now (`Rules::chamber_closed`).
+fn chamber_closed(target: &Item, spot: Spot, rules: &Rules) -> bool {
+    rules.chamber_closed == Some(target.id) && matches!(spot, Spot::Slot(slot) if target.kind.slots.get(slot).is_some_and(|holder| is_chamber(&holder.name)))
+}
+
 /// Drops one item on another (`ItemController.ExecutePossibleAction`,
 /// `CompoundItem.Apply`): two stacks of one kind become one if the other
 /// has the room; else it goes into the first of the other's slots that
-/// takes it, else into the first of its grids with room; else as much of
-/// a stack as the other holds goes over. Swapping two things by dropping
-/// one on the other is switched off in the game.
+/// takes it, a weapon's chambers last (`Weapon.AllSlots`) and a round of a
+/// stack split off for a chamber (`SplitMax`), else into the first of its
+/// grids with room; else as much of a stack as the other holds goes over.
+/// Swapping two things by dropping one on the other is switched off in the
+/// game.
 pub fn apply_item(roots: &mut [&mut Item], id: Id, onto: Id, rules: &Rules) -> Result<Applied, Refusal> {
     if id == onto {
         return Err(Refusal::NoAction);
     }
     let (from, to) = (root_of(roots, id)?, root_of(roots, onto)?);
+    if chamber_held(roots[from], id, rules) {
+        return Err(Refusal::HandsBusy);
+    }
     let (item, target) = (roots[from].find(id).ok_or(Refusal::NoSuchPlace)?, roots[to].find(onto).ok_or(Refusal::NoSuchPlace)?);
     let alike = item.kind.stack_max > 1 && item.kind.template == target.kind.template;
     let (count, room) = (item.count, target.stack_room());
@@ -1402,15 +2294,28 @@ pub fn apply_item(roots: &mut [&mut Item], id: Id, onto: Id, rules: &Rules) -> R
         roots[to].find_mut(onto).ok_or(Refusal::NoSuchPlace)?.count += count;
         return Ok(Applied::Merged);
     }
-    // (A chamber is not among the places a thing dropped on a weapon is
-    // tried in: what the game does with a round dropped there is not read.)
     let slots: Vec<usize> = (0..target.kind.slots.len())
         .filter(|slot| !is_chamber(&target.kind.slots[*slot].name) && target.slot_takes(*slot, item).is_ok())
         .collect();
+    // A chamber takes one round: of a stack, one is split off for it.
+    let one = Item { count: 1, ..item.clone() };
+    let chambers: Vec<usize> = (0..target.kind.slots.len())
+        .filter(|slot| is_chamber(&target.kind.slots[*slot].name) && target.slot_takes(*slot, &one).is_ok())
+        .collect();
+    let closed = chambers.iter().any(|slot| chamber_closed(target, Spot::Slot(*slot), rules));
+    let many = count > 1;
     let cells = (0..target.kind.grids.len()).find_map(|grid| target.find_room(grid, item).map(|place| Spot::Cell(grid, place)));
     let mut refused = Refusal::NoAction;
-    for spot in slots.into_iter().map(Spot::Slot).chain(cells) {
-        match move_item(roots, id, onto, spot, rules) {
+    for spot in slots.into_iter().map(Spot::Slot).chain(chambers.into_iter().map(Spot::Slot)).chain(cells) {
+        let chamber = matches!(spot, Spot::Slot(slot) if is_chamber(&roots[to].find(onto).map_or(String::new(), |target| target.kind.slots[slot].name.clone())));
+        let done = if chamber && closed {
+            Err(Refusal::HandsBusy)
+        } else if chamber && many {
+            split_item(roots, id, 1, onto, spot, rules).map(|_| ())
+        } else {
+            move_item(roots, id, onto, spot, rules)
+        };
+        match done {
             Ok(()) => return Ok(Applied::Put(spot)),
             Err(refusal) => refused = refusal,
         }
@@ -1491,6 +2396,217 @@ mod tests {
         assert!((rounds.weight() - 0.36).abs() < 1e-6);
     }
 
+    /// A weapon taken apart in a raid: each of its own parts that may come
+    /// off goes where Ctrl and a click sends it, with what is fitted to it;
+    /// a vital part stays, and so does the round in the chamber.
+    #[test]
+    fn a_weapon_comes_apart_but_for_its_vital_parts() {
+        let part_of = |name: &str| {
+            let mut kind = kind(name, "mod", 0.2, [1, 1]);
+            kind.class_names.push("Mod".into());
+            kind.slots = vec![holder("mod_mount", [0, 0], &["mount"], &[])];
+            Item::new(Arc::new(kind))
+        };
+        let slots = vec![
+            Holder { required: true, ..holder("mod_barrel", [0, 0], &["barrel"], &[]) },
+            holder("mod_stock", [0, 0], &["stock"], &[]),
+            holder("patron_in_weapon", [0, 0], &["round"], &[]),
+        ];
+        let mut rifle = Item::new(Arc::new(Kind { slots, merges: true, ..kind("rifle", "weapon", 3.0, [3, 1]) }));
+        let mut stock = part_of("stock");
+        stock.slots[0] = Some(part_of("pad"));
+        let (stock_id, pad_id) = (stock.id, stock.slots[0].as_ref().unwrap().id);
+        rifle.slots[0] = Some(part_of("barrel"));
+        rifle.slots[1] = Some(stock);
+        rifle.slots[2] = Some(thing("round", "ammo", 0.01, [1, 1]));
+        let rifle_id = rifle.id;
+        let mut crate_ = pack("crate", [6, 6]);
+        crate_.stow(rifle).unwrap();
+        let mut bag = pack("bag", [4, 4]);
+        let bag_id = bag.id;
+        let mut roots = [&mut crate_, &mut bag];
+        let came = disassemble(&mut roots, rifle_id, &[bag_id], Order::OTHER_SIDE, &RAID);
+        assert_eq!(came.len(), 2);
+        assert!(matches!(came[0].1, Err(Refusal::Vital(_))));
+        assert!(matches!(came[1], (id, Ok((holder, Applied::Put(_)))) if id == stock_id && holder == bag_id));
+        assert!(roots[1].find(pad_id).is_some());
+        let rifle = roots[0].find(rifle_id).unwrap();
+        assert!(rifle.slots[0].is_some() && rifle.slots[1].is_none() && rifle.slots[2].is_some());
+    }
+
+    /// The rounds a magazine holds are counted from its top, the last
+    /// stack's first; a weapon's chamber is filled and emptied.
+    #[test]
+    fn a_magazine_s_rounds_from_the_top_and_a_chamber_filled() {
+        let round = |name: &str, count: u32| Item { count, ..Item::new(Arc::new(Kind { stack_max: 60, ..kind(name, "ammo", 0.01, [1, 1]) })) };
+        let mut magazine = thing("magazine", "magazine", 0.1, [1, 2]);
+        magazine.loose = vec![round("bottom", 20), round("top", 2)];
+        let named = |at: u32| magazine_round_at(&magazine, at).map(|kind| kind.name.clone());
+        assert_eq!((named(0), named(1), named(2), named(22)), (Some("top".into()), Some("top".into()), Some("bottom".into()), None));
+        let slots = vec![holder("patron_in_weapon", [0, 0], &["ammo"], &[])];
+        let mut rifle = Item::new(Arc::new(Kind { slots, ..kind("rifle", "weapon", 3.0, [4, 1]) }));
+        let rifle_id = rifle.id;
+        let kind = magazine_round_at(&magazine, 0);
+        assert!(set_chambered(&mut rifle, rifle_id, kind) && chambered(&rifle).is_some_and(|round| round.count == 1));
+        assert!(set_chambered(&mut rifle, rifle_id, None) && chambered(&rifle).is_none());
+    }
+
+    /// A round let go on a weapon goes into its empty chamber, one split
+    /// off a stack; not into a full one, nor into the chamber of the weapon
+    /// in hand whose hands would not take it.
+    #[test]
+    fn a_round_let_go_on_a_weapon_goes_into_its_chamber() {
+        let slots = vec![holder("mod_magazine", [0, 0], &["magazine"], &[]), holder("patron_in_weapon", [0, 0], &["round"], &[])];
+        let rifle = Item::new(Arc::new(Kind { slots, merges: true, ..kind("rifle", "weapon", 3.0, [4, 1]) }));
+        let rifle_id = rifle.id;
+        let mut rounds = Item::new(Arc::new(Kind { stack_max: 60, ..kind("round", "round", 0.01, [1, 1]) }));
+        rounds.count = 20;
+        let rounds_id = rounds.id;
+        let mut bag = pack("bag", [6, 4]);
+        bag.stow(rifle).unwrap();
+        bag.stow(rounds).unwrap();
+        let mut roots = [&mut bag];
+        let closed = Rules { chamber_closed: Some(rifle_id), ..RAID };
+        assert_eq!(apply_item(&mut roots, rounds_id, rifle_id, &closed), Err(Refusal::HandsBusy));
+        assert_eq!(apply_item(&mut roots, rounds_id, rifle_id, &RAID), Ok(Applied::Put(Spot::Slot(1))));
+        let rifle = roots[0].find(rifle_id).unwrap();
+        assert_eq!(rifle.slots[1].as_ref().map(|round| round.count), Some(1));
+        assert_eq!(roots[0].find(rounds_id).map(|stack| stack.count), Some(19));
+        assert!(apply_item(&mut roots, rounds_id, rifle_id, &RAID).is_err(), "the chamber is full");
+        // The round in it stays where the hands would not let it out: not
+        // moved, merged or thrown out.
+        let chambered_id = roots[0].find(rifle_id).and_then(|rifle| rifle.slots[1].as_ref()).map(|round| round.id).unwrap();
+        let held = Rules { chamber_held: Some(rifle_id), ..RAID };
+        let bag_id = roots[0].id;
+        let cell = Spot::Cell(0, roots[0].find_room(0, roots[0].find(chambered_id).unwrap()).unwrap());
+        assert_eq!(move_item(&mut roots, chambered_id, bag_id, cell, &held), Err(Refusal::HandsBusy));
+        assert_eq!(apply_item(&mut roots, chambered_id, rounds_id, &held), Err(Refusal::HandsBusy));
+        assert_eq!(take_out(&mut roots, chambered_id, &held).err(), Some(Refusal::HandsBusy));
+        assert_eq!(apply_item(&mut roots, chambered_id, rounds_id, &RAID), Ok(Applied::Merged));
+        assert!(roots[0].find(rifle_id).unwrap().slots[1].is_none());
+    }
+
+    /// A malfunctioned weapon keeps its magazine with a failure to feed and
+    /// takes no round into its chamber with any (`IncompatibleByMalfunction`);
+    /// it and such a magazine are drawn unusable once the shooter knows.
+    #[test]
+    fn a_malfunctioned_weapon_keeps_its_magazine_and_its_chamber() {
+        use crate::malfunction::Malf;
+        let slots = vec![holder("mod_magazine", [0, 0], &["magazine"], &[]), holder("patron_in_weapon", [0, 0], &["ammo"], &[])];
+        let mut rifle = Item::new(Arc::new(Kind { slots, merges: true, ..kind("rifle", "weapon", 3.0, [4, 1]) }));
+        let magazine = thing("magazine", "magazine", 0.1, [1, 2]);
+        let magazine_id = magazine.id;
+        rifle.slots[0] = Some(magazine);
+        let rifle_id = rifle.id;
+        let round = thing("round", "ammo", 0.01, [1, 1]);
+        let round_id = round.id;
+        let mut bag = pack("bag", [6, 4]);
+        bag.stow(rifle).unwrap();
+        bag.stow(round).unwrap();
+        let bag_id = bag.id;
+        let mut roots = [&mut bag];
+        let set = |roots: &mut [&mut Item], malf: Malf, known: bool| {
+            let rifle = roots[0].find_mut(rifle_id).unwrap();
+            (rifle.malfunction.malf, rifle.malfunction.known) = (malf, known);
+        };
+        // A failure to feed: the magazine stays, and no round goes in.
+        set(&mut roots, Malf::Feed, false);
+        let out = Spot::Cell(0, roots[0].find_room(0, roots[0].find(magazine_id).unwrap()).unwrap());
+        assert_eq!(move_item(&mut roots, magazine_id, bag_id, out, &RAID), Err(Refusal::Malfunction));
+        assert_eq!(move_item(&mut roots, round_id, rifle_id, Spot::Slot(1), &RAID), Err(Refusal::Malfunction));
+        assert!(!unusable_by_malfunction(roots[0], roots[0].find(rifle_id).unwrap()), "not known: drawn as it is");
+        set(&mut roots, Malf::Feed, true);
+        assert!(unusable_by_malfunction(roots[0], roots[0].find(rifle_id).unwrap()));
+        assert!(unusable_by_malfunction(roots[0], roots[0].find(magazine_id).unwrap()), "its magazine with a failure to feed");
+        // A jam: the magazine may leave, still no round in.
+        set(&mut roots, Malf::Jam, true);
+        assert!(!unusable_by_malfunction(roots[0], roots[0].find(magazine_id).unwrap()));
+        assert_eq!(move_item(&mut roots, round_id, rifle_id, Spot::Slot(1), &RAID), Err(Refusal::Malfunction));
+        assert_eq!(move_item(&mut roots, magazine_id, bag_id, out, &RAID), Ok(()));
+        // Put right, the round goes in.
+        set(&mut roots, Malf::None, false);
+        assert_eq!(move_item(&mut roots, round_id, rifle_id, Spot::Slot(1), &RAID), Ok(()));
+    }
+
+    /// A magazine is known once a round in or out leaves it empty or
+    /// full; a shot that leaves it neither unknows it, anything else
+    /// leaves it as it was.
+    #[test]
+    fn a_magazine_is_known_empty_or_full_and_unknown_after_a_shot() {
+        assert!(known_after(0, 30, false, true) && known_after(30, 30, false, false));
+        assert!(!known_after(29, 30, true, true) && known_after(29, 30, true, false));
+        assert!(!known_after(12, 30, false, false));
+    }
+
+    /// Forced extra cells add up beside the largest of the rest
+    /// (`ExtraSizeForceAdd`); a thing that does not merge with its parts
+    /// counts none of them, whatever its places say of themselves; the
+    /// chamber's round never counts.
+    #[test]
+    fn forced_cells_add_up_and_only_a_merging_thing_counts_its_parts() {
+        let part = |name: &str, extra: [u32; 4], forced_extra: bool| Item::new(Arc::new(Kind { extra, forced_extra, ..kind(name, "mod", 0.1, [1, 1]) }));
+        let slots = vec![holder("mod_handguard", [0, 0], &["mod"], &[]), holder("mod_muzzle", [0, 0], &["mod"], &[]), holder("patron_in_weapon", [0, 0], &["mod"], &[])];
+        let mut rifle = Item::new(Arc::new(Kind { slots: slots.clone(), merges: true, ..kind("rifle", "weapon", 2.0, [2, 1]) }));
+        rifle.slots[0] = Some(part("handguard", [1, 0, 0, 0], false));
+        rifle.slots[1] = Some(part("silencer", [1, 0, 0, 0], true));
+        assert_eq!(rifle.cells(), [4, 1]);
+        rifle.slots[2] = Some(part("round", [3, 0, 0, 0], false));
+        assert_eq!(rifle.cells(), [4, 1]);
+        let mut merging_slots = slots;
+        merging_slots[0].merges = Some(true);
+        let mut armour = Item::new(Arc::new(Kind { slots: merging_slots, ..kind("armour", "armoredEquipment", 2.0, [3, 3]) }));
+        armour.slots[0] = Some(part("plate", [1, 1, 1, 1], false));
+        assert_eq!(armour.cells(), [3, 3]);
+    }
+
+    /// A stock folded takes its reduction off the right, of the weapon it
+    /// is on or of itself alone; a weapon that folds leaves its folded slot
+    /// out. In a grid the weapon is made its new size where it lies, and a
+    /// fold with no room for that is refused with nothing changed; a part
+    /// that blocks folding keeps the weapon from it.
+    #[test]
+    fn a_fold_shortens_the_weapon_where_it_lies() {
+        // A stock is a part (`Stock` under `Mod`), which the fold's walk up
+        // goes by.
+        let part_of = |mut kind: Kind| {
+            kind.class_names.push("Mod".into());
+            kind
+        };
+        let stock_kind = |reduce: u32| Arc::new(Kind { extra: [0, 1, 0, 0], foldable: true, fold_reduce: reduce, ..part_of(kind("stock", "stock", 0.9, [2, 2])) });
+        let slots = vec![holder("mod_stock", [0, 0], &["stock"], &[]), holder("mod_barrel", [0, 0], &["mod"], &[])];
+        let mut shotgun = Item::new(Arc::new(Kind { slots: slots.clone(), merges: true, ..kind("shotgun", "weapon", 3.0, [4, 2]) }));
+        shotgun.slots[0] = Some(Item::new(stock_kind(1)));
+        assert_eq!(shotgun.cells(), [5, 2]);
+        let mut pack = Item::new(Arc::new(Kind { grids: vec![holder("main", [5, 4], &[], &[])], ..kind("pack", "backpack", 1.0, [5, 5]) }));
+        pack.put(0, shotgun.clone(), Place { x: 0, y: 0, turned: false }).unwrap();
+        let (shotgun_id, stock_id) = (shotgun.id, shotgun.slots[0].as_ref().unwrap().id);
+        assert_eq!(fold(&mut [&mut pack], shotgun_id), Ok((stock_id, true)));
+        let folded = &pack.grids[0][0].1;
+        assert_eq!((folded.cells(), folded.slots[0].as_ref().unwrap().cells()), ([4, 2], [1, 2]));
+        // Something now lies where the stock would come out to: no room.
+        pack.put(0, thing("box", "item", 0.1, [1, 1]), Place { x: 4, y: 1, turned: false }).unwrap();
+        assert_eq!(fold(&mut [&mut pack], shotgun_id), Err(Refusal::NoRoom));
+        assert!(pack.find(stock_id).unwrap().folded && pack.find(shotgun_id).unwrap().cells() == [4, 2]);
+        pack.grids[0].retain(|(_, item)| item.id == shotgun_id);
+        assert_eq!(fold(&mut [&mut pack], stock_id), Ok((stock_id, false)));
+        assert_eq!(pack.find(shotgun_id).unwrap().cells(), [5, 2]);
+        // A weapon that folds itself, its stock in its folded slot.
+        let mut folding = Item::new(Arc::new(Kind { slots: slots.clone(), merges: true, foldable: true, folded_slot: "mod_stock".into(), ..kind("smg", "weapon", 2.0, [3, 2]) }));
+        folding.slots[0] = Some(Item::new(Arc::new(Kind { extra: [0, 2, 0, 0], ..kind("fixed", "stock", 0.5, [2, 2]) })));
+        assert_eq!(folding.cells(), [5, 2]);
+        let folding_id = folding.id;
+        assert_eq!(fold(&mut [&mut folding], folding_id), Ok((folding_id, true)));
+        assert_eq!(folding.cells(), [3, 2]);
+        // Its folded slot empty, it has nothing to fold.
+        folding.slots[0] = None;
+        assert!(!can_be_folded(&folding) && fold(&mut [&mut folding], folding_id) == Err(Refusal::NoAction));
+        // A part that blocks folding.
+        let mut blocked = Item::new(Arc::new(Kind { slots, merges: true, ..kind("shotgun", "weapon", 3.0, [4, 2]) }));
+        blocked.slots[0] = Some(Item::new(stock_kind(1)));
+        blocked.slots[1] = Some(Item::new(Arc::new(Kind { blocks_folding: true, ..kind("barrel", "mod", 0.5, [2, 1]) })));
+        assert!(can_be_folded(&blocked) && !can_fold(&blocked));
+    }
+
     /// An equipment slot takes what its filter names, one at a time; a
     /// helmet that blocks the earpiece keeps a headset out, and is kept
     /// out by one already worn. The carried weight is every slot's, and
@@ -1520,7 +2636,7 @@ mod tests {
         assert_eq!(equipment.drawn(), ["helmet"]);
     }
 
-    const RAID: Rules = Rules { in_raid: true, backpacks_deep: 2 };
+    const RAID: Rules = Rules { in_raid: true, backpacks_deep: 2, busy_weapon: None, chamber_closed: None, chamber_held: None };
 
     fn pack(name: &str, cells: [u32; 2]) -> Item {
         Item::new(Arc::new(Kind { grids: vec![holder("main", cells, &["item"], &[])], classes: vec![name.into(), BACKPACK.into(), "item".into()], ..kind(name, "backpack", 1.0, [3, 3]) }))
@@ -1836,6 +2952,12 @@ mod tests {
         assert_eq!(worn.find(vest_shells).unwrap().count, 6);
         // No more is taken than there is.
         assert_eq!(take_rounds(&mut worn, gun_id, 10), 6);
+        // What is taken, by kind, goes onto a tube's top.
+        let mut tube = thing("tube", "magazine", 0.1, [1, 1]);
+        let tube_id = tube.id;
+        let shell = Arc::new(kind("shell", "ammo", 0.04, [1, 1]));
+        assert!(put_rounds_into(&mut tube, tube_id, &[(shell.clone(), 2), (shell, 1)]));
+        assert_eq!((tube.loose.len(), magazine_rounds(&tube)), (1, 3));
         assert_eq!(rounds_in_reach(&worn, gun_id), 0);
     }
 
@@ -1906,6 +3028,115 @@ mod tests {
             full.find_mut(vest_id).unwrap().grids[grid].push((Place { x: 0, y: 0, turned: false }, thing("brick", "item", 1.0, [2, 2])));
         }
         assert_eq!(swap_magazine(&mut full, rifle_id, None, Some(5), false).map(|old| old.id), Some(fitted_id));
+    }
+
+    /// A magazine is loaded a round at a time from a stack, onto its top
+    /// stack where the round is the same, as many as it has room for; it
+    /// refuses a round its filter does not take, and one more when full. It
+    /// is unloaded from the top, each round onto a stack of its kind with
+    /// room in the vest, else into a free cell; a round with nowhere to go
+    /// stays in.
+    #[test]
+    fn a_magazine_is_loaded_and_unloaded_a_round_at_a_time() {
+        let (mut worn, [vest_id, _, _], _) = dressed();
+        let worn_id = worn.id;
+        let round = Arc::new(Kind { stack_max: 60, ..kind("round", "ammo", 0.01, [1, 1]) });
+        let slug = Arc::new(Kind { stack_max: 60, classes: vec!["slug".into(), "round".into(), "ammo".into(), "item".into()], ..kind("slug", "ammo", 0.03, [1, 1]) });
+        let magazine = Item::new(Arc::new(Kind { cartridges: vec![holder("cartridges", [0, 0], &["round"], &[])], capacity: 3, ..kind("mag", "magazine", 0.2, [1, 2]) }));
+        let (mut stack, mut slugs, shells) = (Item::new(round.clone()), Item::new(slug), thing("shell", "ammo", 0.04, [1, 1]));
+        (stack.count, slugs.count) = (2, 5);
+        let (mag_id, stack_id, slugs_id, shells_id) = (magazine.id, stack.id, slugs.id, shells.id);
+        let vest = worn.find_mut(vest_id).unwrap();
+        vest.put(0, magazine, Place { x: 0, y: 0, turned: false }).unwrap();
+        vest.put(2, stack, Place { x: 0, y: 0, turned: false }).unwrap();
+        vest.put(2, slugs, Place { x: 1, y: 0, turned: false }).unwrap();
+        vest.put(2, shells, Place { x: 0, y: 1, turned: false }).unwrap();
+        assert_eq!(rounds_to_load(worn.find(mag_id).unwrap(), worn.find(stack_id).unwrap()), 2);
+        assert_eq!(rounds_to_load(worn.find(mag_id).unwrap(), worn.find(slugs_id).unwrap()), 3);
+        for _ in 0..2 {
+            load_round(&mut [&mut worn], stack_id, mag_id).unwrap();
+        }
+        assert_eq!(load_round(&mut [&mut worn], shells_id, mag_id), Err(Refusal::Filter));
+        load_round(&mut [&mut worn], slugs_id, mag_id).unwrap();
+        assert_eq!(load_round(&mut [&mut worn], slugs_id, mag_id), Err(Refusal::NoRoom));
+        let loaded = worn.find(mag_id).unwrap();
+        assert_eq!(loaded.loose.iter().map(|stack| (stack.kind.name.as_str(), stack.count)).collect::<Vec<_>>(), [("round", 2), ("slug", 1)]);
+        assert!(worn.find(stack_id).is_none());
+        assert_eq!(worn.find(slugs_id).unwrap().count, 4);
+        // The slug on top goes onto the slugs' stack; the rounds, whose
+        // stack is gone, into the vest's first free cell, then onto it.
+        assert_eq!(unload_round(&mut [&mut worn], mag_id, worn_id, &RAID), Ok((slugs_id, Applied::Merged)));
+        assert_eq!(worn.find(slugs_id).unwrap().count, 5);
+        let (put, _) = unload_round(&mut [&mut worn], mag_id, worn_id, &RAID).unwrap();
+        assert_eq!(put, vest_id);
+        let new_stack = worn.find(vest_id).unwrap().grids.iter().flatten().find(|(_, item)| item.kind.name == "round").map(|(_, item)| item.id).unwrap();
+        assert_eq!(unload_round(&mut [&mut worn], mag_id, worn_id, &RAID), Ok((new_stack, Applied::Merged)));
+        assert_eq!((worn.find(new_stack).unwrap().count, magazine_rounds(worn.find(mag_id).unwrap())), (2, 0));
+        assert_eq!(unload_round(&mut [&mut worn], mag_id, worn_id, &RAID), Err(Refusal::NoAction));
+        // With every cell taken the round stays in its magazine.
+        let (mut full, [vest_id, pockets_id, bag_id], _) = dressed();
+        let mut magazine = Item::new(Arc::new(Kind { cartridges: vec![holder("cartridges", [0, 0], &["round"], &[])], capacity: 3, ..kind("mag", "magazine", 0.2, [1, 2]) }));
+        fill_magazine(&mut magazine, round, 3);
+        let (mag_id, full_id) = (magazine.id, full.id);
+        full.find_mut(vest_id).unwrap().put(0, magazine, Place { x: 0, y: 0, turned: false }).unwrap();
+        for (holder, grid, cells) in [(vest_id, 1, [1, 2]), (vest_id, 2, [2, 2]), (pockets_id, 0, [1, 1]), (pockets_id, 1, [1, 1]), (bag_id, 0, [4, 4])] {
+            let Some(holder) = full.find_mut(holder) else { continue };
+            holder.grids[grid].push((Place { x: 0, y: 0, turned: false }, thing("brick", "item", 1.0, cells)));
+        }
+        assert!(unload_round(&mut [&mut full], mag_id, full_id, &RAID).is_err());
+        assert_eq!(magazine_rounds(full.find(mag_id).unwrap()), 3);
+    }
+
+    /// The menu's Reload on a weapon swaps its magazine for the fullest
+    /// within reach at once, the old one to the smallest grid with room of
+    /// the vest, the pockets and the backpack; with none fitted it names the
+    /// found one to be moved in; with nothing to take it is refused. Install
+    /// puts a magazine into the weapon in hand's empty slot, or swaps the
+    /// one there out to the first place for it.
+    #[test]
+    fn the_menu_swaps_or_fits_a_weapon_s_magazine() {
+        let place = |x, y| Place { x, y, turned: false };
+        let (mut worn, [vest_id, _, bag_id], _) = dressed();
+        let (rifle_id, fitted_id) = rifle_worn(&mut worn, 12);
+        let next = loaded("mag", 30);
+        let next_id = next.id;
+        worn.find_mut(vest_id).unwrap().put(0, next, place(0, 0)).unwrap();
+        assert_eq!(menu_reload(&mut worn, rifle_id), Ok(MenuReload::Swapped(fitted_id, next_id)));
+        assert_eq!(worn.holder_of(next_id), Some((rifle_id, Spot::Slot(0))));
+        // Its place found before the swap, as the game finds it: the new one
+        // still fills the vest's first grid, so the second, as small.
+        assert_eq!(worn.holder_of(fitted_id), Some((vest_id, Spot::Cell(1, place(0, 0)))));
+        assert_eq!(magazine_rounds(worn.find(fitted_id).unwrap()), 12);
+        // None fitted: the found one is named, to be moved in.
+        worn.find_mut(rifle_id).unwrap().slots[0] = None;
+        assert_eq!(menu_reload(&mut worn, rifle_id), Ok(MenuReload::Fit(fitted_id)));
+        // Nothing with a round within reach: refused.
+        let (mut bare, _, _) = dressed();
+        let (bare_rifle, _) = rifle_worn(&mut bare, 0);
+        assert_eq!(menu_reload(&mut bare, bare_rifle), Err(Refusal::NoAction));
+        // Install: into the empty slot of the weapon in hand, by a move.
+        assert_eq!(menu_install(&mut worn, fitted_id, Some(rifle_id)), Ok(MenuInstall::Fit(rifle_id, 0)));
+        // With one fitted, swapped at once; the old one to the first place
+        // for it, the vest first.
+        let other = loaded("mag", 7);
+        let other_id = other.id;
+        worn.find_mut(vest_id).unwrap().put(2, other, place(0, 0)).unwrap();
+        worn.find_mut(rifle_id).unwrap().slots[0] = worn.take(fitted_id);
+        assert_eq!(menu_install(&mut worn, other_id, Some(rifle_id)), Ok(MenuInstall::Swapped(rifle_id, fitted_id)));
+        assert_eq!(worn.holder_of(other_id), Some((rifle_id, Spot::Slot(0))));
+        assert_eq!(worn.holder_of(fitted_id).map(|(holder, _)| holder), Some(vest_id));
+        // While the weapon's hands are busy, nothing leaves it or goes in.
+        let busy = Rules { busy_weapon: Some(rifle_id), ..RAID };
+        let worn_id = worn.id;
+        assert_eq!(quick_find(&mut [&mut worn], other_id, &[worn_id], Order::UNLOAD_WEAPON, &busy), Err(Refusal::HandsBusy));
+        assert_eq!(worn.holder_of(other_id), Some((rifle_id, Spot::Slot(0))));
+        assert!(quick_find(&mut [&mut worn], other_id, &[worn_id], Order::UNLOAD_WEAPON, &RAID).is_ok());
+        assert_eq!(move_item(&mut [&mut worn], fitted_id, rifle_id, Spot::Slot(0), &busy), Err(Refusal::HandsBusy));
+        // A magazine no weapon takes.
+        let drum = loaded("drum", 50);
+        let drum_id = drum.id;
+        worn.find_mut(bag_id).unwrap().put(0, drum, place(0, 0)).unwrap();
+        assert_eq!(menu_install(&mut worn, drum_id, Some(rifle_id)), Err(Refusal::NoAction));
     }
 
     #[test]

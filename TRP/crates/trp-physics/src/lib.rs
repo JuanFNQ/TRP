@@ -271,9 +271,94 @@ unsafe extern "C" fn layer_filter(info: *mut FilterShaderCallbackInfo) -> u16 {
     (*info.pairFlags).mBits = if phys_PxFilterObjectIsTrigger(info.attributes0) || phys_PxFilterObjectIsTrigger(info.attributes1) {
         PxPairFlag::eTRIGGER_DEFAULT as u16
     } else {
-        (PxPairFlag::eCONTACT_DEFAULT | PxPairFlag::eDETECT_CCD_CONTACT) as u16
+        // A pair with a body that reports its touches is told of when it
+        // first touches, and where (asked for alone: it changes nothing of
+        // the pair's motion).
+        let report = (info.filterData0.word1 | info.filterData1.word1) & REPORTS_TOUCHES != 0;
+        let told = if report { PxPairFlag::eNOTIFY_TOUCH_FOUND | PxPairFlag::eNOTIFY_TOUCH_CCD | PxPairFlag::eNOTIFY_CONTACT_POINTS } else { 0 };
+        (PxPairFlag::eCONTACT_DEFAULT | PxPairFlag::eDETECT_CCD_CONTACT | told) as u16
     };
     PxFilterFlag::eDEFAULT as u16
+}
+
+/// The mark on a shape's filter (its second word) of a body that reports
+/// its touches (`World::report_touches`).
+const REPORTS_TOUCHES: u32 = 1;
+
+/// What an actor is to its world, kept in its user data: a body or a still
+/// thing by its place, or nothing.
+const TAG_BODY: usize = 1;
+const TAG_STILL: usize = 2;
+
+fn tag(kind: usize, index: usize) -> *mut std::ffi::c_void {
+    ((index << 2) | kind) as *mut std::ffi::c_void
+}
+
+unsafe fn tagged(actor: *mut PxRigidActor) -> Option<Met> {
+    if actor.is_null() {
+        return None;
+    }
+    let tag = (*(actor as *mut PxActor)).userData as usize;
+    match tag & 3 {
+        TAG_BODY => Some(Met::Body(Body(tag >> 2))),
+        TAG_STILL => Some(Met::Still(tag >> 2)),
+        _ => None,
+    }
+}
+
+/// What a body that reports its touches met, as the engine first found
+/// them touching (Unity's `OnCollisionEnter`: once a pair of shapes, as
+/// the pair begins to touch, by the discrete step or by a sweep;
+/// `PROVISIONAL`: how Unity reports a touch a sweep found is not read, and
+/// it is taken as a touch like any other).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Touch {
+    pub body: Body,
+    pub other: Met,
+    /// The pair's first point of contact, and the normal there, pointing
+    /// out of what it met towards the body; none where the engine gave no
+    /// point.
+    pub contact: Option<(V3, V3)>,
+}
+
+/// What was met: another body, or a still thing of the world by the order
+/// it was put in (`add_static` and `add_ground` count together).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Met {
+    Body(Body),
+    Still(usize),
+}
+
+/// The engine's report of the pairs that began to touch in a step, kept as
+/// touches of the bodies that asked (`World::take_touches`). Called from
+/// within `World::step`, on its thread.
+unsafe extern "C" fn on_contact(user: *mut std::ffi::c_void, header: *const PxContactPairHeader, pairs: *const PxContactPair, count: u32) {
+    let (Some(touches), Some(header)) = ((user as *mut Vec<Touch>).as_mut(), header.as_ref()) else { return };
+    let removed = (PxContactPairHeaderFlag::eREMOVED_ACTOR_0 | PxContactPairHeaderFlag::eREMOVED_ACTOR_1) as u16;
+    if header.flags.mBits & removed != 0 || pairs.is_null() {
+        return;
+    }
+    let sides = [tagged(header.actors[0]), tagged(header.actors[1])];
+    let began = (PxPairFlag::eNOTIFY_TOUCH_FOUND | PxPairFlag::eNOTIFY_TOUCH_CCD) as u16;
+    let gone = (PxContactPairFlag::eREMOVED_SHAPE_0 | PxContactPairFlag::eREMOVED_SHAPE_1) as u16;
+    for pair in std::slice::from_raw_parts(pairs, count as usize) {
+        if pair.events.mBits & began == 0 || pair.flags.mBits & gone != 0 {
+            continue;
+        }
+        let mut point: PxContactPairPoint = std::mem::zeroed();
+        let found = PxContactPair_extractContacts(pair, &mut point, 1) > 0;
+        for side in 0..2 {
+            let (Some(Met::Body(body)), Some(other)) = (sides[side], sides[1 - side]) else { continue };
+            if PxShape_getSimulationFilterData(pair.shapes[side]).word1 & REPORTS_TOUCHES == 0 {
+                continue;
+            }
+            // The engine's normal is the way the pair's first shape must
+            // go to leave the second.
+            let sign = if side == 0 { 1.0 } else { -1.0 };
+            let contact = found.then(|| ([point.position.x, point.position.y, point.position.z], [point.normal.x * sign, point.normal.y * sign, point.normal.z * sign]));
+            touches.push(Touch { body, other, contact });
+        }
+    }
 }
 
 /// A world of the engine's, stepped by hand as the game steps its own.
@@ -290,6 +375,10 @@ pub struct World {
     statics: Vec<*mut PxRigidStatic>,
     joints: Vec<*mut PxJoint>,
     materials: Vec<(Material, *mut PxMaterial)>,
+    /// The engine's reports of touches go here (`on_contact`), behind a
+    /// box so that their place stays as the world moves.
+    touches: Box<Vec<Touch>>,
+    events: *mut PxSimulationEventCallback,
 }
 
 // The engine's objects are only reached through `&mut World`.
@@ -354,6 +443,10 @@ impl World {
             let dispatcher = phys_PxDefaultCpuDispatcherCreate(0, null_mut());
             desc.cpuDispatcher = dispatcher as *mut PxCpuDispatcher;
             enable_custom_filter_shader(&mut desc, layer_filter, 0);
+            let mut touches: Box<Vec<Touch>> = Box::default();
+            let told = SimulationEventCallbackInfo { collision_callback: Some(on_contact), collision_user_data: &mut *touches as *mut Vec<Touch> as *mut std::ffi::c_void, ..Default::default() };
+            let events = create_simulation_event_callbacks(&told);
+            desc.simulationEventCallback = events;
             desc.bounceThresholdVelocity = settings.bounce_threshold;
             desc.frictionType = settings.friction_type;
             desc.solverType = settings.solver_type;
@@ -382,7 +475,7 @@ impl World {
                     phys_PxSetGroupCollisionFlag(a, b, settings.layer_matrix[a as usize] >> b & 1 == 1);
                 }
             }
-            Self { physics, dispatcher, scene, settings, convention: JointConvention::GAME, bodies: Vec::new(), statics: Vec::new(), joints: Vec::new(), materials: Vec::new() }
+            Self { physics, dispatcher, scene, settings, convention: JointConvention::GAME, bodies: Vec::new(), statics: Vec::new(), joints: Vec::new(), materials: Vec::new(), touches, events }
         }
     }
 
@@ -484,6 +577,7 @@ impl World {
                 PxShape_release_mut(shape);
             }
             phys_PxSetGroup(actor as *mut PxActor, layer);
+            (*(actor as *mut PxActor)).userData = tag(TAG_STILL, self.statics.len());
             PxScene_addActor_mut(self.scene, actor as *mut PxActor, null_mut());
             self.statics.push(actor);
         }
@@ -501,6 +595,7 @@ impl World {
                 PxShape_setRestOffset_mut(shape, 0.0);
             }
             phys_PxSetGroup(plane as *mut PxActor, layer);
+            (*(plane as *mut PxActor)).userData = tag(TAG_STILL, self.statics.len());
             PxScene_addActor_mut(self.scene, plane as *mut PxActor, null_mut());
             self.statics.push(plane);
         }
@@ -533,6 +628,7 @@ impl World {
                 PxRigidBody_setRigidBodyFlag_mut(body, PxRigidBodyFlag::eENABLE_CCD, true);
             }
             phys_PxSetGroup(actor as *mut PxActor, desc.layer);
+            (*(actor as *mut PxActor)).userData = tag(TAG_BODY, self.bodies.len());
             PxScene_addActor_mut(self.scene, actor as *mut PxActor, null_mut());
             PxRigidBody_setLinearVelocity_mut(body, &vec3(desc.velocity), true);
             PxRigidBody_setAngularVelocity_mut(body, &vec3(desc.spin), true);
@@ -727,8 +823,63 @@ impl World {
         }
     }
 
+    /// A body from now on reports what it begins to touch
+    /// (`take_touches`), as a body with a script that hears its collisions
+    /// does in Unity. Its pairs are filtered again, so that one touching
+    /// already is reported as it touches anew.
+    pub fn report_touches(&mut self, body: Body) {
+        unsafe {
+            let actor = self.actor(body) as *mut PxRigidActor;
+            let count = PxRigidActor_getNbShapes(actor);
+            let mut shapes = vec![null_mut::<PxShape>(); count as usize];
+            PxRigidActor_getShapes(actor, shapes.as_mut_ptr(), count, 0);
+            for shape in shapes {
+                let mut filter = PxShape_getSimulationFilterData(shape);
+                filter.word1 |= REPORTS_TOUCHES;
+                PxShape_setSimulationFilterData_mut(shape, &filter);
+            }
+            PxScene_resetFiltering_mut(self.scene, actor as *mut PxActor);
+        }
+    }
+
+    /// The touches reported since they were last taken, in the order the
+    /// engine found them.
+    pub fn take_touches(&mut self) -> Vec<Touch> {
+        std::mem::take(&mut *self.touches)
+    }
+
     pub fn body_count(&self) -> usize {
         self.bodies.iter().filter(|b| b.is_some()).count()
+    }
+
+    /// The first thing a sphere meets going from `origin` along the unit
+    /// way `dir` within `distance`, among every shape of the world, still
+    /// or moving (`PxSceneQueryExt::sweepSingle` with the normal and the
+    /// least way out of a shape it starts in, as the engine sweeps a
+    /// particle: `PhysXRaycast::ParticleIntersect`, its flags `eNORMAL |
+    /// eMTD`): the distance along the way (below nought where it starts in
+    /// a shape, by how far) and the surface's normal.
+    pub fn sweep_sphere(&self, origin: V3, dir: V3, distance: f32, radius: f32) -> Option<(f32, V3)> {
+        unsafe {
+            let geometry = PxSphereGeometry_new_1(radius.max(1e-6));
+            let mut hit = PxSweepHit_new();
+            let filter = PxQueryFilterData_new();
+            let flags = PxSceneQueryFlags { mBits: (PxHitFlag::eNORMAL | PxHitFlag::eMTD) as u16 };
+            let found = PxSceneQueryExt_sweepSingle_mut(
+                self.scene,
+                &geometry as *const PxSphereGeometry as *const PxGeometry,
+                &pose(origin, [0.0, 0.0, 0.0, 1.0]),
+                &vec3(dir),
+                distance.max(0.0),
+                flags,
+                &mut hit,
+                &filter as *const PxQueryFilterData as *const PxSceneQueryFilterData,
+                null_mut(),
+                std::ptr::null(),
+                0.0,
+            );
+            found.then(|| (hit.distance, [hit.normal.x, hit.normal.y, hit.normal.z]))
+        }
     }
 }
 
@@ -749,6 +900,7 @@ impl Drop for World {
                 PxMaterial_release_mut(material);
             }
             PxScene_release_mut(self.scene);
+            destroy_simulation_event_callbacks(self.events);
             PxDefaultCpuDispatcher_release_mut(self.dispatcher);
         }
     }
@@ -810,5 +962,20 @@ mod tests {
         assert!(centre.iter().all(|c| c.abs() < 1e-5));
         // A box's own turning: m (b^2 + c^2) / 12 about each axis.
         assert!((inertia[0] - 0.5 * (0.01 + 0.16) / 12.0).abs() < 1e-5, "{inertia:?}");
+    }
+
+    /// A sphere swept down onto the ground and onto a box meets each where
+    /// it should, with the surface's normal; one swept clear meets nothing.
+    #[test]
+    fn a_swept_sphere_meets_the_ground_and_a_box() {
+        let mut world = World::new(Settings::game());
+        world.add_ground(0.0, Material::default(), 0);
+        world.add_static([2.0, 0.5, 0.0], [0.0, 0.0, 0.0, 1.0], &[Collider { shape: Shape::Box { half: [0.5; 3] }, at: [0.0; 3], turn: [0.0, 0.0, 0.0, 1.0], material: Material::default() }], 0);
+        world.step(1.0 / 60.0);
+        let (d, n) = world.sweep_sphere([0.0, 1.0, 0.0], [0.0, -1.0, 0.0], 2.0, 0.1).expect("the ground");
+        assert!((d - 0.9).abs() < 1e-3 && (n[1] - 1.0).abs() < 1e-4, "{d} {n:?}");
+        let (d, n) = world.sweep_sphere([0.0, 0.5, 0.0], [1.0, 0.0, 0.0], 3.0, 0.1).expect("the box's side");
+        assert!((d - 1.4).abs() < 1e-3 && (n[0] + 1.0).abs() < 1e-4, "{d} {n:?}");
+        assert!(world.sweep_sphere([0.0, 3.0, 0.0], [1.0, 0.0, 0.0], 3.0, 0.1).is_none());
     }
 }

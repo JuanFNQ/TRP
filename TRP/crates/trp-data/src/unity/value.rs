@@ -50,6 +50,16 @@ impl Value {
         }
     }
 
+    /// A struct's fields by name, in their stored order; none for anything
+    /// else.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &Value)> {
+        let fields = match self {
+            Value::Struct(s) => s.fields.as_slice(),
+            _ => &[],
+        };
+        fields.iter().map(|(name, value)| (&**name, value))
+    }
+
     /// Field lookup through a dotted path.
     pub fn at(&self, path: &str) -> Option<&Value> {
         path.split('.').try_fold(self, |v, name| v.get(name))
@@ -127,6 +137,13 @@ impl Value {
     pub fn as_uints(&self) -> Option<&[u32]> {
         match self {
             Value::UInts(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_ints(&self) -> Option<&[i32]> {
+        match self {
+            Value::Ints(v) => Some(v),
             _ => None,
         }
     }

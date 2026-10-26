@@ -43,7 +43,7 @@
 //! Not in this: the feet set on the ground (the game runs a solver for
 //! them, which moves nothing on level ground) and equipment.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
@@ -55,6 +55,7 @@ use trp_data::unity::Assets as UnityAssets;
 
 use crate::controller::Controller;
 use crate::inventory_view::Carried;
+use crate::park::{EvenParked, Park};
 use crate::render_data::Converted;
 use crate::weapon::{FirstPersonHands, WeaponRig};
 use crate::{convert, GameData, View};
@@ -89,6 +90,37 @@ pub struct UpperBody;
 #[derive(Component)]
 pub struct LowerBody;
 
+/// Which of the two suits a piece of the body is (`UpperBodySuit`, its
+/// body; `LowerBodySuit`, its legs), which a suit chosen on the OVERALL tab
+/// takes the place of (`clothing`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SuitRole {
+    Upper,
+    Lower,
+}
+
+#[derive(Component, Clone, Copy)]
+pub struct SuitPiece(pub SuitRole);
+
+/// A piece of a torso of the newer kind (`TorsoSkin`): drawn while its mesh
+/// is the one the game draws for what is worn (`show_torso`).
+#[derive(Component, Clone, Copy)]
+pub struct TorsoPiece(pub trp_data::arms::Torso);
+
+/// The bones the install's suits hang on beyond the default suits' (every
+/// one of the 165 parts read, inventory spec, "The OVERALL tab"), by their
+/// paths as the parts name them: in the skeleton from the start where the
+/// options' `CLOTHING` is on, for a suit chosen later.
+pub const SUIT_BONES: [&str; 7] = [
+    "Root_Joint/Base HumanPelvis/Base HumanSpine1/Base HumanGear1",
+    "Root_Joint/Base HumanPelvis/Base HumanSpine1/Base HumanGear2",
+    "Root_Joint/Base HumanPelvis/Base HumanSpine1/Base HumanGear3",
+    "Root_Joint/Base HumanPelvis/Base HumanSpine1/Base HumanGear4/Base HumanGear4_1",
+    "Root_Joint/Base HumanPelvis/Base HumanSpine1/Base HumanGear5",
+    "Root_Joint/Base HumanPelvis/Base HumanSpine1/Base HumanSpine2/Base HumanSpine3/Base HumanBackpack",
+    "Root_Joint/Base HumanPelvis/Base HumanSpine1/Base HumanSpine2/Base HumanSpine3/Base HumanRibcage/Weapon_root",
+];
+
 /// The clothing the body is drawn in, read before the simulation is made.
 #[derive(Resource, Default)]
 pub struct BodyParts {
@@ -101,16 +133,22 @@ pub struct BodyParts {
     /// hangs from it.
     pub bones: Vec<String>,
     /// Worn items that are models of their own, for the head bone, each
-    /// with the item it is.
-    pub on_head: Vec<(String, Hierarchy)>,
+    /// with the item it is, the parts it may have fitted and its hinge.
+    pub on_head: Vec<HeadModel>,
     /// For each part, the item it is and what it is the mesh over, where
     /// it is something worn: such a part is drawn only while the
     /// character has that item on over just that.
     pub item: Vec<Option<WornPiece>>,
     /// Which of the items that may be worn are armour and which vests:
-    /// what is worn over them takes its mesh by them.
+    /// what is worn over them takes its mesh by them. And which armour is
+    /// worn like a vest (`VestlikeArmor`), under which a torso of the newer
+    /// kind takes its mesh for a vest.
     armour: Vec<String>,
     vests: Vec<String>,
+    pub vestlike: Vec<String>,
+    /// For each part, the suit it is of, where it is the upper suit's body
+    /// or the lower suit's legs.
+    pub suit: Vec<Option<SuitRole>>,
     /// The outfits that are not the install's, each with the item it is:
     /// its meshes, and the rig they are drawn on, which has the bones the
     /// parts above hang on at the outfit's own places.
@@ -130,6 +168,9 @@ pub struct BodyParts {
     /// one; and the pose the game's screens stand them in, once read.
     pub standing: Vec<String>,
     pub standing_pose: Option<trp_sim::body::Pose>,
+    /// The same pose for the dummy on the range, with its switch on
+    /// (`dummy`).
+    pub dummy_pose: Option<trp_sim::body::Pose>,
     /// Which of `parts` is the head's, if one is.
     pub head: Option<usize>,
 }
@@ -203,6 +244,45 @@ pub struct OutfitSkeletons(Vec<OutfitSkeleton>);
 #[derive(Resource, Default)]
 pub struct OutfitPose(Vec<(Entity, Transform)>);
 
+/// A worn thing's model for the head bone (`BodyParts::on_head`): the item
+/// it is, its objects, the parts it may have fitted (each hidden until
+/// fitted) and its hinges (a helmet's, or a face shield's own).
+pub struct HeadModel {
+    pub item: String,
+    pub model: Hierarchy,
+    pub parts: Vec<trp_data::dress::WornPart>,
+    pub hinges: Vec<trp_data::dress::Hinge>,
+}
+
+/// A part a worn thing's model may have fitted (body animator spec, "A
+/// worn thing's parts and a helmet's hinge"): the worn thing's template
+/// and the slots and templates from it down to the part. Drawn while the
+/// thing worn has it fitted so (`show_head_parts`).
+#[derive(Component, Clone)]
+pub struct HeadPart {
+    pub(crate) item: String,
+    pub(crate) path: Vec<(String, String)>,
+}
+
+/// A hinge on a copy of a model worn on the head (`HelmetDress`): the worn
+/// thing's template and the way down from it to the thing whose model
+/// carries the hinge (none: the worn thing; a face shield's own, its slot),
+/// the hinge's two turns in the engine's axes, its filter, and that thing
+/// as last seen, its face shield and the way the filter was last set, as
+/// they stood; whether this copy is the gear page's figure's.
+#[derive(Component, Clone)]
+pub struct HelmetHinge {
+    item: String,
+    owner: Vec<(String, String)>,
+    off: [f32; 4],
+    on: [f32; 4],
+    filter: trp_sim::hysteresis::Hysteresis,
+    worn: Option<trp_sim::inventory::Id>,
+    shield: Option<trp_sim::inventory::Id>,
+    down: bool,
+    figure: bool,
+}
+
 /// A piece of something worn: the item's template and what it is the mesh
 /// over (any, if the list is empty). Drawn while the character has the
 /// item on over that (`show_worn`).
@@ -238,9 +318,17 @@ impl BodyParts {
     ///
     /// `custom_hands` is the options' switch `CUSTOM FIRST PERSON HANDS` as
     /// the run begins: off, no outfit's arms are read or fitted at all.
-    pub fn load(unity: &mut UnityAssets, db: &trp_data::Database, keys: &[&str], worn: &[String], custom_hands: bool) -> Self {
+    ///
+    /// `present` is every thing the run has, by its template: of the parts
+    /// a model on the head may have fitted, those are read.
+    ///
+    /// `suits` is the options' `CLOTHING` as the run begins: on, the bones
+    /// the install's other suits hang on are in the skeleton too
+    /// (`SUIT_BONES`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(unity: &mut UnityAssets, db: &trp_data::Database, keys: &[&str], worn: &[String], present: &HashSet<String>, custom_hands: bool, suits: bool) -> Self {
         let (mut parts, mut upper, mut items) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut of_outfit, mut top) = (Vec::new(), Vec::new());
+        let (mut of_outfit, mut top, mut suit) = (Vec::new(), Vec::new(), Vec::new());
         let (mut legs, mut head) = (None, None);
         for (index, key) in keys.iter().enumerate().filter(|(_, key)| !key.is_empty() && **key != "none") {
             match trp_data::arms::load(unity, key) {
@@ -256,6 +344,11 @@ impl BodyParts {
                     items.push(None);
                     of_outfit.push(None);
                     top.push(index == 0);
+                    suit.push(match index {
+                        0 => Some(SuitRole::Upper),
+                        1 => Some(SuitRole::Lower),
+                        _ => None,
+                    });
                 }
                 Err(e) => eprintln!("the body's part {key} could not be read: {e:#}"),
             }
@@ -269,6 +362,11 @@ impl BodyParts {
             worn.iter().filter(|item| class(item) == Some(parent)).cloned().collect()
         };
         let (armour, vests) = (of_class(ARMOUR), of_class(VEST));
+        let vestlike: Vec<String> = armour
+            .iter()
+            .filter(|item| db.items.get(*item).and_then(|template| template.prefab_key()).is_some_and(|key| trp_data::dress::vestlike(unity, key).unwrap_or(false)))
+            .cloned()
+            .collect();
         let either = |any: bool| if any { vec![false, true] } else { vec![false] };
         let cases: Vec<Under> =
             either(!armour.is_empty()).into_iter().flat_map(|armour| either(!vests.is_empty()).into_iter().map(move |vest| Under { armour, vest })).collect();
@@ -330,6 +428,7 @@ impl BodyParts {
                             items.push(None);
                             of_outfit.push(Some(id.clone()));
                             top.push(false);
+                            suit.push(None);
                             has.push("one of the install's own tops".to_owned());
                         }
                         Err(e) => eprintln!("the outfit {}: its top {key} could not be read, and the character's own is drawn: {e:#}", definition.name),
@@ -372,11 +471,17 @@ impl BodyParts {
                                 items.push(Some(WornPiece { item: item.clone(), over: vec![*under] }));
                                 of_outfit.push(None);
                                 top.push(false);
+                                suit.push(None);
                             }
                         }
                     }
                     Ok(Worn::Rigid(model)) => {
-                        on_head.push((item.clone(), model));
+                        let (model, fitted, hinges) = trp_data::dress::head_model(unity, db, item, model, &|part| present.contains(part));
+                        if !fitted.is_empty() || !hinges.is_empty() {
+                            let named: String = hinges.iter().map(|hinge| format!(", a hinge on {}{}", model.nodes[hinge.node].name, hinge.owner.last().map_or(String::new(), |(_, of)| format!(" (its part {of}'s own)")))).collect();
+                            println!("worn on the head, {item}: {} parts it may have fitted{named}", fitted.len());
+                        }
+                        on_head.push(HeadModel { item: item.clone(), model, parts: fitted, hinges });
                         break;
                     }
                     Err(e) => {
@@ -397,6 +502,9 @@ impl BodyParts {
         // head is drawn: the neck hangs beside the ribcage.
         if !on_head.is_empty() {
             wanted.extend(ribcage.map(|above| format!("{above}/Base HumanNeck/{HEAD}")));
+        }
+        if suits {
+            wanted.extend(SUIT_BONES.map(str::to_owned));
         }
         let of_outfits = outfits.iter().flat_map(|(_, outfit)| outfit.rig.bones.iter().chain(outfit.arms.iter().flat_map(|arms| &arms.rig.bones)).map(|bone| &bone.path));
         let of_hands = their_hands.iter().flat_map(|(_, hands)| &hands.bone_paths);
@@ -420,7 +528,17 @@ impl BodyParts {
             }
         }
         standing.sort_by_key(|path| path.matches('/').count());
-        Self { parts, upper, bones, on_head, item: items, armour, vests, outfits, of_outfit, top, their_hands, standing, standing_pose: None, head }
+        Self { parts, upper, bones, on_head, item: items, armour, vests, vestlike, suit, outfits, of_outfit, top, their_hands, standing, standing_pose: None, dummy_pose: None, head }
+    }
+
+    /// The torso's mesh the game draws for what the character has on
+    /// (`TorsoSkin.ApplySkin`: the slots of the body armour, the tactical
+    /// vest and the backpack, and whether the armour is worn like a vest).
+    pub fn torso_for(&self, carried: &Carried) -> trp_data::arms::Torso {
+        let worn = |slot: &str| carried.equipment.worn(slot);
+        let armour = worn("ArmorVest");
+        let vestlike = armour.is_some_and(|armour| self.vestlike.contains(&armour.kind.template));
+        trp_data::arms::TorsoMeshes::drawn(armour.is_some(), vestlike, worn("TacticalVest").is_some(), worn("Backpack").is_some())
     }
 
     /// What an outfit has to draw in place of the character's own: a
@@ -446,9 +564,9 @@ pub fn show_outfit(
     parts: Res<BodyParts>,
     features: Res<crate::options_view::Features>,
     mut on: ResMut<OutfitOn>,
-    made: Query<(), Or<(Added<OutfitPiece>, Added<OwnBody>)>>,
-    mut pieces: Query<(&OutfitPiece, &mut Visibility), Without<OwnBody>>,
-    mut own: Query<(&OwnBody, &mut Visibility), Without<OutfitPiece>>,
+    made: Query<(), (Or<(Added<OutfitPiece>, Added<OwnBody>)>, EvenParked)>,
+    mut pieces: Query<(&OutfitPiece, &mut Visibility), (Without<OwnBody>, EvenParked)>,
+    mut own: Query<(&OwnBody, &mut Visibility), (Without<OutfitPiece>, Without<TorsoPiece>, EvenParked)>,
 ) {
     if parts.outfits.is_empty() || (!carried.is_changed() && made.is_empty() && !features.is_changed()) {
         return;
@@ -486,6 +604,30 @@ pub fn show_outfit(
     }
 }
 
+/// Draws of a torso of the newer kind the mesh the game draws for what is
+/// worn (`TorsoSkin.ApplySkin`, as the armour, the vest or the backpack
+/// comes and goes), where the character's own body is drawn at all
+/// (`show_outfit`'s rule).
+pub fn show_torso(
+    carried: Res<Carried>,
+    parts: Res<BodyParts>,
+    on: Res<OutfitOn>,
+    made: Query<(), (Added<TorsoPiece>, EvenParked)>,
+    mut pieces: Query<(&OwnBody, &TorsoPiece, &mut Visibility), EvenParked>,
+) {
+    if !carried.is_changed() && !on.is_changed() && made.is_empty() {
+        return;
+    }
+    let drawn = parts.torso_for(&carried);
+    for (own, torso, mut visibility) in &mut pieces {
+        let shown = torso.0 == drawn && !(on.body || (on.top && own.top));
+        let wanted = if shown { Visibility::Inherited } else { Visibility::Hidden };
+        if *visibility != wanted {
+            *visibility = wanted;
+        }
+    }
+}
+
 /// Draws of the worn items those the character has on: what the
 /// equipment holds in the slots the game draws (inventory spec,
 /// "Equipment slots") and what `--wear` named, each by the mesh for what
@@ -493,8 +635,8 @@ pub fn show_outfit(
 pub fn show_worn(
     carried: Res<Carried>,
     parts: Res<BodyParts>,
-    made: Query<(), Added<WornPiece>>,
-    mut pieces: Query<(&WornPiece, &mut Visibility)>,
+    made: Query<(), (Added<WornPiece>, EvenParked)>,
+    mut pieces: Query<(&WornPiece, &mut Visibility), EvenParked>,
 ) {
     if !carried.is_changed() && made.is_empty() {
         return;
@@ -507,6 +649,70 @@ pub fn show_worn(
         let wanted = if shown { Visibility::Inherited } else { Visibility::Hidden };
         if *visibility != wanted {
             *visibility = wanted;
+        }
+    }
+}
+
+/// The thing worn in a slot the game draws that is of that template.
+fn worn_of<'a>(carried: &'a Carried, template: &str) -> Option<&'a trp_sim::inventory::Item> {
+    trp_sim::inventory::WORN.iter().filter_map(|slot| carried.equipment.worn(slot)).find(|item| item.kind.template == template)
+}
+
+/// Draws of the parts a worn thing's model may have fitted those the thing
+/// worn has fitted so (`ObjectsFactory.AttachMods`): each slot down to the
+/// part holding what it names.
+pub fn show_head_parts(carried: Res<Carried>, made: Query<(), (Added<HeadPart>, EvenParked)>, mut parts: Query<(&HeadPart, &mut Visibility), EvenParked>) {
+    if !carried.is_changed() && made.is_empty() {
+        return;
+    }
+    for (part, mut visibility) in &mut parts {
+        let fitted = worn_of(&carried, &part.item).and_then(|worn| part.path.iter().try_fold(worn, |at, (slot, template)| at.in_slot(slot).filter(|held| held.kind.template == *template)));
+        let wanted = if fitted.is_some() { Visibility::Inherited } else { Visibility::Hidden };
+        if *visibility != wanted {
+            *visibility = wanted;
+        }
+    }
+}
+
+/// Turns each hinge as its face shield stands (`HelmetDress`; body animator
+/// spec, "A worn thing's parts and a helmet's hinge"), by the thing whose
+/// model carries it (the helmet; or a face shield, its own): that thing put
+/// on or fitted is set at once (`Init`, `UpdateState(initial)`, as its
+/// model is made); while it is worn, its face shield changed or switched
+/// sets the filter's way (`SetFaceShield`, `OnFaceShieldChanged`), and each
+/// frame the filter moves on (`HysteresisFilter.Update`); a value given
+/// turns the hinge to the engine's blend of its two turns
+/// (`Quaternion.Lerp`). A turn of the gear page's figure asks for its
+/// drawing.
+pub fn turn_hinges(carried: Res<Carried>, time: Res<Time>, mut hinges: Query<(&mut HelmetHinge, &mut Transform), EvenParked>, mut figure: Option<ResMut<crate::figure_view::Figure>>) {
+    for (mut hinge, mut transform) in &mut hinges {
+        let owner = worn_of(&carried, &hinge.item).and_then(|worn| hinge.owner.iter().try_fold(worn, |at, (slot, template)| at.in_slot(slot).filter(|held| held.kind.template == *template)));
+        let Some(worn) = owner else {
+            if hinge.worn.is_some() {
+                hinge.worn = None;
+            }
+            continue;
+        };
+        let shield = trp_sim::inventory::face_shield(worn).map(|shield| shield.id);
+        let down = trp_sim::inventory::hinge_down(worn);
+        let hinge = &mut *hinge;
+        let given = if hinge.worn != Some(worn.id) {
+            (hinge.worn, hinge.shield, hinge.down) = (Some(worn.id), shield, down);
+            hinge.filter.set(down, true)
+        } else {
+            if hinge.shield != shield || hinge.down != down {
+                (hinge.shield, hinge.down) = (shield, down);
+                hinge.filter.set(down, false);
+            }
+            hinge.filter.update(time.delta_secs())
+        };
+        if let Some(value) = given {
+            transform.rotation = convert::rotation(trp_sim::math::quat_lerp(hinge.off, hinge.on, value));
+            if hinge.figure {
+                if let Some(figure) = figure.as_mut() {
+                    figure.ask();
+                }
+            }
         }
     }
 }
@@ -564,6 +770,12 @@ impl BodyRig {
     /// What the drawn body hangs from.
     pub fn root(&self) -> Entity {
         self.root
+    }
+
+    /// Each collarbone the meshes are drawn on (kept where the animated
+    /// one is), in the order the body lists them.
+    pub fn kept_collarbones(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.collarbones.iter().map(|(_, kept)| *kept)
     }
 
     /// The ribcage as the body's animation has it, and as it is drawn.
@@ -645,6 +857,14 @@ pub fn spawn_body(
     // And the corpse the character becomes, likewise, hidden until then
     // (`death`).
     let mut corpse = crate::figure_view::Builder::corpse(&mut commands, &parts.standing);
+    // And the dummies on the range, with their switch on: the same again
+    // for each, standing as the model does where it stands until its
+    // character poses it (`dummy`).
+    let mut dummies: Vec<crate::figure_view::Builder> = parts
+        .dummy_pose
+        .as_ref()
+        .map(|pose| (0..crate::dummy::PLACES.len()).map(|which| crate::figure_view::Builder::dummy(&mut commands, &parts.standing, pose, crate::dummy::place(which), which)).collect())
+        .unwrap_or_default();
 
     // The entity a mesh's bone is tied to.
     let joint = |path: &str| -> Entity {
@@ -673,48 +893,68 @@ pub fn spawn_body(
 
     let mut drawn = 0;
     for (index, (((part, upper), item), (of_outfit, top))) in parts.parts.iter().zip(&parts.upper).zip(&parts.item).zip(parts.of_outfit.iter().zip(&parts.top)).enumerate() {
-        let entry = match converted.mesh(unity, part.mesh, &mut meshes) {
-            Ok(entry) => entry,
-            Err(e) => {
-                warn!("a mesh of the body: {e:#}");
-                continue;
-            }
+        // A torso of the newer kind has a mesh for each case of what is
+        // worn, each drawn by itself (`show_torso`).
+        let meshes_of: Vec<(Option<trp_data::arms::Torso>, trp_data::unity::ObjRef)> = match &part.torso {
+            Some(torso) => trp_data::arms::Torso::ALL.iter().filter_map(|&case| Some((Some(case), torso.mesh(case)?))).collect(),
+            None => vec![(None, part.mesh)],
         };
         let joints: Vec<Entity> = part.bone_paths.iter().map(|path| joint(path)).collect();
-        let inverse_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(entry.bind_poses.clone()));
-        for (slot, mesh) in entry.parts.iter().enumerate() {
-            let material_ref = part.materials.get(slot).copied().flatten();
-            let material = converted.material(unity, material_ref, &mut images, &mut materials);
-            let piece = commands
-                .spawn((
-                    Name::new("Clothing"),
-                    Mesh3d(mesh.clone()),
-                    MeshMaterial3d(material.clone()),
-                    SkinnedMesh { inverse_bindposes: inverse_bindposes.clone(), joints: joints.clone() },
-                    // Skinned bounds are not tracked.
-                    NoFrustumCulling,
-                ))
-                .id();
-            if *upper {
-                commands.entity(piece).insert((UpperBody, RenderLayers::layer(SEEN)));
-            } else {
-                commands.entity(piece).insert((LowerBody, RenderLayers::layer(SEEN)));
-            }
-            match (item, of_outfit) {
-                (Some(worn), _) => commands.entity(piece).insert(worn.clone()),
-                // One of the install's own tops, worn as an outfit.
-                (None, Some(outfit)) => commands.entity(piece).insert((OutfitPiece { item: outfit.clone() }, Visibility::Hidden)),
-                (None, None) => commands.entity(piece).insert(OwnBody { top: *top }),
+        for (case, mesh_ref) in meshes_of {
+            let entry = match converted.mesh(unity, mesh_ref, &mut meshes) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    warn!("a mesh of the body: {e:#}");
+                    continue;
+                }
             };
-            commands.entity(root).add_child(piece);
-            if let Some(figure) = figure.as_mut() {
-                figure.skinned(&mut commands, piece, (mesh, &material), &inverse_bindposes, &part.bone_paths, item.is_none() && of_outfit.is_some());
+            let inverse_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(entry.bind_poses.clone()));
+            for (slot, mesh) in entry.parts.iter().enumerate() {
+                let material_ref = part.materials.get(slot).copied().flatten();
+                let material = converted.material(unity, material_ref, &mut images, &mut materials);
+                let piece = commands
+                    .spawn((
+                        Name::new("Clothing"),
+                        Mesh3d(mesh.clone()),
+                        MeshMaterial3d(material.clone()),
+                        SkinnedMesh { inverse_bindposes: inverse_bindposes.clone(), joints: joints.clone() },
+                        // Skinned bounds are not tracked.
+                        NoFrustumCulling,
+                        // Out of the engine's work while hidden (`park`).
+                        Park,
+                    ))
+                    .id();
+                if *upper {
+                    commands.entity(piece).insert((UpperBody, RenderLayers::layer(SEEN)));
+                } else {
+                    commands.entity(piece).insert((LowerBody, RenderLayers::layer(SEEN)));
+                }
+                match (item, of_outfit) {
+                    (Some(worn), _) => commands.entity(piece).insert(worn.clone()),
+                    // One of the install's own tops, worn as an outfit.
+                    (None, Some(outfit)) => commands.entity(piece).insert((OutfitPiece { item: outfit.clone() }, Visibility::Hidden)),
+                    (None, None) => commands.entity(piece).insert(OwnBody { top: *top }),
+                };
+                if let Some(role) = parts.suit.get(index).copied().flatten() {
+                    commands.entity(piece).insert(SuitPiece(role));
+                }
+                if let Some(case) = case {
+                    commands.entity(piece).insert((TorsoPiece(case), Visibility::Hidden));
+                }
+                commands.entity(root).add_child(piece);
+                let hidden = (item.is_none() && of_outfit.is_some()) || case.is_some();
+                if let Some(figure) = figure.as_mut() {
+                    figure.skinned(&mut commands, piece, (mesh, &material), &inverse_bindposes, &part.bone_paths, hidden);
+                }
+                let corpse_piece = corpse.skinned(&mut commands, piece, (mesh, &material), &inverse_bindposes, &part.bone_paths, hidden);
+                if parts.head == Some(index) {
+                    commands.entity(corpse_piece).insert(crate::death::CorpseHead);
+                }
+                for dummy in &mut dummies {
+                    dummy.skinned(&mut commands, piece, (mesh, &material), &inverse_bindposes, &part.bone_paths, hidden);
+                }
+                drawn += 1;
             }
-            let corpse_piece = corpse.skinned(&mut commands, piece, (mesh, &material), &inverse_bindposes, &part.bone_paths, item.is_none() && of_outfit.is_some());
-            if parts.head == Some(index) {
-                commands.entity(corpse_piece).insert(crate::death::CorpseHead);
-            }
-            drawn += 1;
         }
     }
     // The outfits that are not the install's (`docs/spec/outfits.md`).
@@ -770,6 +1010,11 @@ pub fn spawn_body(
         let rest: Vec<bevy::math::Affine3A> = outfit.rig.bones.iter().map(|bone| bevy::math::Affine3A::from_mat4(convert::matrix(bone.bind))).collect();
         let model_ours = figure.as_mut().filter(|_| outfit.has_body()).map(|figure| figure.outfit(&mut commands, item, &outfit.rig.in_space(|p| convert::position(p).to_array()), &rest));
         let corpse_ours = outfit.has_body().then(|| corpse.outfit(&mut commands, item, &outfit.rig.in_space(|p| convert::position(p).to_array()), &rest));
+        let dummies_ours: Vec<Vec<Entity>> = if outfit.has_body() {
+            dummies.iter_mut().map(|dummy| dummy.outfit(&mut commands, item, &outfit.rig.in_space(|p| convert::position(p).to_array()), &rest)).collect()
+        } else {
+            Vec::new()
+        };
         for piece in outfit.pieces.iter().filter(|_| outfit.has_body()) {
             // A mesh whose picture was not found is not drawn at all: it
             // would have no colour of its own.
@@ -789,6 +1034,7 @@ pub fn spawn_body(
                         NoFrustumCulling,
                         Visibility::Hidden,
                         OutfitPiece { item: item.clone() },
+                        Park,
                     ))
                     .id();
                 if let (Some(figure), Some(model_ours)) = (figure.as_mut(), model_ours.as_ref()) {
@@ -796,6 +1042,9 @@ pub fn spawn_body(
                 }
                 if let Some(corpse_ours) = corpse_ours.as_ref() {
                     corpse.skinned_on(&mut commands, entity, (&mesh, &material), &inverse_bindposes, corpse_ours.clone(), true);
+                }
+                for (dummy, ours) in dummies.iter_mut().zip(&dummies_ours) {
+                    dummy.skinned_on(&mut commands, entity, (&mesh, &material), &inverse_bindposes, ours.clone(), true);
                 }
                 if zone != trp_data::outfit::LEGS {
                     commands.entity(entity).insert((UpperBody, RenderLayers::layer(SEEN)));
@@ -872,10 +1121,12 @@ pub fn spawn_body(
     let head = parts.bones.iter().position(|path| path.ends_with(HEAD)).map(|at| bones[at]);
     let model_head = figure.as_ref().and_then(|figure| figure.bone(HEAD));
     let corpse_head = corpse.bone(HEAD);
-    for (item, model) in parts.on_head.iter().filter(|_| head.is_some()) {
+    let dummy_heads: Vec<Option<Entity>> = dummies.iter().map(|dummy| dummy.bone(HEAD)).collect();
+    for HeadModel { item, model, parts: fitted, hinges } in parts.on_head.iter().filter(|_| head.is_some()) {
         let mut entities: Vec<Entity> = Vec::with_capacity(model.nodes.len());
         let mut model_entities: Vec<Entity> = Vec::with_capacity(model.nodes.len());
         let mut corpse_entities: Vec<Entity> = Vec::with_capacity(model.nodes.len());
+        let mut dummy_entities: Vec<Vec<Entity>> = vec![Vec::with_capacity(model.nodes.len()); dummies.len()];
         for (index, node) in model.nodes.iter().enumerate() {
             let transform = match index {
                 0 => convert::transform([0.0; 3], [0.5, -0.5, -0.5, -0.5], [1.0; 3]),
@@ -883,18 +1134,52 @@ pub fn spawn_body(
             };
             let visibility = if node.active { Visibility::Inherited } else { Visibility::Hidden };
             let entity = commands.spawn((Name::new(node.name.clone()), transform, visibility)).id();
-            // The whole model is shown and hidden by its first object.
+            // The whole model is shown and hidden by its first object, a
+            // part it may have fitted by the part's.
             if index == 0 {
-                commands.entity(entity).insert(WornPiece { item: item.clone(), over: Vec::new() });
+                commands.entity(entity).insert((WornPiece { item: item.clone(), over: Vec::new() }, Park));
+            }
+            let part = fitted.iter().find(|part| part.root == index);
+            if let Some(part) = part {
+                commands.entity(entity).insert((HeadPart { item: item.clone(), path: part.path.clone() }, Park));
+            }
+            let shown_by = (index == 0 || part.is_some()).then_some(entity);
+            // Its hinge, on each copy of it.
+            let hinged = hinges.iter().find(|hinge| hinge.node == index).map(|hinge| HelmetHinge {
+                item: item.clone(),
+                owner: hinge.owner.clone(),
+                off: hinge.off,
+                on: hinge.on,
+                filter: trp_sim::hysteresis::Hysteresis::new(hinge.forward.clone(), hinge.backward.clone()),
+                worn: None,
+                shield: None,
+                down: true,
+                figure: false,
+            });
+            if let Some(hinged) = &hinged {
+                commands.entity(entity).insert(hinged.clone());
             }
             commands.entity(node.parent.map_or(head.unwrap_or(root), |p| entities[p])).add_child(entity);
             entities.push(entity);
             if let Some(figure) = figure.as_mut() {
                 let on = node.parent.map(|p| model_entities[p]).or(model_head);
-                model_entities.push(figure.hung(&mut commands, on, transform, visibility, (index == 0).then_some(entity)));
+                let copy = figure.hung(&mut commands, on, transform, visibility, shown_by);
+                if let Some(hinged) = &hinged {
+                    commands.entity(copy).insert(HelmetHinge { figure: true, ..hinged.clone() });
+                }
+                model_entities.push(copy);
+            }
+            for (which, dummy) in dummies.iter_mut().enumerate() {
+                let on = node.parent.map(|p| dummy_entities[which][p]).or(dummy_heads[which]);
+                let copy = dummy.hung(&mut commands, on, transform, visibility, shown_by);
+                dummy_entities[which].push(copy);
             }
             let on = node.parent.map(|p| corpse_entities[p]).or(corpse_head);
-            corpse_entities.push(corpse.hung(&mut commands, on, transform, visibility, (index == 0).then_some(entity)));
+            let copy = corpse.hung(&mut commands, on, transform, visibility, shown_by);
+            if let Some(hinged) = hinged {
+                commands.entity(copy).insert(hinged);
+            }
+            corpse_entities.push(copy);
             let Some(renderer) = &node.renderer else { continue };
             let entry = match converted.mesh(unity, renderer.mesh, &mut meshes) {
                 Ok(entry) => entry,
@@ -920,6 +1205,11 @@ pub fn spawn_body(
                     let corpse_piece = corpse.rigid(&mut commands, *on, mesh, &material);
                     commands.entity(corpse_piece).insert(crate::death::CorpseHead);
                 }
+                for (which, dummy) in dummies.iter_mut().enumerate() {
+                    if let Some(on) = dummy_entities[which].last() {
+                        dummy.rigid(&mut commands, *on, mesh, &material);
+                    }
+                }
                 drawn += 1;
             }
         }
@@ -929,6 +1219,11 @@ pub fn spawn_body(
         figure.finish(&mut commands);
     }
     corpse.finish_corpse(&mut commands);
+    if !dummies.is_empty() {
+        let (rigs, skeletons): (Vec<_>, Vec<_>) = dummies.into_iter().map(|dummy| dummy.finish_dummy()).unzip();
+        commands.insert_resource(crate::dummy::DummyRigs(rigs));
+        commands.insert_resource(crate::dummy::DummySkeletons(skeletons));
+    }
     let ribcage_animated = parts.bones.iter().position(|path| path.ends_with(RIBCAGE)).map(|at| bones[at]);
     commands.insert_resource(BodyRig { root, bones, collarbones, ribcage: rig.root, ribcage_animated, ribcage_drawn });
 }
@@ -938,6 +1233,15 @@ pub fn spawn_body(
 /// squeeze draws it in as the game's does. And the drawn ribcage: on that
 /// root for the character's own eyes, and for another's where the animated
 /// ribcage is, seen the same way.
+///
+/// For the character's own eyes on a mount, the root is moved off the
+/// ribcage onto the mount's point (`Shown::rig_apart`), and the arms go
+/// with it whole: recorded, the game's upper arms stay as far from the
+/// weapon as off a mount while they leave the ribcage by up to half a
+/// metre (`courses7\10-anything`). So the collarbones are seen from where
+/// the root would be without the mount's move, and carried with it; seen
+/// from the moved root they stayed on the body and the sleeves between
+/// them and the upper arms stretched.
 pub fn see_collarbones(
     rig: Option<Res<BodyRig>>,
     controller: Res<Controller>,
@@ -948,7 +1252,11 @@ pub fn see_collarbones(
     kept.ribcage = Transform::IDENTITY;
     let Some(rig) = rig else { return };
     let Ok(ribcage) = helper.compute_global_transform(rig.ribcage) else { return };
-    let (_, turn, at) = ribcage.to_scale_rotation_translation();
+    let (_, turn, mut at) = ribcage.to_scale_rotation_translation();
+    let own_eyes = controller.movement.body.point_of_view() == trp_sim::PointOfView::FirstPerson;
+    if own_eyes {
+        at -= turn * crate::convert::position(controller.shown().rig_apart);
+    }
     let seen = |entity: Entity| -> Option<Transform> {
         let (_, bone_turn, bone_at) = helper.compute_global_transform(entity).ok()?.to_scale_rotation_translation();
         Some(Transform { translation: turn.inverse() * (bone_at - at), rotation: turn.inverse() * bone_turn, scale: Vec3::ONE })
@@ -1044,7 +1352,7 @@ pub fn show_upper_body(
     rig: Option<Res<BodyRig>>,
     outfit: Res<OutfitOn>,
     features: Res<crate::options_view::Features>,
-    mut pieces: Query<(&mut RenderLayers, Option<&mut crate::shadow_only::ShadowOnly>), Or<(With<UpperBody>, With<LowerBody>)>>,
+    mut pieces: Query<(&mut RenderLayers, Option<&mut crate::shadow_only::ShadowOnly>), (Or<(With<UpperBody>, With<LowerBody>)>, EvenParked)>,
     mut hands: Query<&mut Visibility, With<FirstPersonHands>>,
     mut outfit_arms: Query<(&OutfitArms, &mut Visibility), Without<FirstPersonHands>>,
 ) {

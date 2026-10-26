@@ -15,8 +15,8 @@
 //!   how far to the side of the camera it lies (`PROVISIONAL`: the source's
 //!   own curve and the engine's pan law are not read; the place is the
 //!   character's, 1.4 m up, not the weapon's bone);
-//! - at the overall volume; the mixer's `Weaponry` group adds nothing
-//!   (`PROVISIONAL`: not read).
+//! - at the overall volume, through the mixer's `Guns/Instrumental` group,
+//!   read at 0.52.0: 0 dB, with the groups above it (`Group::Guns`).
 //!
 //! With the options' `HANDS SOUNDS` off the players are not read and
 //! nothing plays.
@@ -134,7 +134,10 @@ struct Draws(Rng);
 pub struct AimingBanks {
     banks: HashMap<String, Arc<AimingBank>>,
     left: HashMap<String, Vec<usize>>,
-    coming: Option<Mutex<Receiver<ByKind>>>,
+    /// The weapon's mount sound (`WeaponSounds.VerticalMountSounds`), with
+    /// its random share of the volume (`DeltaVolume`).
+    mount: Option<(Arc<AimingBank>, f32)>,
+    coming: Option<Mutex<Receiver<(ByKind, Option<(Arc<AimingBank>, f32)>)>>>,
 }
 
 /// The banks by the weapons' kinds, as read.
@@ -154,6 +157,17 @@ pub fn start_reading(app: &mut App, install: trp_data::Install, on: bool) {
         let (send, receive) = channel();
         std::thread::spawn(move || match trp_data::sound::aiming_sounds(&install) {
             Ok(read) => {
+                // The mount's bank beside them (mounting spec, "Sounds").
+                let mount = match trp_data::sound::mount_sounds(&install) {
+                    Ok((bank, clips)) => Some((
+                        Arc::new(AimingBank { name: bank.name.clone(), volume: bank.base_volume, rolloff: bank.rolloff, clips: clips.into_iter().map(|(name, clip)| (name, Samples::of_owned(clip))).collect() }),
+                        bank.delta_volume,
+                    )),
+                    Err(e) => {
+                        eprintln!("the weapon's mount sound could not be read; it is silent: {e:#}");
+                        None
+                    }
+                };
                 // Each bank made ready once, however many kinds share it.
                 let mut made: HashMap<String, Arc<AimingBank>> = HashMap::new();
                 let banks = read
@@ -166,7 +180,7 @@ pub fn start_reading(app: &mut App, install: trp_data::Install, on: bool) {
                         (kind, ready)
                     })
                     .collect();
-                let _ = send.send(banks);
+                let _ = send.send((banks, mount));
             }
             Err(e) => eprintln!("the aiming's sounds could not be read; they are silent: {e:#}"),
         });
@@ -184,9 +198,10 @@ fn take_aiming(mut banks: ResMut<AimingBanks>) {
     });
     match got {
         None => banks.coming = Some(coming),
-        Some(Some(read)) => {
+        Some(Some((read, mount))) => {
             info!("the aiming's sounds: {} kinds of weapon", read.len());
             banks.banks = read.into_iter().collect();
+            banks.mount = mount;
         }
         Some(None) => {}
     }
@@ -231,11 +246,12 @@ fn play(
     time: Res<Time>,
     mut aiming: ResMut<AimingBanks>,
 ) {
-    if controller.hands_sounds.is_empty() && controller.aims_up == 0 {
+    if controller.hands_sounds.is_empty() && controller.aims_up == 0 && controller.mount_sounds == 0 {
         return;
     }
     let marks = std::mem::take(&mut controller.hands_sounds);
     let aims = std::mem::take(&mut controller.aims_up);
+    let mounts = std::mem::take(&mut controller.mount_sounds);
     let (Some(hands), Some(mixer)) = (hands, mixer) else { return };
     let Some(sounds) = hands.sounds.as_ref() else { return };
     let overall = levels.map_or(1.0, |levels| levels.overall_gain());
@@ -266,13 +282,47 @@ fn play(
                     }
                 }
                 match placed {
-                    None => mixer.0.add(Voice::whole(clip, gain)),
+                    None => mixer.0.add_to(crate::ui_sound::Group::Guns, Voice::whole(clip, gain)),
                     // Past the bank's rolloff it is not heard (`PlayClip`).
                     Some((distance, _)) if distance > bank.rolloff => {}
                     Some((_, gains)) => {
                         let pitch: Pitch = Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits()));
-                        mixer.0.add(Voice::placed(clip, [gains[0] * gain, gains[1] * gain], pitch));
+                        mixer.0.add_to(crate::ui_sound::Group::Guns, Voice::placed(clip, [gains[0] * gain, gains[1] * gain], pitch));
                     }
+                }
+            }
+        }
+    }
+    // The weapon's mount sound (`WeaponSoundPlayer.PlayMountSound`): one of
+    // the bank's clips, at its random volume times the aiming sound's
+    // (`VolumeMultByWeaponErgonomic`), at the weapon.
+    if let (Some((kind_ergonomics, (bank, delta))), true) = (sounds.aiming.zip(aiming.mount.clone()), mounts > 0) {
+        let (_, ergonomics) = kind_ergonomics;
+        if !bank.clips.is_empty() {
+            let drawn = (draws.0.range(0.0, bank.clips.len() as f32) as usize).min(bank.clips.len() - 1);
+            let (name, clip) = &bank.clips[drawn];
+            let random = if delta > 0.0 { bank.volume + draws.0.range(-delta, 0.0) } else { bank.volume };
+            let gain = random * aiming_volume(ergonomics, controller.movement.stamina.settings.overweight) * overall;
+            if let Some(log) = &log {
+                use std::io::Write;
+                if let Ok(mut out) = log.0.lock() {
+                    let _ = writeln!(out, "{:9.3} hands        {:28} {name} volume {gain:.4} {}", time.elapsed_secs(), "mount", if own_eyes { "whole" } else { "placed" });
+                    let _ = out.flush();
+                }
+            }
+            if own_eyes {
+                mixer.0.add_to(crate::ui_sound::Group::Guns, Voice::whole(clip, gain));
+            } else if let Ok(camera) = camera.single() {
+                let p = controller.movement.position;
+                let to_source = Vec3::new(p[0], p[1] + HANDS_HIGH, -p[2]) - camera.translation();
+                let distance = to_source.length();
+                if distance <= bank.rolloff {
+                    let falloff = if distance > FULL_WITHIN { FULL_WITHIN / distance } else { 1.0 };
+                    let side = if distance > 1e-4 { (to_source / distance).dot(camera.right().as_vec3()).clamp(-1.0, 1.0) } else { 0.0 };
+                    let angle = (side + 1.0) * std::f32::consts::FRAC_PI_4;
+                    let level = gain * falloff;
+                    let pitch: Pitch = Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits()));
+                    mixer.0.add_to(crate::ui_sound::Group::Guns, Voice::placed(clip, [angle.cos() * level, angle.sin() * level], pitch));
                 }
             }
         }
@@ -293,7 +343,7 @@ fn play(
             }
         }
         if own_eyes {
-            mixer.0.add(Voice::whole(clip, gain));
+            mixer.0.add_to(crate::ui_sound::Group::Guns, Voice::whole(clip, gain));
             continue;
         }
         let Ok(camera) = camera.single() else { continue };
@@ -308,7 +358,7 @@ fn play(
         let angle = (side + 1.0) * std::f32::consts::FRAC_PI_4;
         let level = gain * falloff;
         let pitch: Pitch = Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits()));
-        mixer.0.add(Voice::placed(clip, [angle.cos() * level, angle.sin() * level], pitch));
+        mixer.0.add_to(crate::ui_sound::Group::Guns, Voice::placed(clip, [angle.cos() * level, angle.sin() * level], pitch));
     }
 }
 

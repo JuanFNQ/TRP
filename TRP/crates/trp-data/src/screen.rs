@@ -18,8 +18,13 @@ use crate::install::Install;
 use crate::unity::reader::Reader;
 use crate::unity::{class, SerializedFile};
 
+mod skills;
+pub use skills::*;
+
 /// The engine's class number for a transform laid out on a screen.
 const RECT_TRANSFORM: i32 = 224;
+
+// ==== A scene's objects: layouts, nodes, rects, behaviours, pointers ====
 
 /// How a screen transform is laid out in what it hangs from, in the
 /// engine's terms: the two anchors as shares of the parent's rectangle,
@@ -43,6 +48,27 @@ pub struct Layout {
 fn z_turn([x, y, z, w]: [f32; 4]) -> f32 {
     let _ = (x, y);
     (2.0 * z.atan2(w)).to_degrees()
+}
+
+/// An object's transform against its parent's, in the engine's axes (z
+/// forward, the turn's quaternion x, y, z, w).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Local {
+    pub rotation: [f32; 4],
+    pub position: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+/// The turn `a` then `b` (`a * b`), quaternions x, y, z, w.
+pub fn quaternion_product(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let [ax, ay, az, aw] = a;
+    let [bx, by, bz, bw] = b;
+    [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ]
 }
 
 /// One object of a scene.
@@ -95,6 +121,12 @@ pub struct Scene {
     /// Each of those parts' engine class (`Canvas` 223, `CanvasGroup` 225
     /// and the rest), by its number.
     component_classes: HashMap<i64, i32>,
+    /// Each object's own transform as the file has it (turn, place and
+    /// scale in the engine's axes, against its parent), where it was read
+    /// from a scene file.
+    locals: HashMap<usize, Local>,
+    /// Where each object of the file lies in it, by its number.
+    spans: HashMap<i64, (usize, usize)>,
     /// The files a pointer's first number counts in, from 1.
     pub externals: Vec<String>,
     data: Vec<u8>,
@@ -124,6 +156,11 @@ fn string(r: &mut Reader) -> Result<String> {
 /// with the list of its scenes.
 const BUILD_SETTINGS: i32 = 141;
 
+/// The engine's class number of a cubemap.
+const CUBEMAP: i32 = 89;
+
+// ==== The screens' prefabs found by name: tooltips, menus, windows, icons ====
+
 /// The build's scenes by their paths in the game's project, in order: the
 /// scene at place `n` is the file `level<n>`.
 /// The line at the screen's foot that says the game's version
@@ -145,6 +182,137 @@ pub fn version_label(install: &Install) -> Result<(ScenePanel, f32)> {
         .and_then(|group| row_group(scene.fields(group)))
         .map_or(0.0, |group| group.padding[3]);
     Ok((ScenePanel { file: file.clone(), ..ScenePanel::of(&scene, label) }, below))
+}
+
+/// A notice as the game's notifier shows it in a raid (`NotifierView`'s
+/// default template: `Preloader UI/BottomPanel/Content/UpperPart/Notifier/
+/// Content/Notification` in the preloader's scene): the template with all
+/// under it (its `Content` box, the box's `Text` and `Icon`), the box's
+/// row padding (its `HorizontalLayoutGroup`: left, right, top, bottom), the
+/// row's own padding below it and the bottom panel's below that (their
+/// `VerticalLayoutGroup`s); and the alert's icon (`notification_icon_alert_red`,
+/// which `ENotificationIconType.Alert` names in `StaticIcons.NotificationSprites`).
+#[derive(Debug, Clone)]
+pub struct NoticeLook {
+    pub panel: ScenePanel,
+    pub content: usize,
+    pub text: usize,
+    pub icon: usize,
+    pub padding: [f32; 4],
+    pub below: f32,
+    pub alert: Option<(String, i64)>,
+    /// The plain notice's icon (`ENotificationIconType.Default`:
+    /// `notification_icon_alert_green`).
+    pub plain: Option<(String, i64)>,
+}
+
+pub fn notice(install: &Install) -> Result<NoticeLook> {
+    const NOTICE: &str = "/BottomPanel/Content/UpperPart/Notifier/Content/Notification";
+    let index = scene_paths(install)?.iter().position(|path| path.ends_with("UI/PreloaderUIScene.unity")).context("the build has no preloader's scene")?;
+    let file = format!("level{index}");
+    let scene = Scene::load(install, &file, true)?;
+    let top = (0..scene.nodes.len()).find(|&node| scene.path(node).ends_with(NOTICE)).with_context(|| format!("{file} has no notice's template"))?;
+    let panel = ScenePanel { file: file.clone(), ..ScenePanel::of(&scene, top) };
+    let (content, text, icon) = (panel.find("Content").context("the notice's box")?, panel.find("Content/Text").context("the notice's text")?, panel.find("Content/Icon").context("the notice's icon")?);
+    let padding = panel.nodes[content].group.map_or([0.0; 4], |group| group.padding);
+    // Below the box: the row's own padding, and the bottom panel's
+    // `Content`'s (the notifier's column ends at its foot).
+    let column = |node: usize| scene.behaviour(node, "VerticalLayoutGroup").and_then(|group| row_group(scene.fields(group))).map_or(0.0, |group| group.padding[3]);
+    let mut below = column(top);
+    let mut at = scene.nodes[top].parent;
+    while let Some(node) = at {
+        if scene.path(node).ends_with("/BottomPanel/Content") {
+            below += column(node);
+            break;
+        }
+        at = scene.nodes[node].parent;
+    }
+    let [alert, plain] = sprites_named(install, "resources.assets", ["notification_icon_alert_red", "notification_icon_alert_green"]);
+    Ok(NoticeLook { panel, content, text, icon, padding, below, alert, plain })
+}
+
+/// Sprites of one of the build's files by their names, where it has them.
+pub fn sprites_named<const N: usize>(install: &Install, file: &str, names: [&str; N]) -> [Option<(String, i64)>; N] {
+    let mut found = [(); N].map(|_| None);
+    let Ok(mut pictures) = ScenePictures::new(install) else { return found };
+    let Ok(ids) = pictures.objects(file, SPRITE) else { return found };
+    for id in ids {
+        let Ok(cut) = pictures.sprite(file, id) else { continue };
+        if let Some(at) = names.iter().position(|name| *name == cut.name) {
+            found[at] = Some((file.to_owned(), id));
+        }
+        if found.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    found
+}
+
+/// The glow a weapon's malfunction brings up at the screen's lower right
+/// (`PreloaderUI._malfunctionGlow`: `BattleUIMalfunctionGlow` on
+/// `Preloader UI/MalfunctionGlow` in the preloader's scene): its panel (its
+/// place), and each of its kinds' (`_glows`, `GlowParams`: the kind's
+/// number, `EGlowType` Examined 0, Repaired 1, TypeExamined 2; its picture;
+/// the curve of its alpha over its seconds).
+#[derive(Debug, Clone)]
+pub struct GlowLook {
+    pub panel: ScenePanel,
+    pub glows: Vec<(i32, (String, i64), crate::curve::Curve)>,
+}
+
+pub fn malfunction_glow(install: &Install) -> Result<GlowLook> {
+    const GLOW: &str = "Preloader UI/MalfunctionGlow";
+    let index = scene_paths(install)?.iter().position(|path| path.ends_with("UI/PreloaderUIScene.unity")).context("the build has no preloader's scene")?;
+    let file = format!("level{index}");
+    let scene = Scene::load(install, &file, true)?;
+    let top = (0..scene.nodes.len()).find(|&node| scene.path(node).ends_with(GLOW)).with_context(|| format!("{file} has no malfunction glow"))?;
+    let panel = ScenePanel { file: file.clone(), ..ScenePanel::of(&scene, top) };
+    let fields = panel.script(0, "BattleUIMalfunctionGlow").context("the glow's script")?;
+    // First its base's (`UIElement`, a `SerializedMonoBehaviour`): Odin's
+    // `serializationData`, its format, bytes, objects, string, prefab, the
+    // prefab's objects and changes, and its nodes (none here, which is
+    // what this reads past). Then its image (`_glow`), then its kinds: each
+    // its number, its sprite and its curve (keys of time, value, slopes in
+    // and out, the weighting and its two weights; then the curve's ends and
+    // its turn order).
+    let mut r = Reader::new(fields);
+    let align = |r: &mut Reader| r.pos = (r.pos + 3) & !3;
+    r.i32()?;
+    let bytes = r.i32()? as usize;
+    r.pos += bytes;
+    align(&mut r);
+    for _ in 0..r.i32()? {
+        pointer(&mut r)?;
+    }
+    let length = r.i32()? as usize;
+    r.pos += length;
+    align(&mut r);
+    pointer(&mut r)?;
+    for _ in 0..r.i32()? {
+        pointer(&mut r)?;
+    }
+    for _ in 0..r.i32()? {
+        let length = r.i32()? as usize;
+        r.pos += length;
+        align(&mut r);
+    }
+    anyhow::ensure!(r.i32()? == 0, "the glow's script keeps Odin's nodes, which are not read");
+    pointer(&mut r)?;
+    let mut glows = Vec::new();
+    for _ in 0..r.i32()? {
+        let kind = r.i32()?;
+        let sprite = pointer(&mut r)?;
+        let mut curve = crate::curve::Curve::default();
+        for _ in 0..r.i32()? {
+            let (time, value, in_slope, out_slope) = (r.f32()?, r.f32()?, r.f32()?, r.f32()?);
+            let (_weighted, _in_weight, _out_weight) = (r.i32()?, r.f32()?, r.f32()?);
+            curve.keys.push(crate::curve::Key { time, value, in_slope, out_slope });
+        }
+        let (_before, _after, _order) = (r.i32()?, r.i32()?, r.i32()?);
+        let Some(at) = panel.file_of(sprite.file) else { continue };
+        glows.push((kind, (at, sprite.path), curve));
+    }
+    Ok(GlowLook { panel, glows })
 }
 
 /// The game's simple tooltip (`ItemUiContext.Tooltip`, a `SimpleTooltip`:
@@ -174,12 +342,149 @@ pub fn context_menu(install: &Install) -> Result<ScenePanel> {
     Ok(ScenePanel { file, ..ScenePanel::of(&scene, menu) })
 }
 
+/// The load component a magazine's view shows while it is worked
+/// (`ItemViewLoadAmmoComponent`): the Resource the item views' animation
+/// makes it from (`ItemViewAnimation._loadAmmoComponentTemplate`).
+pub fn load_ammo_component(install: &Install) -> Result<ScenePanel> {
+    const WANTED: &str = "prefabs/ugui/layouts/itemviewcomponents/itemviewloadammocomponent";
+    let paths = resource_paths(install)?;
+    let (_, file, id) = paths.iter().find(|(path, ..)| path == WANTED).with_context(|| format!("no resource is at {WANTED}"))?;
+    let scene = Scene::load_prefab(install, file, *id)?;
+    Ok(ScenePanel { file: file.clone(), ..ScenePanel::of(&scene, 0) })
+}
+
+/// The menu that holds a line's own lines (`InteractionButtonsContainer.
+/// SubMenuTemplate`, a `SimpleContextMenu`): the prefab the item's menu's
+/// holder of lines points to in the scene's shared file, told from its
+/// other pointers by having a holder of lines of its own. Laid out as the
+/// item's menu is, from the same templates.
+pub fn context_submenu(install: &Install) -> Result<ScenePanel> {
+    let menu = context_menu(install)?;
+    let holder = menu.find("InteractionButtonsContainer").context("the item's menu has no holder of lines")?;
+    let fields = menu.script(holder, "InteractionButtonsContainer").context("the holder of lines' script")?;
+    for start in (0..fields.len().saturating_sub(11)).step_by(4) {
+        let to = pointer(&mut Reader::new(&fields[start..]))?;
+        if to.file < 1 || to.path <= 0 || to.path >= 1 << 40 {
+            continue;
+        }
+        let Some(shared) = menu.file_of(to.file).filter(|name| name.starts_with("sharedassets")) else { continue };
+        let Ok(prefab) = Scene::load_prefab_of_script(install, &shared, to.path) else { continue };
+        let panel = ScenePanel { file: shared.clone(), ..ScenePanel::of(&prefab, 0) };
+        if panel.find("InteractionButtonsContainer").is_some() {
+            return Ok(panel);
+        }
+    }
+    anyhow::bail!("the item's menu points to no menu of lines of its own")
+}
+
 /// The game's window that shows a thing (`InfoWindow`, with its
 /// `ItemSpecificationPanel` and `ItemInfoWindowLabels`): the prefab the
 /// preloader's item context makes it from (`ItemUiContext._infoWindowTemplate`,
 /// in the scene's shared file), found among the prefabs its script points
 /// to by its own script.
 pub fn info_window(install: &Install) -> Result<ScenePanel> {
+    context_window(install, "InfoWindow").context("the item context points to no window that shows a thing")
+}
+
+/// The game's repair window (`RepairWindow`; workbench spec, "The repair
+/// window"): its prefab (`ItemUiContext._repairWindowTemplate`), found as
+/// the other windows of the item context are.
+pub fn repair_window(install: &Install) -> Result<ScenePanel> {
+    context_window(install, "RepairWindow").context("the item context points to no repair window")
+}
+
+/// What the repair window's scripts keep beside its objects
+/// (`RepairerParametersPanel`, `ConditionCharacteristicsSlider`): the
+/// object shown only for a trader (`_repairerStandingGameObject`), the
+/// icons a kit's points take in place of the cash's
+/// (`_repairPointsInStashSprite`, `_repairPointsToPaySprite`, each a file
+/// and a number), the sum's colours when it is more than is had and
+/// otherwise (`_criticalColor`, `_defaultColor`), and the condition bar's
+/// (its border and current durability coloured so, critical for a broken
+/// item).
+#[derive(Debug, Clone, Default)]
+pub struct RepairFigures {
+    pub standing: Option<usize>,
+    pub in_stash: Option<(String, i64)>,
+    pub to_pay: Option<(String, i64)>,
+    pub sum_colors: [[f32; 4]; 2],
+    pub slider_colors: [[f32; 4]; 2],
+}
+
+pub fn repair_figures(panel: &ScenePanel) -> Result<RepairFigures> {
+    let parameters = panel.find("Inner/Contents/RepairerPanel").context("the repair window's repairer panel")?;
+    let fields = panel.script(parameters, "RepairerParametersPanel").context("its script")?;
+    let mut r = Reader::new(fields);
+    skip_odin(&mut r)?;
+    // Its 23 objects' pointers, in its fields' order, then its two colours.
+    let start = r.pos;
+    let mut pointers = Vec::new();
+    for _ in 0..23 {
+        pointers.push(pointer(&mut r)?);
+    }
+    let sum_colors = [color(&mut r)?, color(&mut r)?];
+    let sprite = |at: usize| -> Option<(String, i64)> { pointers.get(at).filter(|to| to.path != 0).and_then(|to| Some((panel.file_of(to.file)?, to.path))) };
+    let standing = panel.pointer_at(fields, start + 12 * 3);
+    let slider = panel.find("Inner/Contents/RepairerPanel/ExceptionItemGroup/ConditionPanel/ConditionSlider").context("the condition's slider")?;
+    let fields = panel.script(slider, "ConditionCharacteristicsSlider").context("its script")?;
+    let mut r = Reader::new(fields);
+    skip_odin(&mut r)?;
+    r.skip(9 * 12)?;
+    let slider_colors = [color(&mut r)?, color(&mut r)?];
+    Ok(RepairFigures { standing, in_stash: sprite(17), to_pay: sprite(21), sum_colors, slider_colors })
+}
+
+/// The game's window of a container's grids (`GridWindow`; inventory
+/// spec, "A container's window"): its prefab (`ItemUiContext.
+/// _gridWindowTemplate`), the objects its script works, and the colours
+/// it gives its icon and its caption's ground, as it is the priority
+/// window or not (`_iconIdleColor`, `_iconSelectedColor`,
+/// `_headerIdleColor`, `_headerSelectedColor`).
+#[derive(Debug, Clone)]
+pub struct GridWindowLook {
+    pub panel: ScenePanel,
+    pub caption_panel: usize,
+    pub icon: usize,
+    pub caption: usize,
+    pub close: usize,
+    pub priority: Option<usize>,
+    pub icon_colors: [[f32; 4]; 2],
+    pub header_colors: [[f32; 4]; 2],
+}
+
+/// Where the grid window's colours lie among its script's fields: the
+/// icon's two after the eleven references of the window and its own (128
+/// bytes in), the caption ground's two after one more reference (172:
+/// `local\gridwindow_fields_s130.txt`).
+const GRID_WINDOW_ICON_COLORS: usize = 128;
+const GRID_WINDOW_HEADER_COLORS: usize = 172;
+
+pub fn grid_window(install: &Install) -> Result<GridWindowLook> {
+    let panel = context_window(install, "GridWindow").context("the item context points to no window of a container's grids")?;
+    let find = |path: &str| panel.find(path).with_context(|| format!("the grid window has no {path}"));
+    let fields = panel.script(0, "GridWindow").context("the grid window's script")?;
+    let colors = |at: usize| -> Option<[[f32; 4]; 2]> {
+        let mut r = Reader::new(fields.get(at..)?);
+        Some([color(&mut r).ok()?, color(&mut r).ok()?])
+    };
+    let caption_panel = find("Caption Panel")?;
+    let own = panel.nodes[caption_panel].image.map_or([1.0; 4], |image| image.color);
+    Ok(GridWindowLook {
+        caption_panel,
+        icon: find("Caption Panel/Icon")?,
+        caption: find("Caption Panel/Caption")?,
+        close: find("Caption Panel/Close Button")?,
+        priority: panel.find("Caption Panel/Priority"),
+        icon_colors: colors(GRID_WINDOW_ICON_COLORS).unwrap_or([[1.0; 4]; 2]),
+        header_colors: colors(GRID_WINDOW_HEADER_COLORS).unwrap_or([own; 2]),
+        panel,
+    })
+}
+
+/// A window the preloader's item context makes (`ItemUiContext`, in the
+/// scene's shared file), found among the prefabs its script points to by
+/// the script on the prefab's top.
+fn context_window(install: &Install, class: &str) -> Result<ScenePanel> {
     let index = scene_paths(install)?.iter().position(|path| path.ends_with("UI/PreloaderUIScene.unity")).context("the build has no preloader's scene")?;
     let file = format!("level{index}");
     let scene = Scene::load(install, &file, true)?;
@@ -196,11 +501,348 @@ pub fn info_window(install: &Install) -> Result<ScenePanel> {
         let Some(shared) = panel.file_of(to.file).filter(|name| name.starts_with("sharedassets")) else { continue };
         let Ok(prefab) = Scene::load_prefab_of_script(install, &shared, to.path) else { continue };
         let window = ScenePanel { file: shared.clone(), ..ScenePanel::of(&prefab, 0) };
-        if window.script(0, "InfoWindow").is_some() {
+        if window.script(0, class).is_some() {
             return Ok(window);
         }
     }
-    bail!("the item context points to no window that shows a thing")
+    bail!("the item context points to no {class}")
+}
+
+/// The inspect window's row templates (inspect-window spec, "A row"): a
+/// bar row (`CharacteristicPanel`), a compact row
+/// (`CompactCharacteristicPanel`) and a row with a dropdown
+/// (`CompactCharacteristicDropdownPanel`), the prefabs the window's script
+/// points to in its own file.
+#[derive(Debug, Clone, Default)]
+pub struct InfoRows {
+    pub bar: ScenePanel,
+    pub compact: ScenePanel,
+    pub dropdown: ScenePanel,
+    /// A slot of the parts' panel (`_modSlotViewPrefab`, `ModSlotView`), a
+    /// prefab of another file (`resources.assets`), where it was found.
+    pub mod_slot: Option<ScenePanel>,
+}
+
+/// The inspect window's row templates, by its own script's pointers into
+/// its file (`ItemSpecificationPanel`), each known by the script on the
+/// prefab's top.
+pub fn info_rows(install: &Install, window: &ScenePanel) -> Result<InfoRows> {
+    let fields = window.script(0, "ItemSpecificationPanel").context("the window has no specification panel")?;
+    let (mut bar, mut compact, mut dropdown, mut mod_slot) = (None, None, None, None);
+    let mut tried = std::collections::HashSet::new();
+    for start in (0..fields.len().saturating_sub(11)).step_by(4) {
+        let mut r = Reader::new(&fields[start..]);
+        let Ok(to) = pointer(&mut r) else { continue };
+        if !(0..64).contains(&to.file) || to.path <= 0 || to.path >= 1 << 40 || !tried.insert((to.file, to.path)) {
+            continue;
+        }
+        // (A pointer of the window's own file to one of its objects is not
+        // a prefab of its own.)
+        if to.file == 0 && window.ids.contains_key(&to.path) {
+            continue;
+        }
+        let Some(file) = window.file_of(to.file) else { continue };
+        let Ok(prefab) = Scene::load_prefab_of_script(install, &file, to.path) else { continue };
+        let mut panel = ScenePanel::of(&prefab, 0);
+        panel.file = file.clone();
+        if panel.script(0, "ModSlotView").is_some() {
+            mod_slot.get_or_insert(panel);
+        } else if panel.script(0, "CharacteristicPanel").is_some() {
+            bar.get_or_insert(panel);
+        } else if panel.script(0, "CompactCharacteristicDropdownPanel").is_some() {
+            dropdown.get_or_insert(panel);
+        } else if panel.script(0, "CompactCharacteristicPanel").is_some() {
+            compact.get_or_insert(panel);
+        }
+    }
+    Ok(InfoRows {
+        bar: bar.context("the window's bar row is not had")?,
+        compact: compact.context("the window's compact row is not had")?,
+        dropdown: dropdown.context("the window's dropdown row is not had")?,
+        mod_slot,
+    })
+}
+
+/// A TextMeshPro sprite asset's sprites by their names (`TMP_SpriteAsset`,
+/// as a text's `<sprite name="…">` finds them), each the engine's own
+/// sprite its glyph points to (file and number), from a resource's path
+/// (`Sprite Assets/armor_classes`). The asset's fields by TextMeshPro's
+/// published order: its character table (each its kind, its code, its
+/// glyph's number, its scale, its name, its name's hash), then its glyph
+/// table (each its number, its metrics, its rectangle, its scale, its
+/// atlas, its kind, and a pointer to its sprite: 64 bytes); found as the
+/// first run of characters of the sprite kind that the glyph table follows.
+pub fn tmp_sprite_names(install: &Install, path: &str) -> Result<Vec<(String, (String, i64))>> {
+    let wanted = path.to_lowercase();
+    let mut asset = None;
+    for (at, file, id) in resource_paths(install)? {
+        if at == wanted {
+            let (class, bytes) = object_bytes(install, &file, id)?;
+            if class == crate::unity::class::MONO_BEHAVIOUR {
+                asset = Some((file, bytes));
+            }
+        }
+    }
+    let (file, bytes) = asset.with_context(|| format!("no sprite asset at {path}"))?;
+    let word = |at: usize| bytes.get(at..at + 4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+    // The character table: a count, then each character.
+    let characters = |start: usize| -> Option<(Vec<(String, u32)>, usize)> {
+        let count = word(start)? as usize;
+        if !(1..=4096).contains(&count) {
+            return None;
+        }
+        let mut at = start + 4;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            if word(at)? != 2 {
+                return None;
+            }
+            let glyph = word(at + 8)?;
+            let len = word(at + 16)? as usize;
+            let name = std::str::from_utf8(bytes.get(at + 20..at + 20 + len)?).ok()?;
+            if len == 0 || !name.chars().all(|c| c.is_ascii_graphic()) {
+                return None;
+            }
+            out.push((name.to_owned(), glyph));
+            at += 20 + ((len + 3) & !3) + 4;
+        }
+        Some((out, at))
+    };
+    let (names, glyphs_at) = (0..bytes.len()).step_by(4).find_map(characters).context("the sprite asset has no characters")?;
+    let count = word(glyphs_at).context("no glyph table")? as usize;
+    let mut sprites = HashMap::new();
+    for g in 0..count {
+        let at = glyphs_at + 4 + g * 64;
+        let (Some(index), Some(file_index)) = (word(at), word(at + 52)) else { break };
+        let path_id = bytes.get(at + 56..at + 64).map(|b| i64::from_le_bytes(b.try_into().unwrap_or_default())).unwrap_or(0);
+        if file_index == 0 && path_id != 0 {
+            sprites.insert(index, path_id);
+        }
+    }
+    Ok(names.into_iter().filter_map(|(name, glyph)| Some((name, (file.clone(), *sprites.get(&glyph)?)))).collect())
+}
+
+/// How large the window that shows a thing may be stretched
+/// (`StretchWindow._maxSize`), where it has the script. The script keeps
+/// Odin's serialized data first (its dictionary of areas), so the size is
+/// found as the two figures just before its pointer to what it stretches
+/// (`_stretchableObject`, the window's own `LayoutElement`, on its top).
+pub fn stretch_limit(window: &ScenePanel) -> Option<[f32; 2]> {
+    let fields = (0..window.nodes.len()).find_map(|index| window.script(index, "StretchWindow"))?;
+    let figure = |at: usize| fields.get(at..at + 4).map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+    (0..fields.len().saturating_sub(20)).step_by(4).find_map(|at| {
+        let size = [figure(at)?, figure(at + 4)?];
+        (window.pointer_at(fields, at + 8) == Some(0) && size.iter().all(|side| side.is_finite() && (100.0..10000.0).contains(side))).then_some(size)
+    })
+}
+
+/// Every sprite the build keeps as a resource under a path's beginning
+/// (`Resources/Slots/`: lower case, as the resource manager keeps them),
+/// each with what of its path follows the beginning and its file and
+/// number; read in one pass over the resources' list.
+pub fn resource_sprites(install: &Install, under: &str) -> Result<Vec<(String, (String, i64))>> {
+    let wanted = under.to_lowercase();
+    let mut found = Vec::new();
+    let mut builds: HashMap<String, Option<BuildFile>> = HashMap::new();
+    for (path, file, id) in resource_paths(install)? {
+        let Some(rest) = path.strip_prefix(&wanted) else { continue };
+        let build = builds.entry(file.clone()).or_insert_with(|| BuildFile::open(install, &file).ok());
+        if build.as_ref().is_some_and(|opened| opened.meta.object(id).is_some_and(|object| object.class_id == SPRITE)) {
+            found.push((rest.to_owned(), (file, id)));
+        }
+    }
+    Ok(found)
+}
+
+/// A row's colours and pictures as its script keeps them (inspect-window
+/// spec, "A row"): a compact row's increasing and decreasing colours
+/// (`_increasingColor`, `_decreasingColor`, after its value's text), and a
+/// bar row's own (`CurrentColor`, `LowColor`, `SubColor`, `AddColor`, after
+/// its comparison's bar) with its adding and subtracting pictures
+/// (`AddSprite`, `SubSprite`), each a file and a number.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RowLook {
+    pub increasing: [f32; 4],
+    pub decreasing: [f32; 4],
+    pub bar: Option<BarLook>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BarLook {
+    pub current: [f32; 4],
+    pub low: [f32; 4],
+    pub sub: [f32; 4],
+    pub add: [f32; 4],
+    pub add_sprite: Option<(String, i64)>,
+    pub sub_sprite: Option<(String, i64)>,
+}
+
+/// A row's look from its script (`class`) on its top, found by the
+/// script's pointers to its value's text and its comparison's bar, which
+/// the colours follow.
+pub fn row_look(panel: &ScenePanel, class: &str) -> Option<RowLook> {
+    let fields = panel.script(0, class)?;
+    let at = |path: &str| -> Option<usize> {
+        let node = panel.find(path)?;
+        (0..fields.len().saturating_sub(11)).step_by(4).find(|&start| panel.pointer_at(fields, start) == Some(node))
+    };
+    let colour = |start: usize| -> Option<[f32; 4]> {
+        let mut r = Reader::new(fields.get(start..start + 16)?);
+        Some([r.f32().ok()?, r.f32().ok()?, r.f32().ok()?, r.f32().ok()?])
+    };
+    let value = at("Value")?;
+    let mut look = RowLook { increasing: colour(value + 12)?, decreasing: colour(value + 28)?, bar: None };
+    if let Some(compare) = at("bars/CompareDelta") {
+        let sprite = |start: usize| -> Option<(String, i64)> {
+            let to = pointer(&mut Reader::new(fields.get(start..)?)).ok()?;
+            Some((panel.file_of(to.file)?, to.path)).filter(|(_, id)| *id != 0)
+        };
+        look.bar = Some(BarLook {
+            current: colour(compare + 12)?,
+            low: colour(compare + 28)?,
+            sub: colour(compare + 44)?,
+            add: colour(compare + 60)?,
+            add_sprite: sprite(compare + 76),
+            sub_sprite: sprite(compare + 88),
+        });
+    }
+    Some(look)
+}
+
+/// The attributes' icons (`StaticIcons.ItemAttributeSprites`): each
+/// attribute's name (its `EItemAttributeId`) and its sprite's file and
+/// number. The Resource `Static Icons` keeps it as an enum dictionary (a
+/// list of key names, then a list of as many pointers): the one whose keys
+/// have the weapon's ergonomics and accuracy.
+pub fn attribute_icons(install: &Install) -> Result<Vec<(String, (String, i64))>> {
+    icon_table(install, &["Ergonomics", "CenterOfImpact"], 8).context("the static icons have no attributes' icons")
+}
+
+/// The other three tables of icons of a thing's figures that the same
+/// Resource keeps (`StaticIcons.GetAttributeIcon` picks a table by the
+/// enum the attribute's id is of): a health effect's
+/// (`HealEffectSprites`, by `EHealthFactorType`), a damage effect's
+/// (`DamageEffectSprites`, `EDamageEffectType`) and a stimulant's buff's
+/// (`StimulatorBuffSprites`, `EStimulatorBuffType`); each found by names
+/// only it has among the four. Names may be in more than one (`Pain`,
+/// `Fracture`, the bleedings): the table goes by the enum.
+pub fn figure_icons(install: &Install) -> Result<[Vec<(String, (String, i64))>; 3]> {
+    Ok([
+        icon_table(install, &["Hydration", "Energy"], 3).context("the static icons have no health effects' icons")?,
+        icon_table(install, &["RadExposure", "HeavyBleeding"], 3).context("the static icons have no damage effects' icons")?,
+        icon_table(install, &["HealthRate", "SkillRate"], 3).context("the static icons have no buffs' icons")?,
+    ])
+}
+
+/// The first enum dictionary of the Resource `Static Icons` whose keys
+/// hold every name of `must`, with at least `least` keys.
+fn icon_table(install: &Install, must: &[&str], least: usize) -> Result<Vec<(String, (String, i64))>> {
+    let paths = resource_paths(install)?;
+    let (_, file, id) = paths.iter().find(|(path, ..)| path == "static icons").context("no resource is at static icons")?;
+    let (_, bytes) = object_bytes(install, file, *id)?;
+    let table_at = |start: usize| -> Option<Vec<(String, (String, i64))>> {
+        let mut r = Reader::new(bytes.get(start..)?);
+        let count = r.u32().ok()? as usize;
+        if !(least..=400).contains(&count) {
+            return None;
+        }
+        let mut keys = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = r.u32().ok()? as usize;
+            if !(1..=48).contains(&len) {
+                return None;
+            }
+            let key = std::str::from_utf8(r.bytes(len).ok()?).ok()?;
+            if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return None;
+            }
+            keys.push(key.to_owned());
+            r.align(4);
+        }
+        if !must.iter().all(|name| keys.iter().any(|key| key == name)) || r.u32().ok()? as usize != count {
+            return None;
+        }
+        let mut icons = Vec::new();
+        for key in keys {
+            let to = pointer(&mut r).ok()?;
+            if to.file == 0 && to.path != 0 {
+                icons.push((key, (file.clone(), to.path)));
+            }
+        }
+        Some(icons)
+    };
+    (0..bytes.len()).step_by(4).find_map(table_at).context("no such table")
+}
+
+/// The most letters a text field takes (`TMP_InputField.m_CharacterLimit`),
+/// from its script's stored fields, by TextMeshPro's published field order:
+/// after the selectable's trigger names (the last, `Disabled`), its
+/// interactable flag and target graphic, the field's six pointers, its
+/// scroll sensitivity and eight settings (content, input and keyboard
+/// types, the asterisk, the line type, the two keyboard flags, the
+/// validation), its regular expression (a string) and its global point
+/// size. None where the trigger is not found.
+pub fn input_limit(fields: &[u8]) -> Option<u32> {
+    let needle = b"\x08\x00\x00\x00Disabled";
+    let at = fields.windows(needle.len()).position(|window| window == needle)? + needle.len();
+    let regex = at + 4 + 12 + 6 * 12 + 4 + 8 * 4;
+    let word = |at: usize| fields.get(at..at + 4).map(|word| u32::from_le_bytes(word.try_into().unwrap_or_default()));
+    let length = word(regex)? as usize;
+    let after = regex + 4 + length.div_ceil(4) * 4;
+    word(after + 4)
+}
+
+/// The game's window that edits a thing's tag (`EditTagWindow`, its colours'
+/// panel and its input): the prefab the preloader's item context makes it
+/// from (`ItemUiContext._editTagWindowTemplate`), found as the window that
+/// shows a thing is.
+pub fn tag_window(install: &Install) -> Result<ScenePanel> {
+    item_context_window(install, "EditTagWindow")
+}
+
+/// A window the preloader's item context makes from a prefab of the
+/// scene's shared files, found among the prefabs its script points to by
+/// the window's own script.
+fn item_context_window(install: &Install, script: &str) -> Result<ScenePanel> {
+    let index = scene_paths(install)?.iter().position(|path| path.ends_with("UI/PreloaderUIScene.unity")).context("the build has no preloader's scene")?;
+    let file = format!("level{index}");
+    let scene = Scene::load(install, &file, true)?;
+    let context = (0..scene.nodes.len()).find(|&node| scene.path(node).ends_with("/UIContext")).with_context(|| format!("{file} has no item context"))?;
+    let panel = ScenePanel::of(&scene, context);
+    let fields = panel.script(0, "ItemUiContext").context("the item context's script")?;
+    let mut tried = std::collections::HashSet::new();
+    for start in (0..fields.len().saturating_sub(11)).step_by(4) {
+        let mut r = Reader::new(&fields[start..]);
+        let to = pointer(&mut r)?;
+        if to.file < 1 || to.path <= 0 || to.path >= 1 << 40 || !tried.insert((to.file, to.path)) {
+            continue;
+        }
+        let Some(shared) = panel.file_of(to.file).filter(|name| name.starts_with("sharedassets")) else { continue };
+        let Ok(prefab) = Scene::load_prefab_of_script(install, &shared, to.path) else { continue };
+        let window = ScenePanel { file: shared.clone(), ..ScenePanel::of(&prefab, 0) };
+        if window.script(0, script).is_some() {
+            return Ok(window);
+        }
+    }
+    bail!("the item context points to no {script}")
+}
+
+#[cfg(test)]
+mod input_tests {
+    /// The tag's field as the install stores it: the limit, 16, after the
+    /// trigger names, the pointers, the settings, an empty expression and
+    /// the point size, 24.
+    #[test]
+    fn a_text_field_s_limit_is_read_after_its_settings() {
+        let mut fields = vec![0u8; 252];
+        fields.extend_from_slice(b"\x08\x00\x00\x00Disabled");
+        fields.extend(std::iter::repeat_n(0u8, 4 + 12 + 72 + 36));
+        fields.extend_from_slice(&0u32.to_le_bytes());
+        fields.extend_from_slice(&24f32.to_le_bytes());
+        fields.extend_from_slice(&16u32.to_le_bytes());
+        assert_eq!(super::input_limit(&fields), Some(16));
+        assert_eq!(super::input_limit(&[0u8; 64]), None);
+    }
 }
 
 /// The health's effects the game has an icon for, in the order of the
@@ -256,6 +898,53 @@ pub fn effect_icons(install: &Install) -> Result<Vec<(&'static str, (String, i64
     Ok(icons)
 }
 
+/// The wish list's groups, by the game's names (`EWishlistGroup`).
+pub const WISH_GROUPS: [&str; 5] = ["Quests", "Hideout", "Trading", "Equipment", "Other"];
+
+/// The wish list's groups' icons: those of its menu's lines and of the
+/// window that shows a thing (`StaticIcons.WishlistSprites`), then the
+/// outlined ones of a thing's view (`WishlistSpritesOutline`); each a
+/// group's name and its sprite's file and number. The Resource `Static
+/// Icons` keeps its tables as the game's enum dictionaries (a list of key
+/// names, then a list of as many pointers); these two are the first two
+/// whose keys are the five groups.
+pub fn wishlist_icons(install: &Install) -> Result<[Vec<(&'static str, (String, i64))>; 2]> {
+    let paths = resource_paths(install)?;
+    let (_, file, id) = paths.iter().find(|(path, ..)| path == "static icons").context("no resource is at static icons")?;
+    let (_, bytes) = object_bytes(install, file, *id)?;
+    let table_at = |start: usize| -> Option<Vec<(&'static str, (String, i64))>> {
+        let mut r = Reader::new(bytes.get(start..)?);
+        if r.u32().ok()? != WISH_GROUPS.len() as u32 {
+            return None;
+        }
+        let mut keys = Vec::new();
+        for _ in 0..WISH_GROUPS.len() {
+            let len = r.u32().ok()? as usize;
+            if len > 16 {
+                return None;
+            }
+            let key = std::str::from_utf8(r.bytes(len).ok()?).ok()?;
+            keys.push(*WISH_GROUPS.iter().find(|group| **group == key)?);
+            r.align(4);
+        }
+        if r.u32().ok()? != WISH_GROUPS.len() as u32 {
+            return None;
+        }
+        let mut icons = Vec::new();
+        for key in keys {
+            let to = pointer(&mut r).ok()?;
+            if to.file == 0 && to.path != 0 {
+                icons.push((key, (file.clone(), to.path)));
+            }
+        }
+        Some(icons)
+    };
+    let mut found = (0..bytes.len()).step_by(4).filter_map(table_at);
+    let plain = found.next().context("the static icons have no wish list's icons")?;
+    let outlined = found.next().context("the static icons have no wish list's outlined icons")?;
+    Ok([plain, outlined])
+}
+
 pub fn scene_paths(install: &Install) -> Result<Vec<String>> {
     let path = install.root.join("EscapeFromTarkov_Data").join("globalgamemanagers");
     let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -273,6 +962,8 @@ pub fn scene_paths(install: &Install) -> Result<Vec<String>> {
 /// dogtag).
 const GEAR_VIEWS: [&str; 11] =
     ["Earpiece", "Headwear", "FaceCover", "ArmBand", "ArmorVest", "Eyewear", "FirstPrimaryWeapon", "Holster", "SecondPrimaryWeapon", "Scabbard", "Dogtag"];
+
+// ==== The GEAR panel, and the scene read ====
 
 /// The inventory screen's equipment panel as the game lays it out: the
 /// panel's size and, for each equipment slot it has a view for, that
@@ -420,14 +1111,17 @@ impl Scene {
         let mut of_transform: HashMap<i64, usize> = HashMap::new();
         let mut fathers: Vec<(usize, i64)> = Vec::new();
         let mut lists: Vec<(usize, Vec<i64>)> = Vec::new();
+        let mut locals = HashMap::new();
         for object in meta.objects.iter().filter(|o| o.class_id == class::TRANSFORM || o.class_id == RECT_TRANSFORM) {
             let mut r = Reader::new(bytes(object.offset, object.size)?);
             let owner = pointer(&mut r)?;
             let Some(&index) = by_object.get(&owner.path).filter(|_| owner.file == 0) else { continue };
-            let turn = z_turn([r.f32()?, r.f32()?, r.f32()?, r.f32()?]);
-            r.skip(12)?; // place
-            let scale = pair(&mut r)?;
-            r.skip(4)?;
+            let rotation = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
+            let turn = z_turn(rotation);
+            let position = [r.f32()?, r.f32()?, r.f32()?];
+            let whole_scale = [r.f32()?, r.f32()?, r.f32()?];
+            let scale = [whole_scale[0], whole_scale[1]];
+            locals.insert(index, Local { rotation, position, scale: whole_scale });
             let children = r.i32()?.max(0) as usize;
             let list: Vec<i64> = (0..children).map(|_| pointer(&mut r).map(|child| child.path)).collect::<Result<_>>()?;
             let father = pointer(&mut r)?;
@@ -493,7 +1187,61 @@ impl Scene {
             }
         }
         let component_classes = meta.objects.iter().filter(|o| components.contains_key(&o.path_id)).map(|o| (o.path_id, o.class_id)).collect();
-        Ok(Self { nodes, behaviours, classes, objects: by_object, transforms: of_transform, components, component_classes, externals: meta.externals.clone(), data })
+        let spans = meta.objects.iter().map(|o| (o.path_id, (o.offset, o.size))).collect();
+        Ok(Self { nodes, behaviours, classes, objects: by_object, transforms: of_transform, components, component_classes, locals, spans, externals: meta.externals.clone(), data })
+    }
+
+    /// An object's own transform, where the scene was read from a scene
+    /// file.
+    pub fn local(&self, node: usize) -> Option<Local> {
+        self.locals.get(&node).copied()
+    }
+
+    /// An object's turn in the world: its own after each of those above it
+    /// (the engine's `Transform.rotation`), in the engine's axes.
+    pub fn world_rotation(&self, node: usize) -> [f32; 4] {
+        let own = self.local(node).map_or([0.0, 0.0, 0.0, 1.0], |local| local.rotation);
+        match self.nodes[node].parent {
+            Some(parent) => quaternion_product(self.world_rotation(parent), own),
+            None => own,
+        }
+    }
+
+    /// The object an engine part of that number is on (what a script's
+    /// pointer to a `Light` leads to).
+    pub fn part_owner(&self, id: i64) -> Option<usize> {
+        self.components.get(&id).copied()
+    }
+
+    /// An object's place in the world: its own place, scaled and turned by
+    /// each of those above it and moved by their places
+    /// (`Transform.position`), in the engine's axes.
+    pub fn world_position(&self, node: usize) -> [f32; 3] {
+        let own = self.local(node).map_or([0.0; 3], |local| local.position);
+        match self.nodes[node].parent {
+            Some(parent) => {
+                let scale = self.local(parent).map_or([1.0; 3], |local| local.scale);
+                let scaled = [own[0] * scale[0], own[1] * scale[1], own[2] * scale[2]];
+                let turned = crate::level_light::rotate(self.world_rotation(parent), scaled);
+                let at = self.world_position(parent);
+                [at[0] + turned[0], at[1] + turned[1], at[2] + turned[2]]
+            }
+            None => own,
+        }
+    }
+
+    /// The bytes of an engine part of that class on an object (a `Light`,
+    /// 108), as the file has them.
+    /// The number of an object's part of that engine class, which is what
+    /// points to it (a level of detail's renderers).
+    pub fn component_id(&self, node: usize, class: i32) -> Option<i64> {
+        self.components.iter().find(|(id, &at)| at == node && self.component_classes.get(id) == Some(&class)).map(|(&id, _)| id)
+    }
+
+    pub fn component(&self, node: usize, class: i32) -> Option<&[u8]> {
+        let (&id, _) = self.components.iter().find(|(id, &at)| at == node && self.component_classes.get(id) == Some(&class))?;
+        let &(offset, size) = self.spans.get(&id)?;
+        self.data.get(offset..offset + size)
     }
 
     /// The engine classes of an object's parts (its transform, a canvas, a
@@ -514,6 +1262,12 @@ impl Scene {
         self.behaviours.iter().find(|behaviour| behaviour.node == node && self.class_of(behaviour) == Some(class))
     }
 
+    /// Every script of that class on an object, in the object's order
+    /// (`GetComponents`).
+    pub fn behaviours_of<'a>(&'a self, node: usize, class: &'a str) -> impl Iterator<Item = &'a Behaviour> + 'a {
+        self.behaviours.iter().filter(move |behaviour| behaviour.node == node && self.class_of(behaviour) == Some(class))
+    }
+
     /// A prefab of one of the build's own files (`resources.assets`) and
     /// all under it, read object by object from its root game object, as a
     /// scene of its own with its scripts named: the file is some 300 MB,
@@ -529,7 +1283,7 @@ impl Scene {
         let mut reader = PrefabReader {
             install: install.clone(),
             build,
-            scene: Scene { nodes: Vec::new(), behaviours: Vec::new(), classes: HashMap::new(), objects: HashMap::new(), transforms: HashMap::new(), components: HashMap::new(), component_classes: HashMap::new(), externals, data: Vec::new() },
+            scene: Scene { nodes: Vec::new(), behaviours: Vec::new(), classes: HashMap::new(), objects: HashMap::new(), transforms: HashMap::new(), components: HashMap::new(), component_classes: HashMap::new(), locals: HashMap::new(), spans: HashMap::new(), externals, data: Vec::new() },
             outside: HashMap::new(),
         };
         reader.visit(root, None)?;
@@ -595,6 +1349,8 @@ impl Scene {
         Some(place(self.nodes[index].layout?, outer))
     }
 }
+
+// ==== Looks: images and texts ====
 
 /// The engine's layout of a screen transform in its parent's rectangle.
 pub fn place(layout: Layout, outer: Rect) -> Rect {
@@ -662,6 +1418,12 @@ pub struct TextLook {
     /// asset's own, or a preset of its own (an outline, a shadow), by the
     /// file it is in (counted as `font`) and its number; none where unset.
     pub material: Option<(i32, i64)>,
+    /// Whether its words are broken into lines at its width
+    /// (`m_enableWordWrapping`), and what becomes of what does not fit
+    /// (`m_overflowMode`: overflowing 0, an ellipsis 1, masked 2, cut
+    /// off 3).
+    pub wraps: bool,
+    pub overflow: u32,
 }
 
 fn color(r: &mut Reader) -> Result<[f32; 4]> {
@@ -717,8 +1479,16 @@ pub fn text_look(fields: &[u8]) -> Option<TextLook> {
         let size = r.f32()?;
         r.skip(4 + 4)?; // the size it began with, the weight
         let (auto, least, most) = (flag(r)?, r.f32()?, r.f32()?);
-        let (style, horizontal, vertical) = (r.u32()?, r.u32()?, r.u32()?);
-        r.skip(4)?; // the alignment as it was once kept
+        let (style, mut horizontal, mut vertical) = (r.u32()?, r.u32()?, r.u32()?);
+        // The alignment as it was once kept (`m_textAlignment`): where it is
+        // not marked converted (0xFFFF) TextMeshPro takes it over the two
+        // above as the text loads (`TMP_Text.LoadDefaultSettings`, its
+        // published source), its low byte the horizontal and the next the
+        // vertical.
+        let legacy = r.u32()?;
+        if legacy != 0xFFFF && legacy > 0xFF {
+            (horizontal, vertical) = (legacy & 0xFF, legacy & 0xFF00);
+        }
         let spacing = r.f32()?;
         // The spacing of words, lines and paragraphs, the narrowing, the
         // wrapping and its ratio, the overflow, two linked texts; then
@@ -726,15 +1496,19 @@ pub fn text_look(fields: &[u8]) -> Option<TextLook> {
         // orthographic, culling, two mappings, the line offset, the
         // sorting, the static scale, the buffer, the descender, the
         // page; then the margins.
-        r.skip(4 * 5 + 4 + 4 + 4 + 12 + 12)?;
+        r.skip(4 * 5)?;
+        let (wraps, _ratio, overflow) = (flag(r)?, r.f32()?, r.u32()?);
+        r.skip(12 + 12)?;
         let kerning = flag(r)?;
         r.skip(4 * 14)?;
         let margin = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
         let material = (material.path != 0).then_some((material.file, material.path));
-        Ok(Some(TextLook { text, font: (font.file, font.path), color, size, auto_size: auto.then_some([least, most]), style, horizontal, vertical, spacing, kerning, margin, material }))
+        Ok(Some(TextLook { text, font: (font.file, font.path), color, size, auto_size: auto.then_some([least, most]), style, horizontal, vertical, spacing, kerning, margin, material, wraps, overflow }))
     };
     read(&mut Reader::new(fields)).ok().flatten()
 }
+
+// ==== A scene's panel: nodes, row groups, elements, placing ====
 
 /// A part of a screen as its scene has it: an object and everything under
 /// it, in the order the screen draws them (each over those before), each
@@ -881,6 +1655,36 @@ impl ScenePanel {
     /// One of its objects by its path below the top.
     pub fn find(&self, path: &str) -> Option<usize> {
         self.nodes.iter().position(|node| node.path == path)
+    }
+
+    /// One of its objects and all under it, as a panel of its own with that
+    /// object at its top, on (a template the game makes copies of: a
+    /// dropdown's line).
+    pub fn subtree(&self, top: usize) -> Self {
+        let below = |index: usize| {
+            let mut at = Some(index);
+            while let Some(here) = at {
+                if here == top {
+                    return true;
+                }
+                at = self.nodes[here].parent;
+            }
+            false
+        };
+        let kept: Vec<usize> = (0..self.nodes.len()).filter(|&index| below(index)).collect();
+        let place = |index: usize| kept.iter().position(|&at| at == index);
+        let prefix = format!("{}/", self.nodes[top].path);
+        let nodes = kept
+            .iter()
+            .map(|&index| {
+                let node = &self.nodes[index];
+                let path = if index == top { String::new() } else { node.path.strip_prefix(&prefix).unwrap_or(&node.path).to_owned() };
+                let parent = if index == top { None } else { node.parent.and_then(place) };
+                PanelNode { path, parent, active: node.active || index == top, ..node.clone() }
+            })
+            .collect();
+        let remap = |map: &HashMap<i64, usize>| map.iter().filter_map(|(&id, &index)| Some((id, place(index)?))).collect();
+        Self { nodes, externals: self.externals.clone(), file: self.file.clone(), ids: remap(&self.ids), transforms: remap(&self.transforms) }
     }
 
     /// The fields of a script of that class on an object.
@@ -1136,6 +1940,8 @@ impl ScenePanel {
     }
 }
 
+// ==== The HEALTH panel's parts, figures and slot views ====
+
 /// A part's view on the health panel (`BodyPartView`): itself, and what it
 /// writes to as health changes, each an object of the panel.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -1286,6 +2092,196 @@ impl HealthViews {
         self.parameters.iter().find(|(field, _)| *field == name).and_then(|(_, view)| view.as_ref())
     }
 }
+
+// ==== The OVERALL panel and its model camera ====
+
+/// The inventory screen's OVERALL tab (`OverallScreen`; inventory spec,
+/// "The OVERALL tab"): the whole panel, and the figures its scripts keep
+/// that its drawing goes by: each clothing dropdown's (`DropDownBox`: its
+/// ground's colour under the pointer, the most of its list in sight) and
+/// the model's turn by a drag (`XCoordRotation._rotationSpeed`, degrees a
+/// pixel).
+#[derive(Debug, Clone)]
+pub struct OverallPanel {
+    pub panel: ScenePanel,
+    pub dropdown_highlight: Option<[f32; 4]>,
+    pub dropdown_most_seen: Option<f32>,
+    /// A line of a dropdown's list, tinted as the mouse is on it (its
+    /// template's `Button`, where its transition is the tint: none here, its
+    /// transition being an animator's it has not got); and the template the
+    /// lines are made from (`_elementTemplate`), as a panel of its own.
+    pub line_tints: Option<Tints>,
+    pub line: Option<ScenePanel>,
+    /// The scroll view of a dropdown's list (`ScrollRectNoDrag`).
+    pub list_scroll: Option<Scrolling>,
+    pub turn_a_pixel: Option<f32>,
+    /// What draws the character into its view (`CameraImage.targetCamera`).
+    pub camera: Option<ModelCamera>,
+    /// The side's pictures the character panel's script puts on its side's
+    /// icon (`_bearSprite`, `_usecSprite`, `_noSprite`), each its file and
+    /// number.
+    pub side_sprites: [Option<(String, i64)>; 3],
+    /// Each text the install's words fill (`LocalizedText`), by its
+    /// object: the key and the case the words are put in.
+    pub localized: Vec<(usize, String, u32)>,
+}
+
+/// The camera that draws the character into the OVERALL tab's model view
+/// (`CameraImage.targetCamera`, the scene's `Camera_inventory`): its field
+/// of view up and down and its near and far planes (degrees, metres), and
+/// where it stands and how it is turned in the view's own axes, which the
+/// character stands in too (`PlayerModelView.Show`), the install's axes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelCamera {
+    pub fov: f32,
+    pub near: f32,
+    pub far: f32,
+    pub place: [f32; 3],
+    pub turn: [f32; 4],
+}
+
+impl OverallPanel {
+    /// Reads it from the scene file that holds the inventory screen.
+    pub fn load(install: &Install, file: &str) -> Result<Self> {
+        const OVERALL: &str = "/InventoryScreen/Overall Panel";
+        let scene = Scene::load(install, file, true)?;
+        let top = (0..scene.nodes.len()).find(|&node| scene.nodes[node].name == "Overall Panel" && scene.path(node).ends_with(OVERALL)).with_context(|| format!("{file} has no OVERALL panel"))?;
+        let panel = ScenePanel { file: file.to_owned(), ..ScenePanel::of(&scene, top) };
+        let below = |path: &str| (0..scene.nodes.len()).find(|&node| scene.path(node).ends_with(&format!("{OVERALL}/{path}")));
+        // A dropdown's own fields end with its ground's colour under the
+        // pointer, four pointers (twelve bytes each: the scroll area's
+        // layout, the bar, the arrows up and down) and the most of its
+        // list in sight.
+        let dropdown = below("LeftSide/ClothingPanel/Upper/ClothingSelector").and_then(|node| scene.behaviour(node, "DropDownBox")).map(|script| scene.fields(script));
+        let tail = |fields: &[u8], back: usize| fields.len().checked_sub(back).and_then(|at| fields.get(at..at + 4)).map(|b| f32::from_le_bytes(b.try_into().expect("four")));
+        let dropdown_most_seen = dropdown.and_then(|fields| tail(fields, 4));
+        let dropdown_highlight = dropdown.and_then(|fields| {
+            let at = 4 + 4 * 12 + 16;
+            Some([tail(fields, at)?, tail(fields, at - 4)?, tail(fields, at - 8)?, tail(fields, at - 12)?])
+        });
+        let template = panel.find("LeftSide/ClothingPanel/Upper/ClothingSelector/Element");
+        let line_tints = template.and_then(|line| panel.script(line, "Button")).and_then(selectable).and_then(|(tints, _)| tints);
+        let line = template.map(|line| panel.subtree(line));
+        let list_scroll = panel.find("LeftSide/ClothingPanel/Upper/ClothingSelector/Open Panel/Scroll Area").and_then(|area| Scrolling::of(&panel, area, "ScrollRectNoDrag"));
+        let turn_a_pixel = below("LeftSide/CharacterPanel/PlayerModelView/DragTrigger")
+            .and_then(|node| scene.behaviour(node, "XCoordRotation"))
+            .and_then(|script| scene.fields(script).get(..4).map(|b| f32::from_le_bytes(b.try_into().expect("four"))));
+        let camera = match below("LeftSide/CharacterPanel/PlayerModelView") {
+            Some(view) => model_camera(install, file, &scene, view).with_context(|| format!("{file}: the OVERALL tab's camera"))?,
+            None => None,
+        };
+        // The character panel's script's fields end with fifteen pointers,
+        // its own: the side's three pictures are the ninth to the
+        // eleventh.
+        let window = panel.find("LeftSide").and_then(|side| panel.script(side, "InventoryPlayerModelWithStatsWindow"));
+        let sprite = |n: usize| -> Option<(String, i64)> {
+            let fields = window?;
+            let at = fields.len().checked_sub(15 * 12)? + n * 12;
+            let to = pointer(&mut Reader::new(fields.get(at..)?)).ok()?;
+            (to.path != 0).then(|| Some((panel.file_of(to.file)?, to.path))).flatten()
+        };
+        let side_sprites = [sprite(8), sprite(9), sprite(10)];
+        let localized = (0..panel.nodes.len()).filter_map(|index| localized(&panel, index).map(|(key, case)| (index, key, case))).collect();
+        Ok(Self { panel, dropdown_highlight, dropdown_most_seen, line_tints, line, list_scroll, turn_a_pixel, camera, side_sprites, localized })
+    }
+}
+
+/// The key and the case of a text the install's words fill
+/// (`LocalizedText`: its own key, or the text's words where it has none,
+/// `GetTextFromObject`; `EStringCase`).
+pub fn localized(panel: &ScenePanel, index: usize) -> Option<(String, u32)> {
+    let fields = panel.script(index, "LocalizedText")?;
+    let mut r = Reader::new(fields);
+    skip_odin(&mut r).ok()?;
+    let key = string(&mut r).ok()?;
+    let count = r.u32().ok()? as usize;
+    r.skip(12 * count).ok()?;
+    let case = r.u32().ok()?;
+    let key = if key.is_empty() { panel.nodes[index].text.as_ref()?.text.clone() } else { key };
+    Some((key, case))
+}
+
+/// Words put in a text's case (`EStringCase`: none, lower, upper, title).
+pub fn in_case(words: String, case: u32) -> String {
+    match case {
+        1 => words.to_lowercase(),
+        2 => words.to_uppercase(),
+        3 => words.split(' ').map(|word| word.chars().take(1).flat_map(char::to_uppercase).chain(word.chars().skip(1).flat_map(char::to_lowercase)).collect::<String>()).collect::<Vec<_>>().join(" "),
+        _ => words,
+    }
+}
+
+/// The camera a model view's `CameraImage` names, if it is one of the
+/// scene's own: its figures by the engine's order of a camera's fields
+/// (2022.3: its object, whether it is on, how it clears and to what, its
+/// kinds of projection and fit, the physical camera's figures and its
+/// rectangle on the screen, then the near and far planes and the field of
+/// view), and its place and turn from its own transform up to the view's.
+fn model_camera(install: &Install, file: &str, scene: &Scene, view: usize) -> Result<Option<ModelCamera>> {
+    let Some(script) = scene.behaviour(view, "CameraImage") else { return Ok(None) };
+    let to = pointer(&mut Reader::new(scene.fields(script)))?;
+    if to.file != 0 || to.path == 0 {
+        return Ok(None);
+    }
+    let mut build = BuildFile::open(install, file)?;
+    let mut object = |id: i64| -> Result<(i32, Vec<u8>)> {
+        let found = *build.meta.object(id).with_context(|| format!("no object {id}"))?;
+        Ok((found.class_id, build.bytes(found.offset, found.size)?))
+    };
+    let (class_id, camera) = object(to.path)?;
+    if class_id != 20 {
+        bail!("the view's camera is an object of class {class_id}");
+    }
+    let mut r = Reader::new(&camera);
+    let owner = pointer(&mut r)?;
+    r.skip(116 - 12)?;
+    let (near, far, fov) = (r.f32()?, r.f32()?, r.f32()?);
+    // The object's first part is its transform.
+    let (_, owner) = object(owner.path)?;
+    let mut r = Reader::new(&owner);
+    r.skip(4)?;
+    let mut transform = pointer(&mut r)?.path;
+    let view_transform = scene.transforms.iter().find(|(_, &node)| node == view).map(|(&id, _)| id);
+    let (mut place, mut turn) = ([0.0f32; 3], [0.0f32, 0.0, 0.0, 1.0]);
+    for _ in 0..32 {
+        if Some(transform) == view_transform {
+            return Ok(Some(ModelCamera { fov, near, far, place, turn }));
+        }
+        let (_, bytes) = object(transform)?;
+        let mut r = Reader::new(&bytes);
+        pointer(&mut r)?;
+        let q = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
+        let at = [r.f32()?, r.f32()?, r.f32()?];
+        let scale = [r.f32()?, r.f32()?, r.f32()?];
+        let children = r.i32()?.max(0) as usize;
+        r.skip(12 * children)?;
+        let father = pointer(&mut r)?;
+        // What was had so far is in this transform's own axes.
+        let moved = rotate(q, [place[0] * scale[0], place[1] * scale[1], place[2] * scale[2]]);
+        place = [moved[0] + at[0], moved[1] + at[1], moved[2] + at[2]];
+        turn = multiply(q, turn);
+        if father.path == 0 {
+            break;
+        }
+        transform = father.path;
+    }
+    Ok(None)
+}
+
+/// A point turned by a rotation (x, y, z, w).
+fn rotate([x, y, z, w]: [f32; 4], [px, py, pz]: [f32; 3]) -> [f32; 3] {
+    // v + 2w(q×v) + 2q×(q×v)
+    let (cx, cy, cz) = (y * pz - z * py, z * px - x * pz, x * py - y * px);
+    let (dx, dy, dz) = (y * cz - z * cy, z * cx - x * cz, x * cy - y * cx);
+    [px + 2.0 * (w * cx + dx), py + 2.0 * (w * cy + dy), pz + 2.0 * (w * cz + dz)]
+}
+
+/// One rotation after another: `b`, then `a` (x, y, z, w).
+fn multiply([ax, ay, az, aw]: [f32; 4], [bx, by, bz, bw]: [f32; 4]) -> [f32; 4] {
+    [aw * bx + ax * bw + ay * bz - az * by, aw * by - ax * bz + ay * bw + az * bx, aw * bz + ax * by - ay * bx + az * bw, aw * bw - ax * bx - ay * by - az * bz]
+}
+
+// ==== The HEALTH panel, the scene's pictures and clips ====
 
 /// The inventory screen's health panel (`InventoryScreenHealthPanel`),
 /// which its HEALTH tab shows in the left panel in place of the equipment
@@ -1507,6 +2503,59 @@ pub fn resource_paths(install: &Install) -> Result<Vec<(String, String, i64)>> {
     Ok(paths)
 }
 
+/// The game's mouse pointers (`EFT.UI.CursorSwitcher.Init`, `ECursorType`):
+/// each kind's picture among the build's Resources and the point of it
+/// that points, in pixels from its top left, as the game hands them to the
+/// system (`Cursor.SetCursor`, a hardware cursor at the picture's own
+/// size). `Invisible`'s picture (`cursor_invisible`) is not in the build.
+pub const CURSORS: [(&str, [u32; 2]); 9] = [
+    ("cursor_idle", [11, 11]),
+    ("cursor_over", [11, 11]),
+    ("cursor_stretch_horizontal", [16, 16]),
+    ("cursor_stretch_vertical", [16, 16]),
+    ("cursor_stretch_corner", [16, 16]),
+    ("cursor_stretch_corner_2", [16, 16]),
+    ("cursor_hand", [17, 10]),
+    ("cursor_set_pin", [7, 10]),
+    ("cursor_set_lock", [7, 10]),
+];
+
+/// A mouse pointer's picture: its Resources path, its size, the point that
+/// points (from the top left), and its pixels, eight-bit RGBA in the sRGB
+/// space, top row first.
+#[derive(Debug, Clone)]
+pub struct CursorPicture {
+    pub path: String,
+    pub size: [u32; 2],
+    pub hotspot: [u32; 2],
+    pub rgba: Vec<u8>,
+}
+
+/// The game's mouse pointers that the build holds (`CURSORS`), each read
+/// from its texture in the build's Resources (`resources.assets`), its rows
+/// turned to come top first.
+pub fn cursor_pictures(install: &Install) -> Result<Vec<CursorPicture>> {
+    let paths = resource_paths(install)?;
+    let mut pictures = ScenePictures::new(install)?;
+    let mut out = Vec::new();
+    for (path, hotspot) in CURSORS {
+        let Some((_, file, id)) = paths.iter().find(|(name, _, _)| name == path) else { continue };
+        let texture = pictures.texture(file, *id).with_context(|| format!("the pointer {path}"))?;
+        let levels = crate::unity::texture::mips(&texture)?;
+        let level = *levels.first().with_context(|| format!("the pointer {path} has no picture"))?;
+        let pixels = crate::unity::texture::decode_rgba(&texture, level)?;
+        let (width, height) = (texture.width as usize, texture.height as usize);
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for row in (0..height).rev() {
+            rgba.extend_from_slice(&pixels[row * width * 4..(row + 1) * width * 4]);
+        }
+        out.push(CursorPicture { path: path.to_owned(), size: [texture.width, texture.height], hotspot, rgba });
+    }
+    Ok(out)
+}
+
+// ==== The item, container, scrolling and tab views ====
+
 /// The game's views of a thing in a slot and in a grid (`SlotItemView`,
 /// `GridItemView`): their prefabs among the build's Resources, as
 /// `ItemViewFactory.CreateFromPool` names them (`Prefabs/UGUI/Layouts/`
@@ -1678,13 +2727,19 @@ impl ScrollBar {
     /// up and down its sliding area (`Scrollbar.UpdateVisuals`). Its
     /// left, top, width and height, y down.
     pub fn handle_in(&self, panel: &ScenePanel, whole: [f32; 2], value: f32, size: f32) -> Option<[f32; 4]> {
-        let [x, y, w, h] = panel.rect(self.sliding?, whole);
-        let layout = panel.nodes[self.handle?].layout;
-        let moved = value.clamp(0.0, 1.0) * (1.0 - size);
-        let (low, high) = if self.bottom_up { (moved, moved + size) } else { (1.0 - moved - size, 1.0 - moved) };
-        let rect = place(Layout { anchor_min: [0.0, low], anchor_max: [1.0, high], scale: [1.0, 1.0], ..layout }, Rect { at: [0.0, 0.0], size: [w, h] });
-        Some([x + rect.at[0], y + h - rect.at[1] - rect.size[1], rect.size[0], rect.size[1]])
+        Some(handle_on(panel.rect(self.sliding?, whole), panel.nodes[self.handle?].layout, self.bottom_up, value, size))
     }
+}
+
+/// Where a scroll bar's handle lies (`Scrollbar.UpdateVisuals`), from its
+/// sliding area's rectangle (left, top, width, height, y down), the
+/// handle's own layout, the bar's way, its value and the handle's share.
+pub fn handle_on(sliding: [f32; 4], layout: Layout, bottom_up: bool, value: f32, size: f32) -> [f32; 4] {
+    let [x, y, w, h] = sliding;
+    let moved = value.clamp(0.0, 1.0) * (1.0 - size);
+    let (low, high) = if bottom_up { (moved, moved + size) } else { (1.0 - moved - size, 1.0 - moved) };
+    let rect = place(Layout { anchor_min: [0.0, low], anchor_max: [1.0, high], scale: [1.0, 1.0], ..layout }, Rect { at: [0.0, 0.0], size: [w, h] });
+    [x + rect.at[0], y + h - rect.at[1] - rect.size[1], rect.size[0], rect.size[1]]
 }
 
 impl ContainerViews {
@@ -1860,13 +2915,7 @@ impl TabBar {
     /// A tab's words: what the install's words have for its key (`say`),
     /// else the key, in the case its `LocalizedText` puts them.
     pub fn words(tab: &TabParts, say: &dyn Fn(&str) -> Option<String>) -> String {
-        let words = say(&tab.key).unwrap_or_else(|| tab.key.clone());
-        match tab.case {
-            1 => words.to_lowercase(),
-            2 => words.to_uppercase(),
-            3 => words.split(' ').map(|word| word.chars().take(1).flat_map(char::to_uppercase).chain(word.chars().skip(1).flat_map(char::to_lowercase)).collect::<String>()).collect::<Vec<_>>().join(" "),
-            _ => words,
-        }
+        in_case(say(&tab.key).unwrap_or_else(|| tab.key.clone()), tab.case)
     }
 
     /// How wide every tab is (`TabSizeController.UpdateLayout`): of each
@@ -1915,6 +2964,8 @@ impl TabBar {
         }
     }
 }
+
+// ==== TextMeshPro's fonts and glyphs ====
 
 /// A TextMeshPro font asset (`TMP_FontAsset`, a script's object of the
 /// build's files) as far as a line's width goes: the size its glyphs were
@@ -2112,6 +3163,8 @@ pub fn text_width(font: &[u8], text: &str, size: f32, kerning: bool) -> Option<f
     Some(width * size / face.units_per_em() as f32)
 }
 
+// ==== The quick, battle, grid, slider and stash views ====
+
 /// The inventory's quick-use panel (`Items Panel/Quick Use Panel`,
 /// `InventoryScreenQuickAccessPanel`) as its scene has it, its top that
 /// panel: its views in the row's order, the grenade's (`_grenadeSlot`),
@@ -2262,29 +3315,157 @@ pub struct BattleViews {
     pub effects_grid: Option<GridGroup>,
     pub effect_template: Option<usize>,
     pub stack_count: Option<usize>,
+    /// The in-raid interaction panel (`ActionPanel`), where the scene has
+    /// it; else why it could not be read.
+    pub action: Option<ActionPanelParts>,
+    pub action_missing: Option<String>,
+    /// The mount's icon in the stance panel (`_bipodPanel`, a
+    /// `BattleUiBipodPanel` on `MountStance`), where the scene has it.
+    pub mount: Option<MountIcon>,
+}
+
+/// The stance panel's mount icon (`BattleUiBipodPanel`; mounting spec,
+/// "The battle screen's icon"): the image shown while mounted
+/// (`_mountImage`, `MountStance/Mount`), each side's arrow and the game's
+/// number of its side (`_mountDirections`: 0 forward, -1 left, 1 right),
+/// the red image flashed when nothing is found (`_mountUnavailableImage`,
+/// at alpha 0 in the scene) and the flash's length (`_highlightDuration`).
+#[derive(Debug, Clone, Default)]
+pub struct MountIcon {
+    pub image: usize,
+    pub directions: Vec<(usize, i32)>,
+    pub unavailable: usize,
+    pub highlight: f32,
+}
+
+impl MountIcon {
+    /// Read from the panel's script: after what every screen element has,
+    /// its list of directions (each a pointer to an object and the side's
+    /// number), then its two pointers and the flash's length.
+    fn read(panel: &ScenePanel) -> Option<Self> {
+        let node = (0..panel.nodes.len()).find(|&index| panel.script(index, "BattleUiBipodPanel").is_some())?;
+        let fields = panel.script(node, "BattleUiBipodPanel")?;
+        let mut r = Reader::new(fields.get(UI_ELEMENT..)?);
+        let count = r.u32().ok()? as usize;
+        let mut directions = Vec::new();
+        for n in 0..count {
+            let at = UI_ELEMENT + 4 + 16 * n;
+            let side = i32::from_le_bytes(fields.get(at + 12..at + 16)?.try_into().ok()?);
+            directions.push((panel.pointer_at(fields, at)?, side));
+        }
+        let after = UI_ELEMENT + 4 + 16 * count;
+        let image = panel.pointer_at(fields, after)?;
+        let unavailable = panel.pointer_at(fields, after + 12)?;
+        let highlight = f32::from_le_bytes(fields.get(after + 24..after + 28)?.try_into().ok()?);
+        Some(Self { image, directions, unavailable, highlight })
+    }
+
+    /// Every object the script turns on and off.
+    pub fn scripted(&self) -> Vec<usize> {
+        std::iter::once(self.image).chain(self.directions.iter().map(|(object, _)| *object)).collect()
+    }
+}
+
+/// The battle screen's interaction panel (`ActionPanel`; inventory spec,
+/// "The menu of what is looked at"): its objects, the pointer's three
+/// sprites (`UIPointer`: over something to do, refused, and the sense of
+/// a thing near), and how far the panel moves while aiming
+/// (`_aimingShift`, in the canvas's units, y up).
+#[derive(Debug, Clone)]
+pub struct ActionPanelParts {
+    pub panel: ScenePanel,
+    /// The pointer (`Cursor`), a line's ground and words (the template's
+    /// `Image` and `Text`), the list's ground (`Background`), the name's
+    /// ground and words (`Item Panel`), the error's (`Error Panel`).
+    pub cursor: usize,
+    pub line_ground: usize,
+    pub line_text: usize,
+    pub list_ground: usize,
+    pub name_ground: usize,
+    pub name_text: usize,
+    pub error_ground: usize,
+    pub error_text: usize,
+    pub hover_sprite: Option<(i32, i64)>,
+    pub unavailable_sprite: Option<(i32, i64)>,
+    pub sense_sprite: Option<(i32, i64)>,
+    pub aiming_shift: [f32; 2],
+}
+
+impl ActionPanelParts {
+    fn read(panel: ScenePanel) -> Result<Self> {
+        let find = |path: &str| panel.find(path).with_context(|| format!("the interaction panel has no {path}"));
+        let cursor = find("Cursor")?;
+        // The pointer's own: its image, then its three sprites, each a
+        // reference (a file's number and an object's).
+        let sprites = panel.script(cursor, "UIPointer").context("the interaction panel's pointer has no UIPointer")?;
+        let sprite = |at: usize| -> Option<(i32, i64)> {
+            let to = pointer(&mut Reader::new(sprites.get(at..)?)).ok()?;
+            (to.path != 0).then_some((to.file, to.path))
+        };
+        // The panel's own script: its eight references, then the shift
+        // (two floats, 140 bytes in: `local\actionpanel_fields_s130.txt`).
+        let shift = panel.script(0, "ActionPanel").and_then(|fields| {
+            let x = f32::from_le_bytes(fields.get(140..144)?.try_into().ok()?);
+            let y = f32::from_le_bytes(fields.get(144..148)?.try_into().ok()?);
+            Some([x, y])
+        });
+        Ok(Self {
+            cursor,
+            line_ground: find("Interaction Buttons Container/Interaction Button Template/Image")?,
+            line_text: find("Interaction Buttons Container/Interaction Button Template/Text")?,
+            list_ground: find("Interaction Buttons Container/Background")?,
+            name_ground: find("Item Panel/Image")?,
+            name_text: find("Item Panel/Text")?,
+            error_ground: find("Error Panel/Image")?,
+            error_text: find("Error Panel/Text")?,
+            hover_sprite: sprite(12),
+            unavailable_sprite: sprite(24),
+            sense_sprite: sprite(36),
+            aiming_shift: shift.unwrap_or([0.0, -200.0]),
+            panel,
+        })
+    }
 }
 
 /// A grid of a screen (`GridLayoutGroup`), read by the engine's order of
 /// its fields: its padding (left, right, top, bottom), its corner and the
 /// axis it fills first (horizontal 0, vertical 1), its cells' size, the
-/// space between them.
+/// space between them, and its columns where it holds them to a number
+/// (`m_Constraint` 1, `FixedColumnCount`, and `m_ConstraintCount`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct GridGroup {
     pub padding: [f32; 4],
+    /// Where its cells lie in it (`childAlignment`: upper left 0 to lower
+    /// right 8, row by row).
+    pub alignment: u32,
     pub start_corner: u32,
     pub start_axis: u32,
     pub cell: [f32; 2],
     pub spacing: [f32; 2],
+    pub columns: Option<i32>,
 }
 
 fn grid_group(fields: &[u8]) -> Option<GridGroup> {
     let read = |r: &mut Reader| -> Result<GridGroup> {
         let padding = [r.i32()? as f32, r.i32()? as f32, r.i32()? as f32, r.i32()? as f32];
-        let _alignment = r.u32()?;
+        let alignment = r.u32()?;
         let (start_corner, start_axis) = (r.u32()?, r.u32()?);
-        Ok(GridGroup { padding, start_corner, start_axis, cell: pair(r)?, spacing: pair(r)? })
+        let (cell, spacing) = (pair(r)?, pair(r)?);
+        let constraint = r.u32().ok();
+        let count = r.i32().ok();
+        let columns = (constraint == Some(1)).then_some(count).flatten();
+        Ok(GridGroup { padding, alignment, start_corner, start_axis, cell, spacing, columns })
     };
     read(&mut Reader::new(fields)).ok()
+}
+
+impl ScenePanel {
+    /// The grid on one of its objects, a `GridLayoutGroup` or the game's
+    /// own kind of it (`FlexibleGridLayoutGroup`, whose cells are as wide
+    /// as its columns share its width).
+    pub fn grid(&self, index: usize) -> Option<GridGroup> {
+        self.script(index, "GridLayoutGroup").or_else(|| self.script(index, "FlexibleGridLayoutGroup")).and_then(grid_group)
+    }
 }
 
 /// A slider of a screen (`Slider`): its object, its handle and the area
@@ -2424,6 +3605,12 @@ impl BattleViews {
             // of its fields.
             own.len().checked_sub(12).and_then(|last| health.pointer_at(own, last))
         });
+        views.mount = MountIcon::read(&views.stance);
+        // The interaction panel, where the scene has it whole.
+        match panel_of("ActionPanel").and_then(ActionPanelParts::read) {
+            Ok(parts) => views.action = Some(parts),
+            Err(e) => views.action_missing = Some(format!("{e:#}")),
+        }
         Ok(views)
     }
 }
@@ -2432,6 +3619,84 @@ impl BattleViews {
 /// (`UIElement`: its disposables and the rest, all empty in a scene), in
 /// bytes.
 const UI_ELEMENT: usize = 40;
+
+/// One of the battle screen's two panels of a sight (optics spec,
+/// "Zeroing", the HUD): where it stands (its own layout, on the screen of
+/// 1920 by 1080), its ground's colour, its row's padding (left, right, top,
+/// bottom), and its words' look (its script's text: `AmmoCountPanel.
+/// _ammoCount`, `AnimatedTextPanel._currentCrate`) with the name of the file
+/// its font asset is in.
+#[derive(Debug, Clone)]
+pub struct SightPanel {
+    pub layout: Layout,
+    pub ground: [f32; 4],
+    pub padding: [f32; 4],
+    pub text: TextLook,
+    pub font_file: Option<String>,
+    /// The ammunition's panel's details line (`AmmoCountPanel._ammoDetails`,
+    /// the round's name under a look at the magazine), where it has one.
+    pub details: Option<SightDetails>,
+}
+
+/// A panel's details line: its words' look and their font asset's file,
+/// its own layout (it hangs from the words), and its icon (`AmmoImage`):
+/// the sprite's file and number and the icon's layout, which hangs from
+/// the line.
+#[derive(Debug, Clone)]
+pub struct SightDetails {
+    pub text: TextLook,
+    pub font_file: Option<String>,
+    pub layout: Layout,
+    pub icon: Option<(String, i64, Layout)>,
+}
+
+/// The ammunition's panel (`AmmoPanel`, whose words a zeroing distance, a
+/// fire mode and a look at the magazine set) and the optic's
+/// (`OpticCratePanel`, a magnification's), as the battle screen has them.
+#[derive(Debug, Clone)]
+pub struct SightPanels {
+    pub ammo: SightPanel,
+    pub optic: SightPanel,
+    /// The tactical devices' activation mode's (`TacticalInteractionPanel`,
+    /// an `AnimatedTextPanel`: "Press" or "Hold" as T+B switches it), where
+    /// the scene has it.
+    pub tactical: Option<SightPanel>,
+}
+
+impl SightPanels {
+    /// Reads them from the scene that holds the inventory screen.
+    pub fn load(install: &Install, file: &str) -> Result<Self> {
+        const SCREEN: &str = "/EFTBattleUIScreen Variant";
+        let scene = Scene::load(install, file, true)?;
+        let panel_of = |name: &str, class: &str| -> Result<SightPanel> {
+            let end = format!("{SCREEN}/{name}");
+            let top = (0..scene.nodes.len()).find(|&node| scene.path(node).ends_with(&end)).with_context(|| format!("{file} has no {name}"))?;
+            let panel = ScenePanel { file: file.to_owned(), ..ScenePanel::of(&scene, top) };
+            let fields = panel.script(0, class).with_context(|| format!("{name}'s {class}"))?;
+            let words = panel.pointer_at(fields, UI_ELEMENT).with_context(|| format!("{name}'s words"))?;
+            let text = panel.nodes[words].text.clone().with_context(|| format!("{name}'s words have no text"))?;
+            let font_file = panel.file_of(text.font.0);
+            // The second pointer, where the class has one: the details.
+            let details = (class == "AmmoCountPanel").then(|| panel.pointer_at(fields, UI_ELEMENT + 12)).flatten().and_then(|line| {
+                let text = panel.nodes[line].text.clone()?;
+                let icon = (0..panel.nodes.len()).find(|&i| panel.nodes[i].parent == Some(line) && panel.nodes[i].image.is_some_and(|image| image.sprite.is_some())).and_then(|i| {
+                    let (file, id) = panel.nodes[i].image?.sprite?;
+                    Some((panel.file_of(file)?, id, panel.nodes[i].layout))
+                });
+                Some(SightDetails { font_file: panel.file_of(text.font.0), text, layout: panel.nodes[line].layout, icon })
+            });
+            Ok(SightPanel {
+                layout: panel.nodes[0].layout,
+                ground: panel.nodes[0].image.map_or([0.0; 4], |image| image.color),
+                padding: panel.nodes[0].group.map_or([0.0; 4], |group| group.padding),
+                text,
+                font_file,
+                details,
+            })
+        };
+        Ok(Self { ammo: panel_of("AmmoPanel", "AmmoCountPanel")?, optic: panel_of("OpticCratePanel", "AnimatedTextPanel")?, tactical: panel_of("TacticalInteractionPanel", "AnimatedTextPanel").ok() })
+    }
+}
 
 /// The inventory's panel on the right for a container opened in a raid
 /// (`Stash Panel`'s `Simple Panel`, `SimpleStashPanel`; a corpse's gear
@@ -2550,6 +3815,8 @@ impl StashViews {
         Ok(Self { panel, simple, header, grid_name, filters, filter_tabs, money, name_panel, name, lobby_only, sort, sorting_table, search, scroll, external, pin, lock, priority, grids, scrolling })
     }
 }
+
+// ==== Rigs' layouts, sprites, fonts and materials ====
 
 /// A container's own layout of its grids (`TemplatedGridsView`, the
 /// Resource `UI/Rig Layouts/<its layout's name>`): the prefab, and its grid
@@ -2784,6 +4051,8 @@ pub fn script_name(install: &Install, file: &str, path_id: i64) -> Option<String
     string(&mut r).ok()
 }
 
+// ==== Reading a prefab: objects, meshes, files, trees ====
+
 /// What reads a prefab (`Scene::load_prefab`): its file, the scene made,
 /// and the files its scripts are named in.
 struct PrefabReader<'a> {
@@ -2836,14 +4105,22 @@ impl PrefabReader<'_> {
         for component in components.iter().filter(|component| component.file == 0) {
             self.scene.components.insert(component.path, index);
             let (class_id, bytes) = self.object(component.path)?;
+            // Every part's class and bytes (a camera's, a light's figures),
+            // as a scene file's are kept.
+            self.scene.component_classes.insert(component.path, class_id);
+            let at = self.scene.data.len();
+            self.scene.data.extend_from_slice(&bytes);
+            self.scene.spans.insert(component.path, (at, bytes.len()));
             let mut r = Reader { data: &bytes, pos: 0, big_endian };
             match class_id {
                 class::TRANSFORM | RECT_TRANSFORM => {
                     pointer(&mut r)?;
-                    let turn = z_turn([r.f32()?, r.f32()?, r.f32()?, r.f32()?]);
-                    r.skip(12)?; // place
-                    let scale = pair(&mut r)?;
-                    r.skip(4)?;
+                    let rotation = [r.f32()?, r.f32()?, r.f32()?, r.f32()?];
+                    let turn = z_turn(rotation);
+                    let position = [r.f32()?, r.f32()?, r.f32()?];
+                    let whole = [r.f32()?, r.f32()?, r.f32()?];
+                    let scale = [whole[0], whole[1]];
+                    self.scene.locals.insert(index, Local { rotation, position, scale: whole });
                     let count = r.i32()?.max(0) as usize;
                     children = (0..count).map(|_| pointer(&mut r).map(|child| child.path)).collect::<Result<_>>()?;
                     pointer(&mut r)?; // father
@@ -2888,15 +4165,135 @@ pub fn object_bytes(install: &Install, file: &str, id: i64) -> Result<(i32, Vec<
     Ok((object.class_id, build.bytes(object.offset, object.size)?))
 }
 
+/// A plain mesh of one of the build's own files (no type tree): its
+/// vertices' places, in the engine's axes, and its triangles.
+#[derive(Debug, Clone, Default)]
+pub struct BuildMesh {
+    pub name: String,
+    pub positions: Vec<[f32; 3]>,
+    pub triangles: Vec<u32>,
+    /// Its normals and first texture coordinates, where it has them as
+    /// floats (else empty).
+    pub normals: Vec<[f32; 3]>,
+    pub uvs: Vec<[f32; 2]>,
+}
+
+/// The engine's class number of a mesh, and of a mesh filter.
+const MESH: i32 = 43;
+pub const MESH_FILTER: i32 = 33;
+
+/// A mesh of the build's own files by its number, read by the engine's
+/// order of a mesh's fields (its name, its parts each with its bounds, the
+/// blend shapes, the bones, the flags, the index buffer, the vertex data):
+/// a mesh without blend shapes or bones, its places of the first stream
+/// and floats, as a level's sky's are; its normals and first texture
+/// coordinates with them where they are floats too.
+pub fn build_mesh(install: &Install, file: &str, id: i64) -> Result<BuildMesh> {
+    let (class, bytes) = object_bytes(install, file, id)?;
+    if class != MESH {
+        bail!("{file} {id} is of class {class}, not a mesh");
+    }
+    let mut r = Reader::new(&bytes);
+    let name = string(&mut r)?;
+    // The parts: where each starts, how many indices, its topology, its
+    // base and first vertex and count, its bounds (6 floats).
+    let parts = r.u32()?;
+    for _ in 0..parts {
+        let topology = {
+            r.skip(8)?;
+            r.i32()?
+        };
+        if topology != 0 {
+            bail!("{name}: a part of topology {topology}, not triangles");
+        }
+        r.skip(12 + 24)?;
+    }
+    // Blend shapes (their vertices, shapes, channels, weights), bind
+    // poses, bones' names, the root bone, the bones' bounds, the variable
+    // weights: all to be empty.
+    for what in ["blend shape vertices", "blend shapes", "blend channels", "blend weights", "bind poses", "bone names"] {
+        if r.u32()? != 0 {
+            bail!("{name} has {what}");
+        }
+    }
+    r.skip(4)?;
+    for what in ["bones' bounds", "variable weights"] {
+        if r.u32()? != 0 {
+            bail!("{name} has {what}");
+        }
+    }
+    let compression = r.u8()?;
+    if compression != 0 {
+        bail!("{name} is compressed");
+    }
+    r.skip(3)?;
+    let wide = r.i32()? == 1;
+    let size = r.u32()? as usize;
+    let index_bytes = r.bytes(size)?;
+    r.align(4);
+    let triangles = if wide {
+        index_bytes.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    } else {
+        index_bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]) as u32).collect()
+    };
+    let count = r.u32()? as usize;
+    let channels = r.u32()? as usize;
+    let mut stride = 0usize;
+    let mut place = None;
+    let (mut normal, mut uv) = (None, None);
+    for n in 0..channels {
+        let (stream, offset, format, dimension) = (r.u8()?, r.u8()?, r.u8()?, r.u8()? & 0x0f);
+        if dimension == 0 {
+            continue;
+        }
+        if stream != 0 {
+            bail!("{name}: a channel in stream {stream}");
+        }
+        // Formats 0 float, 1 half; 1, 2, 3 bytes, 4 to 11 two or four.
+        let width = match format {
+            0 | 10 | 11 => 4,
+            1 | 4 | 5 | 8 | 9 => 2,
+            _ => 1,
+        };
+        stride = stride.max(offset as usize + width * dimension as usize);
+        if n == 0 {
+            if format != 0 || dimension != 3 {
+                bail!("{name}: places of format {format} and {dimension} figures");
+            }
+            place = Some(offset as usize);
+        }
+        // The engine's channels: 1 the normals, 4 the first coordinates.
+        if n == 1 && format == 0 && dimension == 3 {
+            normal = Some(offset as usize);
+        }
+        if n == 4 && format == 0 && dimension == 2 {
+            uv = Some(offset as usize);
+        }
+    }
+    let place = place.with_context(|| format!("{name} has no places"))?;
+    let size = r.u32()? as usize;
+    let data = r.bytes(size)?;
+    // A stream's vertices are padded to a multiple of four bytes.
+    let stride = if count > 0 { data.len() / count } else { stride };
+    let float = |v: usize, at: usize, k: usize| {
+        let at = v * stride + at + 4 * k;
+        f32::from_le_bytes(data[at..at + 4].try_into().expect("four bytes"))
+    };
+    let positions = (0..count).map(|v| [float(v, place, 0), float(v, place, 1), float(v, place, 2)]).collect();
+    let normals = normal.map_or_else(Vec::new, |at| (0..count).map(|v| [float(v, at, 0), float(v, at, 1), float(v, at, 2)]).collect());
+    let uvs = uv.map_or_else(Vec::new, |at| (0..count).map(|v| [float(v, at, 0), float(v, at, 1)]).collect());
+    Ok(BuildMesh { name, positions, triangles, normals, uvs })
+}
+
 /// One of the build's own files, its table read from its head and its
 /// objects by their ranges, as wanted: `resources.assets` is some 300 MB.
-struct BuildFile {
+pub(crate) struct BuildFile {
     file: std::fs::File,
-    meta: SerializedFile,
+    pub(crate) meta: SerializedFile,
 }
 
 impl BuildFile {
-    fn open(install: &Install, name: &str) -> Result<Self> {
+    pub(crate) fn open(install: &Install, name: &str) -> Result<Self> {
         use std::io::Read;
         let path = install.root.join("EscapeFromTarkov_Data").join(name);
         let mut file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
@@ -2910,13 +4307,26 @@ impl BuildFile {
         Ok(Self { file, meta })
     }
 
-    fn bytes(&mut self, offset: usize, size: usize) -> Result<Vec<u8>> {
+    pub(crate) fn bytes(&mut self, offset: usize, size: usize) -> Result<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
         self.file.seek(SeekFrom::Start(offset as u64))?;
         let mut bytes = vec![0; size];
         self.file.read_exact(&mut bytes)?;
         Ok(bytes)
     }
+}
+
+/// One object of the build's own files (`Resources/unity default
+/// resources`, which keeps no trees) read by a tree of its class borrowed
+/// from a bundle.
+pub fn build_object(install: &Install, name: &str, path_id: i64, class: i32, tree: &crate::unity::typetree::TypeTree) -> Result<crate::unity::Value> {
+    let mut file = BuildFile::open(install, name)?;
+    let object = *file.meta.object(path_id).with_context(|| format!("no object {path_id} in {name}"))?;
+    anyhow::ensure!(object.class_id == class, "object {path_id} in {name} is of class {}, not {class}", object.class_id);
+    let big_endian = file.meta.big_endian;
+    let bytes = file.bytes(object.offset, object.size)?;
+    let mut r = Reader { data: &bytes, pos: 0, big_endian };
+    tree.read(&mut r).with_context(|| format!("object {path_id} of {name}"))
 }
 
 /// The tree of a class as a bundle of the install's has it, to read the
@@ -3012,7 +4422,30 @@ impl ScenePictures {
     /// A texture of that file and number, with its levels: in the file
     /// itself, or in the file beside it that its stream names.
     pub fn texture(&mut self, name: &str, path_id: i64) -> Result<crate::unity::extract::TextureData> {
-        let v = self.read(name, path_id, class::TEXTURE_2D)?;
+        self.texture_of_class(name, path_id, class::TEXTURE_2D)
+    }
+
+    /// A cubemap of that file and number: a texture of six images (its
+    /// faces, +x, −x, +y, −y, +z, −z, each with its levels), which the
+    /// engine keeps as a texture's fields with one more after them, read by
+    /// the texture's tree.
+    pub fn cubemap(&mut self, name: &str, path_id: i64) -> Result<crate::unity::extract::TextureData> {
+        self.texture_of_class(name, path_id, CUBEMAP)
+    }
+
+    /// The name of the file a pointer of a file of the build leads into, by
+    /// the pointer's first number (0 the file itself).
+    pub fn file_name(&mut self, name: &str, file_id: i32) -> Result<String> {
+        if file_id == 0 {
+            return Ok(name.to_owned());
+        }
+        let externals = &self.file(name)?.meta.externals;
+        externals.get(file_id as usize - 1).map(|outside| outside.rsplit('/').next().unwrap_or(outside).to_owned()).with_context(|| format!("no file {file_id} among {name}'s"))
+    }
+
+    fn texture_of_class(&mut self, name: &str, path_id: i64, class: i32) -> Result<crate::unity::extract::TextureData> {
+        let tree = self.texture_tree.clone();
+        let v = self.read_by(name, path_id, class, &tree)?;
         let inline = v.req("image data")?.as_bytes().unwrap_or(&[]);
         let data = if !inline.is_empty() {
             inline.to_vec()

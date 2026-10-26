@@ -230,6 +230,11 @@ pub struct RotationProcess {
     after_offset_current_x: f32,
     return_trajectory_on: bool,
     side: Side,
+    /// Mounted (`_mountedMode`; mounting spec, "Recoil"): what a shot's push
+    /// is multiplied by (the side's, the bipod's or the forward's), the
+    /// return's speed (the bipod's or the mount's) and the return's swing
+    /// aside (always the mount's: `MountingReturnHandSpeedMultiplier`).
+    mounted: Option<(f32, f32, f32)>,
 }
 
 impl RotationProcess {
@@ -256,7 +261,13 @@ impl RotationProcess {
             after_offset_current_x: 0.01,
             return_trajectory_on: false,
             side: Side::None,
+            mounted: None,
         }
+    }
+
+    /// Mounted with these figures, or not (`SetMountedMode`, `SetBipodMode`).
+    pub fn set_mounted(&mut self, mounted: Option<(f32, f32, f32)>) {
+        self.mounted = mounted;
     }
 
     fn reset(&mut self) {
@@ -269,6 +280,7 @@ impl RotationProcess {
             current_angle_add: self.current_angle_add,
             need_update: self.need_update,
             side: self.side,
+            mounted: self.mounted,
             ..fresh
         };
     }
@@ -278,7 +290,8 @@ impl RotationProcess {
         if self.stable_on {
             self.velocity = [0.0; 3];
         }
-        self.force[axis] += value * self.s.category_multiplier * self.multiplier_by_shot_index;
+        let mounted = self.mounted.map_or(1.0, |m| m.0);
+        self.force[axis] += value * self.s.category_multiplier * mounted * self.multiplier_by_shot_index;
         self.need_update = true;
     }
 
@@ -320,6 +333,9 @@ impl RotationProcess {
         }
         if !self.auto_fire_on {
             self.auto_fire_speed = self.s.return_speed * self.s.return_speed_curve.evaluate(self.curve_time);
+            if let Some((_, back, _)) = self.mounted {
+                self.auto_fire_speed *= back;
+            }
         }
         if self.need_update && self.auto_fire_on && !self.stable_on {
             self.auto_fire_speed *= self.multiplier_by_shot_index;
@@ -362,6 +378,9 @@ impl RotationProcess {
             self.after_offset_current_x = self.current[0];
 
             self.recoil_offset_impulse = (self.current[0] * self.s.return_speed).abs() * self.s.return_path_offset;
+            if let Some((_, _, aside)) = self.mounted {
+                self.recoil_offset_impulse *= aside;
+            }
             self.side = if self.current[2] > 0.0 {
                 Side::Right
             } else if self.current[2] < 0.0 {
@@ -442,6 +461,12 @@ impl Recoil {
     /// Whether the weapon is in a run of automatic fire.
     pub fn set_auto_fire(&mut self, on: bool) {
         self.auto_fire = on;
+    }
+
+    /// Whether the weapon's controller has a run of automatic fire on
+    /// (`FirearmController.autoFireOn`), as it was last told.
+    pub fn auto_fire(&self) -> bool {
+        self.auto_fire
     }
 
     /// 0 prone, 1 crouched, 2 standing.

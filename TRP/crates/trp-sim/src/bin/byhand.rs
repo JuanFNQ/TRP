@@ -547,7 +547,7 @@ fn main() -> Result<()> {
                                 }
                                 Some("CHECK CHAMBER") => firearm.check_chamber(),
                                 Some("CHECK") if settings.barrels > 0 => firearm.check_chamber(),
-                                _ => firearm.check_magazine(),
+                                _ => _ = firearm.check_magazine(),
                             }
                         }
                         _ => {}

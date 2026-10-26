@@ -238,6 +238,91 @@ impl Block {
         [m[0] + x, at[1], m[1] + z]
     }
 
+    /// Whether a sphere reaches into the box (`Physics.CheckSphere`).
+    pub fn sphere_overlaps(&self, centre: [f32; 3], radius: f32) -> bool {
+        let c = self.own(centre);
+        let gap: f32 = (0..3).map(|k| (c[k].clamp(self.low[k], self.high[k]) - c[k]).powi(2)).sum();
+        gap < radius * radius
+    }
+
+    /// The shortest way out of the box for a sphere, and how far, if it
+    /// reaches in (`Physics.ComputePenetration` of a sphere and a box):
+    /// from the box's nearest point where the middle is outside, through
+    /// the nearest face where it is inside.
+    pub fn sphere_push(&self, centre: [f32; 3], radius: f32) -> Option<([f32; 3], f32)> {
+        let c = self.own(centre);
+        let near: [f32; 3] = std::array::from_fn(|k| c[k].clamp(self.low[k], self.high[k]));
+        let gap: [f32; 3] = std::array::from_fn(|k| c[k] - near[k]);
+        let off = (gap[0] * gap[0] + gap[1] * gap[1] + gap[2] * gap[2]).sqrt();
+        let (way, depth) = if off > 0.0 {
+            if off >= radius {
+                return None;
+            }
+            (gap.map(|g| g / off), radius - off)
+        } else {
+            // Inside: out through the nearest of the six faces.
+            let mut best = ([0.0, 1.0, 0.0], f32::MAX);
+            for k in 0..3 {
+                for (to_face, sign) in [(c[k] - self.low[k], -1.0), (self.high[k] - c[k], 1.0)] {
+                    if to_face < best.1 {
+                        let mut way = [0.0; 3];
+                        way[k] = sign;
+                        best = (way, to_face);
+                    }
+                }
+            }
+            (best.0, best.1 + radius)
+        };
+        if self.turn == 0.0 {
+            return Some((way, depth));
+        }
+        let [x, z] = self.turn_way(way[0], way[2], true);
+        Some(([x, way[1], z], depth))
+    }
+
+    /// The shortest way out of the box for a capsule (the ends of its
+    /// middle line and its radius), and how far, if it reaches in: the
+    /// deepest of spheres along its line, a centimetre apart at most
+    /// (`PROVISIONAL`: the engine works the capsule out whole).
+    pub fn capsule_push(&self, ends: [[f32; 3]; 2], radius: f32) -> Option<([f32; 3], f32)> {
+        /// The spheres' spacing along the line, at most, in metres.
+        const SPACING: f32 = 0.01;
+        let length = (0..3).map(|k| (ends[1][k] - ends[0][k]).powi(2)).sum::<f32>().sqrt();
+        let count = (length / SPACING).ceil().max(1.0) as usize;
+        (0..=count)
+            .filter_map(|i| {
+                let t = i as f32 / count as f32;
+                self.sphere_push(std::array::from_fn(|k| ends[0][k] + (ends[1][k] - ends[0][k]) * t), radius)
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    /// Whether an upright box (`half` its half-width, half-height and
+    /// half-depth, its middle at `centre`, turned `yaw` degrees about the
+    /// upright as Unity turns: its own z along (sin, 0, cos)) reaches into
+    /// this one: their heights meet, and no level axis of either parts them.
+    pub fn upright_box_overlaps(&self, centre: [f32; 3], half: [f32; 3], yaw: f32) -> bool {
+        if centre[1] + half[1] <= self.low[1] || centre[1] - half[1] >= self.high[1] {
+            return false;
+        }
+        let m = self.middle();
+        let mine = [(self.high[0] - self.low[0]) / 2.0, (self.high[2] - self.low[2]) / 2.0];
+        let a = -self.turn;
+        let my_axes = [[a.cos(), a.sin()], [-a.sin(), a.cos()]];
+        let (s, c) = yaw.to_radians().sin_cos();
+        let its_axes = [[c, -s], [s, c]];
+        let apart = [centre[0] - m[0], centre[2] - m[1]];
+        let dot = |u: [f32; 2], v: [f32; 2]| u[0] * v[0] + u[1] * v[1];
+        for axis in my_axes.iter().chain(its_axes.iter()) {
+            let reach_mine = mine[0] * dot(my_axes[0], *axis).abs() + mine[1] * dot(my_axes[1], *axis).abs();
+            let reach_its = half[0] * dot(its_axes[0], *axis).abs() + half[2] * dot(its_axes[1], *axis).abs();
+            if dot(apart, *axis).abs() >= reach_mine + reach_its {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Whether a place is over the box (or in it, or under it).
     pub fn covers(&self, x: f32, z: f32) -> bool {
         let [x, _, z] = self.own([x, 0.0, z]);
@@ -279,6 +364,35 @@ impl Block {
             leave = leave.min(a.max(b));
         }
         (enter <= leave && enter > 0.0).then_some(enter)
+    }
+
+    /// As `entered`, with the face entered's outward normal in the world.
+    pub fn entered_face(&self, from: [f32; 3], to: [f32; 3]) -> Option<(f32, [f32; 3])> {
+        let (from, to) = (self.own(from), self.own(to));
+        let (mut enter, mut leave, mut face) = (0.0f32, 1.0f32, None);
+        for k in 0..3 {
+            let (start, travel) = (from[k], to[k] - from[k]);
+            if travel.abs() < 1e-9 {
+                if start <= self.low[k] || start >= self.high[k] {
+                    return None;
+                }
+                continue;
+            }
+            let (a, b) = ((self.low[k] - start) / travel, (self.high[k] - start) / travel);
+            if a.min(b) > enter {
+                enter = a.min(b);
+                face = Some((k, if travel > 0.0 { -1.0 } else { 1.0 }));
+            }
+            leave = leave.min(a.max(b));
+        }
+        let (k, sign) = face.filter(|_| enter <= leave && enter > 0.0)?;
+        let mut normal = [0.0; 3];
+        normal[k] = sign;
+        if self.turn != 0.0 {
+            let [x, z] = self.turn_way(normal[0], normal[2], true);
+            normal = [x, normal[1], z];
+        }
+        Some((enter, normal))
     }
 
     fn reach_square(&self, at: [f32; 3], capsule: Capsule, radius: f32) -> ([f32; 3], f32) {

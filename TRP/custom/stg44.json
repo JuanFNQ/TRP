@@ -48,10 +48,11 @@
     "exponent": 3.0,
     "holds": [
       { "name": "the handguard", "bone": "weapon", "palms": [[45.9, -5.0, -6.0]], "shift": [5.6, 2.0, 0.9], "rest": true },
-      { "name": "the magazine", "bone": "mod_magazine", "palms": [[-9.9, -16.8, -8.2], [-9.8, -22.3, -2.8]] },
+      { "name": "the magazine", "bone": "mod_magazine", "palms": [[-8.4, -20.7, -8.6], [-7.8, -23.3, -7.1]] },
       { "name": "the cocking handle", "bone": "weapon_bolt/mod_charge", "palms": [[-9.5, -3.3, -12.7]], "shift": [-6.9, 0.0, 1.1] }
     ]
   },
+  "muzzle_from": "574d967124597745970e7c94",
   "built_weight": 4.6,
   "template": {
     "take": [
@@ -84,6 +85,7 @@
     "name": "mag_stg44_haenel_std_792x33_30",
     "short_name": "StG 44 30",
     "clone": "61840bedd92c473c77021635",
+    "set": { "magAnimationIndex": 3 },
     "take": [
       { "from": "59d625f086f774661516605d", "props": ["Cartridges", "Weight"] }
     ]

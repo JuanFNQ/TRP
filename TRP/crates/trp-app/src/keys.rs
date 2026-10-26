@@ -77,7 +77,12 @@ const AXES_AS_READ: [(&str, &str, &str); 3] = [("MoveX", "D", "A"), ("MoveY", "W
 
 /// The bindings the app acts on; the rest are the game's, kept and
 /// changed by its rules, and do nothing here yet.
-pub const BUILT: [&str; 44] = [
+pub const BUILT: [&str; 54] = [
+    "ThrowGrenade",
+    "Knife",
+    "QuickKnife",
+    "QuickSecondaryWeapon",
+    "ToggleGoggles",
     "QuickReloadWeapon",
     "Nidnod",
     "LeanLockRight",
@@ -122,6 +127,11 @@ pub const BUILT: [&str; 44] = [
     "ForceAutoWeaponMode",
     "CheckFireMode",
     "ExamineWeapon",
+    "BlindShootAbove",
+    "BlindShootRight",
+    "WeaponMounting",
+    "ToggleBipods",
+    "LeftStance",
 ];
 
 /// This engine's keys by the game engine's names for them (the letters,
@@ -209,9 +219,14 @@ pub fn tapped(word: &str) -> Option<Key> {
         "lmb" => "Mouse0",
         "rmb" => "Mouse1",
         "mmb" => "Mouse2",
+        "mouse3" => "Mouse3",
+        "mouse4" => "Mouse4",
         "f1" => "F1",
         "f7" => "F7",
         "f8" => "F8",
+        "f9" => "F9",
+        "pageup" => "PageUp",
+        "pagedown" => "PageDown",
         _ => "",
     };
     let name = match word.as_bytes() {
@@ -308,6 +323,72 @@ fn key_words(key: Code) -> String {
     }
 }
 
+/// A key's name as the game's notices give it (`KeyTools.GetKeyNameAlias`):
+/// Unity's name for it, a few shortened or put as their sign. (The mouse's
+/// three buttons are the game's words for them, `Mouse0` and on: left as
+/// Unity's names.)
+fn key_alias(name: &str) -> String {
+    let short = match name {
+        "Escape" => "Esc",
+        "DoubleQuote" => "\"",
+        "Ampersand" => "&",
+        "LeftParen" => "(",
+        "RightParen" => ")",
+        "Asterisk" => "*",
+        "Plus" => "+",
+        "Comma" => ",",
+        "Minus" => "-",
+        "Slash" | "KeypadDivide" => "/",
+        "Semicolon" => ";",
+        "Less" => "<",
+        "Greater" => ">",
+        "Backspace" => "BSpace",
+        "None" => "",
+        "KeypadMultiply" => "Num *",
+        "KeypadMinus" => "Num -",
+        "KeypadPlus" => "Num +",
+        "KeypadEnter" => "\u{23ce}",
+        "KeypadEquals" => "=",
+        "UpArrow" => "\u{2191}",
+        "DownArrow" => "\u{2193}",
+        "RightArrow" => "\u{2192}",
+        "LeftArrow" => "\u{2190}",
+        "Insert" => "Ins",
+        "PageUp" => "PgUp",
+        "PageDown" => "PgDn",
+        "Numlock" => "NLock",
+        "CapsLock" => "Caps",
+        "ScrollLock" => "SLock",
+        "RightShift" => "RShift",
+        "LeftShift" => "LShift",
+        "RightControl" => "RCtrl",
+        "LeftControl" => "LCtrl",
+        "RightAlt" => "RAlt",
+        "LeftAlt" => "LAlt",
+        "LeftMeta" | "LeftWindows" => "LWin",
+        "RightMeta" | "RightWindows" => "RWin",
+        "SysReq" => "PrtScn",
+        "Delete" => "Del",
+        "LeftBracket" => "[",
+        "Backslash" => "\\",
+        "RightBracket" => "]",
+        "BackQuote" => "`",
+        _ => {
+            if let Some(digit) = name.strip_prefix("Alpha").filter(|rest| rest.len() == 1) {
+                return digit.to_owned();
+            }
+            if let Some(digit) = name.strip_prefix("Keypad").filter(|rest| rest.len() == 1 && rest.chars().all(|c| c.is_ascii_digit())) {
+                return format!("Kp {digit}");
+            }
+            if let Some(number) = name.strip_prefix("JoystickButton") {
+                return format!("JB {number}");
+            }
+            name
+        }
+    };
+    short.to_owned()
+}
+
 /// A variant in words: `L ALT + T`, `C + WHEEL UP`; nothing for an empty one.
 pub fn words(source: &Source) -> String {
     let wheel = source.wheel.map(|up| if up { "WHEEL UP" } else { "WHEEL DOWN" }.to_owned());
@@ -336,9 +417,14 @@ pub struct Bindings {
     captions: HashMap<String, String>,
     /// Nothing is heard: a key is being chosen for a binding.
     pub muted: bool,
+    /// Nothing is heard: a text field has the keys (a tag being named).
+    pub typing: bool,
     /// How many times the bindings have been changed: what is drawn of
     /// them is drawn afresh when this moves.
     pub version: u32,
+    /// The wheel's input to a variable scope's zoom on this frame
+    /// (`trp_sim::sights::zoom_input`).
+    zoom: f32,
 }
 
 impl Bindings {
@@ -356,7 +442,9 @@ impl Bindings {
             index: HashMap::new(),
             captions: HashMap::new(),
             muted: false,
+            typing: false,
             version: 0,
+            zoom: 0.0,
         };
         bindings.changed();
         bindings
@@ -378,6 +466,19 @@ impl Bindings {
         self.captions.get(name).map_or("", String::as_str)
     }
 
+    /// A binding's first key as the game names it in a notice
+    /// (`ControlSettingsGroup.GetKeyName`: `InputSource.ToString` without
+    /// its quotes, its keys in the order kept, each by
+    /// `KeyTools.GetKeyNameAlias`, " + " between): `T + LShift`. None where
+    /// nothing is bound (the notice then says `Settings/NotSet`). A wheel's
+    /// axis is left out (the game names it first; none of the notices'
+    /// keys is one).
+    pub fn notice_name(&self, name: &str) -> Option<String> {
+        let group = self.controls.keys.get(*self.index.get(name)?)?;
+        let source = group.variants.iter().find(|variant| !variant.is_empty())?;
+        Some(source.keys.iter().map(|key| key_alias(&trp_sim::bindings::name(*key))).collect::<Vec<_>>().join(" + "))
+    }
+
     /// Whether the binding is given on this frame: the game's command
     /// for it comes.
     pub fn fired(&self, name: &str) -> bool {
@@ -396,6 +497,13 @@ impl Bindings {
         self.mouse
     }
 
+    /// The wheel's input to a variable scope's zoom on this frame: its turn
+    /// times the options' `OpticSensitivity`, with the zoom's keys held
+    /// (optics spec, "Zoom and modes").
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
     /// An axis's push on this frame, -1 to 1.
     pub fn axis(&self, name: &str) -> f32 {
         self.controls.axes.iter().position(|axis| axis.name == name).and_then(|at| self.heard.axes.get(at)).copied().unwrap_or(0.0)
@@ -408,82 +516,6 @@ impl Bindings {
             Some(Key::Mouse(button)) => buttons.pressed(*button),
             None => false,
         }
-    }
-
-    /// The guide to the keys as they are bound now, for the panel at the
-    /// top left of the display (`hud.rs`): sections, each a list of lines
-    /// with the keys and what they do. A binding pressed twice says so
-    /// after its key, and one of those that hold says whether it is held
-    /// or one press on and one press off, as the install has it.
-    pub fn guide(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
-        let press = |name: &str| self.index.get(name).map(|at| self.controls.keys[*at].press);
-        let key = |name: &str| match (self.caption(name), press(name)) {
-            ("", _) => "-".to_owned(),
-            (words, Some(PressType::DoubleClick)) => format!("{words} x2"),
-            (words, _) => words.to_owned(),
-        };
-        let pair = |first: &str, second: &str| format!("{} / {}", key(first), key(second));
-        let axis = |name: &str| {
-            let [up, down] = self.controls.axes.iter().find(|axis| axis.name == name).map(|axis| axis.pairs[0].clone()).unwrap_or_default();
-            let said = |source: &Source| if source.is_empty() { "-".to_owned() } else { words(source) };
-            (said(&up), said(&down))
-        };
-        // Held, or a press on and a press off: only the bindings that hold
-        // have the two ways.
-        let how = |name: &str, does: &str| match press(name) {
-            Some(PressType::Continuous) => format!("{does} (hold)"),
-            Some(PressType::Press) => format!("{does} (press on, press off)"),
-            _ => does.to_owned(),
-        };
-        let line = |keys: String, does: &str| (keys, does.to_owned());
-        let ((right, left), (forward, back), (lean_right, lean_left)) = (axis("MoveX"), axis("MoveY"), axis("LeanX"));
-        vec![
-            (
-                "MOVEMENT",
-                vec![
-                    line(format!("{forward} {left} {back} {right}"), "Move"),
-                    (key("Sprint"), how("Sprint", "Sprint")),
-                    (key("Walk"), how("Walk", "Walk slowly")),
-                    line(key("Jump"), "Jump; held with forward, vault"),
-                    line(key("Duck"), "Crouch or stand"),
-                    line(key("Prone"), "Lie down or get up"),
-                    (pair("LeanLockLeft", "LeanLockRight"), how("LeanLockLeft", "Lean")),
-                    line(format!("{lean_left} / {lean_right}"), "Lean slowly; it stays"),
-                    (pair("StepLeft", "StepRight"), how("StepLeft", "Step aside")),
-                    line(pair("Next", "Previous"), "Walking speed"),
-                    line(pair("NextWalkPose", "PreviousWalkPose"), "Stance"),
-                    line(format!("{} (hold)", key("Nidnod")), "Look around with the head"),
-                    line(key("DropBackpack"), "Drop the backpack"),
-                ],
-            ),
-            (
-                "WEAPON",
-                vec![
-                    line(key("Shoot"), "Fire"),
-                    (key("Aim"), how("Aim", "Aim")),
-                    line(key("Breath"), "Hold breath, aiming"),
-                    line(key("ReloadWeapon"), "Reload"),
-                    line(key("QuickReloadWeapon"), "Quick reload: the magazine let fall"),
-                    line(key("CheckAmmo"), "Check the magazine"),
-                    line(key("CheckChamber"), "Check the chamber"),
-                    line(key("ShootingMode"), "Next fire mode"),
-                    line(key("ForceAutoWeaponMode"), "Automatic fire"),
-                    line(key("CheckFireMode"), "Check the fire mode"),
-                    line(key("ExamineWeapon"), "Look the weapon over"),
-                    line(key("FoldStock"), "Fold the stock"),
-                    line(format!("{} / {} / {}", key("PrimaryWeaponFirst"), key("PrimaryWeaponSecond"), key("SecondaryWeapon")), "Sling / back / holster"),
-                ],
-            ),
-            (
-                "WORLD",
-                vec![
-                    line(key("Interact"), "Do the menu's chosen line"),
-                    line(pair("Next", "Previous"), "Choose a line, with a menu up"),
-                    line(key("Inventory"), "Inventory; its last tab, options"),
-                    line(key("ThrowItem"), "Put down, in the inventory"),
-                ],
-            ),
-        ]
     }
 }
 
@@ -499,17 +531,21 @@ pub fn hear(
     options: Res<crate::Options>,
     time: Res<Time<Real>>,
     mut bindings: ResMut<Bindings>,
+    (panel, controller): (Option<Res<crate::hud::GuideShown>>, Res<crate::controller::Controller>),
 ) {
     let bindings = &mut *bindings;
     let map = &bindings.keys;
     // While a key is being chosen every key counts as up, so that what
     // was held is let go of and nothing new is heard.
-    let muted = bindings.muted;
+    let muted = bindings.muted || bindings.typing;
+    // With the debug panel open the mouse is its buttons': its travel and
+    // its buttons are not the character's (`debug_menu`).
+    let mouse_muted = muted || (!options.unattended() && crate::hud::panel_open(panel.as_deref(), &controller));
     let held = |code: Code| {
         !muted
             && match map.get(&code) {
                 Some(Key::Board(key)) => keys.pressed(*key),
-                Some(Key::Mouse(button)) => buttons.pressed(*button),
+                Some(Key::Mouse(button)) => !mouse_muted && buttons.pressed(*button),
                 None => false,
             }
     };
@@ -518,13 +554,17 @@ pub fn hear(
     // input settings have that axis read one for a notch (`Mouse Scroll`,
     // one a count): one notch in a frame is a press, and two in the same
     // frame are none.
-    let wheel = if muted { 0 } else { notch(scroll.delta.y) };
+    let wheel = if mouse_muted { 0 } else { notch(scroll.delta.y) };
     bindings.heard = bindings.preset.update(&held, wheel, time.delta_secs());
+    // A variable scope's zoom reads the wheel itself, by its turn, past the
+    // commands (`ScopeZoomHandler.GetZoomInput`).
+    let turned = if mouse_muted { 0.0 } else { scroll.delta.y };
+    bindings.zoom = trp_sim::sights::zoom_input(&bindings.controls, &held, turned, options.optic_sensitivity, options.invert[1]);
     // The mouse's travel, which is the turn's unless the free look's keys
     // give it to the head (`Preset::mouse`). A run nobody is at the keys
     // of has the travel it was told (`--mouse`) in place of the mouse's.
     let travel = if options.unattended() { scripted.0.unwrap_or_default() } else { motion.delta };
-    bindings.mouse = if muted { MouseHeard::default() } else { bindings.preset.mouse([travel.x, travel.y]) };
+    bindings.mouse = if mouse_muted { MouseHeard::default() } else { bindings.preset.mouse([travel.x, travel.y]) };
 }
 
 /// The mouse's travel on this frame in a run nobody is at the keys of:

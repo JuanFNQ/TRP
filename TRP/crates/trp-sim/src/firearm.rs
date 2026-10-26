@@ -14,7 +14,10 @@ use crate::marks::Mark;
 use crate::weapon_animator::{WeaponAnimator, WeaponAnimatorData};
 
 mod chambers;
+mod malfunctions;
 pub use chambers::Chamber;
+pub use malfunctions::{Wear, WearSwitches};
+use crate::malfunction::Malf;
 
 /// How far into the fire state the game starts it.
 const FIRE_STATE_START: f32 = 0.2;
@@ -88,6 +91,8 @@ pub struct FirearmSettings {
     /// as it begins.
     pub must_open_bolt: bool,
     pub manual_bolt_catch: bool,
+    /// A round may be put into its chamber by hand (`isChamberLoad`).
+    pub chamber_load: bool,
     /// The weapon has a stock that folds, fitted, and nothing on it that
     /// blocks the folding (`ItemManipulator.CanFold`).
     pub foldable: bool,
@@ -121,6 +126,17 @@ pub struct FirearmSettings {
     /// operation, from the sights only (more-weapons spec, "One barrel
     /// loaded alone, and the rocket launcher").
     pub rocket_launcher: bool,
+    /// A weapon with no chamber (`Chambers` empty with a detachable
+    /// magazine: `Weapon.HasChambers` false; the PPSh-41, the RPD and
+    /// RPDN, the M60s, the Uzi, the AA-12s): the round fired comes straight
+    /// off its magazine, none waits in a chamber, and the animator is not
+    /// told of one (more-weapons spec, "A weapon with no chamber").
+    pub no_chamber: bool,
+    /// Its template is mountable (`IsMountable`), and it has a bipod, which
+    /// folds forward or not (`BipodViewController.BipodToggleDirection`):
+    /// mounting spec, "Who may ask", "The bipod".
+    pub mountable: bool,
+    pub bipod: Option<bool>,
 }
 
 /// What the weapon did this step, for the host to show and sound.
@@ -161,7 +177,54 @@ pub enum Event {
     /// The next magazine has appeared in the hand (the mark `MagShow`,
     /// `OnMagAppeared`): the weapon draws one again.
     MagazineShown,
+    /// A magazine moved out of the weapon or into it from the inventory has
+    /// gone (the hand has put it away, `OnMagPuttedToRig`) or is in (and a
+    /// round chambered from it if one was to be: `InsertMagOperation.
+    /// SwitchToIdlingState`): the inventory's move is made now.
+    MagazineMoved,
+    /// A round put into the chamber from the inventory is in (the mark
+    /// `AddAmmoInChamber`, `LoadCartridgeToChamber.OnAddAmmoInChamber`).
+    Chambered,
+    /// The hands gave up putting a round into the chamber, being put away
+    /// meanwhile (`LoadCartridgeToChamber.HideWeapon`): the inventory's move
+    /// is undone.
+    ChamberGivenUp,
+    /// The round taken out of the chamber from the inventory has gone (the
+    /// discharge's `MagHide` mark, `DischargeOperation.OnMagPuttedToRig`):
+    /// the chamber is empty.
+    Discharged,
+    /// The weapon's wear and malfunctions (`docs/spec/malfunctions.md`): a
+    /// shot's malfunction (`SwitchToMalfunction`; known to the shooter at
+    /// once); a shot's wear, for the item; the reminder (`ExamineMalfunction`
+    /// when known: the glow and the words); the kind looked at and known
+    /// (whether for the first time); the repair begun and over; a misfire
+    /// put right by a reload, a draw or the chamber unloaded; the repair
+    /// throwing out a failure to feed's round (onto the ground, a thing) or
+    /// a misfired one (drawn only); the heat's stray shot.
+    Malfunctioned(Malf),
+    Worn { durability: f32, max_durability: f32 },
+    MalfunctionReminder { malf: Malf, type_known: bool },
+    MalfunctionExamined { malf: Malf, first: bool },
+    MalfunctionRepairBegun(Malf),
+    MalfunctionRepaired(Malf),
+    MalfunctionCleared(Malf),
+    FedRoundThrown,
+    MisfiredRoundThrown,
+    Autoshot,
+    /// For the left shoulder (left-shoulder spec, "What takes it off"): an
+    /// operation has begun (`SetLeftStanceAnimOnStartOperation`: the rest's
+    /// start and its `IdleStart` mark, the draw, any other), or the
+    /// inventory opened or shut (`FirearmController.SetInventoryOpened`).
+    /// The host passes it to `Movement::left_stance_call`.
+    LeftStance(crate::left_stance::Call),
     FireMode(FireMode),
+    /// The battle screen is to name this way of firing in its ammunition's
+    /// panel (`ShowFireMode`: the fire mode key, changed or not; the force
+    /// to automatic where it changed; the look at the selector).
+    FireModeShown(FireMode),
+    /// A look at the magazine has begun (`Idling.CheckAmmo`): the battle
+    /// screen names its count (`ShowAmmoDetails`).
+    MagazineChecked,
     /// The weapon has appeared in the hands: its draw's last mark.
     Appeared,
     /// It has been put away: its put-away's last mark. Whatever is taken
@@ -188,6 +251,23 @@ pub enum Event {
     /// (the mark `ThirdAction`: 1 as it comes to the hands, 2 as it
     /// leaves them): for `Body::set_weapon_action`.
     BodyAction(i32),
+    /// An operation that ends blind fire has begun with it on (the stock
+    /// folded, the backpack dropped, the weapon put away, a reload): the
+    /// host ends it in the movement and the weapon's motion
+    /// (`Movement::end_blind_fire`; blind-fire spec, "What ends it").
+    BlindFireEnded,
+    /// An operation that ends a mount has been asked for (mounting spec,
+    /// "What ends it"): a reload, the looks, the fire mode's look, with the
+    /// exit (`StartExitingMountedState`); the stock folded and the weapon put
+    /// away, at once (`ExitMountedState`). The host tells the movement
+    /// (`Movement::leave_mount`), mounted or not.
+    LeaveMount { at_once: bool },
+    /// The bipod has been put out or in (`ToggleBipodOperation.Start`): the
+    /// host asks the body for the gesture (`Interaction::bipod`) and tells the
+    /// weapon's motion (`Hands::set_bipod`) and the movement
+    /// (`Movement::set_mount_weapon`). The operation ends on the gesture's
+    /// mark (`bipod_toggled`).
+    Bipod { out: bool, forward: bool },
 }
 
 /// The mastering level from which a reload keeps the sights up.
@@ -248,7 +328,7 @@ enum Operation {
     Idle,
     /// One shot, then a wait until the weapon may fire again. The
     /// inventory opening is only noted.
-    Single { cooldown: f32, fired: bool, ready: bool, second_shot: bool, open_inventory: bool, planned: Option<Planned> },
+    Single { cooldown: f32, fired: bool, ready: bool, second_shot: bool, open_inventory: bool, planned: Option<Planned>, malf: Malf },
     /// Shots on a clock for as long as the trigger is held. The clock
     /// waits for the fire state's own shot mark.
     Automatic { clock: f32, shots: u32, running: bool, open_inventory: bool, planned: Option<Planned> },
@@ -273,12 +353,37 @@ enum Operation {
     /// The stock being folded or unfolded (`FoldStockOperation`), until
     /// the state's mark for it: `to` is how it will stand.
     Fold { to: bool, hide: Option<bool> },
+    /// The bipod being put out or in (`ToggleBipodOperation`), until the
+    /// body's gesture's mark (`OnBipodToggle`).
+    Bipod { hide: Option<bool> },
     /// A look at the weapon (at its magazine, into its chamber, at its
     /// selector, or all over), through which the aim key and the trigger
     /// do nothing. It is ready to end once its state's first mark has
     /// come, and ends at the resting state's. `examine` is the look all
     /// over, which the trigger does end.
     Utility { ready: bool, time: f32, in_inventory: bool, examine: bool },
+    /// The magazine taken out of the weapon from the inventory
+    /// (`PullOutMagOperation`; firing spec, "A magazine taken out or put
+    /// in from the inventory"), until the hand has put it away: `pulled`
+    /// that its `MagOut` mark has come.
+    InventoryMagOut { pulled: bool },
+    /// A magazine put into the weapon from the inventory
+    /// (`InsertMagOperation`), until it is in, or a round chambered from
+    /// it: `shown`, `inserted` that those marks have come.
+    InventoryMagIn { shown: bool, inserted: bool },
+    /// A round put into the empty chamber from the inventory
+    /// (`LoadCartridgeToChamber`), until it is in.
+    InventoryChamber,
+    /// The round taken out of the chamber from the inventory
+    /// (`DischargeOperation`), until the hand has put it away.
+    InventoryDischarge,
+    /// A shot's malfunction, until its state's mark (`StartMalfunction`).
+    Malfunction { malf: Malf },
+    /// The look at a malfunction (`ExamineMalfunctionTypeOperation`).
+    ExamineMalfunction,
+    /// Its repair (`RepairMalfunction`), `ejected` that its round has been
+    /// thrown out.
+    RepairMalfunction { malf: Malf, ejected: bool },
     /// The backpack being dropped (`DropBackpackOperation`), until the
     /// body's gesture has it off the shoulders: nothing is taken
     /// meanwhile but the sights going down.
@@ -296,6 +401,7 @@ enum Operation {
     ChambersReload { can_abort: bool, aborted: bool, added: bool, hide: Option<bool> },
 }
 
+#[derive(Clone)]
 pub struct Firearm {
     pub settings: FirearmSettings,
     /// For a weapon whose rounds lie in chambers of their own (a
@@ -326,6 +432,21 @@ pub struct Firearm {
     aim_flags: bool,
     /// A round is chambered.
     pub chamber: bool,
+    /// A weapon with no chamber's own `Armed` (`Weapon.Armed`): kept by the
+    /// clips' `Arm` and `Disarm` marks and given to the animator as it is
+    /// drawn (`SetAnimatorValues`), whose draw arms it where it is not.
+    armed: bool,
+    /// The fitted magazine's `magAnimationIndex`, and the one the next
+    /// reload or magazine put in brings: the animator's `RelTypeOld` and
+    /// `RelTypeNew`, by which the reload's and the look's clips are chosen
+    /// (firing spec, "Which magazine"). The build's at first.
+    mag_variant: i32,
+    incoming_variant: i32,
+    /// The chambered round has gone to the shell port with a shot and the
+    /// next is not yet in sight in the chamber (the fire clip's
+    /// `AddAmmoInChamber`, an automatic cycle's `AUTO_CHAMBER`): what a host
+    /// draws there (`round_drawn_in_chamber`).
+    round_out: bool,
     /// Rounds in the fitted magazine, if one is fitted.
     pub magazine: Option<u32>,
     /// Rounds in the magazine a reload under way is fitting, and whether
@@ -364,12 +485,31 @@ pub struct Firearm {
     shot_made: bool,
     operation: Operation,
     events: Vec<Event>,
+    /// The kind of operation the left shoulder was last told had begun.
+    left_stance_seen: Option<std::mem::Discriminant<Operation>>,
+    /// The weapon's wear, malfunctions and heat, where the host gave them
+    /// (`set_wear`); and the automatic fire's interval (`_shotsTime`: the
+    /// game's operation is made once a weapon drawn and keeps the last the
+    /// heat set) and the heat's factor applied in this burst (`float_6`).
+    wear: Option<Box<Wear>>,
+    auto_cycle: f32,
+    burst_rate: f32,
     /// The weapon's own animator, and the marks it last delivered.
     animator: WeaponAnimator,
     marks: Vec<Mark>,
     /// Whether what is drawn of the animator is taken on curves without
     /// corners through its clips' samples (`set_drawn_smooth`).
     drawn_smooth: bool,
+    /// The weapon's blind-fire flag (`FirearmController.Blindfire`;
+    /// `docs/spec/blind-fire.md`): while it is on, the sights, their keys,
+    /// the fire mode, the looks and every reload are refused.
+    blind_fire: bool,
+    /// The bipod is out (`FirearmController.BipodState`), and the weapon is
+    /// mounted forward on it, which runs the tactical reload's blend
+    /// (`UpdateTacticalReload`; mounting spec, "The weapon's motion while
+    /// mounted").
+    bipod_out: bool,
+    mount_tactical: bool,
 }
 
 /// What the character's skill with a class of weapon (Pistols, Assault
@@ -421,6 +561,10 @@ impl Firearm {
             self.fill_chambers(false);
         } else if !self.has_chambers() {
             self.chamber = false;
+            // `PROVISIONAL`: a weapon with no chamber found unarmed, as one
+            // with a chamber is found with it empty (the item's own `Armed`
+            // in the game's loot is not read).
+            self.armed = false;
         }
     }
 
@@ -430,8 +574,44 @@ impl Firearm {
         if self.has_chambers() {
             self.fill_chambers(true);
         } else {
-            self.chamber = true;
+            self.chamber = !self.settings.no_chamber;
+            self.armed = true;
         }
+    }
+
+    /// The fitted magazine's `magAnimationIndex`, where the host's item has
+    /// another magazine than the build the weapon was made from.
+    pub fn set_magazine_variant(&mut self, variant: i32) {
+        self.mag_variant = variant;
+    }
+
+    /// The `magAnimationIndex` of the magazine the next reload or magazine
+    /// put in from the inventory brings (`FirearmsAnimator.Reload`'s new
+    /// type, `InsertMagOperation`'s): the host's, as it picks the magazine.
+    pub fn next_magazine_variant(&mut self, variant: i32) {
+        self.incoming_variant = variant;
+    }
+
+    /// Whether a reload's old magazine is still in the hand: the reload has
+    /// begun and the old one has not yet been put away (`MagHide`).
+    pub fn old_magazine_in_hand(&self) -> bool {
+        matches!(self.operation, Operation::Reload { mag_hidden: false, .. })
+    }
+
+    /// Whether a round lies in the weapon's chamber of its own to be drawn
+    /// there (`Firearms.SetRoundIntoWeapon`: the round's model at the
+    /// chamber's point, always there while one is chambered, seen as the
+    /// action opens): not a weapon with chambers of its own or none, and
+    /// not from a shot until the next round is fed in sight
+    /// (`MoveAmmoFromChamberToShellPort`, then `OnAddAmmoInChamber`).
+    pub fn round_drawn_in_chamber(&self) -> bool {
+        self.chamber && !self.round_out && !self.has_chambers() && !self.settings.no_chamber
+    }
+
+    /// Whether a round is ready to fire: the chamber's, or on a weapon with
+    /// no chamber, the magazine's top one (`Idling.SetTriggerPressed`).
+    pub fn loaded(&self) -> bool {
+        self.chamber || (self.settings.no_chamber && self.magazine.is_some_and(|rounds| rounds > 0))
     }
 
     fn made(settings: FirearmSettings, animator: &WeaponAnimatorData) -> Self {
@@ -448,7 +628,11 @@ impl Firearm {
             reload_unloads: false,
             aim_told: false,
             aim_flags: false,
-            chamber: true,
+            chamber: !settings.no_chamber,
+            armed: true,
+            mag_variant: settings.magazine_variant,
+            incoming_variant: settings.magazine_variant,
+            round_out: false,
             magazine: Some(settings.magazine_capacity),
             incoming: settings.magazine_capacity,
             chambers: false,
@@ -468,10 +652,61 @@ impl Firearm {
             shot_made: false,
             operation: Operation::Away,
             events: Vec::new(),
+            left_stance_seen: None,
+            wear: None,
+            auto_cycle: 60.0 / settings.fire_rate,
+            burst_rate: 0.0,
             animator: WeaponAnimator::new(animator),
             marks: Vec::new(),
             drawn_smooth: false,
+            blind_fire: false,
+            bipod_out: false,
+            mount_tactical: false,
             settings,
+        }
+    }
+
+    /// Whether the weapon may start blind fire now (`FirearmController.
+    /// CanSetBlindFire`): its logic idling, not a rocket launcher, the
+    /// inventory shut. So not in a shot, automatic fire, a reload, a look,
+    /// a draw or a put-away.
+    pub fn can_set_blind_fire(&self) -> bool {
+        !self.settings.rocket_launcher && self.is_idling() && !self.inventory
+    }
+
+    /// Blind fire's figure as the movement's gate took it
+    /// (`Movement::take_blind_fire`), told to the operation in hand
+    /// (`FirearmOperation.BlindFire`): the idling and every fire operation
+    /// pass it on, every other operation passes 0. Passed on, the flag is
+    /// on for a side, and a start puts the sights down without the aim
+    /// key's call (no kit's rattle: `BlindFire_Internal` sets `IsAiming`).
+    /// Returns what was passed on, for the weapon's motion
+    /// (`Hands::start_blind_fire`).
+    pub fn set_blind_fire(&mut self, side: i32) -> i32 {
+        let passes = matches!(
+            self.operation,
+            Operation::Idle | Operation::Single { .. } | Operation::Automatic { .. } | Operation::CylinderFire { .. } | Operation::BarrelsFire { .. }
+        );
+        let passed = if passes { side } else { 0 };
+        self.blind_fire = passed != 0;
+        if self.blind_fire {
+            self.aiming = false;
+        }
+        passed
+    }
+
+    /// Whether the weapon's blind-fire flag is on.
+    pub fn blind_fire(&self) -> bool {
+        self.blind_fire
+    }
+
+    /// An operation that ends blind fire has begun (`SetBlindFire(0)` at
+    /// its start): the host ends it in the movement and the weapon's motion
+    /// (`Event::BlindFireEnded`). Only told with the flag on.
+    fn ends_blind_fire(&mut self) {
+        if self.blind_fire {
+            self.blind_fire = false;
+            self.events.push(Event::BlindFireEnded);
         }
     }
 
@@ -510,11 +745,64 @@ impl Firearm {
         }
     }
 
+    /// The same weapon built anew with other parts (the app's builds:
+    /// `inventory::rig_key`) takes over what the build it replaces had in
+    /// it and how that was set, before `start_drawn`: the rounds in its
+    /// chambers (a cylinder's, barrels'; where it has as many), the turn of
+    /// its cylinder, its own chamber, its magazine's count, its fire mode
+    /// (where it has it) and its hammer. The app's: the game changes a part
+    /// on the weapon's own model and its logic goes on as it was.
+    pub fn take_over(&mut self, from: &Firearm) {
+        if self.in_chambers.len() == from.in_chambers.len() {
+            self.in_chambers = from.in_chambers.clone();
+            self.camora = from.camora;
+        }
+        (self.chamber, self.magazine, self.hammer_closed, self.armed) = (from.chamber, from.magazine, from.hammer_closed, from.armed);
+        (self.mag_variant, self.incoming_variant) = (from.mag_variant, from.incoming_variant);
+        if let Some(mode) = from.settings.modes.get(from.mode).copied() {
+            self.start_in_mode(mode);
+        }
+    }
+
+    /// The same weapon built anew with another part (a magazine of another
+    /// kind put in by a reload) takes over everything the build it replaces
+    /// was doing, its operation and its animator's states and times with
+    /// it, where its animator runs machines of the same shape: the reload
+    /// goes on through the change, on the new build's tree (the app's: the
+    /// game changes the part on the weapon's own model). Its own settings
+    /// stay. Whether it could.
+    pub fn carry_on_from(&mut self, from: &Firearm) -> bool {
+        let mut animator = self.animator.clone();
+        if !animator.take_state(&from.animator) {
+            return false;
+        }
+        let settings = self.settings.clone();
+        *self = from.clone();
+        (self.settings, self.animator) = (settings, animator);
+        true
+    }
+
+    /// Whether no magazine is in sight in the hands now: a reload's old one
+    /// has left the hand (`MagHide`) and the new one is not yet shown
+    /// (`MagShow`), or one put in from the inventory is not yet shown: when
+    /// the weapon's model may change its magazine unseen.
+    pub fn magazine_out_of_sight(&self) -> bool {
+        matches!(self.operation, Operation::Reload { mag_hidden: true, mag_shown: false, .. } | Operation::InventoryMagIn { shown: false, .. })
+    }
+
+    /// Whether a magazine going in is in sight now: a reload's or one put
+    /// in from the inventory, from its `MagShow` (where the game makes the
+    /// new magazine's model on the weapon) to the operation's end.
+    pub fn magazine_shown_going_in(&self) -> bool {
+        matches!(self.operation, Operation::Reload { mag_shown: true, .. } | Operation::InventoryMagIn { shown: true, .. })
+    }
+
     /// Has the hammer cocked or down, and the bolt caught open or home,
     /// as something before left them: for a replay that begins where a
     /// recording stood. After `start_drawn`.
     pub fn start_with(&mut self, armed: Option<bool>, bolt_caught: Option<bool>) {
         if let Some(armed) = armed {
+            self.armed = armed;
             self.animator.set_flag("Armed", armed);
             self.animator.set_layer_weight("Hammer", if armed { 0.0 } else { 1.0 });
         }
@@ -541,6 +829,24 @@ impl Firearm {
         self.animator.set_flag("StockFolded", self.folded);
     }
 
+    /// The class skill's two speeds (`weapon_skill_speeds`, or a level's
+    /// buffs: `skills::WeaponBuffs`), which the animator is told as the
+    /// weapon is taken in hand (`SyncWithCharacterSkills`): a change shows
+    /// from the next draw, as in the game.
+    pub fn set_skill_speeds(&mut self, reload_speed: f32, draw_speed: f32) {
+        (self.settings.reload_speed, self.settings.draw_speed) = (reload_speed, draw_speed);
+        self.animator.set("SpeedReload", reload_speed);
+        self.animator.set("SpeedDraw", draw_speed);
+    }
+
+    /// The animator's two speeds for what is under way alone
+    /// (`FirearmsAnimator.SetSpeedParameters`), as the quick draw sets them;
+    /// the weapon's next taking in hand puts its skill's back.
+    pub fn set_animator_speeds(&mut self, reload_speed: f32, draw_speed: f32) {
+        self.animator.set("SpeedReload", reload_speed);
+        self.animator.set("SpeedDraw", draw_speed);
+    }
+
     /// The logic and the animator as the game makes them for a weapon
     /// taken in hand: nothing left over from when it was last there but
     /// what the weapon itself holds (its rounds, its fire mode).
@@ -555,6 +861,13 @@ impl Firearm {
         (self.aiming, self.interrupted) = (false, false);
         (self.inventory, self.reload_flag, self.hands_busy, self.shot_made) = (false, false, false, false);
         self.marks.clear();
+        // A weapon with a malfunction is made with it held on its animator
+        // (`WeaponPrefab`'s spawn of a malfunctioned weapon).
+        let malf = self.malfunction();
+        if malf != Malf::None {
+            self.malfunction_ints(-1, malf.number());
+            self.animator.set_layer_weight("Malfunction", 1.0);
+        }
     }
 
     /// Takes the weapon in hand (`SpawnOperation`): the animator leaves
@@ -576,15 +889,36 @@ impl Firearm {
         self.animator.set_layer_weight("LActions", 0.0);
         self.animator_fold();
         self.animator_rounds();
+        if self.settings.no_chamber {
+            self.animator.set_flag("Armed", self.armed);
+        }
         self.hands_busy = true;
         // The round goes over now; the animator hears of it at the mark
         // of the bolt going home. (Chambers of their own have no bolt to
         // rack.)
-        let arms = !self.has_chambers() && !self.chamber && self.magazine.is_some_and(|rounds| rounds > 0);
+        let arms = !self.has_chambers() && !self.settings.no_chamber && !self.chamber && self.magazine.is_some_and(|rounds| rounds > 0);
         if arms {
             self.take_round();
         }
         self.operation = Operation::Spawn { hide: None, arms };
+    }
+
+    /// Has a draw just begun (`draw`, before the animator has stepped) rack
+    /// the weapon as it comes up, for the look of it alone (the app's: the
+    /// workbench's weapon drawn after a change was built, the user,
+    /// 2026-10-21: "Just a nice visual thing"): the animator is told its
+    /// chamber empty and a round in its magazine, so that it draws by the
+    /// draw that racks, and the rounds as they are at the bolt's mark
+    /// (`AddAmmoInChamber`); no round is moved. A draw that racks of
+    /// itself, a weapon with chambers of its own and one with no magazine
+    /// fitted are left as they are.
+    pub fn rack_drawn(&mut self) {
+        let has_chambers = self.has_chambers() || self.settings.no_chamber;
+        let Operation::Spawn { arms, .. } = &mut self.operation else { return };
+        let Some(rounds) = self.magazine.filter(|_| !*arms && !has_chambers) else { return };
+        *arms = true;
+        self.animator.set("AmmoInChamber", 0.0);
+        self.animator.set("AmmoInMag", rounds.max(1) as f32);
     }
 
     /// Puts the weapon away (`HideWeapon`). At rest, and in a look at it,
@@ -593,7 +927,13 @@ impl Firearm {
     /// where it hands over and a draw. `Event::Hidden` says when it is
     /// out of the hands.
     pub fn hide(&mut self, fast: bool) {
+        // The thing in hand changing leaves a mount at once (`HandsChangingEvent`).
+        self.events.push(Event::LeaveMount { at_once: true });
         match &mut self.operation {
+            // A malfunction's own operations take no put-away: one asked for
+            // meanwhile is lost (the base operation's `ProhibitedCall`;
+            // `PROVISIONAL`: their own `HideWeapon` not read).
+            Operation::Malfunction { .. } | Operation::ExamineMalfunction | Operation::RepairMalfunction { .. } => {}
             Operation::Idle | Operation::Utility { .. } => {
                 if self.is_idling() {
                     self.aiming = false;
@@ -611,20 +951,33 @@ impl Firearm {
                     self.animator.set_flag("BoltActionReload", true);
                 }
             }
-            Operation::Reload { hide, .. } | Operation::Spawn { hide, .. } | Operation::Fold { hide, .. } => *hide = Some(fast),
+            Operation::Reload { hide, .. } | Operation::Spawn { hide, .. } | Operation::Fold { hide, .. } | Operation::Bipod { hide } => *hide = Some(fast),
             Operation::ChambersReload { hide, aborted, .. } => (*hide, *aborted) = (Some(fast), true),
             // A shot from chambers of their own finishes first; a
             // put-away asked for meanwhile is lost.
             Operation::CylinderFire { .. } | Operation::BarrelsFire { .. } => {}
             // A tube being filled is cut short for it.
             Operation::Shells { hide, aborted, .. } => (*hide, *aborted) = (Some(fast), true),
-            // A backpack's drop takes no put-away at all: one asked for
-            // meanwhile is lost.
-            Operation::Remove | Operation::Away | Operation::DropBackpack => {}
+            // A backpack's drop, and a magazine moved from the inventory,
+            // take no put-away at all: one asked for meanwhile is lost
+            // (the base operation's `ProhibitedCall`).
+            Operation::Remove | Operation::Away | Operation::DropBackpack | Operation::InventoryMagOut { .. } | Operation::InventoryMagIn { .. } | Operation::InventoryDischarge => {}
+            // A round being put into the chamber is given up at once, and the
+            // weapon goes (`LoadCartridgeToChamber.HideWeapon`).
+            Operation::InventoryChamber => {
+                self.events.push(Event::ChamberGivenUp);
+                self.aiming = false;
+                self.trigger_to(false);
+                self.animator.set_flag("LoadOne", false);
+                self.start_remove(fast);
+            }
         }
     }
 
     fn start_remove(&mut self, fast: bool) {
+        // The put-away ends blind fire (`Player.TryProceed`, and the
+        // put-away's own start).
+        self.ends_blind_fire();
         self.animator.set_flag("Active", false);
         self.animator.set_flag("FastHide", fast);
         self.hands_busy = true;
@@ -663,14 +1016,16 @@ impl Firearm {
         if self.has_chambers() {
             return self.animate_chambers();
         }
-        self.animator.set("AmmoInChamber", self.chamber as u8 as f32);
+        if !self.settings.no_chamber {
+            self.animator.set("AmmoInChamber", self.chamber as u8 as f32);
+        }
         self.animator.set("AmmoInMag", self.magazine.unwrap_or(0) as f32);
     }
 
     /// What the idling operation tells the animator of the weapon as it
     /// starts (`SetAnimatorValues`).
     fn animator_values(&mut self) {
-        let (fitted, variant) = (self.magazine.is_some(), self.settings.magazine_variant as f32);
+        let (fitted, variant) = (self.magazine.is_some(), self.mag_variant as f32);
         self.animator_rounds();
         if self.settings.modes.len() > 1 {
             self.animator.set("FireMode", mode_number(self.mode()));
@@ -704,7 +1059,7 @@ impl Firearm {
 
     /// Whether the idling operation is the one in hand, whatever the
     /// animator is still playing out.
-    fn is_idling(&self) -> bool {
+    pub fn is_idling(&self) -> bool {
         self.operation == Operation::Idle
     }
 
@@ -792,6 +1147,10 @@ impl Firearm {
         if pressed && (!self.hands_free || self.reload_flag) {
             return;
         }
+        // A malfunction takes the trigger: no shot (`Idling.SetTriggerPressed`).
+        if self.malfunction_trigger(pressed) {
+            return;
+        }
         self.animator_rounds();
         // Chambers of their own have operations of their own, and so has
         // a rocket launcher.
@@ -805,7 +1164,7 @@ impl Firearm {
             return self.barrels_trigger(pressed);
         }
         self.trigger_to(pressed);
-        if pressed && self.chamber {
+        if pressed && self.loaded() {
             // One shot a press in the two single modes; anything else
             // fires for as long as the trigger is held.
             if matches!(self.mode(), FireMode::Single | FireMode::SemiAuto) {
@@ -832,7 +1191,17 @@ impl Firearm {
     /// a weapon being drawn or put away does not hear of it at all (one
     /// that has just appeared is told afresh: `draw`).
     pub fn set_inventory(&mut self, open: bool) {
+        // The left shoulder first (`FirearmController.SetInventoryOpened`).
+        self.events.push(Event::LeftStance(crate::left_stance::Call::Inventory(open)));
+        // Opened, blind fire is over (`FirearmController.InventoryOpened`).
+        if open {
+            self.ends_blind_fire();
+        }
         match &mut self.operation {
+            // The malfunction's own operations leave the animator be (the
+            // base operation's `ProhibitedCall`); the rest after them goes
+            // by it.
+            Operation::Malfunction { .. } | Operation::ExamineMalfunction | Operation::RepairMalfunction { .. } => self.inventory = open,
             Operation::Idle => {
                 self.aiming = false;
                 self.idle_trigger(false);
@@ -856,8 +1225,8 @@ impl Firearm {
                 }
             }
             // A stock being folded only notes it, and tells the animator
-            // when the fold is over.
-            Operation::Fold { .. } => self.inventory = open,
+            // when the fold is over; so does the bipod's toggle.
+            Operation::Fold { .. } | Operation::Bipod { .. } => self.inventory = open,
             Operation::Reload { mag_out, mag_shown, .. } => {
                 self.inventory = open;
                 if *mag_out || *mag_shown {
@@ -890,8 +1259,163 @@ impl Firearm {
                 }
             }
             Operation::CylinderFire { .. } | Operation::BarrelsFire { .. } => self.inventory = open,
+            // A magazine moved from the inventory tells the animator at
+            // once (`PullOutMagOperation`, `InsertMagOperation`:
+            // `SetInventoryOpened`).
+            Operation::InventoryMagOut { .. } | Operation::InventoryMagIn { .. } | Operation::InventoryChamber | Operation::InventoryDischarge => {
+                self.inventory = open;
+                self.animator.set_flag("Inventory", open);
+            }
             Operation::Spawn { .. } | Operation::Remove | Operation::Away => {}
         }
+    }
+
+    /// Whether the inventory may move the weapon's magazine now, which the
+    /// hands then do (`FirearmController.CanExecute`): only while the
+    /// logic idles.
+    pub fn can_move_magazine(&self) -> bool {
+        matches!(self.operation, Operation::Idle)
+    }
+
+
+    /// The magazine moved out of the weapon from the inventory
+    /// (`PullOutMagOperation`; firing spec, "A magazine taken out or put
+    /// in from the inventory"): the hands take it out by the reload's first
+    /// half from their inventory pose, and `Event::MagazineMoved` says when
+    /// it has gone. False, and nothing done, if the logic is not idling or
+    /// no magazine is in.
+    pub fn pull_out_magazine(&mut self) -> bool {
+        if !self.can_move_magazine() || self.magazine.is_none() {
+            return false;
+        }
+        self.trigger_to(false);
+        self.animator.set_flag("MagInFromInv", false);
+        self.animator.trigger("MagOutFromInv");
+        self.animator.set_flag("CanReload", false);
+        self.animator.set_flag("Fire", false);
+        self.animator.set_flag("IsExternalMag", true);
+        // (`PullOutMagOperation.Start`: the fitted one's, nought with none.)
+        self.animator.set("RelTypeOld", if self.magazine.is_some() { self.mag_variant as f32 } else { 0.0 });
+        let s = &self.settings;
+        if s.bolt_catch && self.chamber && !s.manual_bolt_catch && !s.must_open_bolt {
+            self.set_bolt_catch(false);
+        }
+        (self.hands_busy, self.reload_flag) = (true, true);
+        self.operation = Operation::InventoryMagOut { pulled: false };
+        true
+    }
+
+    /// A magazine of `rounds` put into the weapon from the inventory
+    /// (`InsertMagOperation`): the hands put it in by the reload's second
+    /// half, and chamber a round from it if the chamber is empty;
+    /// `Event::MagazineMoved` says when it is done. False, and nothing
+    /// done, if the logic is not idling or a magazine is in already.
+    pub fn insert_magazine(&mut self, rounds: u32) -> bool {
+        if !self.can_move_magazine() || self.magazine.is_some() {
+            return false;
+        }
+        self.trigger_to(false);
+        self.incoming = rounds;
+        self.chambers = !self.chamber && !self.settings.no_chamber && rounds > 0;
+        let variant = self.incoming_variant as f32;
+        self.animator.set_flag("Fire", false);
+        self.animator.set_flag("IsExternalMag", true);
+        self.animator.set_flag("CanReload", true);
+        self.animator.set("RelTypeOld", variant);
+        self.animator.set("RelTypeNew", variant);
+        self.animator.trigger("MagInFromInv");
+        let s = &self.settings;
+        if s.bolt_catch && self.chamber && !self.chambers && !s.manual_bolt_catch && !s.must_open_bolt {
+            self.set_bolt_catch(false);
+        }
+        (self.hands_busy, self.reload_flag) = (true, true);
+        self.operation = Operation::InventoryMagIn { shown: false, inserted: false };
+        true
+    }
+
+
+    /// Whether the hands would take a round put into the chamber from the
+    /// inventory now (`Idling.Execute`, a round moved to a chamber): the
+    /// logic idles, the weapon has one chamber of the weapon's own and it
+    /// is empty, a weapon of a detachable magazine has none in, and its
+    /// chamber is loaded by hand (`isChamberLoad`).
+    pub fn can_load_chamber(&self) -> bool {
+        self.can_move_magazine() && !self.has_chambers() && !self.settings.no_chamber && !self.chamber && (self.settings.internal_magazine || self.magazine.is_none()) && self.settings.chamber_load
+    }
+
+    /// Whether the weapon has one chamber of its own (not a cylinder's nor
+    /// barrels'), which `chamber` says of.
+    pub fn single_chamber(&self) -> bool {
+        !self.has_chambers()
+    }
+
+    /// A round put into the empty chamber from the inventory
+    /// (`LoadCartridgeToChamber`; firing spec, "A round into the chamber
+    /// from the inventory"): aiming off, the trigger let go, the animator's
+    /// load of one (`LoadOne`, chamber 0) from its inventory pose or its
+    /// rest; at the state's `AddAmmoInChamber` mark the round is in
+    /// (`Event::Chambered`) and the logic idles. False, and nothing done,
+    /// where the hands would not take it (`can_load_chamber`).
+    pub fn load_chamber(&mut self) -> bool {
+        if !self.can_load_chamber() {
+            return false;
+        }
+        self.aiming = false;
+        self.trigger_to(false);
+        self.animator.set_flag("Fire", false);
+        self.animator.set_flag("UseLeftHand", false);
+        self.animator.set_flag("LoadOne", true);
+        self.animator.set("ChamberIndex", 0.0);
+        (self.hands_busy, self.reload_flag) = (true, true);
+        self.operation = Operation::InventoryChamber;
+        true
+    }
+
+    /// Whether the hands would let the chambered round be taken out from
+    /// the inventory now (`Idling.Execute`, a round moved out of a chamber):
+    /// the logic idles, the weapon has one chamber of its own with a round
+    /// in it, and a weapon of a detachable magazine has none in, one of a
+    /// magazine of its own has it empty.
+    pub fn can_discharge(&self) -> bool {
+        let emptied = if self.settings.internal_magazine { self.magazine.unwrap_or(0) == 0 } else { self.magazine.is_none() };
+        // (An animator without the state would never give its mark: the
+        // round stays, `PROVISIONAL`, the game's weapons all having it.)
+        let played = self.animator.has("Discharge") && self.animator.has_state("Hands.DISCHARGE");
+        self.can_move_magazine() && !self.has_chambers() && !self.settings.no_chamber && self.chamber && emptied && played
+    }
+
+    /// The chambered round taken out from the inventory (`DischargeOperation`;
+    /// firing spec, "The chambered round taken out from the inventory"):
+    /// aiming off, the trigger let go, blind fire ended, the animator's
+    /// `Discharge` (the AKM's `DISCHARGE`, from its inventory pose or its
+    /// rest); at the state's `MagHide` mark the chamber is empty
+    /// (`Event::Discharged`) and the logic idles. False, and nothing done,
+    /// where the hands would not let it out (`can_discharge`).
+    pub fn discharge(&mut self) -> bool {
+        if !self.can_discharge() {
+            return false;
+        }
+        // It puts a misfire right (`DischargeOperation.Start`).
+        self.clear_misfire();
+        self.aiming = false;
+        self.animator.set_flag("Discharge", true);
+        self.trigger_to(false);
+        self.animator.set_flag("Fire", false);
+        self.ends_blind_fire();
+        self.animator.set("ChamberIndex", 0.0);
+        // (`SetLoadOneForNextOperation`: a load after it only for a round
+        // moved from one chamber to another.)
+        self.animator.set_flag("LoadOne", false);
+        (self.hands_busy, self.reload_flag) = (true, true);
+        self.operation = Operation::InventoryDischarge;
+        true
+    }
+
+    /// A magazine's move from the inventory done: the inventory makes it,
+    /// and the logic idles.
+    fn inventory_move_over(&mut self) {
+        self.events.push(Event::MagazineMoved);
+        self.to_idle();
     }
 
     /// Whether the animator is in its resting state, on a way out of it or
@@ -936,6 +1460,11 @@ impl Firearm {
     /// well, where the key does nothing either way. What else lowers them
     /// is `lower_aim` and `sprint_started`.
     pub fn set_aim(&mut self, want: bool, allowed: bool) {
+        // In blind fire the call is refused outright, either way
+        // (`FirearmController.SetAim`).
+        if self.blind_fire {
+            return;
+        }
         // Whoever uses the key, an obstacle no longer has the sights to
         // give back.
         self.interrupted = false;
@@ -1068,6 +1597,16 @@ impl Firearm {
     }
 
     fn reload_magazine(&mut self, rounds: u32, quick: bool) {
+        // The reload's key leaves a mount first (`FirearmHandsInputTranslator`).
+        self.events.push(Event::LeaveMount { at_once: false });
+        // No reload starts in blind fire (`CanStartReload`), nor with a
+        // failure to feed, which reminds instead.
+        if self.blind_fire {
+            return;
+        }
+        if self.malfunction() == Malf::Feed {
+            return self.remind();
+        }
         match &mut self.operation {
             // A reload asked for while the last one's animation is still
             // playing out is taken like any other: the operation begins
@@ -1108,13 +1647,13 @@ impl Firearm {
     fn begin_reload(&mut self, rounds: u32, quick: bool) {
         self.events.push(Event::MagazineSwap { left: self.magazine, quick });
         self.incoming = rounds;
-        self.chambers = !self.chamber && rounds > 0;
-        let (fitted, variant) = (self.magazine.is_some(), self.settings.magazine_variant as f32);
+        self.chambers = !self.chamber && !self.settings.no_chamber && rounds > 0;
+        let fitted = self.magazine.is_some();
         self.animator.set_flag("Inventory", false);
         self.animator.set_flag("IsExternalMag", true);
         self.animator.set_flag("CanReload", true);
-        self.animator.set("RelTypeOld", if fitted { variant } else { -1.0 });
-        self.animator.set("RelTypeNew", variant);
+        self.animator.set("RelTypeOld", if fitted { self.mag_variant as f32 } else { -1.0 });
+        self.animator.set("RelTypeNew", self.incoming_variant as f32);
         self.animator.trigger(if quick { "ReloadFast" } else { "Reload" });
         // With a round chambered and none to chamber from the new
         // magazine, a bolt held open is let go as the reload begins
@@ -1137,7 +1676,7 @@ impl Firearm {
     /// Asked for during a shot, it follows the shot if nothing else is to.
     /// `Event::RoundsTaken` says what has left the character's stock.
     pub fn reload_shells(&mut self, within_reach: u32) {
-        if within_reach == 0 || self.magazine.is_none() {
+        if within_reach == 0 || self.magazine.is_none() || self.blind_fire {
             return;
         }
         match &mut self.operation {
@@ -1311,15 +1850,90 @@ impl Firearm {
     /// (`Event::Folded`) and the logic idles again while the animation
     /// plays out. Whether it began.
     pub fn fold_stock(&mut self) -> bool {
-        if !self.settings.foldable || !self.is_idling() {
+        if !self.settings.foldable {
             return false;
         }
+        // A stock that folds leaves a mount at once (`FoldStock`'s command).
+        self.events.push(Event::LeaveMount { at_once: true });
+        if !self.is_idling() {
+            return false;
+        }
+        // The fold is not refused in blind fire, and ends it
+        // (`FoldStockOperation.Start`).
+        self.ends_blind_fire();
         self.trigger_to(false);
         self.animator.set_flag("Inventory", false);
         self.animator.trigger("StockSwitch");
         self.hands_busy = true;
         self.operation = Operation::Fold { to: !self.folded, hide: None };
         true
+    }
+
+    /// Whether the thing in hand may mount (`Player.TryMountWeapon`'s part of
+    /// the weapon's): a mountable firearm in hand, in no reload, draw,
+    /// put-away or interaction with the inventory.
+    pub fn may_mount(&self) -> bool {
+        self.settings.mountable
+            && !self.reloading()
+            && !matches!(
+                self.operation,
+                Operation::Away | Operation::Spawn { .. } | Operation::Remove | Operation::DropBackpack | Operation::InventoryMagOut { .. } | Operation::InventoryMagIn { .. } | Operation::InventoryChamber | Operation::InventoryDischarge
+            )
+    }
+
+    /// Mounted or not, as the mount told the weapon (`FirearmsAnimator.
+    /// SetMounted`: the animator's `Mounted`, where it has one); and whether
+    /// mounted forward on the bipod (the tactical reload's blend runs then).
+    pub fn set_mounted(&mut self, mounted: bool, on_bipod: bool) {
+        if self.animator.has("Mounted") {
+            self.animator.set_flag("Mounted", mounted);
+        }
+        self.mount_tactical = mounted && on_bipod;
+    }
+
+    /// Whether the weapon has a bipod, and whether it is out.
+    pub fn bipod(&self) -> Option<bool> {
+        self.settings.bipod.map(|_| self.bipod_out)
+    }
+
+    /// The bipod's key (`FirearmController.ToggleBipod`): refused without a
+    /// bipod, mounted, with the weapon stuck into something, in a sprint,
+    /// with the body unable to make a gesture (`gesture_free`: its queue
+    /// takes one and it may interact), with the animator not at rest, and in
+    /// any operation but the idling one. Taken, the bipod is out (or in) at
+    /// once, the animator's inventory flag down and its `Bipod` set where it
+    /// has one, blind fire ended, and `Event::Bipod` given. Whether taken.
+    pub fn toggle_bipod(&mut self, mounted: bool, sprinting: bool, gesture_free: bool) -> bool {
+        let Some(forward) = self.settings.bipod else { return false };
+        if mounted || self.overlap > 0.0 || sprinting || !gesture_free || !self.animator_idling() || !self.is_idling() {
+            return false;
+        }
+        self.bipod_out = !self.bipod_out;
+        self.animator.set_flag("Inventory", false);
+        if self.animator.has("Bipod") {
+            self.animator.set_flag("Bipod", self.bipod_out);
+        }
+        self.ends_blind_fire();
+        self.operation = Operation::Bipod { hide: None };
+        self.events.push(Event::Bipod { out: self.bipod_out, forward });
+        true
+    }
+
+    /// Whether the bipod's toggle is the operation in hand.
+    pub fn toggling_bipod(&self) -> bool {
+        matches!(self.operation, Operation::Bipod { .. })
+    }
+
+    /// The body's gesture's mark (`OnBipodToggle`; `ToggleBipodOperation.
+    /// SwitchToIdle`): the animator is told how the inventory stands, the
+    /// weapon idles, and a put-away asked for meanwhile goes.
+    pub fn bipod_toggled(&mut self) {
+        let Operation::Bipod { hide } = self.operation else { return };
+        self.animator.set_flag("Inventory", self.inventory);
+        self.to_idle();
+        if let Some(fast) = hide {
+            self.hide(fast);
+        }
     }
 
     /// The fold's mark (`FoldStockOperation.OnFold`, `SwitchToIdle`).
@@ -1338,11 +1952,32 @@ impl Firearm {
     /// The next fire mode. The idling operation does it itself: the mode
     /// changes at once and the animator plays the switch when it is next
     /// at rest, so the trigger and the reload key work through it.
+    /// The fire mode key (`ChangeWeaponMode`: `GetNextFireMode`, which on a
+    /// weapon of one way of firing is that one): the screen names the mode
+    /// whether it changed or not.
     pub fn next_fire_mode(&mut self) {
-        if self.settings.modes.len() > 1 {
-            let next = self.settings.modes[(self.mode + 1) % self.settings.modes.len()];
-            self.set_fire_mode(next);
+        let count = self.settings.modes.len();
+        if count > 0 {
+            let next = self.settings.modes[(self.mode + 1) % count];
+            self.change_fire_mode_shown(next);
         }
+    }
+
+    /// `Idling.ChangeFireMode` from a key: refused as `set_fire_mode` refuses
+    /// it, the bolt held open among it; else the screen names the mode
+    /// (`ShowFireMode`), changed or not, and it is set. Whether it changed.
+    fn change_fire_mode_shown(&mut self, mode: FireMode) -> bool {
+        // Refused in blind fire before anything is shown
+        // (`FirearmController.ChangeFireMode`).
+        if self.blind_fire {
+            return false;
+        }
+        let idling = matches!(self.operation, Operation::Idle | Operation::Utility { .. });
+        if !idling || !self.settings.modes.contains(&mode) || (self.settings.bolt_catch && self.settings.no_fire_mode_on_bolt_catch && self.bolt_caught()) {
+            return false;
+        }
+        self.events.push(Event::FireModeShown(mode));
+        self.set_fire_mode(mode)
     }
 
     /// Changes to one of the weapon's fire modes (`Idling.ChangeFireMode`).
@@ -1350,6 +1985,9 @@ impl Firearm {
     /// is one), and **not while the bolt is held open** on a weapon that
     /// says so (`NoFiremodeOnBoltcatch`). Whether it changed.
     pub fn set_fire_mode(&mut self, mode: FireMode) -> bool {
+        if self.blind_fire {
+            return false;
+        }
         let idling = matches!(self.operation, Operation::Idle | Operation::Utility { .. });
         let Some(index) = self.settings.modes.iter().position(|has| *has == mode).filter(|_| idling) else { return false };
         if self.settings.bolt_catch && self.settings.no_fire_mode_on_bolt_catch && self.bolt_caught() {
@@ -1376,7 +2014,13 @@ impl Firearm {
     /// nothing until it is over; which state plays is the animator's
     /// choice by the fire mode and the bolt.
     pub fn check_chamber(&mut self) {
-        if self.is_idling() && !self.trigger {
+        self.events.push(Event::LeaveMount { at_once: false });
+        // With a malfunction, its repair where its kind is known, else the
+        // reminder (`Idling.CheckChamber`).
+        if self.malfunction_check_chamber() {
+            return;
+        }
+        if self.is_idling() && !self.trigger && !self.blind_fire {
             self.aiming = false;
             self.animator.trigger("CheckChamber");
             self.hands_busy = true;
@@ -1388,7 +2032,14 @@ impl Firearm {
     /// more than one way of firing, and only at rest. The sights go down
     /// for it. Whether the look began.
     pub fn check_fire_mode(&mut self) -> bool {
-        if !self.is_idling() || self.settings.modes.len() <= 1 {
+        self.events.push(Event::LeaveMount { at_once: false });
+        if !self.is_idling() || self.blind_fire {
+            return false;
+        }
+        // The screen names the mode first, a weapon of one way of firing too
+        // (`Idling.CheckFireMode`'s first line).
+        self.events.push(Event::FireModeShown(self.mode()));
+        if self.settings.modes.len() <= 1 {
             return false;
         }
         self.aiming = false;
@@ -1402,13 +2053,42 @@ impl Firearm {
     /// **not with the sights up**, which it does not put down. The
     /// trigger ends it (`trigger_changed`). Whether the look began.
     pub fn examine(&mut self) -> bool {
-        if !self.is_idling() || self.aiming {
+        // With a malfunction, the look at it (`Idling.ExamineWeapon`: the
+        // shooter knows of it from the shot), which puts the sights down.
+        if self.malfunction() != Malf::None {
+            return self.examine_malfunction();
+        }
+        if !self.is_idling() || self.aiming || self.blind_fire {
             return false;
         }
+        // Begun, the look leaves a mount (`FirearmController.ExamineWeapon`).
+        self.events.push(Event::LeaveMount { at_once: false });
         self.hands_busy = true;
         self.operation = Operation::Utility { ready: false, time: 0.0, in_inventory: false, examine: true };
         self.animator.trigger("Look");
         true
+    }
+
+    /// The magnification key's sign to the hands (`FirearmsAnimator.
+    /// ModToggleTrigger`, which every operation gives with a change of a
+    /// scope's mode: `SetScopeMode`): the animator's `ModSwitch`, where it
+    /// has one (optics spec, "Zoom and modes").
+    pub fn mod_switch(&mut self) {
+        self.animator.trigger("ModSwitch");
+    }
+
+    /// Whether the operation in hand lets a tactical device be switched
+    /// (`CanChangeLightState`, overridden to refuse only by the draw, the
+    /// put-away, a part fitted or taken off, a magazine put in or pulled
+    /// out through the inventory, the backpack dropped and the bipod;
+    /// tactical-devices spec, "The keys"): at rest, aimed, in any fire, in
+    /// a reload, a look or a fold it may. A part changes here only at
+    /// rest, by a new build (the app), and there is no bipod.
+    pub fn can_change_lights(&self) -> bool {
+        !matches!(
+            self.operation,
+            Operation::Away | Operation::Spawn { .. } | Operation::Remove | Operation::InventoryMagOut { .. } | Operation::InventoryMagIn { .. } | Operation::DropBackpack
+        )
     }
 
     /// Puts the weapon on its fullest way of firing
@@ -1419,8 +2099,10 @@ impl Firearm {
         if self.settings.modes.len() <= 1 {
             return false;
         }
-        let fullest = [FireMode::FullAuto, FireMode::Burst].into_iter().find(|mode| self.settings.modes.contains(mode));
-        fullest.is_some_and(|mode| self.set_fire_mode(mode))
+        // (`GetForceAutoFireMode`: automatic, bursts, both barrels, double
+        // action, in that order; only where it is not the mode already.)
+        let fullest = [FireMode::FullAuto, FireMode::Burst, FireMode::Doublet, FireMode::DoubleAction].into_iter().find(|mode| self.settings.modes.contains(mode));
+        fullest.filter(|mode| *mode != self.mode()).is_some_and(|mode| self.change_fire_mode_shown(mode))
     }
 
     /// The backpack is to be dropped with this in hand (the idling
@@ -1433,6 +2115,8 @@ impl Firearm {
         if !self.is_idling() {
             return false;
         }
+        // It ends blind fire (`DropBackpackOperation.Start`).
+        self.ends_blind_fire();
         self.animator.set_flag("Fire", false);
         self.animator.set_flag("Inventory", false);
         self.aiming = false;
@@ -1455,13 +2139,24 @@ impl Firearm {
     }
 
     /// Looks at the magazine. The sights go down for it and the aim key
-    /// does nothing until it is over.
-    pub fn check_magazine(&mut self) {
-        if self.is_idling() && self.magazine.is_some() {
+    /// does nothing until it is over. Whether it began (the battle screen
+    /// then names the count: `Event::MagazineChecked`).
+    pub fn check_magazine(&mut self) -> bool {
+        self.events.push(Event::LeaveMount { at_once: false });
+        // A failure to feed allows no look at the magazine (`Idling.CheckAmmo`).
+        if self.malfunction() == Malf::Feed {
+            self.remind();
+            return false;
+        }
+        if self.is_idling() && self.magazine.is_some() && !self.blind_fire {
+            self.events.push(Event::MagazineChecked);
             self.aiming = false;
             self.animator.trigger("CheckAmmo");
             self.hands_busy = true;
             self.operation = Operation::Utility { ready: false, time: 0.0, in_inventory: false, examine: false };
+            true
+        } else {
+            false
         }
     }
 
@@ -1504,8 +2199,21 @@ impl Firearm {
     /// A single shot begins: its rounds are settled now, and the shot
     /// itself is made when the fire state's mark reaches the operation.
     fn start_single(&mut self) {
-        self.take_round();
-        self.animate_fire();
+        // The roll, as the operation begins (`FireOperation.PrepareShot`): a
+        // misfire is no shot at all; any other malfunction lets the fire
+        // state come by the animator's own way in (`StartFireAnimation`
+        // plays it only with none), its shot made at its mark.
+        let malf = self.roll_shot();
+        if malf == Malf::Misfire {
+            return self.misfire_single();
+        }
+        self.take_round_malfunctioned(malf);
+        self.round_out = true;
+        if malf == Malf::None {
+            self.animate_fire();
+        } else {
+            self.animator.set_flag("Fire", self.trigger);
+        }
         // A bolt action holds its bolt for as long as the trigger is held
         // (`BoltActionFireOperation.Start`).
         if self.settings.bolt_action {
@@ -1518,11 +2226,14 @@ impl Firearm {
             second_shot: false,
             open_inventory: false,
             planned: None,
+            malf,
         };
     }
 
     fn start_automatic(&mut self) {
         self.events.push(Event::AutoFire(true));
+        // The heat's factor is applied afresh each burst (`float_6`).
+        self.burst_rate = 0.0;
         self.animate_fire();
         // The clock does not start at zero, so that the first step does
         // not count as the start of a second cycle.
@@ -1539,8 +2250,16 @@ impl Firearm {
         self.trigger = pressed;
     }
 
-    /// Takes the chambered round and feeds the next from the magazine.
+    /// Takes the chambered round and feeds the next from the magazine; a
+    /// weapon with no chamber takes the round off its magazine
+    /// (`GetAmmoForSingleShot`: `PopToNowhere`).
     fn take_round(&mut self) {
+        if self.settings.no_chamber {
+            if let Some(rounds) = self.magazine.as_mut() {
+                *rounds = rounds.saturating_sub(1);
+            }
+            return;
+        }
         self.chamber = match &mut self.magazine {
             Some(rounds) if *rounds > 0 => {
                 *rounds -= 1;
@@ -1553,11 +2272,27 @@ impl Firearm {
     /// Fires the chambered round and feeds the next from the magazine, in
     /// one: an automatic shot.
     fn fire_round(&mut self) {
-        self.take_round();
+        // The roll, each shot of the run (`AutomaticFireOperation.InternalOnFireEvent`):
+        // a misfire makes no shot; any other malfunction's shot is made and
+        // the run is over.
+        let malf = self.roll_shot();
+        if malf == Malf::Misfire {
+            self.take_round_malfunctioned(malf);
+            return self.switch_to_malfunction(malf, true);
+        }
+        self.take_round_malfunctioned(malf);
+        self.round_out = true;
         self.events.push(Event::Shot { strength: self.settings.shot_strength });
-        self.events.push(Event::FireSound { trigger: self.trigger, doublet: false });
+        // A malfunctioned shot plays its tail at once (`FireBullet`'s
+        // `malfunctioned`), as a trigger let go.
+        let trigger = self.trigger && malf == Malf::None;
+        self.events.push(Event::FireSound { trigger, doublet: false });
         if let Operation::Automatic { shots, .. } = &mut self.operation {
             *shots += 1;
+        }
+        self.shot_worn();
+        if malf != Malf::None {
+            return self.switch_to_malfunction(malf, true);
         }
         self.animator.set_flag("Fire", self.trigger);
     }
@@ -1565,6 +2300,7 @@ impl Firearm {
     /// The idling operation takes over (`Idling.Start`).
     fn to_idle(&mut self) {
         self.operation = Operation::Idle;
+        self.round_out = false;
         self.animator_values();
     }
 
@@ -1586,6 +2322,8 @@ impl Firearm {
     /// with it the scripted recordings' automatic fire has the game's round
     /// count on every frame, where a shot of each had come a frame off).
     pub fn step_on_clock(&mut self, dt: f32, player_dt: f32) -> Vec<Event> {
+        // An operation the host began since the last frame.
+        self.note_operation();
         // The animator hears of the sights whenever they have changed.
         if self.aiming != self.aim_told {
             self.tell_aim();
@@ -1593,10 +2331,15 @@ impl Firearm {
         // A reload made with the sights up stiffens the weapon, and lets
         // it go a moment after either ends.
         self.clock += dt;
-        if self.aiming && self.reloading() {
+        if (self.aiming && self.reloading()) || self.mount_tactical {
             self.tactical.aim_for(1.0, 4.0, 0.0, self.clock);
         } else {
             self.tactical.aim_for(0.0, 2.0, 0.2, self.clock);
+        }
+        let heat_rate = self.heat_rate().filter(|mult| (mult - self.burst_rate).abs() > f32::EPSILON);
+        // The heat's stray shot, at rest.
+        if matches!(self.operation, Operation::Idle) {
+            self.autoshot();
         }
         match &mut self.operation {
             Operation::Single { cooldown, ready, .. } => {
@@ -1607,7 +2350,15 @@ impl Firearm {
             }
             Operation::Automatic { running: false, .. } => {}
             Operation::Automatic { clock, .. } => {
-                let cycle = 60.0 / self.settings.fire_rate;
+                // The heat's factor, where a new one is drawn: the interval
+                // changed with the phase kept (`AutomaticFireOperation.Update`).
+                if let Some(mult) = heat_rate {
+                    let phase = *clock % self.auto_cycle / self.auto_cycle;
+                    self.auto_cycle = 60.0 / (self.settings.fire_rate * mult);
+                    *clock = self.auto_cycle * (phase % 1.0);
+                    self.burst_rate = mult;
+                }
+                let cycle = self.auto_cycle;
                 let start = *clock % cycle / cycle;
                 let end = start + player_dt / cycle;
                 *clock += player_dt;
@@ -1650,11 +2401,55 @@ impl Firearm {
             marks.push(mark);
         }
         self.marks = marks;
+        self.note_operation();
         std::mem::take(&mut self.events)
+    }
+
+    /// What the operation in hand does to the left shoulder as it begins
+    /// (`SetLeftStanceAnimOnStartOperation`): the rest and the draw put its
+    /// animation back, the fire (`FireOperationBase`'s) leaves it, every
+    /// other takes it off (`FirearmOperation`'s). No weapon of the install
+    /// refuses it (`BlockLeftStance`), and none is stationary.
+    fn left_stance_start(&self) -> Option<crate::left_stance::HandsStart> {
+        use crate::left_stance::HandsStart;
+        match self.operation {
+            Operation::Idle => Some(HandsStart::Idle),
+            Operation::Spawn { .. } => Some(HandsStart::Draw { blocked: false }),
+            Operation::Single { .. } | Operation::Automatic { .. } | Operation::CylinderFire { .. } | Operation::BarrelsFire { .. } => None,
+            // `MalfunctionOperation`'s own start leaves it too.
+            Operation::Malfunction { .. } => None,
+            _ => Some(HandsStart::Other),
+        }
+    }
+
+    /// An operation begun since the left shoulder was last told: its start
+    /// told now. (The game calls it from each operation's `Start`; a change
+    /// of kind is that here, the operations' own changes of their fields
+    /// not being starts. `PROVISIONAL`: looked at as a frame begins and
+    /// ends, so one begun and over between the two is not told.)
+    fn note_operation(&mut self) {
+        let kind = std::mem::discriminant(&self.operation);
+        if self.left_stance_seen != Some(kind) {
+            self.left_stance_seen = Some(kind);
+            if let Some(start) = self.left_stance_start() {
+                self.events.push(Event::LeftStance(crate::left_stance::Call::Start(start)));
+            }
+        }
+    }
+
+    /// Whether the operation in hand passes the left shoulder's key on
+    /// (`ToggleLeftStance`: `Idling`'s, and so the looks', which are built
+    /// on it; every other drops it). Lying down is the movement's to refuse.
+    pub fn may_toggle_left_stance(&self) -> bool {
+        matches!(self.operation, Operation::Idle | Operation::Utility { .. })
     }
 
     /// One of the animator's marks reaches the operation in hand.
     fn on_mark(&mut self, mark: &Mark) {
+        // A malfunction's repair answers its own marks (`RepairMalfunction`).
+        if self.repair_mark(&mark.name) {
+            return;
+        }
         // Chambers of their own answer their operations' marks first.
         if matches!(self.operation, Operation::CylinderFire { .. } | Operation::BarrelsFire { .. } | Operation::ChambersReload { .. }) {
             let answered = if self.settings.cylinder.is_some() { self.cylinder_mark(&mark.name) } else { self.barrels_mark(&mark.name) };
@@ -1662,12 +2457,15 @@ impl Firearm {
                 return;
             }
         }
+        let misfired = self.malfunction() == Malf::Misfire;
         match (mark.name.as_str(), &mut self.operation) {
             ("Arm", _) => {
+                self.armed = true;
                 self.animator.set_flag("Armed", true);
                 self.animator.set_layer_weight("Hammer", 0.0);
             }
             ("Disarm", _) => {
+                self.armed = false;
                 self.animator.set_flag("Armed", false);
                 self.animator.set_layer_weight("Hammer", 1.0);
             }
@@ -1685,19 +2483,31 @@ impl Firearm {
                 self.events.push(Event::Hidden);
             }
             // The shot itself, a frame after its round was taken.
-            ("FiringBullet", Operation::Single { fired, .. }) => {
+            ("FiringBullet", Operation::Single { fired, malf, .. }) => {
                 *fired = true;
+                let malf = *malf;
                 // Its sound with the trigger still held, then let go
                 // (`FireOperation.OnFireEvent`).
                 self.events.push(Event::FireSound { trigger: self.trigger, doublet: false });
                 self.shot_made = true;
                 self.trigger_to(false);
                 self.animator.set_flag("Fire", false);
+                self.shot_worn();
+                if malf != Malf::None {
+                    self.switch_to_malfunction(malf, false);
+                }
             }
+            // A malfunction's state: its case out (a failure to feed's), the
+            // chamber shown empty, and at its mark the weapon at rest with it.
+            ("ShellEject", Operation::Malfunction { .. }) => self.events.push(Event::ShellEject),
+            ("DelAmmoChamber", Operation::Malfunction { .. }) => self.animator.set("AmmoInChamber", 0.0),
+            ("MalfunctionOff", Operation::Malfunction { .. }) => self.malfunction_held(),
+            ("MalfunctionOff", Operation::ExamineMalfunction) => self.malfunction_examined(),
             ("FiringBullet", Operation::Automatic { running, .. }) => *running = true,
             ("ShellEject", Operation::Single { .. }) => self.events.push(Event::ShellEject),
             ("DelAmmoChamber", Operation::Single { .. }) => self.animator.set("AmmoInChamber", 0.0),
             ("AddAmmoInChamber", Operation::Single { .. }) => {
+                self.round_out = false;
                 self.animator_rounds();
                 self.animator.set_flag("Fire", self.trigger);
             }
@@ -1731,6 +2541,65 @@ impl Firearm {
                 }
             }
             ("FoldOn" | "FoldOff", Operation::Fold { .. }) => self.folded_now(),
+            // A magazine taken out from the inventory: out of the weapon at
+            // its mark, put away at the hand's (`PullOutMagOperation.
+            // OnMagPulledOutFromWeapon`, `OnMagPuttedToRig`).
+            ("MagOut", Operation::InventoryMagOut { pulled }) if !*pulled => {
+                *pulled = true;
+                self.magazine = None;
+                self.events.push(Event::MagazineOut);
+                self.animator.set("AmmoInMag", 0.0);
+                self.animator.set_flag("MagInWeapon", false);
+                self.animator.set("MagInWeaponFloat", 0.0);
+            }
+            ("MagHide", Operation::InventoryMagOut { pulled: true }) => {
+                self.events.push(Event::MagazineHidden);
+                self.inventory_move_over();
+            }
+            // The chambered round taken out from the inventory, put away
+            // (`DischargeOperation.OnMagPuttedToRig`).
+            ("MagHide", Operation::InventoryDischarge) => {
+                self.animator.set_flag("Discharge", false);
+                self.chamber = false;
+                self.animator_rounds();
+                self.animator.set_flag("CanReload", false);
+                self.events.push(Event::Discharged);
+                self.to_idle();
+            }
+            // One put in from the inventory (`InsertMagOperation.
+            // OnMagAppeared`, `OnMagInsertedToWeapon`, `OnAddAmmoInChamber`).
+            ("MagShow", Operation::InventoryMagIn { shown, .. }) if !*shown => {
+                *shown = true;
+                self.events.push(Event::MagazineShown);
+            }
+            ("MagIn", Operation::InventoryMagIn { inserted, .. }) if !*inserted => {
+                *inserted = true;
+                self.magazine = Some(self.incoming);
+                self.mag_variant = self.incoming_variant;
+                self.events.push(Event::MagazineIn);
+                self.animator.set("AmmoInMag", self.incoming as f32);
+                self.animator.set_flag("MagInWeapon", true);
+                self.animator.set("MagInWeaponFloat", 1.0);
+                if !self.chambers {
+                    self.inventory_move_over();
+                }
+            }
+            // A round put into the chamber from the inventory
+            // (`LoadCartridgeToChamber.OnAddAmmoInChamber`).
+            ("AddAmmoInChamber", Operation::InventoryChamber) => {
+                self.chamber = true;
+                self.animator_rounds();
+                self.animator.set_flag("CanReload", false);
+                self.animator.set_flag("LoadOne", false);
+                self.events.push(Event::Chambered);
+                self.to_idle();
+            }
+            ("AddAmmoInChamber", Operation::InventoryMagIn { inserted: true, .. }) if self.chambers => {
+                self.chambers = false;
+                self.take_round();
+                self.animator_rounds();
+                self.inventory_move_over();
+            }
             ("MagIn", Operation::Reload { mag_in, .. }) if !*mag_in => {
                 *mag_in = true;
                 self.magazine = Some(self.incoming);
@@ -1738,11 +2607,22 @@ impl Firearm {
                 self.animator.set_flag("MagInWeapon", true);
                 self.animator.set("MagInWeaponFloat", 1.0);
                 self.animator.set("AmmoInMag", self.incoming as f32);
-                // With nothing to chamber the reload is over here.
-                if !self.chambers {
+                // With nothing to chamber the reload is over here; a weapon
+                // with no chamber's goes on to the animation's rest
+                // (`ReloadExternalMagResult`: only with chambers).
+                if !self.chambers && !self.settings.no_chamber {
                     self.reload_over();
                 }
-                self.animator.set("RelTypeOld", self.settings.magazine_variant as f32);
+                // (`OnMagInsertedToWeapon`: the new one's.)
+                self.mag_variant = self.incoming_variant;
+                self.animator.set("RelTypeOld", self.mag_variant as f32);
+            }
+            ("AddAmmoInChamber", Operation::Reload { .. }) if self.chambers && misfired => {
+                // A reload's chambering puts a misfire right (`ReloadExternalMagOperation.OnAddAmmoInChamber`).
+                self.clear_misfire();
+                self.chambers = false;
+                self.take_round();
+                self.animator_rounds();
             }
             ("AddAmmoInChamber", Operation::Reload { catch_off, .. }) if self.chambers => {
                 let let_go = !std::mem::replace(catch_off, true);
@@ -1784,8 +2664,12 @@ impl Firearm {
         self.aim_flags = false;
         match self.operation {
             // The weapon is back at rest: the body is told the hands are
-            // free, and the trigger is heard again after a reload.
-            Operation::Idle => (self.hands_busy, self.reload_flag) = (false, false),
+            // free, and the trigger is heard again after a reload; and the
+            // left shoulder's animation put back (`Idling.OnIdleStartEvent`).
+            Operation::Idle => {
+                (self.hands_busy, self.reload_flag) = (false, false);
+                self.events.push(Event::LeftStance(crate::left_stance::Call::Start(crate::left_stance::HandsStart::Idle)));
+            }
             Operation::Single { fired: true, ref mut ready, .. } => *ready = true,
             Operation::Reload { mag_shown: true, .. } => {
                 self.reload_flag = false;
@@ -1804,6 +2688,8 @@ impl Firearm {
     /// if that was asked for meanwhile.
     fn appeared(&mut self) {
         let Operation::Spawn { hide, .. } = self.operation else { return };
+        // A misfire is put right by the draw (`SpawnOperation.WeaponAppeared`).
+        self.clear_misfire();
         self.to_idle();
         self.events.push(Event::Appeared);
         if let Some(fast) = hide {
@@ -1873,6 +2759,7 @@ impl Firearm {
             if s.bolt_catch && !s.manual_bolt_catch && !self.chamber && self.magazine == Some(0) {
                 self.set_bolt_catch(true);
             }
+            self.round_out = false;
             self.animator_rounds();
             self.animator.set_flag("Fire", self.trigger);
         }
@@ -1902,7 +2789,9 @@ impl Firearm {
         }
         // An open inventory ends the run at the cycle's end, trigger or no.
         if self.trigger && !open_inventory {
-            if self.chamber {
+            // Held on while a round is left: in the chamber, or for a
+            // weapon with no chamber in its magazine.
+            if self.loaded() {
                 return;
             }
             self.automatic_to_idle(open_inventory);
@@ -2087,6 +2976,7 @@ pub(crate) mod tests {
             open_bolt_reload: false,
             must_open_bolt: false,
             manual_bolt_catch: false,
+            chamber_load: true,
             foldable: false,
             reload_speed: 1.0,
             draw_speed: 1.0,
@@ -2094,9 +2984,12 @@ pub(crate) mod tests {
             barrels: 0,
             fast_reload: true,
             rocket_launcher: false,
+            no_chamber: false,
             magazine_variant: 0,
             mastering: 0,
             stop_aiming_at: 0.1,
+            mountable: true,
+            bipod: None,
         }
     }
 
@@ -2284,6 +3177,37 @@ pub(crate) mod tests {
         let mut w = Firearm::new(settings(), &animator());
         (w.chamber, w.magazine) = (false, Some(12));
         w.draw();
+        assert!(w.chamber && w.magazine == Some(11));
+    }
+
+    /// A draw made to rack for the look of it tells the animator an empty
+    /// chamber and a round to feed, and moves no round; a draw that racks
+    /// of itself is left as it is.
+    #[test]
+    fn a_racked_draw_moves_no_round() {
+        let mut w = Firearm::new(settings(), &animator());
+        (w.chamber, w.magazine) = (true, Some(12));
+        w.draw();
+        w.rack_drawn();
+        assert_eq!((w.animator.get("AmmoInChamber"), w.animator.get("AmmoInMag")), (0.0, 12.0));
+        run_until(&mut w, |w| !w.occupied());
+        run(&mut w, 0.2);
+        assert!(w.is_idle(), "{:?}", w.operation);
+        assert_eq!((w.chamber, w.magazine), (true, Some(12)));
+        // An empty magazine is drawn racking all the same, and still holds
+        // nothing.
+        let mut w = Firearm::new(settings(), &animator());
+        (w.chamber, w.magazine) = (true, Some(0));
+        w.draw();
+        w.rack_drawn();
+        assert_eq!(w.animator.get("AmmoInMag"), 1.0);
+        run_until(&mut w, |w| !w.occupied());
+        assert!(w.chamber && w.magazine == Some(0));
+        // Drawn with none chambered, it chambers one of itself, once.
+        let mut w = Firearm::new(settings(), &animator());
+        (w.chamber, w.magazine) = (false, Some(12));
+        w.draw();
+        w.rack_drawn();
         assert!(w.chamber && w.magazine == Some(11));
     }
 

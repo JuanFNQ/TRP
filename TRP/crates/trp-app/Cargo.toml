@@ -29,12 +29,18 @@ bevy = { version = "0.18", default-features = false, features = [
     # Systems and parameters named in what the engine reports (0.17 leaves them out without it).
     "debug",
     "bevy_pbr",
+    # A light's texture (Bevy's clustered decals): the sun's cookie of the
+    # clouds' shadows (`clouds_view.rs`).
+    "pbr_light_textures",
     "bevy_render",
     "bevy_text",
     "bevy_ui",
     "bevy_ui_render",
     "bevy_window",
     "bevy_winit",
+    # The game's own mouse pointers (`cursor::point`): a picture as the
+    # system's pointer.
+    "custom_cursor",
     "default_font",
     "png",
     "tonemapping_luts",

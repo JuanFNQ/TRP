@@ -23,6 +23,9 @@ pub struct Carried {
     pub place: Option<(u32, u32, bool)>,
     /// How many are in the stack.
     pub count: u32,
+    /// Its fold folded, where it has one (`upd.Foldable.Folded`; a
+    /// recording's `fold`, which recorder 0.10.2 writes).
+    pub folded: bool,
 }
 
 /// The equipment of a character a new account starts with.
@@ -71,6 +74,7 @@ impl Loadout {
                     slot: text(entry, "slotId"),
                     place,
                     count: entry.pointer("/upd/StackObjectsCount").and_then(Json::as_u64).unwrap_or(1) as u32,
+                    folded: entry.pointer("/upd/Foldable/Folded").and_then(Json::as_bool).unwrap_or(false),
                 })
             })
             .collect();
@@ -114,6 +118,7 @@ impl Loadout {
                 slot: text(entry, "at"),
                 place: whole(entry, "x").zip(whole(entry, "y")).map(|(x, y)| (x, y, whole(entry, "r") == Some(1))),
                 count: whole(entry, "n").unwrap_or(1).max(1),
+                folded: whole(entry, "fold") == Some(1),
             });
             let weight = entry.get("kg").and_then(Json::as_f64).unwrap_or(0.0) as f32;
             recorded.push(Recorded { cells: [whole(entry, "w").unwrap_or(0), whole(entry, "h").unwrap_or(0)], weight });
@@ -125,7 +130,12 @@ impl Loadout {
     /// A weapon as its stock preset in the database has it, as a list of
     /// the same kind: the weapon itself first, then its parts.
     pub fn of_preset(db: &Database, weapon_template: &str) -> Result<Self> {
-        let preset = db.default_preset(weapon_template)?;
+        Ok(Self::of_build(db.default_preset(weapon_template)?))
+    }
+
+    /// The same list of any of the database's builds (`ItemPresets`, the
+    /// stock one or another).
+    pub fn of_build(preset: &crate::database::Preset) -> Self {
         let entry = |item: &crate::database::PresetItem| Carried {
             id: item.id.clone(),
             template: item.template.clone(),
@@ -133,6 +143,7 @@ impl Loadout {
             slot: item.slot.clone(),
             place: None,
             count: 1,
+            folded: false,
         };
         let mut items: Vec<Carried> = preset.items.iter().filter(|item| item.id == preset.root).map(entry).collect();
         let mut at = 0;
@@ -141,7 +152,7 @@ impl Loadout {
             items.extend(preset.items.iter().filter(|item| item.id != preset.root && item.parent.as_deref() == Some(parent.as_str())).map(entry));
             at += 1;
         }
-        Ok(Self { equipment: preset.root.clone(), items })
+        Self { equipment: preset.root.clone(), items }
     }
 }
 
@@ -172,6 +183,11 @@ impl Loadout {
         let mut takes_round: Vec<String> = weapon.holders("Chambers").into_iter().flat_map(|chamber| chamber.takes).collect();
         if let Some(cylinder) = own_magazine.as_ref().and_then(|magazine| db.items.get(magazine)).filter(|_| takes_round.is_empty()) {
             takes_round = cylinder.holders("Slots").into_iter().filter(|slot| slot.name.starts_with("camora_")).flat_map(|camora| camora.takes).collect();
+        }
+        // A weapon with no chamber at all (the M60s, the RPD: `Chambers`
+        // empty) takes what its own magazine's cartridges take.
+        if let Some(magazine) = own_magazine.as_ref().and_then(|magazine| db.items.get(magazine)).filter(|_| takes_round.is_empty()) {
+            takes_round = magazine.holders("Cartridges").into_iter().flat_map(|cartridges| cartridges.takes).collect();
         }
         let own_round = weapon
             .props
@@ -244,6 +260,16 @@ pub struct ItemTexts {
     pub descriptions: std::collections::HashMap<String, String>,
     pub kinds: std::collections::HashMap<String, String>,
     pub kg: String,
+    /// Every key's words, by the key in lower case (the game's locale
+    /// is looked up whatever the case: `LocalizationManager`).
+    pub words: std::collections::HashMap<String, String>,
+}
+
+impl ItemTexts {
+    /// The install's words for a key, whatever its case.
+    pub fn say(&self, key: &str) -> Option<String> {
+        self.words.get(&key.to_lowercase()).cloned()
+    }
 }
 
 pub fn item_texts(install: &Install, language: &str) -> Result<ItemTexts> {
@@ -254,6 +280,7 @@ pub fn item_texts(install: &Install, language: &str) -> Result<ItemTexts> {
     let mut out = ItemTexts { kg: said(" kg").unwrap_or_else(|| " kg".to_owned()), ..ItemTexts::default() };
     for (key, value) in &texts {
         let Some(words) = value.as_str() else { continue };
+        out.words.insert(key.to_lowercase(), words.to_owned());
         if let Some(id) = key.strip_suffix(" Name") {
             out.names.insert(id.to_owned(), words.to_owned());
         } else if let Some(id) = key.strip_suffix(" Description") {
@@ -296,7 +323,18 @@ pub struct Holder {
     /// A slot whose part the item cannot do without (`_required`): a
     /// vital part.
     pub required: bool,
+    /// An armour's slot, for a plate or a soft insert (`ArmorSlot`: its
+    /// prototype is `ARMOR_SLOT_PROTO`), which a container's row does not
+    /// show among its special slots (`SearchableSlotView.CreateSlots`).
+    pub armour: bool,
+    /// Its first filter says it is locked (`locked`: an armour's built-in
+    /// inserts' slots, which nothing is taken out of).
+    pub locked: bool,
 }
+
+/// The prototype of an armour's slots (`SlotSerializer.Deserialize` makes
+/// an `ArmorSlot` of a slot with it).
+pub const ARMOR_SLOT_PROTO: &str = "64479fdf9731c8fadc0642c1";
 
 impl Database {
     /// An item's classes: its own template and its parents', nearest
@@ -338,6 +376,8 @@ impl ItemTemplate {
                     refuses: filters.iter().flat_map(|f| ids(f, "ExcludedFilter")).collect(),
                     merges: holder.get("_mergeSlotWithChildren").and_then(Json::as_bool),
                     required: holder.get("_required").and_then(Json::as_bool).unwrap_or(false),
+                    armour: holder.get("_proto").and_then(Json::as_str).is_some_and(|proto| proto.eq_ignore_ascii_case(ARMOR_SLOT_PROTO)),
+                    locked: filters.first().and_then(|filter| filter.get("locked")).and_then(Json::as_bool).unwrap_or(false),
                 }
             })
             .collect()

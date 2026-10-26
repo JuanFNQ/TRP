@@ -86,6 +86,8 @@ So the weapon is held up and to the left of where the body's clip has it for as 
 
 ## Built
 
+**A character no one is at the keys of** (2026-10-20, 0.95.0; `trp_sim::puppet`, the dummies of `body-hits.md`): the replay's composition for a character seen from outside made reusable, with a bot's mask (the turn-away alone), on a pacer of its own; drawn by the app for the dummies on the range.
+
 In the simulation (`trp_sim::PointOfView`):
 
 - `Body::set_point_of_view`: the flag, the figure and layer 1's weight; `carried`, `arm_pose` and `held` take the first-person factor as 1, and the shoulder as all the body's. `Body::set_weapon_action` (the mark's number, from `FirearmEvent::BodyAction`, which the firearm and the empty hands now give), `Body::set_draw_speed`, `Body::weigh_reach_for_vest`. The states read for it: `Weapon.INACTIVE`, `INACTIVE_PRONE`, `idle_to_out`, `out_to_idle`; all of `UtilityOperation` and `Additive_FullBody`.

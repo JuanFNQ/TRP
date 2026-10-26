@@ -35,6 +35,28 @@ pub const DOOR_WAITS: f32 = 0.5;
 /// (`SetDoorState` asks for 1.5; a door's routine drops it and runs at 1).
 const CONTAINER_PACE: f32 = 1.5;
 
+/// What a thing sounds, each on the frame the game plays it (interactions
+/// spec, "A thing's sounds"). The clips, their volumes and where they
+/// sound from are the host's: a thing here says only which and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThingSound {
+    /// A swing's first frame (`SmoothDoorOpenCoroutine`): one of the open
+    /// clips if the swing opens (a kick's does not count as opening), and
+    /// one of the squeak clips unless the thing was locked, both at one
+    /// drawn volume of the opening's range.
+    Swing { opens: bool, squeaks: bool },
+    /// One of the shut clips (`PlayShut`): the frame a shutting swing's
+    /// curve time passes the thing's shut shift before the end, or its
+    /// last frame if it never did; not for a thing that was locked.
+    Shut,
+    /// A kick lands and throws the door open (`Door.KickOpen`): its breach
+    /// clip, at full volume, before its swing's own sound.
+    Breach,
+    /// A kick lands and the door holds (`Door.FailBreach`): its hit clip,
+    /// at full volume.
+    Hit,
+}
+
 /// The kind of thing, which decides how it waits and turns, which gesture
 /// it asks for and what the game offers to do to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +103,18 @@ pub enum Action {
     MoveIn,
     /// A thing lying loose: taken up.
     Take,
+    /// The workbench on the range (the user's, 2026-10-20): the edit build
+    /// screen opened for the weapon in hand, by the game's words for its
+    /// item menu's line (`Editbuild`). The game's workbench offers no line
+    /// of its own.
+    EditBuild,
+    /// The workbench on the range (the user's, 2026-10-25: "Give the
+    /// workbench one more option in the interact menu: Repair Gear - Only
+    /// pressable when you have a repair kit, much like a key"): the
+    /// inventory opened for repairing, a repair kit let go on what it
+    /// mends opening the game's repair window. The game repairs out of a
+    /// raid only, by its item menu's line.
+    RepairGear,
 }
 
 impl Action {
@@ -96,6 +130,9 @@ impl Action {
             Action::FlashAndClear => "Flash & clear",
             Action::MoveIn => "Move in",
             Action::Take => "Take",
+            Action::EditBuild => "Editbuild",
+            // (No text of the game's: the user's words.)
+            Action::RepairGear => "Repair gear",
         }
     }
 }
@@ -224,6 +261,10 @@ struct Swing {
     /// Thrown open by a kick: along the kick's own curve, not the
     /// settings'.
     kicked: bool,
+    /// Whether its first frame has run, which sounds its opening, and
+    /// whether a shutting has sounded its shut clip (`_shutPlayed`).
+    begun: bool,
+    shut_played: bool,
 }
 
 /// A container's or a trunk's wait before it does what it was told.
@@ -288,6 +329,11 @@ pub struct Thing {
     clock: f32,
     timers: Vec<Timer>,
     swings: Vec<Swing>,
+    /// Seconds of the curve before its end at which a shutting sounds its
+    /// shut clip (`ShutShift`, the prefab's: 0 unless it says).
+    pub shut_shift: f32,
+    /// What it has sounded and the host has not yet taken.
+    sounds: Vec<ThingSound>,
 }
 
 impl Thing {
@@ -319,7 +365,14 @@ impl Thing {
             clock: 0.0,
             timers: Vec::new(),
             swings: Vec::new(),
+            shut_shift: 0.0,
+            sounds: Vec::new(),
         }
+    }
+
+    /// What it has sounded since this was last asked, in order.
+    pub fn take_sounds(&mut self) -> Vec<ThingSound> {
+        std::mem::take(&mut self.sounds)
     }
 
     /// A door, shut, that turns about `hinge` from `shut_angle` to
@@ -505,6 +558,11 @@ impl Thing {
         }
         (self.breaching, self.result, self.broken) = (true, None, true);
         self.record = [0.0, KICK_LASTS];
+        // The breach clip, and the swing's own opening at once: the
+        // routine runs to its first yield as it is started, and a kick's
+        // swing has no wait.
+        self.sounds.push(ThingSound::Breach);
+        self.sounds.push(ThingSound::Swing { opens: false, squeaks: self.fallback != ThingState::Locked });
         self.swings.push(Swing {
             wait: None,
             from: self.shut_angle,
@@ -514,12 +572,15 @@ impl Thing {
             pace: 1.0,
             to: ThingState::Open,
             kicked: true,
+            begun: true,
+            shut_played: false,
         });
     }
 
     /// The kick lands and the door holds (`Door.FailBreach`): three tenths
     /// of a second on it is what it was again, unless it is swinging.
     pub fn fail_breach(&mut self) {
+        self.sounds.push(ThingSound::Hit);
         self.failed_kick = Some((0.0, true));
     }
 
@@ -627,6 +688,8 @@ impl Thing {
             pace: CONTAINER_PACE,
             to,
             kicked: false,
+            begun: false,
+            shut_played: false,
         };
         match self.kind {
             Kind::Door => {
@@ -664,12 +727,7 @@ impl Thing {
                 self.swings.remove(index);
                 continue;
             }
-            self.place(&swing, settings);
-            swing.progress += dt * swing.pace;
-            if self.kind != Kind::Container {
-                // The game's own routine keeps the shared record.
-                self.record[0] = swing.progress;
-            }
+            self.run_frame(&mut swing, dt, settings);
             self.swings[index] = swing;
             index += 1;
         }
@@ -705,13 +763,32 @@ impl Thing {
             self.set_state(to, settings);
             if self.swings.len() > before {
                 let mut swing = self.swings[before];
-                self.place(&swing, settings);
-                swing.progress += dt * swing.pace;
-                if self.kind != Kind::Container {
-                    self.record[0] = swing.progress;
-                }
+                self.run_frame(&mut swing, dt, settings);
                 self.swings[before] = swing;
             }
+        }
+    }
+
+    /// One frame of a swing past its wait: its first frame sounds the
+    /// opening (`PlaySound` as the routine reaches the swing), the thing
+    /// stands where the curve has it, the time moves on, and a shutting
+    /// sounds its shut clip on the frame the time passes the shift before
+    /// the curve's end (`ProgressTime > Duration - ShutShift`, read after
+    /// the frame's `UpdateTime`).
+    fn run_frame(&mut self, swing: &mut Swing, dt: f32, settings: &ThingSettings) {
+        if !swing.begun {
+            swing.begun = true;
+            self.sounds.push(ThingSound::Swing { opens: swing.opening && !swing.kicked, squeaks: self.fallback != ThingState::Locked });
+        }
+        self.place(swing, settings);
+        swing.progress += dt * swing.pace;
+        if self.kind != Kind::Container {
+            // The game's own routine keeps the shared record.
+            self.record[0] = swing.progress;
+        }
+        if !swing.opening && !swing.shut_played && swing.progress > settings.duration() - self.shut_shift && self.fallback != ThingState::Locked {
+            swing.shut_played = true;
+            self.sounds.push(ThingSound::Shut);
         }
     }
 
@@ -725,6 +802,10 @@ impl Thing {
     /// The swing is over: the thing is at its new angle and in its new
     /// state (a door's or a trunk's the last order's, a container's its own).
     fn finish(&mut self, swing: Swing) {
+        // A shutting that never reached its shift sounds its clip as it ends.
+        if !swing.opening && !swing.shut_played && !swing.kicked && self.fallback != ThingState::Locked {
+            self.sounds.push(ThingSound::Shut);
+        }
         let state = match self.kind {
             Kind::Container => swing.to,
             Kind::Door | Kind::Trunk => self.result.unwrap_or(swing.to),
@@ -962,5 +1043,133 @@ mod tests {
         assert_eq!(delta_angle(110.0, 0.0), -110.0);
         assert_eq!(delta_angle(0.0, -30.0), -30.0);
         assert_eq!(delta_angle(350.0, 10.0), 20.0);
+    }
+
+    /// Steps the thing until it has sounded something, and says what and
+    /// on which frame (the key's own frame has been stepped before).
+    fn frames_until_sound(thing: &mut Thing, settings: &ThingSettings) -> (usize, Vec<ThingSound>) {
+        for frame in 1..2000 {
+            thing.step(DT, settings);
+            let sounds = thing.take_sounds();
+            if !sounds.is_empty() {
+                return (frame, sounds);
+            }
+        }
+        panic!("nothing sounded")
+    }
+
+    /// A door's opening sounds the open clip and the squeak together on
+    /// the first frame of its swing, half a second after the key; its
+    /// shutting the squeak then, and the shut clip the frame the curve's
+    /// time passes its end (no shift): the frame before it stands still.
+    #[test]
+    fn a_door_sounds_its_opening_and_its_shutting() {
+        let settings = settings();
+        let mut door = door();
+        door.work(true, [0.5, 0.0, 1.0], &settings);
+        door.step(DT, &settings);
+        assert!(door.take_sounds().is_empty(), "nothing on the key's frame");
+        let (frame, sounds) = frames_until_sound(&mut door, &settings);
+        assert_eq!(sounds, vec![ThingSound::Swing { opens: true, squeaks: true }]);
+        assert_eq!(frame, (DOOR_WAITS / DT).round() as usize, "the first frame at or past the wait");
+        let done = frames_until_done(&mut door, &settings);
+        assert!(door.take_sounds().is_empty(), "an opening sounds nothing more");
+        assert_eq!(door.state(), ThingState::Open);
+        // Shut it: the squeak at the swing's start, the shut clip at its end.
+        door.work(false, [0.5, 0.0, 1.0], &settings);
+        door.step(DT, &settings);
+        let (frame, sounds) = frames_until_sound(&mut door, &settings);
+        assert_eq!(sounds, vec![ThingSound::Swing { opens: false, squeaks: true }]);
+        assert_eq!(frame, (DOOR_WAITS / DT).round() as usize);
+        let (frame, sounds) = frames_until_sound(&mut door, &settings);
+        assert_eq!(sounds, vec![ThingSound::Shut]);
+        let swing_frames = (2.5 / DT).round() as usize;
+        assert!((swing_frames - 1..=swing_frames).contains(&frame), "the frame the time passes 2.5 s, counted from the swing's own first: {frame}");
+        frames_until_done(&mut door, &settings);
+        assert_eq!(door.state(), ThingState::Shut);
+        assert!(door.take_sounds().is_empty());
+        let _ = done;
+    }
+
+    /// A shift moves the shut clip earlier by that many seconds of the
+    /// curve: a door's by the seconds themselves, a container's by two
+    /// thirds of them (it runs the curve at 1.5).
+    #[test]
+    fn the_shut_shift() {
+        let settings = settings();
+        let mut door = door();
+        door.shut_shift = 1.0;
+        door.at_rest(true);
+        door.work(false, [0.5, 0.0, 1.0], &settings);
+        door.step(DT, &settings);
+        let (swing, _) = frames_until_sound(&mut door, &settings);
+        let (frame, sounds) = frames_until_sound(&mut door, &settings);
+        assert_eq!(sounds, vec![ThingSound::Shut]);
+        let expected = (DOOR_WAITS / DT).round() as usize + (1.5 / DT).round() as usize;
+        assert!((expected - 1..=expected).contains(&(swing + frame)), "{}", swing + frame);
+        let mut lid = Thing::container(None, None, 0.0, -30.0);
+        lid.shut_shift = 1.0;
+        lid.at_rest(true);
+        lid.tell(false, &settings);
+        lid.step(DT, &settings);
+        // The wait runs out and the swing's first frame runs at once.
+        let (frame, sounds) = frames_until_sound(&mut lid, &settings);
+        assert_eq!(sounds, vec![ThingSound::Swing { opens: false, squeaks: true }]);
+        assert_eq!(frame, (0.55 / DT).round() as usize);
+        let (frame, sounds) = frames_until_sound(&mut lid, &settings);
+        assert_eq!(sounds, vec![ThingSound::Shut]);
+        // (2.5 - 1) / 1.5 = 1 s of the swing, the frame the time passes it.
+        assert!(((1.0 / DT).round() as usize - 1..=(1.0 / DT).round() as usize).contains(&frame), "{frame}");
+    }
+
+    /// A container's opening sounds on the frame its wait runs out, which
+    /// is its swing's first; its shutting without a shift sounds the shut
+    /// clip as the time passes the end, 1.67 s in.
+    #[test]
+    fn a_container_sounds_as_its_wait_runs_out() {
+        let settings = settings();
+        let mut lid = Thing::container(None, None, 0.0, -30.0);
+        lid.work(true, [0.0; 3], &settings);
+        lid.step(DT, &settings);
+        let (frame, sounds) = frames_until_sound(&mut lid, &settings);
+        assert_eq!(sounds, vec![ThingSound::Swing { opens: true, squeaks: true }]);
+        assert_eq!(frame, (0.55 / DT).round() as usize);
+        frames_until_done(&mut lid, &settings);
+        assert!(lid.take_sounds().is_empty());
+        lid.tell(false, &settings);
+        lid.step(DT, &settings);
+        let (_, sounds) = frames_until_sound(&mut lid, &settings);
+        assert_eq!(sounds, vec![ThingSound::Swing { opens: false, squeaks: true }]);
+        let (frame, sounds) = frames_until_sound(&mut lid, &settings);
+        assert_eq!(sounds, vec![ThingSound::Shut]);
+        let expected = (2.5 / 1.5 / DT).round() as usize;
+        assert!((expected - 1..=expected).contains(&frame), "{frame}");
+        frames_until_done(&mut lid, &settings);
+        assert_eq!(lid.state(), ThingState::Shut);
+    }
+
+    /// A kick that opens the door sounds its breach clip and the swing's
+    /// squeak (no open clip: the swing is a breach, not an opening) on the
+    /// frame it lands; one that fails sounds the hit clip.
+    #[test]
+    fn a_kick_sounds_its_breach_or_its_hit() {
+        let settings = settings();
+        let mut kicked = door();
+        kicked.start_breach([0.5, 0.0, -1.0]);
+        kicked.kick_open();
+        assert_eq!(kicked.take_sounds(), vec![ThingSound::Breach, ThingSound::Swing { opens: false, squeaks: true }]);
+        frames_until_done(&mut kicked, &settings);
+        assert!(kicked.take_sounds().is_empty(), "a kick's swing sounds nothing more");
+        let mut held = door();
+        held.lock(Some("key".to_owned()));
+        held.start_breach([0.5, 0.0, 1.0]);
+        held.fail_breach();
+        assert_eq!(held.take_sounds(), vec![ThingSound::Hit]);
+        // A locked door thrown open squeaks not: its fallback is locked.
+        let mut locked = door();
+        locked.lock(Some("key".to_owned()));
+        locked.start_breach([0.5, 0.0, -1.0]);
+        locked.kick_open();
+        assert_eq!(locked.take_sounds(), vec![ThingSound::Breach, ThingSound::Swing { opens: false, squeaks: false }]);
     }
 }

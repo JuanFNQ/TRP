@@ -46,7 +46,7 @@ The animator chooses the reload's last state by the catch: with a round chambere
 
 **Course 4's Five-seveN, by hand** (2026-10-16; `local\traces\courses1\4-five-seven`, `byhand`): single shots, a fast series of them with the second press of each pair queued in the first shot, the magazine shot empty and changed, **on the game's states and times on every frame** up to a switch to the other weapon at 20.2 s, after the operations were put on the player's clock (`firing.md`, "A single shot": a queued shot had come a frame early).
 
-Before that, with nothing: tried against the install's own controller (`cargo test -p trp-sim --test install the_five_seven -- --nocapture`):
+Before that, with nothing: tried against the install's own controller (`cargo test -p trp-sim --test sim the_five_seven -- --nocapture`):
 
 | What | The simulation |
 |---|---|

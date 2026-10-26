@@ -270,7 +270,7 @@ The clips carry the hand-over curves the sprint and the crawl have (`weapon-hand
 - **The trigger.** `FirearmController.SetTriggerPressed` passes a press on only if `CheckVaulting` allows: in a vault or climb of an obstacle over `MaxWithoutHandHeight`, a press is no press.
 - **The sights** go down on entering such a move (above), and nothing puts them back.
 - **Harm.** A vault or climb of an obstacle of `MaxWithoutHandHeight` or more with a damaged left leg costs that leg 3 points; a climb of `MaxOneHandHeight` or more with a damaged right leg costs that leg 3.
-- **Sound.** Three audio controllers (vault, sprint vault, climb) play from marks in the clips.
+- **Sound.** Three audio controllers (vault, sprint vault, climb) play from marks of the states: `footsteps.md`, "The vault's sounds" (read and built 2026-10-23).
 - **The landing's sound** after a climb is the jump's, with the height taken differently.
 
 ## What it asks of a host
@@ -289,7 +289,7 @@ What a host is asked for it (`World`): `line` as before, for every ray; `terrain
 
 In the app: Space held vaults or climbs and Space let go jumps, as this install binds them. The range's boxes can all be stood on, the low wall beside the lane is there to vault (0.6 m high, 0.4 m thick) and the ring of blocks to climb (1 m cubes); since 2026-10-14, night, **a window in the door wall** (the user: "add a small vaultable window by the door"; `range::WINDOW`: a sill 0.9 m up in the wall's 0.4 m, an opening 1 m high and 1 m wide), made to the rules above: measured from the lane's side by the simulation's own grid it is an obstacle 0.90 m high and 0.30 m deep and the move chosen is a vault, and before the wall beside it nothing is (`the_window_is_vaulted_through`); a run held on the key walks through it in the vault's state (`--start window --hold w+vault`). The range answers `footing` with a rounded foot of the capsule's radius: `PROVISIONAL`, the engine's own rule for a capsule on an edge not being read.
 
-Measured in the simulation (`cargo test -p trp-sim --test install vault -- --nocapture`; an unburdened, untrained character at 120 frames a second, against boxes of a test world that keeps the character out of them as the game's own controller does, since 2026-10-10):
+Measured in the simulation (`cargo test -p trp-sim --test sim vault -- --nocapture`; an unburdened, untrained character at 120 frames a second, against boxes of a test world that keeps the character out of them as the game's own controller does, since 2026-10-10):
 
 | | |
 |---|---|
@@ -305,7 +305,7 @@ Measured in the simulation (`cargo test -p trp-sim --test install vault -- --noc
 
 Seen in the app (captures `local\shots\vault_body_b.png`, `vault_fp.png`, `climb_body_b.png`, from `--scenario local\scenarios-app\vault-wall.json --yaw 90`): the figure goes over the low wall with its knees drawn up and the rifle held, and comes onto a block with its left hand planted on the top and the rifle in its right.
 
-Not built: the inventory's, medicine's, grenade's and blind fire's refusals (none of those exists here); harm to a damaged leg; the speed of a move with a damaged limb; sound; the left hand's item put away. `VaultState.Exit` asks for the sprint again only if the character can walk, which here means not locked against an obstacle (`movement.md`, "Stopped by what stands in the way"); the other thing that stops a walk, legs being healed, does not exist here. The flag a try leaves up when made stepped aside or getting up is as the game's (above).
+The medicine's and food's and the grenade's refusals are built since 0.131.0 (`movement.md`, "Room to move": `Input::hands_limit_vault`, from the code; blind fire's since 0.123.0, `blind-fire.md`). Not built: the inventory's (an item being moved); harm to a damaged leg; the speed of a move with a damaged limb; sound; the left hand's item put away. `VaultState.Exit` asks for the sprint again only if the character can walk, which here means not locked against an obstacle (`movement.md`, "Stopped by what stands in the way"); the other thing that stops a walk, legs being healed, does not exist here. The flag a try leaves up when made stepped aside or getting up is as the game's (above).
 
 Taken on trust from the reading and marked where they are used: the capsule's figures in a move are the ones the code sets, with no account of the engine not letting a capsule be shorter than it is wide.
 

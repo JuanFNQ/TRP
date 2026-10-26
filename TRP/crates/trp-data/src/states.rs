@@ -114,6 +114,10 @@ pub struct MovementBehaviour {
     /// What the state does to the first-person weapon and camera while the
     /// animator is in it, if anything.
     pub first_person_pose: Option<FirstPersonPose>,
+    /// The curve the state's script reads by how far through the state the
+    /// animator is (`SmoothLerpAnimCurve`), where it has keys: blind fire's
+    /// float follows it (blind-fire spec, "The body").
+    pub curve: Option<crate::curve::Curve>,
 }
 
 /// An offset the weapon's procedural motion blends in while a body state
@@ -363,6 +367,10 @@ impl StateTable {
                         length: number("StateLength", 0.0),
                         unique: flag("CreateUniqueMovementStateObject"),
                         first_person_pose,
+                        curve: behaviour
+                            .get("SmoothLerpAnimCurve")
+                            .and_then(|v| crate::player::curve(v).ok())
+                            .filter(|curve| !curve.keys.is_empty()),
                     },
                 );
                 continue;

@@ -3,10 +3,18 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-# One number for all the crates, raised with every change: docs\manual.md, "Versions".
-version = "0.42.4"
+# The packages' own version stays at 0.0.0: it is part of what cargo builds a crate under, so
+# raising it rebuilt all four crates and relinked every test binary at every change. TRP's
+# number is below, under [workspace.metadata.trp].
+version = "0.0.0"
 edition = "2021"
 publish = false
+
+[workspace.metadata.trp]
+# One number for the whole of TRP, raised with every change (docs\manual.md, "Versions"; in the
+# private repository, .claude\skills\land\check.sh reads and bumps it). trp-app's build.rs reads
+# it from here and the app prints it first (`TRP_VERSION`).
+version = "0.143.1"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -22,6 +30,8 @@ ttf-parser = "0.25"
 crc32fast = "1.5"
 # Vorbis's packets decoded (pure Rust; the clips kept so are FMOD's, rebuilt from the install).
 lewton = { version = "0.10", default-features = false }
+# Unity's crunched pictures (`DXT1Crunched`, `DXT5Crunched`) decoded (pure Rust; a port of the published crunch decoder).
+texture2ddecoder = "0.1.2"
 
 # Parsing multi-megabyte bundles in an unoptimised build is too slow to iterate on.
 [profile.dev]

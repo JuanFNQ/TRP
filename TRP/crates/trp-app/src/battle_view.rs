@@ -93,12 +93,22 @@ pub struct BattleModes {
     /// The parts coloured green to red (`EHealthColorScheme.GreenToRed`,
     /// "Polychrome") rather than white to red ("Monochrome").
     pub green_to_red: bool,
+    /// How the weapon's tactical key works (`TacticalInputMode`: Press,
+    /// the game's default, or Hold), which T+B flips and keeps at once
+    /// (tactical-devices spec, "The keys"; `tactical_view`).
+    pub tactical: trp_sim::tactical::InputMode,
 }
 
 impl BattleModes {
     pub fn read(install: &trp_data::Install) -> Self {
         let shows = |name: &str| install.game_setting(name).as_deref().and_then(Shows::of).unwrap_or_default();
-        Self { quick: shows("QuickSlotsVisibility"), stamina: shows("StaminaVisibility"), health: shows("HealthVisibility"), green_to_red: install.game_setting("HealthColor").as_deref() == Some("GreenToRed") }
+        Self {
+            quick: shows("QuickSlotsVisibility"),
+            stamina: shows("StaminaVisibility"),
+            health: shows("HealthVisibility"),
+            green_to_red: install.game_setting("HealthColor").as_deref() == Some("GreenToRed"),
+            tactical: install.game_setting("TacticalInputMode").as_deref().and_then(trp_sim::tactical::InputMode::of_word).unwrap_or_default(),
+        }
     }
 
     /// The scheme's name as the game keeps it.
@@ -149,8 +159,8 @@ struct Own {
 /// in half a second from where it stands (`DOFade`, DOTween's default
 /// ease, out quad).
 #[derive(Default)]
-struct Fader {
-    alpha: f32,
+pub(crate) struct Fader {
+    pub(crate) alpha: f32,
     steps: Vec<Step>,
     at: f32,
     from: f32,
@@ -169,7 +179,7 @@ const VISIBILITY_DURATION: f32 = 3.0;
 
 impl Fader {
     /// `Show`: to whole, then, raised a while, three seconds and out.
-    fn show(&mut self, autohide: bool) {
+    pub(crate) fn show(&mut self, autohide: bool) {
         self.steps = vec![Step::Fade(1.0)];
         if autohide {
             self.steps.extend([Step::Wait(VISIBILITY_DURATION), Step::Fade(0.0)]);
@@ -178,13 +188,13 @@ impl Fader {
     }
 
     /// `Hide`: after the delay, out.
-    fn hide(&mut self, delay: f32) {
+    pub(crate) fn hide(&mut self, delay: f32) {
         self.steps = if delay > 0.0 { vec![Step::Wait(delay), Step::Fade(0.0)] } else { vec![Step::Fade(0.0)] };
         self.begin();
     }
 
     /// `Close`: gone at once.
-    fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         self.steps.clear();
         self.alpha = 0.0;
     }
@@ -194,7 +204,7 @@ impl Fader {
         self.from = self.alpha;
     }
 
-    fn advance(&mut self, mut dt: f32) {
+    pub(crate) fn advance(&mut self, mut dt: f32) {
         while let Some(&step) = self.steps.first() {
             let length = match step {
                 Step::Wait(time) => time,
@@ -289,6 +299,29 @@ struct BattleState {
     /// The effects' icons shown: each one's effect, by the game's name, and
     /// how many of it.
     effects: Vec<(&'static str, usize)>,
+    /// The mount's icon (`BattleUiBipodPanel`): the side's number of the
+    /// mount shown (`ChangeMountImage`: none, not mounted), the red flash
+    /// under way and how far into it (`OnMountUnavailable`), and the
+    /// searches refused as last seen.
+    mount_side: Option<i32>,
+    mount_flash: Option<f32>,
+    refusals_seen: u32,
+}
+
+/// The red mount icon's alpha so far into its flash of `length` seconds
+/// (`OnMountUnavailable`: `DOFade` to whole in half of it, then out in the
+/// other half, DOTween's default ease, out quad).
+fn mount_flash_alpha(at: f32, length: f32) -> f32 {
+    let half = (length / 2.0).max(1e-6);
+    let out_quad = |x: f32| {
+        let x = x.clamp(0.0, 1.0);
+        1.0 - (1.0 - x) * (1.0 - x)
+    };
+    if at < half {
+        out_quad(at / half)
+    } else {
+        1.0 - out_quad((at - half) / half)
+    }
 }
 
 impl BattleState {
@@ -353,8 +386,8 @@ impl BattleState {
 /// `MovementContext.CovertNoiseLevel`: 1 lying, 2 sprinting; else 0 where
 /// the covert movement is nearly whole (`CovertEfficiency`, over 0.9: none
 /// with a leg damaged, else the speed's share of the top under 0.4 to 0.2
-/// times the Covert Movement skill's speed, less the walk's overweight; the
-/// skill at level 0, its speed 1, skills not being a system of the app's),
+/// times the Covert Movement skill's speed, as its level gives it
+/// (`skills`; 1 untrained), less the walk's overweight),
 /// 2 up off the ground faster than 0.8 of the top, and 1 otherwise.
 fn noise_level(controller: &Controller) -> usize {
     let m = &controller.movement;
@@ -365,7 +398,7 @@ fn noise_level(controller: &Controller) -> usize {
         return 2;
     }
     let ratio = m.clamped_speed() / m.settings.max_speed.max(1e-6);
-    let covert = 0.4 * 1.0;
+    let covert = 0.4 * m.sounds.covert().speed;
     let efficiency = if m.conditions.leg_damaged() { 0.0 } else { ((ratio - covert) / -0.2).clamp(0.0, 1.0) * (1.0 - m.stamina.settings.walk_overweight) };
     if efficiency > 0.9 {
         0
@@ -489,7 +522,7 @@ fn draw_quick_bar(
         if item.is_some_and(|item| Some(item.id) == held.item) {
             selected.push(slot.key.clone());
         }
-        let pictured = item.is_some_and(|item| carried.pictures.contains_key(&item.kind.template));
+        let pictured = item.is_some_and(|item| carried.pictures.contains_key(&crate::icons::picture_key(item)));
         drawn.push(format!("{} {key} {caption} {:?} {pictured}", slot.key, item.map(|item| item.id)));
         words.insert(slot.key.clone(), (key, caption));
     }
@@ -547,7 +580,7 @@ fn follow_stance(
     let Some(views) = look.battle.as_ref().filter(|_| look.tarkov_ui) else { return };
     let m = &controller.movement;
     let alive = controller.health.as_ref().is_none_or(|health| health.alive);
-    let up = !controller.inventory_open && alive;
+    let up = !controller.inventory_open && !controller.edit_build && alive;
     let state = &mut *state;
     // The screen shut (the inventory open, the character dead): every
     // panel gone at once (`BattleUIScreen.Close`).
@@ -585,6 +618,11 @@ fn follow_stance(
         state.sprint_holds = false;
         state.seen = None;
         state.hands_seen = held.changes;
+        // The mount's icon as the character stands (`BattleUiBipodPanel.
+        // Show`: `ChangeMountImage`), no flash.
+        state.mount_side = m.mount_view().map(|view| view.side.number());
+        state.mount_flash = None;
+        state.refusals_seen = controller.mount_refusals;
         match modes.stamina {
             Shows::Always => state.stance.show(false),
             _ => state.stance.hide(0.0),
@@ -666,6 +704,24 @@ fn follow_stance(
         }
     }
     state.seen = Some(now);
+    // The mount's icon (`BattleUiBipodPanel`): set afresh as the mount's
+    // data is set or cleared (`OnMountedStateChanged`: `ChangeMountImage`,
+    // which stops a flash, the panel raised), and flashed red when a search
+    // finds nothing (`OnNothingFound`: `OnMountUnavailable`, unless a flash
+    // is under way; the panel raised).
+    let side = m.mount_view().map(|view| view.side.number());
+    if side != state.mount_side {
+        state.mount_side = side;
+        state.mount_flash = None;
+        state.pull_up(modes);
+    }
+    if controller.mount_refusals != state.refusals_seen {
+        state.refusals_seen = controller.mount_refusals;
+        if state.mount_flash.is_none() {
+            state.mount_flash = Some(0.0);
+        }
+        state.pull_up(modes);
+    }
     if state.ladder.wait > 0 {
         state.ladder.wait -= 1;
         if state.ladder.wait == 0 {
@@ -676,6 +732,15 @@ fn follow_stance(
     state.stance.advance(dt);
     state.health.advance(dt);
     state.quick.advance(dt);
+    let mount = views.mount.as_ref();
+    let flash_length = mount.map_or(0.0, |mount| mount.highlight);
+    if let Some(at) = state.mount_flash.as_mut() {
+        *at += dt;
+        if *at >= flash_length {
+            state.mount_flash = None;
+        }
+    }
+    let red = state.mount_flash.map_or(0.0, |at| mount_flash_alpha(at, flash_length));
 
     // The pieces as the script leaves them.
     let Ok(window) = window.single() else { return };
@@ -716,6 +781,19 @@ fn follow_stance(
                 *visibility = want;
             }
         }
+        if let Some(mount) = mount {
+            let shown = if index == mount.image {
+                Some(state.mount_side.is_some())
+            } else {
+                mount.directions.iter().find(|(object, _)| *object == index).map(|(_, side)| state.mount_side == Some(*side))
+            };
+            if let Some(shown) = shown {
+                let want = if shown { Visibility::Inherited } else { Visibility::Hidden };
+                if *visibility != want {
+                    *visibility = want;
+                }
+            }
+        }
         if let Some((_, [dx, dy])) = handles.iter().find(|(handle, _)| under(index, *handle)) {
             let want = Val2::px(dx * s, dy * s);
             if transform.translation != want {
@@ -732,7 +810,11 @@ fn follow_stance(
                 }
             }
         }
-        if Some(index) == final_image {
+        if mount.is_some_and(|mount| mount.unavailable == index) {
+            if let (Some(mut own), Some(color)) = (own, stance.nodes[index].image.map(|image| crate::health_view::rgba(image.color))) {
+                own.image = Some(color.with_alpha(red));
+            }
+        } else if Some(index) == final_image {
             if let Some(mut own) = own {
                 own.ground = Some(notch_color(state.notches[20]));
             }

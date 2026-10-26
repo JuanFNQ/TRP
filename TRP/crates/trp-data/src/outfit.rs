@@ -840,6 +840,7 @@ fn lay_meshes(model: &xray::Model, how: &[Option<Goes>], zone: &[usize], bones: 
             joints: Vec::with_capacity(count),
             submeshes: vec![Vec::new(); 3],
             bind_poses: vec![NO_MOVE; bones],
+            ..MeshData::default()
         };
         for ((p, n), links) in part.positions.iter().zip(&part.normals).zip(&part.links) {
             let (mut place, mut normal) = ([0.0f32; 3], [0.0f32; 3]);

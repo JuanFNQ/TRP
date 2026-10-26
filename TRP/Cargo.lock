@@ -1286,7 +1286,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6df06e6993a0896bae2fe7644ae6def29a1a92b45dfb1bcebbd92af782be3638"
 dependencies = [
  "bevy_app",
+ "bevy_asset",
  "bevy_ecs",
+ "bevy_image",
  "bevy_input",
  "bevy_math",
  "bevy_platform",
@@ -1308,8 +1310,10 @@ dependencies = [
  "bevy_a11y",
  "bevy_android",
  "bevy_app",
+ "bevy_asset",
  "bevy_derive",
  "bevy_ecs",
+ "bevy_image",
  "bevy_input",
  "bevy_input_focus",
  "bevy_log",
@@ -1318,11 +1322,13 @@ dependencies = [
  "bevy_reflect",
  "bevy_tasks",
  "bevy_window",
+ "bytemuck",
  "cfg-if",
  "js-sys",
  "tracing",
  "wasm-bindgen",
  "web-sys",
+ "wgpu-types",
  "winit",
 ]
 
@@ -3973,6 +3979,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "texture2ddecoder"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "427ae8ec7f2f0fdd3146b77cfa44bea880caf066f7e55398a8467afe2645c832"
+dependencies = [
+ "paste",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4194,7 +4209,7 @@ dependencies = [
 
 [[package]]
 name = "trp-app"
-version = "0.42.4"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "bevy",
@@ -4209,7 +4224,7 @@ dependencies = [
 
 [[package]]
 name = "trp-data"
-version = "0.42.4"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -4220,12 +4235,13 @@ dependencies = [
  "png",
  "serde",
  "serde_json",
+ "texture2ddecoder",
  "ttf-parser",
 ]
 
 [[package]]
 name = "trp-physics"
-version = "0.42.4"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "physx-sys",
@@ -4235,7 +4251,7 @@ dependencies = [
 
 [[package]]
 name = "trp-sim"
-version = "0.42.4"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "serde_json",

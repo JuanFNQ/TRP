@@ -124,6 +124,10 @@ pub struct Facts {
     pub magazine_in_hands: Option<Id>,
     /// Its magazine has been checked (`CheckedMagazine`).
     pub checked: bool,
+    /// Turning its fold would not fit where it lies: a weapon in a grid
+    /// without the room to be its new size there (`ItemManipulator.Fold`
+    /// refused, `Can't fold stock now`).
+    pub fold_refused: bool,
     /// What health says of using it now (`HasPartsToApply`): none without
     /// health, else nothing or its error's key.
     pub health: Option<Result<(), &'static str>>,
@@ -133,12 +137,18 @@ pub struct Facts {
 /// for why (shown in its tooltip; empty for none).
 pub type Can = Result<(), &'static str>;
 
-/// Every key of the game's words a line's reason may be.
-pub const REASONS: [&str; 8] = [
+/// Every key of the game's words a line's reason may be (looked up
+/// whatever its case, as the game's locale is: the install keeps the wish
+/// list's first in lower case).
+pub const REASONS: [&str; 12] = [
+    "InventoryErrors/MalfunctionError",
+    "Already in this group",
+    "Not in wishlist",
     "You can't do this to weapon with internal magazine",
     "InventoryError/You can't unload ammo from an installed magazine",
     "InventoryError/You can't unload from this item",
     "You can't fold this item",
+    "Can't fold stock now",
     "You can't disassemble equipped item",
     "Inventory/IncompatibleItem",
     "Health/ItemResourceDepleted",
@@ -159,6 +169,104 @@ pub fn refusal_key(refused: crate::health::Refused) -> &'static str {
 /// done now.
 pub fn lines(item: &Item, facts: &Facts) -> Vec<(Line, Can)> {
     Line::ALL.into_iter().filter(|line| shown(item, facts, *line)).map(|line| (line, can(item, facts, line))).collect()
+}
+
+/// A group of the wish list (`EWishlistGroup`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WishGroup {
+    Quests,
+    Hideout,
+    Trading,
+    Equipment,
+    Other,
+}
+
+impl WishGroup {
+    /// The game's name for it.
+    pub fn name(self) -> &'static str {
+        match self {
+            WishGroup::Quests => "Quests",
+            WishGroup::Hideout => "Hideout",
+            WishGroup::Trading => "Trading",
+            WishGroup::Equipment => "Equipment",
+            WishGroup::Other => "Other",
+        }
+    }
+}
+
+/// The wish list (`WishlistManager`'s own): kinds of thing, by template,
+/// each in one group.
+pub type Wishlist = std::collections::HashMap<String, WishGroup>;
+
+/// A line of the wish list's own menu (`WishlistContextInteractions.
+/// EWishlistInteractions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WishLine {
+    Group(WishGroup),
+    Remove,
+}
+
+impl WishLine {
+    /// In the game's order.
+    pub const ALL: [WishLine; 6] = [
+        WishLine::Group(WishGroup::Quests),
+        WishLine::Group(WishGroup::Equipment),
+        WishLine::Group(WishGroup::Hideout),
+        WishLine::Group(WishGroup::Other),
+        WishLine::Group(WishGroup::Trading),
+        WishLine::Remove,
+    ];
+
+    /// The game's name for it, which its template goes by
+    /// (`SimpleSpecifiedContextButtons`) and Remove's icon
+    /// (`Characteristics/Icons/`).
+    pub fn name(self) -> &'static str {
+        match self {
+            WishLine::Group(group) => group.name(),
+            WishLine::Remove => "RemoveFromWishlist",
+        }
+    }
+
+    /// Its caption's key in the install's words (`_customNames`).
+    pub fn caption_key(self) -> &'static str {
+        match self {
+            WishLine::Group(WishGroup::Quests) => "EWishlistGroup/Quests",
+            WishLine::Group(WishGroup::Hideout) => "EWishlistGroup/Hideout",
+            WishLine::Group(WishGroup::Trading) => "EWishlistGroup/Trading",
+            WishLine::Group(WishGroup::Equipment) => "EWishlistGroup/Equipment",
+            WishLine::Group(WishGroup::Other) => "EWishlistGroup/Other",
+            WishLine::Remove => "Wishlist/RemoveFromWishlist",
+        }
+    }
+}
+
+/// The wish list's own lines for a kind of thing, in order, each with
+/// whether it can be done (`WishlistContextInteractions.IsInteractive`): a
+/// group's not where the kind is in that group already, Remove's not
+/// where it is in none.
+pub fn wish_lines(template: &str, list: &Wishlist) -> Vec<(WishLine, Can)> {
+    WishLine::ALL
+        .into_iter()
+        .map(|line| {
+            let can = match line {
+                WishLine::Group(group) if list.get(template) == Some(&group) => Err("Already in this group"),
+                WishLine::Remove if !list.contains_key(template) => Err("Not in wishlist"),
+                _ => Ok(()),
+            };
+            (line, can)
+        })
+        .collect()
+}
+
+/// Does a line of the wish list's menu for a kind of thing
+/// (`ItemUiContext.AddToWishList`, `RemoveFromWishList`, `WishlistManager`):
+/// a group's puts the kind in that group, or moves it there from another;
+/// Remove takes it off. Whether the list changed.
+pub fn wish(list: &mut Wishlist, template: &str, line: WishLine) -> bool {
+    match line {
+        WishLine::Group(group) => list.insert(template.to_owned(), group) != Some(group),
+        WishLine::Remove => list.remove(template).is_some(),
+    }
 }
 
 /// The weapon's magazine, where its slot holds one (`GetCurrentMagazine`).
@@ -183,25 +291,22 @@ fn with_parts(item: &Item) -> Vec<&Item> {
     all
 }
 
-/// A part with a switch (`TogglableComponent`: armoured equipment with a
-/// hinge, night and thermal vision).
-fn switched(item: &Item) -> bool {
-    item.kind.hinge || is(item, "NightVision") || is(item, "ThermalVision")
-}
-
 /// Whether the thing can be switched (`CanToggle`): something in it has a
 /// switch, and a face shield is so only as a helmet.
 fn can_toggle(item: &Item) -> bool {
-    with_parts(item).into_iter().any(switched) && (!item.kind.face_shield || is(item, "Helmet"))
+    with_parts(item).into_iter().any(crate::inventory::has_switch) && (!item.kind.face_shield || is(item, "Helmet"))
 }
 
-/// The first part that folds (`FoldableComponent`, in the thing or its
-/// parts), and whether it can fold now (`CanBeFolded`: its folded slot,
-/// where it names one, holds something).
-fn foldable(item: &Item) -> Option<bool> {
-    let part = with_parts(item).into_iter().find(|part| part.kind.foldable)?;
-    let slot = &part.kind.folded_slot;
-    Some(slot.is_empty() || part.kind.slots.iter().zip(&part.slots).any(|(held, what)| held.name == *slot && what.is_some()))
+/// How the thing's switch stands (`Togglable.On`).
+fn switched_on(item: &Item) -> bool {
+    crate::inventory::switched_part(item).is_some_and(|part| part.on)
+}
+
+/// How the thing's fold stands, where it has one that can be turned
+/// (`Foldable.CanBeFolded`, `Folded`: the first part that folds, in the
+/// thing or its parts).
+fn folded(item: &Item) -> Option<bool> {
+    crate::inventory::can_be_folded(item).then(|| crate::inventory::folding_part(item).is_some_and(|part| part.folded))
 }
 
 fn shown(item: &Item, facts: &Facts, line: Line) -> bool {
@@ -230,20 +335,19 @@ fn shown(item: &Item, facts: &Facts, line: Line) -> bool {
         Line::UseAll => facts.health.is_some() && food && item.kind.max_resource >= 1.0,
         Line::Install => magazine_class && !facts.fitted,
         Line::Uninstall => magazine_class && facts.fitted,
-        Line::Open => is(item, "SearchableItem") || is(item, "LockableContainer"),
+        Line::Open => is(item, "SearchableItem") || is(item, "LockableContainer") || is(item, "SimpleContainer"),
         Line::UnloadAmmo => magazine_class || is(item, "AmmoBox"),
         // Every thing counts as examined.
         Line::Examine => false,
         Line::CheckMagazine => magazine_class && facts.something_in_hands && !facts.checked && facts.magazine_in_hands != Some(item.id) && rounds > 0,
-        // Nothing is switched on or folded here: each stands as made.
-        Line::TurnOn => can_toggle(item),
-        Line::TurnOff => false,
-        Line::Fold => foldable(item) == Some(true),
-        Line::Unfold => false,
+        Line::TurnOn => can_toggle(item) && !switched_on(item),
+        Line::TurnOff => can_toggle(item) && switched_on(item),
+        Line::Fold => folded(item) == Some(false),
+        Line::Unfold => folded(item) == Some(true),
         Line::Disassemble => weapon && facts.own,
-        Line::Tag => magazine_class || is(item, "LockableContainer"),
+        Line::Tag => crate::inventory::takes_tag(item),
         // Nothing is tagged here.
-        Line::ResetTag => false,
+        Line::ResetTag => crate::inventory::takes_tag(item) && !item.tag.name.is_empty(),
         // A dog tag's owner's profile is outside a raid's.
         Line::WatchProfile => false,
         Line::AddToWishlist => !item.kind.quest && !is(item, "Money") && !is(item, "SpecItem") && !is(item, "MobContainer"),
@@ -258,6 +362,12 @@ fn can(item: &Item, facts: &Facts, line: Line) -> Can {
             if mode != "ExternalMagazine" && mode != "ExternalMagazineWithInternalReloadSupport" {
                 return Err("You can't do this to weapon with internal magazine");
             }
+            // A malfunction the shooter knows of: a failure to feed, or any
+            // on a weapon that loads its chamber alone too (`ItemContextInteractionsSwitcher`).
+            let malf = item.malfunction.malf;
+            if item.malfunction.known && (malf == crate::malfunction::Malf::Feed || (malf != crate::malfunction::Malf::None && mode == "ExternalMagazineWithInternalReloadSupport")) {
+                return Err("InventoryErrors/MalfunctionError");
+            }
             Ok(())
         }
         Line::Use | Line::UseAll => facts.health.unwrap_or(Err("")),
@@ -271,8 +381,11 @@ fn can(item: &Item, facts: &Facts, line: Line) -> Can {
             Ok(())
         }
         Line::Fold | Line::Unfold => {
-            if foldable(item) != Some(true) {
+            if !crate::inventory::can_fold(item) {
                 return Err("You can't fold this item");
+            }
+            if facts.fold_refused {
+                return Err("Can't fold stock now");
             }
             Ok(())
         }
@@ -297,6 +410,91 @@ mod tests {
 
     fn names(lines: &[(Line, Can)]) -> Vec<&'static str> {
         lines.iter().map(|(line, _)| line.name()).collect()
+    }
+
+    /// A helmet's face shield is switched from the helmet's menu: FLIP DOWN
+    /// while it is up, FLIP UP once it is down; the shield's own menu has
+    /// neither (`CanToggle`).
+    #[test]
+    fn a_face_shield_is_flipped_from_its_helmet() {
+        let shield = thing(&["FaceShield", "ArmoredEquipment"], |kind| {
+            kind.hinge = true;
+            kind.face_shield = true;
+        });
+        let shield_id = shield.id;
+        let mut helmet = thing(&["Helmet", "ArmoredEquipment"], |kind| kind.slots = vec![Holder { name: "mod_equipment".into(), ..Holder::default() }]);
+        helmet.slots[0] = Some(shield.clone());
+        let facts = Facts { own: true, worn: true, ..Facts::default() };
+        let switches = |item: &Item| names(&lines(item, &facts)).into_iter().filter(|name| name.starts_with("Turn")).collect::<Vec<_>>();
+        assert_eq!(switches(&helmet), ["TurnOn"]);
+        assert!(switches(&shield).is_empty());
+        let helmet_id = helmet.id;
+        // Its hinge goes as the shield's switch, and is down with none.
+        assert!(!crate::inventory::hinge_down(&helmet));
+        assert_eq!(crate::inventory::toggle(&mut helmet, helmet_id), Some((shield_id, true)));
+        assert_eq!(switches(&helmet), ["TurnOff"]);
+        assert!(crate::inventory::hinge_down(&helmet));
+        assert_eq!(crate::inventory::toggle(&mut helmet, helmet_id), Some((shield_id, false)));
+        assert_eq!(switches(&helmet), ["TurnOn"]);
+        helmet.slots[0] = None;
+        assert!(crate::inventory::hinge_down(&helmet));
+    }
+
+    /// The wish list's own lines: each group's dimmed where the kind is in
+    /// it already, Remove's where it is in none; a group's line puts the
+    /// kind in that group or moves it there, Remove takes it off.
+    #[test]
+    fn the_wish_list_s_lines_go_by_the_kind_s_group() {
+        let mut list = Wishlist::new();
+        let dimmed = |list: &Wishlist| wish_lines("ak", list).into_iter().filter(|(_, can)| can.is_err()).map(|(line, _)| line.name()).collect::<Vec<_>>();
+        assert_eq!(wish_lines("ak", &list).iter().map(|(line, _)| line.name()).collect::<Vec<_>>(), ["Quests", "Equipment", "Hideout", "Other", "Trading", "RemoveFromWishlist"]);
+        assert_eq!(dimmed(&list), ["RemoveFromWishlist"]);
+        assert!(wish(&mut list, "ak", WishLine::Group(WishGroup::Equipment)));
+        assert_eq!(dimmed(&list), ["Equipment"]);
+        assert!(!wish(&mut list, "ak", WishLine::Group(WishGroup::Equipment)));
+        assert!(wish(&mut list, "ak", WishLine::Group(WishGroup::Trading)));
+        assert_eq!((list.len(), dimmed(&list)), (1, vec!["Trading"]));
+        assert!(wish(&mut list, "ak", WishLine::Remove));
+        assert!(!wish(&mut list, "ak", WishLine::Remove));
+        assert_eq!(dimmed(&list), ["RemoveFromWishlist"]);
+    }
+
+    /// A weapon with a stock that folds offers FOLD while unfolded and
+    /// UNFOLD once folded; a part that blocks folding, or no room for the
+    /// new size where it lies, dims the line with the game's reason.
+    #[test]
+    fn a_fold_is_offered_by_how_it_stands() {
+        let slots = vec![Holder { name: "mod_stock".into(), ..Holder::default() }, Holder { name: "mod_barrel".into(), ..Holder::default() }];
+        let mut gun = thing(&["Weapon"], |kind| {
+            kind.slots = slots;
+            kind.merges = true;
+        });
+        gun.slots[0] = Some(thing(&["Stock", "Mod"], |kind| kind.foldable = true));
+        let facts = Facts { own: true, ..Facts::default() };
+        let folds = |gun: &Item, facts: &Facts| lines(gun, facts).into_iter().filter(|(line, _)| matches!(line, Line::Fold | Line::Unfold)).collect::<Vec<_>>();
+        assert_eq!(folds(&gun, &facts), [(Line::Fold, Ok(()))]);
+        assert_eq!(folds(&gun, &Facts { fold_refused: true, ..facts.clone() }), [(Line::Fold, Err("Can't fold stock now"))]);
+        let id = gun.id;
+        crate::inventory::fold(&mut [&mut gun], id).unwrap();
+        assert_eq!(folds(&gun, &facts), [(Line::Unfold, Ok(()))]);
+        gun.slots[1] = Some(thing(&["Barrel", "Mod"], |kind| kind.blocks_folding = true));
+        assert_eq!(folds(&gun, &facts), [(Line::Unfold, Err("You can't fold this item"))]);
+    }
+
+    /// A magazine, a lockable and a simple container take a tag: Tag
+    /// always, Reset tag once it is named; a simple container opens.
+    #[test]
+    fn a_tag_is_offered_and_reset_when_named() {
+        let facts = Facts { own: true, ..Facts::default() };
+        let tags = |item: &Item| names(&lines(item, &facts)).into_iter().filter(|name| name.ends_with("Tag") || *name == "Open").collect::<Vec<_>>();
+        let mut case = thing(&["SimpleContainer"], |_| {});
+        assert_eq!(tags(&case), ["Open", "Tag"]);
+        let id = case.id;
+        assert!(crate::inventory::set_tag(&mut case, id, "ammo", 2));
+        assert_eq!(tags(&case), ["Open", "Tag", "ResetTag"]);
+        let mut rifle = thing(&["Weapon"], |_| {});
+        let rifle_id = rifle.id;
+        assert!(tags(&rifle).is_empty() && !crate::inventory::set_tag(&mut rifle, rifle_id, "no", 0));
     }
 
     #[test]
@@ -324,7 +522,7 @@ mod tests {
     fn a_weapon_s_lines_go_by_its_magazine_and_where_it_is() {
         let mut rifle = thing(&["AssaultRifle", "Weapon"], |kind| {
             kind.reload_mode = "ExternalMagazine".into();
-            kind.slots = vec![Holder { name: "mod_magazine".into(), cells: [0, 0], takes: Vec::new(), refuses: Vec::new(), merges: None, required: false }];
+            kind.slots = vec![Holder { name: "mod_magazine".into(), cells: [0, 0], takes: Vec::new(), refuses: Vec::new(), merges: None, required: false, armour: false, locked: false }];
         });
         rifle.slots = vec![None];
         let worn = Facts { worn: true, own: true, ..Facts::default() };

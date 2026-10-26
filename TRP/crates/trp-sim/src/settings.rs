@@ -162,6 +162,9 @@ pub struct MovementSettings {
     pub pose_decrease_range: [f32; 2],
     pub transition_speed_range: [f32; 2],
     pub overweight: f32,
+    /// What Strength makes of the weight's limits (`WeightLimits`), which
+    /// the inertia and every overweight share above were worked out with.
+    pub limits: WeightLimits,
     /// What stamina runs on.
     pub stamina: StaminaSettings,
     /// What vaulting and climbing run on (vaulting spec).
@@ -171,12 +174,50 @@ pub struct MovementSettings {
     /// install's `DelayToOpenContainer` (0.55; the class's default is 0.5).
     /// A door waits a half second of its own (interactions spec).
     pub thing_answers_after: f32,
+    /// The box a roll needs to that side and the ray its ground is felt
+    /// with (`RollCheckShift`, `RollCheckSize`, `RollCheckGroundCastLength`:
+    /// 0.5, 0 and 0.2 m from the ribcage over the feet, 0.25 by 0.1 by
+    /// 2.1 m, and 0.5 m in the install; movement spec, "Room to move").
+    pub roll_check_shift: [f32; 3],
+    pub roll_check_size: [f32; 3],
+    pub roll_check_cast: f32,
+    /// The head's two capsules on the player prefab (movement spec, "The
+    /// head's push out of walls"); none where the settings were made
+    /// without the install's prefab, and then nothing pushes the head.
+    pub head: Option<trp_data::player::HeadCollidersData>,
+}
+
+/// What the Strength skill makes of the carried weight's limits
+/// (`PhysicalBase.UpdateWeightLimits`): the inertia's limits raised by
+/// `InertiaLimitsStep` a level of Strength (`SummaryLevel`), and every
+/// overweight limit times the skills' carrying factor (1 + Strength's lift,
+/// `SkillManager.CarryingWeightRelativeModifier`). `BASE` is an untrained
+/// character's, which the settings are made with unless told.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeightLimits {
+    pub strength_level: f32,
+    pub carry: f32,
+}
+
+impl WeightLimits {
+    pub const BASE: Self = Self { strength_level: 0.0, carry: 1.0 };
+
+    /// From the skills' buffs.
+    pub fn of(buffs: &crate::skills::Buffs) -> Self {
+        Self { strength_level: buffs.strength_level as f32, carry: 1.0 + buffs.strength_lift }
+    }
 }
 
 impl MovementSettings {
     /// `config` is the `config` section of `globals.json`; `gravity` is the
-    /// engine's vertical gravity, negative.
+    /// engine's vertical gravity, negative. An untrained character's limits
+    /// (`WeightLimits::BASE`).
     pub fn new(table: impl Into<std::sync::Arc<RootMotionTable>>, hard: &HardSettings, config: &Json, weight: f32, gravity: f32) -> Result<Self> {
+        Self::new_limited(table, hard, config, weight, gravity, WeightLimits::BASE)
+    }
+
+    /// As `new`, with the weight's limits as Strength makes them.
+    pub fn new_limited(table: impl Into<std::sync::Arc<RootMotionTable>>, hard: &HardSettings, config: &Json, weight: f32, gravity: f32, limits: WeightLimits) -> Result<Self> {
         let table = table.into();
         let section = |name: &str| config.get(name).ok_or_else(|| anyhow!("globals have no {name}"));
         let inertia_cfg = section("Inertia")?;
@@ -192,15 +233,20 @@ impl MovementSettings {
         let at = |r: [f32; 2], t: f32| lerp(r[0], r[1], t);
         let inverse = |r: [f32; 2], v: f32| inverse_lerp(r[0], r[1], v);
 
-        // Strength level 0: the limits are the base values.
-        let limits = inertia_cfg.get("InertiaLimits").ok_or_else(|| anyhow!("globals have no InertiaLimits"))?;
-        let mix = limits.get("z").and_then(Json::as_f64).unwrap_or(0.0) as f32;
-        let n = inverse(range(inertia_cfg, "InertiaLimits")?, weight);
+        // The inertia's limits raised by Strength's level, a step a level
+        // (an untrained character's: the base values).
+        let inertia_limits = inertia_cfg.get("InertiaLimits").ok_or_else(|| anyhow!("globals have no InertiaLimits"))?;
+        let mix = inertia_limits.get("z").and_then(Json::as_f64).unwrap_or(0.0) as f32;
+        let step = number(inertia_cfg, "InertiaLimitsStep").unwrap_or(0.0) * limits.strength_level;
+        let [low, high] = range(inertia_cfg, "InertiaLimits")?;
+        let n = inverse([low + step, high + step], weight);
         let inertia = lerp(n * n * n, n, mix);
 
-        let overweight = inverse(range(stamina_cfg, "BaseOverweightLimits")?, weight);
-        let sprint_overweight = inverse(range(stamina_cfg, "SprintOverweightLimits")?, weight);
-        let walk_speed_limit = 1.0 - inverse(range(stamina_cfg, "WalkSpeedOverweightLimits")?, weight);
+        // The overweight limits times the carrying factor (1 untrained).
+        let carried = |name: &str| range(stamina_cfg, name).map(|[low, high]| [low * limits.carry, high * limits.carry]);
+        let overweight = inverse(carried("BaseOverweightLimits")?, weight);
+        let sprint_overweight = inverse(carried("SprintOverweightLimits")?, weight);
+        let walk_speed_limit = 1.0 - inverse(carried("WalkSpeedOverweightLimits")?, weight);
         let max_speed = range(config, "WalkSpeed")?[0];
 
         let mut movement_acceleration_range = hard.curve("MovementAccelerationRange")?.clone();
@@ -308,9 +354,14 @@ impl MovementSettings {
             pose_decrease_range: range(stamina_cfg, "PoseLevelDecreaseSpeed")?,
             transition_speed_range: range(stamina_cfg, "TransitionSpeed")?,
             overweight,
-            stamina: StaminaSettings::new(config, weight, hard.float("DELTA_LEVEL")?)?,
+            limits,
+            stamina: StaminaSettings::new_carrying(config, weight, hard.float("DELTA_LEVEL")?, limits.carry)?,
             vaulting: VaultingSettings::new(config)?,
             thing_answers_after: hard.float("DelayToOpenContainer")?,
+            roll_check_shift: hard.vec3("RollCheckShift")?,
+            roll_check_size: hard.vec3("RollCheckSize")?,
+            roll_check_cast: hard.float("RollCheckGroundCastLength")?,
+            head: None,
         })
     }
 }
@@ -323,10 +374,18 @@ impl MovementSettings {
     /// the walk's floor is keyed by this character again, as the game keys
     /// it for whichever character's weight changed last.
     pub fn reweighed(&self, hard: &HardSettings, config: &Json, weight: f32) -> Result<Self> {
-        let mut fresh = Self::new(self.table.clone(), hard, config, weight, self.gravity)?;
+        self.relimited(hard, config, weight, self.limits)
+    }
+
+    /// These settings for a carried weight and the weight's limits as
+    /// Strength makes them (`PhysicalBase.UpdateWeightLimits`, which the
+    /// game runs when Strength's level changes as when the weight does).
+    pub fn relimited(&self, hard: &HardSettings, config: &Json, weight: f32, limits: WeightLimits) -> Result<Self> {
+        let mut fresh = Self::new_limited(self.table.clone(), hard, config, weight, self.gravity, limits)?;
         fresh.set_strength(self.strength);
         fresh.prone_key_refused_in_reload = self.prone_key_refused_in_reload;
         fresh.steps = self.steps.clone();
+        fresh.head = self.head.clone();
         Ok(fresh)
     }
 
@@ -338,8 +397,9 @@ impl MovementSettings {
         self.max_speed = lerp(self.walk_speed_range[0], self.walk_speed_range[1], t);
         self.sprinting_speed = lerp(self.sprint_speed_range[0], self.sprint_speed_range[1], t);
         // The skill also pushes harder off the ground: a fifth more at
-        // level 50, in proportion below.
-        self.jump_boost = 1.0 + 0.2 * level.max(0.0) / 50.0;
+        // level 50, in proportion below, and no more above
+        // (`StrengthBuffJumpHeightInc`, its rule held at 50).
+        self.jump_boost = 1.0 + 0.2 * level.clamp(0.0, 50.0) / 50.0;
         self.state_speed_limit =
             if self.walk_speed_limit < 1.0 { self.walk_speed_limit * self.max_speed } else { 1.0 };
     }

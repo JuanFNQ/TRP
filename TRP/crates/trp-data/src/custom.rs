@@ -59,6 +59,11 @@ pub struct Definition {
     /// the donor.
     #[serde(default)]
     pub hands: Option<HandsDef>,
+    /// The install's weapon whose muzzle effects it has (its flash and its
+    /// smoke, read with that weapon's own `MuzzleManager`), laid at this
+    /// weapon's `fireport` as they lie from that weapon's (`take_muzzle`).
+    #[serde(default)]
+    pub muzzle_from: Option<String>,
     /// What its item template has other than the donor's.
     #[serde(default)]
     pub template: Changes,
@@ -604,8 +609,13 @@ fn mesh_of(definition: &Definition, model: &fbx::Model, unit: f32) -> Option<Mes
 /// Makes the donor's bare rig this weapon's: nothing of the donor's is
 /// drawn, the model's parts hang on its bones, the bones a weapon's
 /// parts would bring are added, and every bone the edits move rests
-/// where the edits have it.
-pub fn build(definition: &Definition, hierarchy: &mut Hierarchy) -> Result<Build> {
+/// where the edits have it. `hung` are objects of the donor's already
+/// hung on its slots' bones (its magazine's prefab, `crate::weapon`): a
+/// part on such a bone hangs below that object instead, where the object
+/// is the thing the game goes by (a reload shows and hides a magazine's,
+/// and finds its rounds' points below it), and no hand goes by anything
+/// of theirs.
+pub fn build(definition: &Definition, hierarchy: &mut Hierarchy, hung: &[usize]) -> Result<Build> {
     let data = std::fs::read(definition.model_file()).with_context(|| format!("reading {}", definition.model_file().display()))?;
     let scene = fbx::read(&data)?;
     ensure!(scene.up == (1, 1.0), "the model's up is not +y");
@@ -625,6 +635,18 @@ pub fn build(definition: &Definition, hierarchy: &mut Hierarchy) -> Result<Build
     for index in 0..hierarchy.nodes.len() {
         if below(hierarchy, index) {
             hierarchy.nodes[index].renderer = None;
+        }
+    }
+    for &object in hung {
+        for index in object..hierarchy.nodes.len() {
+            let mut at = Some(index);
+            while let Some(node) = at.filter(|&node| node >= object) {
+                if node == object {
+                    hierarchy.nodes[index].grip = None;
+                    break;
+                }
+                at = hierarchy.nodes[node].parent;
+            }
         }
     }
     let bone = |hierarchy: &Hierarchy, path: &str| -> Result<usize> {
@@ -701,6 +723,7 @@ pub fn build(definition: &Definition, hierarchy: &mut Hierarchy) -> Result<Build
             active: true,
             renderer: None,
             scripts: Vec::new(),
+            script_objects: Vec::new(),
             grip: None,
             placer: None,
             // No object of the install's.
@@ -728,7 +751,8 @@ pub fn build(definition: &Definition, hierarchy: &mut Hierarchy) -> Result<Build
     for part in &definition.parts {
         let model = scene.models.iter().find(|model| model.name == part.model).ok_or_else(|| anyhow!("the model has no part {}", part.model))?;
         let mesh = mesh_of(definition, model, unit).ok_or_else(|| anyhow!("the part {} has no mesh", part.model))?;
-        let parent = bone(hierarchy, &part.bone)?;
+        let on = bone(hierarchy, &part.bone)?;
+        let parent = hung.iter().copied().find(|&object| hierarchy.nodes[object].parent == Some(on)).unwrap_or(on);
         let (parent_at, parent_turn) = placed(hierarchy, parent);
         let node = new_node(hierarchy, &part.model, parent, rotate(back(parent_turn), parent_at.map(|c| -c)), back(parent_turn));
         let materials = (0..mesh.submeshes.len())
@@ -743,6 +767,104 @@ pub fn build(definition: &Definition, hierarchy: &mut Hierarchy) -> Result<Build
         build.parts.push(Part { node, mesh: Arc::new(mesh), materials });
     }
     Ok(build)
+}
+
+/// Where an object is in the axes of an object above it, by the
+/// hierarchy at rest; none is scaled on the way.
+fn below(hierarchy: &Hierarchy, above: usize, mut node: usize) -> Result<Placed> {
+    let (mut place, mut turn) = ([0.0; 3], [0.0, 0.0, 0.0, 1.0]);
+    while node != above {
+        let n = &hierarchy.nodes[node];
+        ensure!(n.scale.iter().all(|s| (s - 1.0).abs() < 1e-3), "{} is scaled", n.name);
+        place = add(rotate(n.rotation, place), n.translation);
+        turn = quat_mul(n.rotation, turn);
+        node = n.parent.ok_or_else(|| anyhow!("{} is not below {}", hierarchy.nodes[node].name, hierarchy.nodes[above].name))?;
+    }
+    Ok((place, turn))
+}
+
+/// Another weapon's muzzle effects laid on this one (`muzzle_from`): the
+/// objects the game takes them from on that weapon (`crate::muzzle::
+/// effect_objects`), each put below this weapon's `fireport` where it is
+/// from that weapon's fireport in the axes of its weapon bone, with its
+/// scripts. The receiver's `extractor_smoke` is not taken: it is no
+/// muzzle's, and its fume is not drawn.
+pub fn take_muzzle(from: &Hierarchy, hierarchy: &mut Hierarchy) -> Result<()> {
+    let bone_of = |h: &Hierarchy| (0..h.nodes.len()).find(|&i| h.path(i) == WEAPON_BONE).ok_or_else(|| anyhow!("no weapon bone"));
+    let fireport_of = |h: &Hierarchy, weapon: usize| h.find_below(weapon, "fireport").ok_or_else(|| anyhow!("no fireport"));
+    let (their_weapon, our_weapon) = (bone_of(from)?, bone_of(hierarchy)?);
+    let their_fireport = below(from, their_weapon, fireport_of(from, their_weapon)?)?.0;
+    let our_fireport = fireport_of(hierarchy, our_weapon)?;
+    let turn = below(hierarchy, our_weapon, our_fireport)?.1;
+    for (made, node) in crate::muzzle::effect_objects(from).into_iter().filter(|&node| from.nodes[node].name != "extractor_smoke").enumerate() {
+        let (at, its_turn) = below(from, their_weapon, node)?;
+        let source = &from.nodes[node];
+        hierarchy.nodes.push(Node {
+            name: source.name.clone(),
+            parent: Some(our_fireport),
+            translation: rotate(back(turn), sub(at, their_fireport)),
+            rotation: quat_mul(back(turn), its_turn),
+            scale: [1.0; 3],
+            active: true,
+            renderer: None,
+            scripts: source.scripts.clone(),
+            script_objects: source.script_objects.clone(),
+            grip: None,
+            placer: None,
+            // No object of this weapon's (the build's own count up).
+            transform: ObjRef { file: usize::MAX, path_id: -1 - made as i64 },
+            colliders: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
+/// The weapon's magazine as a thing of its own (let go, or drawn in its
+/// picture): its object, the first under its slot (`build`'s `hung`), as
+/// the root of its own tree, with all below it (the model's magazine, its
+/// rounds' points) and the model's parts among them. The root at the
+/// origin and unturned, as an item's own object (a picture's pose
+/// replaces its turn).
+pub fn magazine_model(weapon: &crate::weapon::Weapon) -> Result<(Hierarchy, Build)> {
+    let custom = weapon.custom.as_ref().ok_or_else(|| anyhow!("{} is one of the install's own", weapon.name))?;
+    let h = &weapon.hierarchy;
+    let slot = h.find_below(0, "mod_magazine").ok_or_else(|| anyhow!("{} has no magazine slot", weapon.name))?;
+    let object = (0..h.nodes.len()).find(|&i| h.nodes[i].parent == Some(slot)).ok_or_else(|| anyhow!("{} has no magazine", weapon.name))?;
+    // Its own and all below it, each after its parent as in the tree.
+    let mut new_index = vec![None; h.nodes.len()];
+    let mut nodes = Vec::new();
+    for index in object..h.nodes.len() {
+        let parent = h.nodes[index].parent.and_then(|parent| new_index[parent]);
+        if index != object && parent.is_none() {
+            continue;
+        }
+        let mut node = h.nodes[index].clone();
+        node.parent = parent;
+        if index == object {
+            (node.translation, node.rotation) = ([0.0; 3], [0.0, 0.0, 0.0, 1.0]);
+        }
+        new_index[index] = Some(nodes.len());
+        nodes.push(node);
+    }
+    // Its parts, with only the materials they are drawn with (each a
+    // picture of every kind to send).
+    let mut materials = Vec::new();
+    let mut parts = Vec::new();
+    for part in custom.parts.iter().filter(|part| new_index[part.node].is_some()) {
+        let own = part
+            .materials
+            .iter()
+            .map(|&index| {
+                let material = &custom.materials[index];
+                materials.iter().position(|kept: &Material| kept.name == material.name).unwrap_or_else(|| {
+                    materials.push(material.clone());
+                    materials.len() - 1
+                })
+            })
+            .collect();
+        parts.push(Part { node: new_index[part.node].unwrap_or(0), mesh: part.mesh.clone(), materials: own });
+    }
+    Ok((Hierarchy { nodes }, Build { parts, materials, edits: custom.edits.clone() }))
 }
 
 /// The pictures a material of the model has, by the file's naming.

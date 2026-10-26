@@ -115,6 +115,17 @@ pub struct Marks {
 }
 
 impl Marks {
+    /// Takes another's points and queue where both follow states of the
+    /// same shape. Whether it could.
+    pub fn take_state(&mut self, from: &Marks) -> bool {
+        let same = self.points.len() == from.points.len() && self.points.iter().zip(&from.points).all(|(a, b)| a.len() == b.len());
+        if same {
+            self.points.clone_from(&from.points);
+            self.queued.clone_from(&from.queued);
+        }
+        same
+    }
+
     pub fn new(table: Arc<MarkTable>) -> Self {
         let points = table.by_state.iter().map(|states| vec![(0.0, false); states.len()]).collect();
         Self { table, points, queued: Vec::new() }

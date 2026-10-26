@@ -87,6 +87,7 @@ pub const PRONE_DROP: usize = 7;
 pub const JUMP: usize = 8;
 /// The kit's banks by their place in `trp_data::sound::GEAR_BANKS`.
 pub const GEAR: usize = 0;
+pub const GEAR_MEDIUM: usize = 1;
 pub const GEAR_FAST: usize = 2;
 
 /// Concrete: where the player begins, and what a thing without a surface
@@ -101,18 +102,40 @@ pub enum BankOf {
     Surface(u8, usize),
     /// The kit's (`GEAR`, `GEAR_FAST`).
     Kit(usize),
+    /// A surface's element for a move over an obstacle at one of its
+    /// marks (`SurfaceSet.VaultSoundSet` and the other two; footsteps
+    /// spec, "The vault's sounds"): the move (`trp_data::sound::VAULT_SETS`'
+    /// place), the mark (`VAULT_MARKS`' place) and the surface. The play's
+    /// `volume` is then the obstacle's height, which the element's volume
+    /// range is read at.
+    Vault { kind: usize, mark: usize, surface: u8 },
+    /// The kit's bank for a move over an obstacle (`GearVault` and the
+    /// other two, `trp_data::sound::VAULT_GEAR_BANKS`' place). The play's
+    /// `volume` is the height's share of the bank's own range.
+    VaultGear(usize),
 }
 
 /// A sound the rules ask for: its bank, whether it is the kit's source
 /// (`_gearSource`) or the steps' (`NestedStepSoundSource`), its volume
-/// (before the bank clamps it to 0 to 1) and the value the bank chooses
-/// its list by.
+/// (before the bank clamps it to 0 to 1; a vault's is the obstacle's
+/// height instead, `BankOf::Vault`) and the value the bank chooses its
+/// list by.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Play {
     pub bank: BankOf,
     pub kit: bool,
     pub volume: f32,
     pub blend: f32,
+    /// Whether the bank chooses by the listener's distance instead of
+    /// `blend` (every sound but a footstep passes the distance, which is
+    /// nought in first person).
+    pub by_distance: bool,
+    /// The kind's multiplier its source's farthest was just set by
+    /// (`UpdateStepSourceRolloff`, `CalculateMovementRolloff` over its
+    /// base): the source is heard no farther than the base rolloff times
+    /// this times the environment's share (`StepSettings`). None for a
+    /// vault's, which a bank plays at a point by its own rolloff.
+    pub reach: Option<f32>,
 }
 
 /// The figures the rules go by.
@@ -138,6 +161,13 @@ pub struct StepSettings {
     pub gear_delay: f32,
     pub turn_angle: f32,
     pub turn_delay: f32,
+    /// How far a character seen from outside is heard at a kind's
+    /// multiplier of 1 (`BaseMaxMovementRolloff`; first person's is 70,
+    /// a constant), and the share of it outdoors and indoors
+    /// (`OutdoorRolloffMult`, `IndoorRolloffMult`): SPT's `settings.json`.
+    pub third_person_rolloff: f32,
+    pub outdoor_rolloff: f32,
+    pub indoor_rolloff: f32,
 }
 
 impl Default for StepSettings {
@@ -153,6 +183,9 @@ impl Default for StepSettings {
             gear_delay: 0.1,
             turn_angle: 45.0,
             turn_delay: 0.5,
+            third_person_rolloff: 90.0,
+            outdoor_rolloff: 0.98,
+            indoor_rolloff: 1.0,
         };
         for (kind, by) in [
             (Kind::Run, 0.85),
@@ -188,6 +221,9 @@ impl StepSettings {
             gear_delay: hard.float("GEAR_SOUND_DELAY")?,
             turn_angle: hard.float("TURN_ANGLE")?,
             turn_delay: hard.float("TURN_SOUND_DELAY")?,
+            third_person_rolloff: 90.0,
+            outdoor_rolloff: 0.98,
+            indoor_rolloff: 1.0,
         })
     }
 
@@ -203,6 +239,16 @@ impl StepSettings {
             if let (Some(kind), Some(by)) = (Kind::ALL.iter().find(|kind| Some(kind.name()) == name), by) {
                 self.multipliers[*kind as usize] = by as f32;
             }
+        }
+        let figure = |name: &str| client.pointer(&format!("/AudioSettings/PlayerSettings/{name}")).and_then(Json::as_f64).map(|v| v as f32);
+        if let Some(rolloff) = figure("BaseMaxMovementRolloff") {
+            self.third_person_rolloff = rolloff;
+        }
+        if let Some(by) = figure("OutdoorRolloffMult") {
+            self.outdoor_rolloff = by;
+        }
+        if let Some(by) = figure("IndoorRolloffMult") {
+            self.indoor_rolloff = by;
         }
     }
 }
@@ -243,8 +289,10 @@ pub struct Moment {
     pub clamped_speed: f32,
     pub speed: f32,
     pub max_speed: f32,
-    /// 0 to 1 by carried weight (`Physical.Overweight`).
+    /// 0 to 1 by carried weight (`Physical.Overweight`), and for an
+    /// upright walk (`WalkOverweight`), which cuts how quietly one walks.
     pub overweight: f32,
+    pub walk_overweight: f32,
     pub leg_damaged: bool,
     /// The view's yaw, and the hands' angle from the body, in degrees.
     pub yaw: f32,
@@ -258,6 +306,9 @@ pub struct StepSounds {
     /// The banks' figures by surface and bank, once the host has read
     /// them (`set_figures`): until then a bank's are 1 and 0.
     figures: Vec<(u8, [Option<Figures>; 9])>,
+    /// The kit's banks' figures, by `trp_data::sound::GEAR_BANKS`' order
+    /// (`set_kit_figures`).
+    kit_figures: [Option<Figures>; 4],
     /// The surface the feet were last found on (`CurrentSurface`).
     pub surface: u8,
     /// The movement state as last seen, and the one before it
@@ -288,6 +339,26 @@ pub struct StepSounds {
     rng: Rng,
     /// What the rules have asked for and the host has not taken.
     asked: Vec<Play>,
+    /// Covert Movement's buffs (`skills::Covert`: every factor 1
+    /// untrained), how quietly one walks (`CovertEfficiency`), and the
+    /// speed it was last worked out at (`_lastSpeedCovertCheck`), or that it
+    /// is to be worked out afresh.
+    covert: crate::skills::Covert,
+    efficiency: f32,
+    efficiency_speed: f32,
+    efficiency_due: bool,
+    /// A character seen from outside (`FirstPersonPointOfView` false): a
+    /// footstep, a sprint's step and the stop take no volume of their
+    /// bank's (`PlayStepSound`, `Sprint`, `StateChangedHandler`).
+    pub third_person: bool,
+}
+
+/// The surfaces the game counts as soft (`MovementContext.SoftSurface`:
+/// asphalt, concrete, gravel, soil, wood, thick wood and puddle, by their
+/// numbers in `BaseBallistic.ESurfaceSound`), which only Covert Movement's
+/// figures go by.
+fn soft(surface: u8) -> bool {
+    matches!(surface, 0 | 2 | 3 | 5 | 7 | 9 | 12)
 }
 
 impl Default for StepSounds {
@@ -321,6 +392,7 @@ impl StepSounds {
         let mut sounds = Self {
             settings,
             figures: Vec::new(),
+            kit_figures: [None; 4],
             surface: CONCRETE,
             state: State::Idle,
             previous: State::Idle,
@@ -336,10 +408,40 @@ impl StepSounds {
             next_landing: 0.0,
             rng: Rng::new(0x5745_5053),
             asked: Vec::new(),
+            covert: crate::skills::Covert::default(),
+            efficiency: 0.0,
+            efficiency_speed: 0.0,
+            efficiency_due: false,
+            third_person: false,
         };
         // The steps' source is made set for running (`CreateNestedSource`).
         sounds.work_out(Kind::Run, None, 0.0);
         sounds
+    }
+
+    /// Covert Movement's buffs, as the skill's level gives them: how
+    /// quietly one walks is worked out afresh on the next step, as the game
+    /// does when the level changes (`UpdateCovertEfficiency(force)`).
+    pub fn set_covert(&mut self, covert: crate::skills::Covert) {
+        if covert != self.covert {
+            self.covert = covert;
+            self.efficiency_due = true;
+        }
+    }
+
+    /// Covert Movement's buffs as they stand.
+    pub fn covert(&self) -> crate::skills::Covert {
+        self.covert
+    }
+
+    /// `CovertMovementVolume`: 1 untrained.
+    fn covert_volume(&self) -> f32 {
+        self.covert.volume(soft(self.surface))
+    }
+
+    /// `CovertEquipmentNoise`: 1 and the overweight, less the buff.
+    fn equipment_noise(&self, overweight: f32) -> f32 {
+        1.0 + overweight - self.covert.equipment
     }
 
     /// The banks' own figures, by surface, in `SURFACE_BANKS`' order.
@@ -350,6 +452,23 @@ impl StepSounds {
     /// Whether the banks' figures have been given.
     pub fn has_figures(&self) -> bool {
         !self.figures.is_empty()
+    }
+
+    /// The kit's banks' own figures, by `GEAR_BANKS`' order.
+    pub fn set_kit_figures(&mut self, figures: [Option<Figures>; 4]) {
+        self.kit_figures = figures;
+    }
+
+    /// The kit's medium rattle a mount sounds (`Player.EnterMountedStateHandler`,
+    /// `ExitMountedStateHandler`: `PlayGearSound(_gearMediumSoundBank,
+    /// RandomVolume)`; mounting spec, "Sounds"): the bank at its own random
+    /// volume, then as `PlayGearSound` has any.
+    pub fn kit_medium(&mut self, overweight: f32) {
+        let f = self.kit_figures[GEAR_MEDIUM].unwrap_or(Figures { base_volume: 1.0, delta_volume: 0.0 });
+        let volume = if f.delta_volume > 0.0 { f.base_volume + self.rng.range(-f.delta_volume, 0.0) } else { f.base_volume };
+        let by = self.work_out(Kind::Gear, None, overweight);
+        let noise = self.equipment_noise(overweight);
+        self.ask(BankOf::Kit(GEAR_MEDIUM), true, volume * by * noise, Some(by));
     }
 
     /// What the rules have asked for since this was last called.
@@ -398,16 +517,17 @@ impl StepSounds {
         }
     }
 
-    fn ask(&mut self, bank: BankOf, kit: bool, volume: f32, blend: f32) {
-        self.asked.push(Play { bank, kit, volume, blend });
+    /// A sound asked for whose bank chooses by the listener's distance.
+    fn ask(&mut self, bank: BankOf, kit: bool, volume: f32, reach: Option<f32>) {
+        self.asked.push(Play { bank, kit, volume, blend: 0.0, by_distance: true, reach });
     }
 
     /// `DefaultPlay`: the kind's multiplier worked out afresh, the volume
-    /// times it, the bank at a blend of 0 (the distance, in first person).
+    /// times it, the bank at the listener's distance.
     fn default_play(&mut self, bank: usize, volume: f32, kind: Kind, overweight: f32) {
         let by = self.work_out(kind, None, overweight);
         let surface = self.surface;
-        self.ask(BankOf::Surface(surface, bank), false, volume * by, 0.0);
+        self.ask(BankOf::Surface(surface, bank), false, volume * by, Some(by));
     }
 
     /// The kit's rattle the host asks for (`Player.PlayGearSound`, not
@@ -417,13 +537,30 @@ impl StepSounds {
         self.gear(volume, false, overweight);
     }
 
+    /// A mark of a move over an obstacle plays a surface's element for it
+    /// (`BaseVaultingAudioController.PlaySound`): the element's bank at
+    /// `lerp(min, max, height)` times the bank's base volume, then as any
+    /// bank at a point, with a blend value of 0 (the distance to the
+    /// camera in first person). The host reads the range and the bank;
+    /// the height goes as the play's volume.
+    pub fn vault_element(&mut self, kind: usize, mark: usize, surface: u8, height: f32) {
+        self.ask(BankOf::Vault { kind, mark, surface }, false, height, None);
+    }
+
+    /// The kit at a grab and at an end of a move over an obstacle
+    /// (`PlayGearSound`): the move's bank at `lerp(0.1, 1, height)` times
+    /// its base volume, then as any bank at a point.
+    pub fn vault_gear(&mut self, kind: usize, height: f32) {
+        self.ask(BankOf::VaultGear(kind), false, lerp(0.1, 1.0, height.clamp(0.0, 1.0)), None);
+    }
+
     /// `PlayGearSound`: the kit's bank, the volume times the gear's
     /// multiplier and the equipment's noise (1 and the overweight, less the
     /// Covert Movement buff, 0 untrained).
     fn gear(&mut self, volume: f32, fast: bool, overweight: f32) {
         let by = self.work_out(Kind::Gear, None, overweight);
-        let noise = 1.0 + overweight;
-        self.ask(BankOf::Kit(if fast { GEAR_FAST } else { GEAR }), true, volume * by * noise, 0.0);
+        let noise = self.equipment_noise(overweight);
+        self.ask(BankOf::Kit(if fast { GEAR_FAST } else { GEAR }), true, volume * by * noise, Some(by));
     }
 
     /// `PlayStepSound`: a footstep of `Run`, crouched low or not.
@@ -431,15 +568,18 @@ impl StepSounds {
         let low = !m.prone && m.smoothed_pose_level < DUCK_BELOW;
         let (bank, kind) = if low { (DUCK, Kind::Duck) } else { (RUN, Kind::Run) };
         let slowest = if m.leg_damaged { MIN_STEP } else { MIN_STEP * m.overweight };
-        let blend = m.clamped_speed.max(slowest);
+        // Covert Movement's factor (`CovertMovementVolumeBySpeed`, 1
+        // untrained), on the blend and the volume alike.
+        let by_speed = self.covert.step_volume(soft(self.surface), self.efficiency);
+        let blend = m.clamped_speed.max(slowest) * by_speed;
         let speed_share = inverse_lerp(0.0, m.max_speed, m.speed);
         let share = speed_share.clamp(self.settings.min_speed_volume, 1.0);
         let by = self.kept_or_worked(kind, m.overweight);
-        let random = self.random_volume(bank);
-        let volume = share * by * random;
-        self.work_out(kind, Some(speed_share), m.overweight);
+        let random = if self.third_person { 1.0 } else { self.random_volume(bank) };
+        let volume = by_speed * share * by * random;
+        let reach = self.work_out(kind, Some(speed_share), m.overweight);
         let surface = self.surface;
-        self.ask(BankOf::Surface(surface, bank), false, volume, blend);
+        self.asked.push(Play { bank: BankOf::Surface(surface, bank), kit: false, volume, blend, by_distance: false, reach: Some(reach) });
         // The kit after it (`CalculateWalkGearVolume`).
         let kit = if low { blend.clamp(0.0, 0.3) } else { (blend * 0.75 * m.pose_level.max(0.0).sqrt()).clamp(0.1, 0.5) };
         if kit > 0.0 {
@@ -449,12 +589,12 @@ impl StepSounds {
 
     /// A sprint's footstep (`Sprint`), with the kit at once.
     fn sprint_step(&mut self, m: &Moment) {
-        let base = self.figures(SPRINT).base_volume;
+        let base = if self.third_person { 1.0 } else { self.figures(SPRINT).base_volume };
         let heavy = 0.5 + 3.0 * m.overweight;
         let volume = self.kept_or_worked(Kind::Sprint, m.overweight) * base * heavy;
-        self.work_out(Kind::Sprint, None, m.overweight);
+        let reach = self.work_out(Kind::Sprint, None, m.overweight);
         let surface = self.surface;
-        self.ask(BankOf::Surface(surface, SPRINT), false, volume, 0.0);
+        self.ask(BankOf::Surface(surface, SPRINT), false, volume, Some(reach));
         self.gear(1.0, false, m.overweight);
     }
 
@@ -471,6 +611,13 @@ impl StepSounds {
     /// leaving `Run` and a crawl's mark set too; `surface` casts the line
     /// down.
     pub fn update(&mut self, m: &Moment, last_step: &mut f32, surface: &mut dyn FnMut() -> Option<u8>) {
+        // How quietly one walks, worked out again when the speed has
+        // changed by a hundredth (`UpdateCovertEfficiency`).
+        if self.efficiency_due || (m.clamped_speed - self.efficiency_speed).abs() >= 0.01 {
+            let share = if m.max_speed > 0.0 { m.clamped_speed / m.max_speed } else { 0.0 };
+            self.efficiency = self.covert.efficiency(share, m.leg_damaged, m.walk_overweight);
+            (self.efficiency_speed, self.efficiency_due) = (m.clamped_speed, false);
+        }
         // The view's turn on this step (`UpdateRotationSpeed`).
         if m.dt > 0.0 {
             if let Some(last) = self.last_yaw {
@@ -508,10 +655,10 @@ impl StepSounds {
             if m.clock - *last_step >= CRAWL_GAP {
                 self.check_surface(surface);
                 let base = self.figures(PRONE).base_volume;
-                let volume = (m.clamped_speed * base).max(0.4) * self.kept_or_worked(Kind::Prone, m.overweight);
-                self.work_out(Kind::Prone, None, m.overweight);
+                let volume = (self.covert_volume() * m.clamped_speed * base).max(0.4) * self.kept_or_worked(Kind::Prone, m.overweight);
+                let reach = self.work_out(Kind::Prone, None, m.overweight);
                 let at = self.surface;
-                self.ask(BankOf::Surface(at, PRONE), false, volume, 0.0);
+                self.ask(BankOf::Surface(at, PRONE), false, volume, Some(reach));
                 *last_step = m.clock;
             }
         }
@@ -548,8 +695,9 @@ impl StepSounds {
                     self.default_play(SPRINT, 1.0, Kind::Sprint, m.overweight);
                 }
                 if matches!(to, State::SprintStop | State::Idle) {
-                    let base = self.figures(STOP).base_volume;
-                    self.default_play(STOP, base, Kind::Stop, m.overweight);
+                    let base = if self.third_person { 1.0 } else { self.figures(STOP).base_volume };
+                    let covert = self.covert_volume();
+                    self.default_play(STOP, base * covert, Kind::Stop, m.overweight);
                 }
             }
             _ => {}
@@ -559,13 +707,15 @@ impl StepSounds {
             State::Sprint | State::Move => self.played = false,
             State::Jump => {
                 self.default_play(JUMP, 1.0, Kind::Jump, m.overweight);
-                self.gear(1.0 + m.overweight, true, m.overweight);
+                let noise = self.equipment_noise(m.overweight);
+                self.gear(noise, true, m.overweight);
             }
             State::ToProne => {
+                let volume = 0.7 * self.covert_volume();
                 if from == State::Sprint {
-                    self.default_play(PRONE_DROP, 0.7, Kind::Drop, m.overweight);
+                    self.default_play(PRONE_DROP, volume, Kind::Drop, m.overweight);
                 } else {
-                    self.gear(0.7, true, m.overweight);
+                    self.gear(volume, true, m.overweight);
                 }
             }
             _ => {}
@@ -623,7 +773,7 @@ impl StepSounds {
         // a turn to the left is below 0 and silent.
         let average = if self.turn_count == 0 { 0.0 } else { self.turns.iter().sum::<f32>() / self.turn_count as f32 };
         let share = inverse_lerp(1.0, TURN_FULL + (1.0 - m.pose_level) * TURN_FULL, average.max(0.0));
-        let volume = share * self.figures(TURN).base_volume;
+        let volume = share * self.covert_volume() * self.figures(TURN).base_volume;
         self.default_play(TURN, volume, Kind::Turn, m.overweight);
         self.last_turn = m.clock;
         if share > 0.4 {
@@ -748,7 +898,7 @@ mod tests {
     use super::*;
 
     fn bank(blend: Option<Vec<f32>>, lists: [Vec<usize>; 3]) -> Bank {
-        Bank { name: "b".into(), base_volume: 0.68, base_pitch: 1.0, delta_volume: 0.05, delta_pitch: 0.15, rolloff: 52.5, blend, lists }
+        Bank { name: "b".into(), base_volume: 0.68, base_pitch: 1.0, delta_volume: 0.05, delta_pitch: 0.15, rolloff: 52.5, blend, lists, source_type: 4, physical: false, limited: false, clip_length: 0.0 }
     }
 
     /// Concrete's run bank: no clip in its first list, the walk in its
@@ -804,6 +954,7 @@ mod tests {
             speed: 1.0,
             max_speed: 1.0,
             overweight: 0.0,
+            walk_overweight: 0.0,
             leg_damaged: false,
             yaw: 0.0,
             hands_to_body: 0.0,
@@ -836,6 +987,35 @@ mod tests {
         assert_eq!(kit.len(), 1);
         assert!(kit[0].kit && kit[0].bank == BankOf::Kit(GEAR));
         assert!((kit[0].volume - 0.5 * 0.5).abs() < 1e-6, "{}", kit[0].volume);
+    }
+
+    /// Covert Movement at level 40, walking slowly enough to walk quietly
+    /// in full: a step on a soft surface (concrete) 48% quieter and its
+    /// blend with it, on a loud one (metal) 24% (`CovertMovementVolumeBy
+    /// Speed`).
+    #[test]
+    fn covert_movement_quiets_a_quiet_step() {
+        let mut levels = crate::skills::SkillLevels::default();
+        levels.set_level(crate::skills::Skill::CovertMovement, 40);
+        let covert = levels.buffs().covert;
+        let step = |covert: Option<crate::skills::Covert>, surface: u8| {
+            let mut sounds = StepSounds::default();
+            if let Some(covert) = covert {
+                sounds.set_covert(covert);
+            }
+            sounds.set_figures(vec![(surface, std::array::from_fn(|_| Some(Figures { base_volume: 0.68, delta_volume: 0.0 })))]);
+            let mut last = 0.0;
+            let slow = |clock: f32, footstep: bool| Moment { clamped_speed: 0.15, speed: 0.15, footstep, ..moment(clock, State::Move) };
+            sounds.update(&slow(1.0, false), &mut last, &mut || Some(surface));
+            sounds.update(&slow(1.2, true), &mut last, &mut || Some(surface));
+            let asked = sounds.take();
+            (asked[0].volume, asked[0].blend)
+        };
+        let ((plain, plain_blend), (quiet, quiet_blend)) = (step(None, CONCRETE), step(Some(covert), CONCRETE));
+        assert!((quiet / plain - 0.52).abs() < 1e-5, "{quiet} against {plain}");
+        assert!((quiet_blend / plain_blend - 0.52).abs() < 1e-5, "{quiet_blend} against {plain_blend}");
+        let (loud_plain, loud) = (step(None, 1).0, step(Some(covert), 1).0);
+        assert!((loud / loud_plain - 0.76).abs() < 1e-5, "{loud} against {loud_plain}");
     }
 
     /// A walk left with no footstep heard in it plays one and counts it;

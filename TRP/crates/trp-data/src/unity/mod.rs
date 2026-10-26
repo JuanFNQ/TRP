@@ -26,6 +26,7 @@ pub mod class {
     pub const MESH: i32 = 43;
     pub const SHADER: i32 = 48;
     pub const ANIMATION_CLIP: i32 = 74;
+    pub const AUDIO_CLIP: i32 = 83;
     pub const AVATAR: i32 = 90;
     pub const ANIMATOR_CONTROLLER: i32 = 91;
     pub const ANIMATOR: i32 = 95;
@@ -34,6 +35,8 @@ pub mod class {
     pub const MONO_SCRIPT: i32 = 115;
     pub const SKINNED_MESH_RENDERER: i32 = 137;
     pub const ASSET_BUNDLE: i32 = 142;
+    pub const PARTICLE_SYSTEM: i32 = 198;
+    pub const PARTICLE_SYSTEM_RENDERER: i32 = 199;
     pub const LOD_GROUP: i32 = 205;
     pub const ANIMATOR_OVERRIDE_CONTROLLER: i32 = 221;
 

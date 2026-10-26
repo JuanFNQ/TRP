@@ -19,6 +19,6 @@ A Rust rewrite, on Bevy, of the first-person character controller of the game Si
 
 On the range, the crate straight ahead holds a rifle, a vest and a backpack; the tables along the low wall hold every weapon of the install. `F1` shows the keys.
 
-The working brief of the AI sessions this was written with (`AGENTS.md`), the day-by-day log and the recording plugin stay in the private repository; the public one holds what building and running the app needs, and its documentation.
+The maintainer's working brief, the day-by-day log and the recording plugin stay in the private repository; the public one holds what building and running the app needs, its documentation, and a short brief for a coding agent (`AGENTS.md`; the words the documents use: `TRP/README.md`, "Reading this repository").
 
 An unofficial fan project, not affiliated with or endorsed by Battlestate Games, GSC Game World, or the teams of Single Player Tushonka, Anomaly or GAMMA.

@@ -1,5 +1,7 @@
 //! The world blurred behind the inventory, as the game's camera blurs it
-//! (`docs/spec/inventory.md`, "What lies behind the screen").
+//! (`docs/spec/inventory.md`, "What lies behind the screen"), and a hit's
+//! blur (health spec, "A hit and health's other screen effects"), which
+//! the game draws by the same material and sums.
 //!
 //! The game's camera carries `InventoryBlur`, which the inventory screen
 //! turns on as it opens in a raid and off as it shuts
@@ -13,6 +15,11 @@
 //! samples and `value * (blurred - sharp) + sharp`, nothing else). The
 //! sizes and the count are the camera prefab's (`Cam2` in the build's
 //! resources). The screen's own drawing comes after and stays sharp.
+//!
+//! A hit's (`FastBlur` on the same camera, its value worked out by
+//! `trp_sim::screen_effects`) is the same with squares of 1024 and 512,
+//! three times down and back, first of the camera's effects: before a
+//! contusion's (`contusion_view`), where the inventory's comes after them.
 
 use bevy::asset::{load_internal_asset, uuid_handle};
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
@@ -38,15 +45,37 @@ const LARGE: u32 = 256;
 const SMALL: u32 = 128;
 const PASSES: usize = 8;
 
+/// The same of a hit's (`FastBlur` on the camera prefab; read by
+/// `trp_data::camera_effects`, `the_camera_effects_are_read`).
+const HIT_LARGE: u32 = 1024;
+const HIT_SMALL: u32 = 512;
+const HIT_PASSES: usize = 3;
+
 /// The time the value takes from nothing to whole and back
 /// (`CameraManager.Blur`'s default, which the inventory screen uses).
 const FADE_TIME: f32 = 0.5;
 
 /// How far the world behind the screen is blurred, on the camera that
-/// draws it: 0 sharp, 1 the blurred square alone.
+/// draws it: 0 sharp, 1 the blurred square alone; and a hit's blur's value
+/// the same way.
 #[derive(Component, Clone, Copy, Default, ShaderType)]
 pub struct ScreenBlur {
     pub value: f32,
+    pub hit: f32,
+}
+
+impl ScreenBlur {
+    /// The inventory's, while it does something: with the value at nothing
+    /// the game's camera copies its picture through unchanged.
+    fn inventory(&self) -> bool {
+        self.value > f32::EPSILON
+    }
+
+    /// A hit's, drawn above nothing (`FastBlur`: below `Mathf.Epsilon` it
+    /// copies).
+    fn hit(&self) -> bool {
+        self.hit > 0.0
+    }
 }
 
 impl ExtractComponent for ScreenBlur {
@@ -54,10 +83,9 @@ impl ExtractComponent for ScreenBlur {
     type QueryFilter = ();
     type Out = ScreenBlur;
 
-    /// Only while it does something: with the value at nothing the game's
-    /// camera copies its picture through unchanged, and here nothing runs.
+    /// Only while one does something; with none, nothing runs.
     fn extract_component(blur: QueryItem<'_, '_, Self::QueryData>) -> Option<Self::Out> {
-        (blur.value > f32::EPSILON).then_some(*blur)
+        (blur.inventory() || blur.hit()).then_some(*blur)
     }
 }
 
@@ -72,8 +100,9 @@ impl Plugin for ScreenBlurPlugin {
             .init_resource::<SpecializedRenderPipelines<BlurPipeline>>()
             .add_systems(RenderStartup, init_pipeline)
             .add_systems(Render, prepare.in_set(RenderSystems::PrepareResources))
+            .add_render_graph_node::<ViewNodeRunner<HitBlurNode>>(Core3d, HitBlurLabel)
             .add_render_graph_node::<ViewNodeRunner<BlurNode>>(Core3d, BlurLabel)
-            .add_render_graph_edges(Core3d, (Node3d::Tonemapping, BlurLabel, Node3d::EndMainPassPostProcessing));
+            .add_render_graph_edges(Core3d, (Node3d::Tonemapping, HitBlurLabel, BlurLabel, Node3d::EndMainPassPostProcessing));
     }
 }
 
@@ -92,35 +121,51 @@ pub fn fade(time: Res<Time>, controller: Res<crate::controller::Controller>, mut
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct BlurLabel;
+pub(crate) struct BlurLabel;
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+pub(crate) struct HitBlurLabel;
 
 #[derive(Resource)]
 struct BlurPipeline {
     /// A picture and its sampler (the copies).
     copy: BindGroupLayoutDescriptor,
-    /// The sharp picture, the sampler, the blurred square and the value.
+    /// The sharp picture, the sampler, the blurred square and the values.
     mix: BindGroupLayoutDescriptor,
     sampler: Sampler,
     fullscreen: FullscreenShader,
 }
 
+/// A copy, or a mix by the inventory's value or by a hit's.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+enum Pass {
+    Copy,
+    Inventory,
+    Hit,
+}
+
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 struct BlurKey {
     format: TextureFormat,
-    mix: bool,
+    pass: Pass,
 }
 
 impl SpecializedRenderPipeline for BlurPipeline {
     type Key = BlurKey;
 
     fn specialize(&self, key: BlurKey) -> RenderPipelineDescriptor {
+        let (label, entry) = match key.pass {
+            Pass::Copy => ("screen blur copy", "copy"),
+            Pass::Inventory => ("screen blur mix", "mix_blurred"),
+            Pass::Hit => ("hit blur mix", "mix_hit"),
+        };
         RenderPipelineDescriptor {
-            label: Some(if key.mix { "screen blur mix" } else { "screen blur copy" }.into()),
-            layout: vec![if key.mix { self.mix.clone() } else { self.copy.clone() }],
+            label: Some(label.into()),
+            layout: vec![if key.pass == Pass::Copy { self.copy.clone() } else { self.mix.clone() }],
             vertex: self.fullscreen.to_vertex_state(),
             fragment: Some(FragmentState {
                 shader: SCREEN_BLUR_SHADER,
-                entry_point: Some(if key.mix { "mix_blurred" } else { "copy" }.into()),
+                entry_point: Some(entry.into()),
                 targets: vec![Some(ColorTargetState { format: key.format, blend: None, write_mask: ColorWrites::ALL })],
                 ..default()
             }),
@@ -146,19 +191,19 @@ fn init_pipeline(mut commands: Commands, device: Res<RenderDevice>, fullscreen: 
     commands.insert_resource(BlurPipeline { copy, mix, sampler, fullscreen: fullscreen.clone() });
 }
 
-/// What a view being blurred needs this frame: its two squares and the
-/// pipelines for its picture's format.
+/// What a view being blurred needs this frame: the squares of each blur it
+/// draws, and the pipelines for its picture's format (a copy, the
+/// inventory's mix, a hit's).
 #[derive(Component)]
 struct BlurViewParts {
-    large: CachedTexture,
-    small: CachedTexture,
-    copy: CachedRenderPipelineId,
-    mix: CachedRenderPipelineId,
+    inventory: Option<[CachedTexture; 2]>,
+    hit: Option<[CachedTexture; 2]>,
+    pipelines: [CachedRenderPipelineId; 3],
 }
 
 fn prepare(
     mut commands: Commands,
-    views: Query<(Entity, &ViewTarget), With<ScreenBlur>>,
+    views: Query<(Entity, &ViewTarget, &ScreenBlur)>,
     done: Query<Entity, (With<BlurViewParts>, Without<ScreenBlur>)>,
     device: Res<RenderDevice>,
     mut textures: ResMut<TextureCache>,
@@ -172,75 +217,101 @@ fn prepare(
     for entity in &done {
         commands.entity(entity).remove::<(BlurViewParts, DynamicUniformIndex<ScreenBlur>)>();
     }
-    for (entity, target) in &views {
+    for (entity, target, blur) in &views {
         let format = target.main_texture_format();
-        let square = |side: u32, label: &'static str| TextureDescriptor {
-            label: Some(label),
-            size: Extent3d { width: side, height: side, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format,
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+        let mut square = |side: u32, label: &'static str| {
+            let descriptor = TextureDescriptor {
+                label: Some(label),
+                size: Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            };
+            textures.get(&device, descriptor)
         };
-        commands.entity(entity).insert(BlurViewParts {
-            large: textures.get(&device, square(LARGE, "screen_blur_large")),
-            small: textures.get(&device, square(SMALL, "screen_blur_small")),
-            copy: pipelines.specialize(&cache, &pipeline, BlurKey { format, mix: false }),
-            mix: pipelines.specialize(&cache, &pipeline, BlurKey { format, mix: true }),
-        });
+        let inventory = blur.inventory().then(|| [square(LARGE, "screen_blur_large"), square(SMALL, "screen_blur_small")]);
+        let hit = blur.hit().then(|| [square(HIT_LARGE, "hit_blur_large"), square(HIT_SMALL, "hit_blur_small")]);
+        let pipelines = [Pass::Copy, Pass::Inventory, Pass::Hit].map(|pass| pipelines.specialize(&cache, &pipeline, BlurKey { format, pass }));
+        commands.entity(entity).insert(BlurViewParts { inventory, hit, pipelines });
     }
 }
 
+/// One blur of the view's picture: copied into the large square, passed
+/// down and back so often, then mixed into the picture by its pipeline.
+fn blur(context: &mut RenderContext, world: &World, target: &ViewTarget, parts: &BlurViewParts, squares: &[CachedTexture; 2], passes: usize, mix: usize, index: u32) {
+    let pipeline = world.resource::<BlurPipeline>();
+    let cache = world.resource::<PipelineCache>();
+    let (Some(copy), Some(mix)) = (cache.get_render_pipeline(parts.pipelines[0]), cache.get_render_pipeline(parts.pipelines[mix])) else { return };
+    let Some(uniform) = world.resource::<ComponentUniforms<ScreenBlur>>().uniforms().binding() else { return };
+    let copy_layout = cache.get_bind_group_layout(&pipeline.copy);
+    let pass = |context: &mut RenderContext, from: &TextureView, into: &TextureView| {
+        let group = context.render_device().create_bind_group("screen_blur_copy", &copy_layout, &BindGroupEntries::sequential((from, &pipeline.sampler)));
+        let mut render = context.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("screen_blur_copy"),
+            color_attachments: &[Some(RenderPassColorAttachment { view: into, depth_slice: None, resolve_target: None, ops: Operations::default() })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        render.set_render_pipeline(copy);
+        render.set_bind_group(0, &group, &[]);
+        render.draw(0..3, 0..1);
+    };
+    let [large, small] = squares;
+    pass(context, target.main_texture_view(), &large.default_view);
+    for _ in 0..passes {
+        pass(context, &large.default_view, &small.default_view);
+        pass(context, &small.default_view, &large.default_view);
+    }
+    let write = target.post_process_write();
+    let group = context.render_device().create_bind_group(
+        "screen_blur_mix",
+        &cache.get_bind_group_layout(&pipeline.mix),
+        &BindGroupEntries::sequential((write.source, &pipeline.sampler, &large.default_view, uniform)),
+    );
+    let mut render = context.begin_tracked_render_pass(RenderPassDescriptor {
+        label: Some("screen_blur_mix"),
+        color_attachments: &[Some(RenderPassColorAttachment { view: write.destination, depth_slice: None, resolve_target: None, ops: Operations::default() })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+    });
+    render.set_render_pipeline(mix);
+    render.set_bind_group(0, &group, &[index]);
+    render.draw(0..3, 0..1);
+}
+
+/// The inventory's blur, after the camera's other effects.
 #[derive(Default)]
 struct BlurNode;
 
 impl ViewNode for BlurNode {
     // Only while the view's value is extracted this frame: its parts and
     // its uniform's index outlive it by a frame (`prepare`).
-    type ViewQuery = (&'static ViewTarget, &'static ScreenBlur, &'static BlurViewParts, &'static DynamicUniformIndex<ScreenBlur>);
+    type ViewQuery = (&'static ViewTarget, &'static BlurViewParts, &'static DynamicUniformIndex<ScreenBlur>);
 
-    fn run(&self, _graph: &mut RenderGraphContext, context: &mut RenderContext, (target, _, parts, index): QueryItem<Self::ViewQuery>, world: &World) -> Result<(), NodeRunError> {
-        let pipeline = world.resource::<BlurPipeline>();
-        let cache = world.resource::<PipelineCache>();
-        let (Some(copy), Some(mix)) = (cache.get_render_pipeline(parts.copy), cache.get_render_pipeline(parts.mix)) else { return Ok(()) };
-        let Some(uniform) = world.resource::<ComponentUniforms<ScreenBlur>>().uniforms().binding() else { return Ok(()) };
-        let copy_layout = cache.get_bind_group_layout(&pipeline.copy);
-        let pass = |context: &mut RenderContext, from: &TextureView, into: &TextureView| {
-            let group = context.render_device().create_bind_group("screen_blur_copy", &copy_layout, &BindGroupEntries::sequential((from, &pipeline.sampler)));
-            let mut render = context.begin_tracked_render_pass(RenderPassDescriptor {
-                label: Some("screen_blur_copy"),
-                color_attachments: &[Some(RenderPassColorAttachment { view: into, depth_slice: None, resolve_target: None, ops: Operations::default() })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            render.set_render_pipeline(copy);
-            render.set_bind_group(0, &group, &[]);
-            render.draw(0..3, 0..1);
-        };
-        pass(context, target.main_texture_view(), &parts.large.default_view);
-        for _ in 0..PASSES {
-            pass(context, &parts.large.default_view, &parts.small.default_view);
-            pass(context, &parts.small.default_view, &parts.large.default_view);
+    fn run(&self, _graph: &mut RenderGraphContext, context: &mut RenderContext, (target, parts, index): QueryItem<Self::ViewQuery>, world: &World) -> Result<(), NodeRunError> {
+        if let Some(squares) = &parts.inventory {
+            blur(context, world, target, parts, squares, PASSES, 1, index.index());
         }
-        let write = target.post_process_write();
-        let group = context.render_device().create_bind_group(
-            "screen_blur_mix",
-            &cache.get_bind_group_layout(&pipeline.mix),
-            &BindGroupEntries::sequential((write.source, &pipeline.sampler, &parts.large.default_view, uniform)),
-        );
-        let mut render = context.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("screen_blur_mix"),
-            color_attachments: &[Some(RenderPassColorAttachment { view: write.destination, depth_slice: None, resolve_target: None, ops: Operations::default() })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        render.set_render_pipeline(mix);
-        render.set_bind_group(0, &group, &[index.index()]);
-        render.draw(0..3, 0..1);
+        Ok(())
+    }
+}
+
+/// A hit's blur, first of the camera's effects.
+#[derive(Default)]
+struct HitBlurNode;
+
+impl ViewNode for HitBlurNode {
+    type ViewQuery = (&'static ViewTarget, &'static BlurViewParts, &'static DynamicUniformIndex<ScreenBlur>);
+
+    fn run(&self, _graph: &mut RenderGraphContext, context: &mut RenderContext, (target, parts, index): QueryItem<Self::ViewQuery>, world: &World) -> Result<(), NodeRunError> {
+        if let Some(squares) = &parts.hit {
+            blur(context, world, target, parts, squares, HIT_PASSES, 2, index.index());
+        }
         Ok(())
     }
 }

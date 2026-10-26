@@ -135,6 +135,17 @@ impl Breath {
         }
     }
 
+    /// The hip wander's scale (`Breath.HipPenalty`): the prefab's until the
+    /// weapon works its own out (`tactical::hip_penalty`; the game never
+    /// keeps the prefab's once a weapon is drawn).
+    pub fn set_hip_penalty(&mut self, penalty: f32) {
+        self.data.hip_penalty = penalty;
+    }
+
+    pub fn hip_penalty(&self) -> f32 {
+        self.data.hip_penalty
+    }
+
     /// How long the breath takes to come round, in seconds, at rest: the
     /// longest of its curves' loops.
     pub(crate) fn period(&self) -> f32 {

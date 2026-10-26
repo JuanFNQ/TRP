@@ -48,6 +48,87 @@ pub fn pose_in(assets: &Assets, files: &[usize]) -> Result<Option<(ObjRef, Pose)
     Ok(Some((object, pose)))
 }
 
+/// The picture a prefab's pivot names to stand for its icon
+/// (`PreviewPivot.Icon.overrideIcon`), which the game takes in place of its
+/// model drawn (`ItemIconCreator`: an armour's built-in insert, whose model
+/// draws nothing), where it names one: its size and its pixels (RGBA as the
+/// texture keeps them, rows from the top).
+pub fn override_icon(assets: &Assets, files: &[usize]) -> Result<Option<([u32; 2], Vec<u8>)>> {
+    let Some(behaviour) = files.iter().flat_map(|&file| assets.objects_of(file, class::MONO_BEHAVIOUR)).find(|&obj| script_class(assets, obj).as_deref() == Some("PreviewPivot")) else {
+        return Ok(None);
+    };
+    let value = assets.read(behaviour)?;
+    let Some(pointer) = value.get("Icon").and_then(|icon| icon.get("overrideIcon")).and_then(|icon| icon.as_pptr()).filter(|pointer| pointer.path_id != 0) else {
+        return Ok(None);
+    };
+    let sprite = assets.resolve_loaded(behaviour.file, pointer).ok_or_else(|| anyhow!("the pivot's own picture is not in the files read"))?;
+    let read = assets.read(sprite)?;
+    let rd = read.req("m_RD")?;
+    let texture = rd.req("texture")?.as_pptr().and_then(|p| assets.resolve_loaded(sprite.file, p)).ok_or_else(|| anyhow!("the pivot's picture has no texture read"))?;
+    let data = crate::unity::extract::read_texture(assets, texture)?;
+    let levels = crate::unity::texture::mips(&data)?;
+    let pixels = crate::unity::texture::decode_rgba(&data, *levels.first().ok_or_else(|| anyhow!("the pivot's picture has no levels"))?)?;
+    let rect = rd.req("textureRect")?;
+    let field = |name: &str| rect.get(name).and_then(|f| f.as_f32()).unwrap_or(0.0).round().max(0.0) as usize;
+    let (x, y, w, h) = (field("x"), field("y"), field("width"), field("height"));
+    let width = data.width as usize;
+    anyhow::ensure!(w > 0 && h > 0 && x + w <= width && y + h <= data.height as usize, "the pivot's picture lies outside its texture");
+    // (The texture's first row is its lowest.)
+    let mut out = Vec::with_capacity(w * h * 4);
+    for row in (y..y + h).rev() {
+        out.extend_from_slice(&pixels[(row * width + x) * 4..(row * width + x + w) * 4]);
+    }
+    Ok(Some(([w as u32, h as u32], out)))
+}
+
+/// Where a weapon's model stands in the edit build screen's preview
+/// (`WeaponPreview.PositionGameObject`; workbench spec, "The preview"): its
+/// container's `PreviewPivot`, the place of its pivot (the container is put
+/// at minus it) and its scale; and the weapon's own object
+/// (`WeaponPrefab._weaponObject`, the first object of the model the app
+/// assembles) under the container: a copy of it is hung there at the
+/// container's middle, unturned (`WeaponPrefab.CreateObjectInstance`), its
+/// own scale kept.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreviewPlace {
+    pub pivot: [f32; 3],
+    pub scale: [f32; 3],
+    /// The pose of its icon (`PreviewPivot.Icon.rotation`), which the
+    /// inspect window's preview turns it by (inspect-window spec, "The
+    /// model").
+    pub icon_rotation: [f32; 4],
+    pub object: ([f32; 3], [f32; 4], [f32; 3]),
+}
+
+/// A weapon prefab's place in the preview, by its bundle's key; none
+/// where it has no `PreviewPivot` (the game then turns it about its
+/// bounds' middle).
+pub fn preview_place(assets: &mut Assets, key: &str) -> Result<Option<PreviewPlace>> {
+    let files = assets.load(key)?;
+    let script = |assets: &Assets, name: &str| files.iter().flat_map(|&file| assets.objects_of(file, class::MONO_BEHAVIOUR)).find(|&obj| script_class(assets, obj).as_deref() == Some(name));
+    let Some(pivot_script) = script(assets, "PreviewPivot") else { return Ok(None) };
+    let pivot = assets.read(pivot_script)?;
+    let vec3 = |v: &crate::unity::Value, name: &str| v.get(name).and_then(crate::unity::Value::as_vec3).unwrap_or([0.0; 3]);
+    let (pivot_position, scale) = (vec3(&pivot, "pivotPosition"), pivot.get("scale").and_then(crate::unity::Value::as_vec3).unwrap_or([1.0; 3]));
+    let container = pivot.req("m_GameObject")?.as_pptr().and_then(|p| assets.resolve_loaded(pivot_script.file, p)).ok_or_else(|| anyhow!("PreviewPivot is on no object"))?;
+    let transform_of = |assets: &Assets, object: ObjRef| -> Result<ObjRef> {
+        let value = assets.read(object)?;
+        crate::unity::extract::components(assets, object, &value).into_iter().find(|c| assets.class_id(*c) == Some(class::TRANSFORM)).ok_or_else(|| anyhow!("an object with no transform"))
+    };
+    let _ = container;
+    let mut object = ([0.0f32; 3], [0.0f32, 0.0, 0.0, 1.0], [1.0f32; 3]);
+    if let Some(prefab_script) = script(assets, "WeaponPrefab") {
+        let prefab = assets.read(prefab_script)?;
+        if let Some(weapon) = prefab.get("_weaponObject").and_then(crate::unity::Value::as_pptr).and_then(|p| assets.resolve_loaded(prefab_script.file, p)) {
+            let t = assets.read(transform_of(assets, weapon)?)?;
+            object.2 = t.get("m_LocalScale").and_then(crate::unity::Value::as_vec3).unwrap_or([1.0; 3]);
+        }
+    }
+    let f = |v: &crate::unity::Value, name: &str| v.get(name).and_then(|x| x.as_f32()).unwrap_or(0.0);
+    let icon_rotation = pivot.get("Icon").and_then(|icon| icon.get("rotation")).map_or([0.0, 0.0, 0.0, 1.0], |r| [f(r, "x"), f(r, "y"), f(r, "z"), f(r, "w")]);
+    Ok(Some(PreviewPlace { pivot: pivot_position, scale, icon_rotation, object }))
+}
+
 /// An item's model as its prefab has it, from the object its icon settings
 /// are on (or, with none, the bundle's first root object), and those
 /// settings.

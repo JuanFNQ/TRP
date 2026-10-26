@@ -44,6 +44,8 @@ pub fn apply_hands(
     globals: Query<&GlobalTransform>,
     mut transforms: Query<&mut Transform, Without<MainCamera>>,
     mut camera: Query<(&mut Transform, &mut Projection), With<MainCamera>>,
+    pip: Option<Res<crate::optic_view::Pip>>,
+    mut zoom: Option<ResMut<crate::optic_view::WorldZoom>>,
 ) {
     let (Some(rig), Some(hands)) = (rig, hands) else { return };
     let shown = controller.shown();
@@ -77,19 +79,31 @@ pub fn apply_hands(
     let Ok(mut root) = transforms.get_mut(rig.root) else { return };
     let squeeze = if *view == View::FirstPerson { hands.hands.fov_scale() } else { 1.0 };
     root.scale = Vec3::new(1.0, 1.0, squeeze);
-    root.translation = lowered;
+    // A mount moves the rig onto its point (`Shown::rig_apart`).
+    root.translation = lowered + convert::position(shown.rig_apart);
     let root = *root;
     // The character's own eyes are where the first-person camera would be,
     // whatever camera the picture is drawn from: from the rig's own origin,
     // the pivot's, however the rig is drawn.
     let pose = shown.camera;
+    // The camera hangs in its own object, which a clip may leave apart from
+    // the ribcage (blind fire's: `Shown::camera_apart`).
+    let place: [f32; 3] = std::array::from_fn(|k| pose.position[k] + shown.camera_apart[k]);
     let seeing = Transform {
-        translation: root.rotation * convert::position(pose.position),
+        translation: root.rotation * convert::position(place),
         rotation: root.rotation * convert::rotation(pose.rotation),
         scale: Vec3::ONE,
     };
     if let Some(mut eye) = eye.single().ok().and_then(|eye| transforms.get_mut(eye).ok()) {
         *eye = seeing;
+    }
+    // With `PIP` off, the world narrowed by the scope's magnification while
+    // aiming through it, the weapon drawn at its size over it
+    // (`optic_view::squeeze_drawn`); the simulation's field of view is
+    // left as the game's.
+    let narrowing = crate::optic_view::world_zoom(pip.is_some_and(|pip| pip.0), *view == View::FirstPerson, &hands.hands, pose.field_of_view);
+    if let Some(zoom) = zoom.as_mut().filter(|zoom| zoom.0 != narrowing) {
+        zoom.0 = narrowing;
     }
     if *view != View::FirstPerson {
         return;
@@ -98,6 +112,7 @@ pub fn apply_hands(
     camera.translation = seeing.translation;
     camera.rotation = seeing.rotation;
     if let Projection::Perspective(perspective) = &mut *projection {
-        perspective.fov = pose.field_of_view.to_radians();
+        let half = (pose.field_of_view.to_radians() * 0.5).tan() / narrowing;
+        perspective.fov = 2.0 * half.atan();
     }
 }

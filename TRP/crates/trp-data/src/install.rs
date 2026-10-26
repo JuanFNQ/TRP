@@ -113,14 +113,7 @@ impl Install {
     /// game's names: progress over 100, at most 51 (`BaseSkill.Level`).
     /// Read, never written; none where there is no profile.
     pub fn profile_skill_levels(&self) -> Option<std::collections::HashMap<String, u32>> {
-        let dir = self.root.join("SPT_Runtime").join("user").join("profiles");
-        let newest = std::fs::read_dir(dir)
-            .ok()?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
-            .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())?;
-        let text = std::fs::read_to_string(newest.path()).ok()?;
-        let profile: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+        let profile = self.newest_profile()?;
         let skills = profile["characters"]["pmc"]["Skills"]["Common"].as_array()?;
         Some(
             skills
@@ -131,6 +124,31 @@ impl Install {
                 })
                 .collect(),
         )
+    }
+
+    /// The newest profile of the install (`SPT_Runtime/user/profiles`):
+    /// read, never written.
+    fn newest_profile(&self) -> Option<serde_json::Value> {
+        let dir = self.root.join("SPT_Runtime").join("user").join("profiles");
+        let newest = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+            .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())?;
+        let text = std::fs::read_to_string(newest.path()).ok()?;
+        serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
+    }
+
+    /// The voice of the newest profile's PMC by its name (`Bear_2_Eng`):
+    /// its `Customization.Voice`, an id of the database's
+    /// `customization.json`, whose `_props.Name` it is
+    /// (`CustomizationSolver.GetVoice`). None where either is missing.
+    pub fn profile_voice(&self) -> Option<String> {
+        let profile = self.newest_profile()?;
+        let id = profile["characters"]["pmc"]["Customization"]["Voice"].as_str()?.to_owned();
+        let text = std::fs::read_to_string(self.database_dir().join("templates").join("customization.json")).ok()?;
+        let all: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+        all.get(&id)?["_props"]["Name"].as_str().map(str::to_owned)
     }
 
     fn settings_page(&self, name: &str) -> Option<serde_json::Value> {
@@ -234,6 +252,15 @@ impl Install {
         Ok(axes)
     }
 
+    /// Whether the build draws with the engine's graphics jobs, which run
+    /// its rendering on threads of its own a frame behind the main thread
+    /// (`boot.config`: `gfx-enable-gfx-jobs=1`, as this install has it).
+    /// `None` where the file or the line is missing.
+    pub fn graphics_jobs(&self) -> Option<bool> {
+        let text = std::fs::read_to_string(self.root.join("EscapeFromTarkov_Data").join("boot.config")).ok()?;
+        text.lines().find_map(|line| line.trim().strip_prefix("gfx-enable-gfx-jobs=")).map(|value| value.trim() == "1")
+    }
+
     /// The display settings of the game's graphics page as this install
     /// has them (`Graphics.ini`).
     pub fn display_settings(&self) -> DisplaySettings {
@@ -247,6 +274,11 @@ impl Install {
             texture_quality: page.get("TextureQuality").and_then(|v| v.as_u64()).map(|v| v.min(2) as u8),
             mip_streaming: page.get("MipStreaming").and_then(|v| v.as_bool()),
             shadows_quality: page.get("ShadowsQuality").and_then(|v| v.as_u64()).map(|v| v.min(3) as u8),
+            ssao: page.get("Ssao").and_then(|v| v.as_str()).and_then(|name| SSAO_CHOICES.into_iter().find(|choice| choice.eq_ignore_ascii_case(name))),
+            clouds_quality: page.get("CloudsQuality").and_then(|v| v.as_str()).and_then(|name| CLOUDS_CHOICES.into_iter().find(|choice| choice.eq_ignore_ascii_case(name))),
+            game_framerate: page.get("GameFramerate").and_then(|v| v.as_u64()).map(|v| v.min(u32::MAX as u64) as u32),
+            disable_game_framerate_limit: page.get("DisableGameFramerateLimit").and_then(|v| v.as_bool()),
+            sharpen: page.get("Sharpen").and_then(|v| v.as_f64()).map(|v| v as f32),
         }
     }
 
@@ -333,6 +365,14 @@ impl Manifest {
 /// it: whether frames wait for the screen, how the window is shown (the
 /// game's own figure: 0 the screen taken over, 1 a borderless window over
 /// all of it, 2 a window), and the resolution.
+/// The ambient occlusion's choices by the names `Graphics.ini` writes them
+/// in (`ESSAOMode`, in the game's order).
+/// The clouds' quality's choices by the names `Graphics.ini` writes them
+/// (`CloudsMode`).
+pub const CLOUDS_CHOICES: [&str; 3] = ["Low", "Medium", "High"];
+
+pub const SSAO_CHOICES: [&str; 6] = ["Off", "FastestPerformance", "FastPerformance", "HighQuality", "HighestQuality", "ColoredHighestQuality"];
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct DisplaySettings {
     pub vsync: Option<bool>,
@@ -344,6 +384,18 @@ pub struct DisplaySettings {
     pub mip_streaming: Option<bool>,
     /// The shadows' quality, 0 (low) to 3 (ultra) (`ShadowsQuality`).
     pub shadows_quality: Option<u8>,
+    /// The ambient occlusion's choice by its name (`Ssao`:
+    /// `FastestPerformance` and the like; `trp_sim::hbao::SsaoMode`).
+    pub ssao: Option<&'static str>,
+    /// The clouds' quality by its name (`CloudsQuality`: `Low`, `Medium`,
+    /// `High`; `trp_sim::clouds::CloudsQuality`).
+    pub clouds_quality: Option<&'static str>,
+    /// The game's frame rate limit in a raid (`GameFramerate`), and whether
+    /// it is turned off (`DisableGameFramerateLimit`).
+    pub game_framerate: Option<u32>,
+    pub disable_game_framerate_limit: Option<bool>,
+    /// The camera's sharpening (`Sharpen`, `CameraManager.SetSharpen`).
+    pub sharpen: Option<f32>,
 }
 
 /// One variant of a binding as the install keeps it (`InputSource`): the

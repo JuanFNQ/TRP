@@ -46,6 +46,8 @@ pub enum Ui {
     BackpackOpen = 1,
     ButtonClick = 3,
     ButtonOver = 4,
+    MenuDropdown = 11,
+    MenuDropdownSelect = 12,
     MenuEscape = 13,
     InspectorClose = 14,
     InspectorOpen = 15,
@@ -53,15 +55,28 @@ pub enum Ui {
     InstallModFunc = 17,
     InstallModGear = 18,
     InstallModVital = 19,
+    MenuModdingClose = 21,
+    MenuModdingOpen = 22,
     OpenContainer = 23,
+    MenuStock = 24,
+    /// A repair made (`RepairComplete`, the repair window's).
+    RepairComplete = 31,
+    MenuWeaponAssemble = 33,
+    MenuWeaponDisassemble = 34,
+    /// A malfunction made known (`MalfunctionExamined`, with its glow).
+    MalfunctionExamined = 40,
 }
 
 impl Ui {
-    pub const ALL: [Ui; 12] = [
+    pub const ALL: [Ui; 21] = [
+        Ui::RepairComplete,
+        Ui::MalfunctionExamined,
         Ui::BackpackClose,
         Ui::BackpackOpen,
         Ui::ButtonClick,
         Ui::ButtonOver,
+        Ui::MenuDropdown,
+        Ui::MenuDropdownSelect,
         Ui::MenuEscape,
         Ui::InspectorClose,
         Ui::InspectorOpen,
@@ -70,6 +85,11 @@ impl Ui {
         Ui::InstallModGear,
         Ui::InstallModVital,
         Ui::OpenContainer,
+        Ui::MenuStock,
+        Ui::MenuWeaponDisassemble,
+        Ui::MenuModdingClose,
+        Ui::MenuModdingOpen,
+        Ui::MenuWeaponAssemble,
     ];
 }
 
@@ -97,11 +117,34 @@ impl Way {
     }
 }
 
-/// A sound asked for: the interface's, or a thing's by its kind's group.
+/// A sound asked for: the interface's, a thing's by its kind's group, or a
+/// round loaded into a magazine or unloaded from it (`PlayUILoadSound`,
+/// `PlayUIUnloadSound`: one of the interface's lists for each).
 #[derive(Message, Clone, Debug)]
 pub enum Sound {
     Ui(Ui),
     Item(String, Way),
+    Load,
+    Unload,
+    /// A thing taken up off the ground, by its kind's group (sound spec,
+    /// "A thing taken up"; `LootItem.RemoveLootItem`): its group's pickup
+    /// clip from where it lay, on a source of the `Character` group with
+    /// its spatialising off, so plain stereo (`forceStereo`), at a volume
+    /// of 1 (the group's `OverallVolume` 1), within 10 m: in the world's
+    /// group, not the interface's.
+    Taken(String),
+    /// A notice shown (`GUISounds.PlayNotificationSound`), at the
+    /// interface's volume.
+    Notification,
+}
+
+/// A clip read, and what it is.
+enum Read {
+    Ui(i32),
+    Item(String),
+    Load,
+    Unload,
+    Notification,
 }
 
 /// The volumes as the game's settings have them: indices 0 to 10 into its
@@ -185,6 +228,27 @@ pub const MIDDLE: f32 = std::f32::consts::FRAC_1_SQRT_2;
 /// `step_sound.rs`), as an `f32`'s bits.
 pub type Pitch = Arc<std::sync::atomic::AtomicU32>;
 
+/// A level a sound follows as it plays, in decibels as an `f32`'s bits (0
+/// dB as made): a group of the game's mixer whose volume scripts move
+/// (`GunsVolume`, `MainVolume`: a contusion's tinnitus, `tinnitus.rs`), or
+/// one sound's own volume moved as it plays.
+pub type Level = Arc<std::sync::atomic::AtomicU32>;
+
+/// Sets a level, in decibels.
+pub fn set_level(level: &Level, db: f32) {
+    level.store(db.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The groups of the game's mixer whose levels the app moves (`Mixed`'s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    /// `Guns` (`GunsVolume`): the shots, the blasts, the hands' sounds.
+    Guns,
+    /// `Main` (`MainVolume`): the world's sounds, the character's own
+    /// movement among them.
+    Main,
+}
+
 /// A sound being played: its clip, how far it has got (in the clip's
 /// frames), what each of the two channels takes of it (of a mono clip's
 /// one channel; of a stereo clip's own, or of both together if `merged`),
@@ -196,6 +260,8 @@ pub struct Voice {
     clip: Samples,
     at: f64,
     gains: [f32; 2],
+    /// Levels it follows as it plays: its group's and its own.
+    levels: Vec<Level>,
     merged: bool,
     pitch: Option<Pitch>,
     /// The frame of the mix it begins at; from the next block if 0.
@@ -222,14 +288,21 @@ impl Voice {
     /// as it is, both times `gain`.
     pub fn whole(clip: &Samples, gain: f32) -> Self {
         let each = if clip.mono() { gain * MIDDLE } else { gain };
-        Self { clip: clip.clone(), at: 0.0, gains: [each; 2], merged: false, pitch: None, starts: 0, started: false, looping: false, ends: None, done: false }
+        Self { clip: clip.clone(), at: 0.0, gains: [each; 2], levels: Vec::new(), merged: false, pitch: None, starts: 0, started: false, looping: false, ends: None, done: false }
     }
 
     /// A clip from a point: what each channel takes of it, a stereo clip's
     /// two channels taken together (a point has one place), and the pitch
     /// it follows.
     pub fn placed(clip: &Samples, gains: [f32; 2], pitch: Pitch) -> Self {
-        Self { clip: clip.clone(), at: 0.0, gains, merged: !clip.mono(), pitch: Some(pitch), starts: 0, started: false, looping: false, ends: None, done: false }
+        Self { clip: clip.clone(), at: 0.0, gains, levels: Vec::new(), merged: !clip.mono(), pitch: Some(pitch), starts: 0, started: false, looping: false, ends: None, done: false }
+    }
+
+    /// A level it follows as it plays besides its gains (read at each
+    /// block's start).
+    pub fn following_level(mut self, level: Level) -> Self {
+        self.levels.push(level);
+        self
     }
 
     /// The pitch it follows (a whole clip from a source whose pitch moves:
@@ -262,6 +335,9 @@ pub struct Mixed {
     /// What the game's own mixer does that the app's does, once read
     /// (`trp_data::sound::master_mixer`).
     game: Arc<std::sync::OnceLock<GameMix>>,
+    /// The levels of the game's groups the app moves (`Group`).
+    guns: Level,
+    main: Level,
 }
 
 /// The game's mixer as the app's follows it: the master group's
@@ -274,6 +350,10 @@ pub struct GameMix {
     pub compressor: Option<[f32; 4]>,
     pub gunshots: f32,
     pub movement: f32,
+    /// The player's own speech's (`ClientPlayer/ClientPlayerSpeech`) and
+    /// its muffled speech's (`ClientPlayerSelfSpeechReverb`).
+    pub speech: f32,
+    pub self_speech: f32,
 }
 
 /// The frames the mix plays in a second.
@@ -292,6 +372,12 @@ impl Mixed {
         self.game.get().map_or(1.0, |game| game.movement)
     }
 
+    /// The player's speech's group's gain, or its muffled speech's, with
+    /// the groups above it (1 until the game's mixer is read).
+    pub fn speech_gain(&self, muffled: bool) -> f32 {
+        self.game.get().map_or(1.0, |game| if muffled { game.self_speech } else { game.speech })
+    }
+
     /// The frames mixed so far: a sound scheduled at this frame or later
     /// begins where it is meant to.
     pub fn clock(&self) -> u64 {
@@ -302,6 +388,19 @@ impl Mixed {
     pub fn add(&self, voice: Voice) {
         if let Ok(mut voices) = self.voices.lock() {
             voices.push(voice);
+        }
+    }
+
+    /// A sound of a group of the game's mixer, following its level.
+    pub fn add_to(&self, group: Group, voice: Voice) {
+        self.add(voice.following_level(self.level(group)));
+    }
+
+    /// A group's level, to move (`set_level`).
+    pub fn level(&self, group: Group) -> Level {
+        match group {
+            Group::Guns => self.guns.clone(),
+            Group::Main => self.main.clone(),
         }
     }
 
@@ -395,6 +494,9 @@ impl Mixing {
     fn mix_voices(&mut self, voices: &mut Vec<Voice>, first: u64) {
         for voice in voices.iter_mut() {
             let pitch = voice.pitch.as_ref().map_or(1.0, |pitch| f32::from_bits(pitch.load(std::sync::atomic::Ordering::Relaxed)) as f64);
+            let db: f32 = voice.levels.iter().map(|level| f32::from_bits(level.load(std::sync::atomic::Ordering::Relaxed))).sum();
+            let level = if db == 0.0 { 1.0 } else { 10f32.powf(db / 20.0) };
+            let gains = voice.gains.map(|gain| gain * level);
             let step = voice.clip.rate as f64 / RATE as f64 * pitch.max(0.01);
             let (data, channels, frames) = (&voice.clip.data, voice.clip.channels, voice.clip.frames());
             let read = |frame: usize, channel: usize| data.get(frame * channels + channel).map_or(0.0, |&s| s as f32 / 32768.0);
@@ -431,11 +533,11 @@ impl Mixing {
                 };
                 if channels == 1 || voice.merged {
                     let one = if channels == 1 { at(0) } else { (at(0) + at(1)) * 0.5 };
-                    self.block[2 * i] += one * voice.gains[0];
-                    self.block[2 * i + 1] += one * voice.gains[1];
+                    self.block[2 * i] += one * gains[0];
+                    self.block[2 * i + 1] += one * gains[1];
                 } else {
-                    self.block[2 * i] += at(0) * voice.gains[0];
-                    self.block[2 * i + 1] += at(1) * voice.gains[1];
+                    self.block[2 * i] += at(0) * gains[0];
+                    self.block[2 * i + 1] += at(1) * gains[1];
                 }
                 voice.at += step;
             }
@@ -488,8 +590,14 @@ impl Source for Mixing {
 struct Sounds {
     ui: HashMap<i32, Samples>,
     items: HashMap<String, Samples>,
+    /// The magazine's lists, in the game's order.
+    load: Vec<Samples>,
+    unload: Vec<Samples>,
+    notification: Option<Samples>,
+    /// The dice for which of a list plays.
+    dice: u64,
     mixed: Mixed,
-    coming: Option<Mutex<Receiver<(Option<i32>, String, Samples)>>>,
+    coming: Option<Mutex<Receiver<(Read, Samples)>>>,
 }
 
 /// The one source the app's sounds are mixed into, for the other kinds of
@@ -508,7 +616,10 @@ pub fn start_reading(app: &mut App, install: trp_data::Install) {
             Ok(mixer) => {
                 let gunshots = mixer.group("Gunshots").map_or(0.0, |group| mixer.path_db(group));
                 let movement = mixer.group("ClientPlayerMovement").map_or(0.0, |group| mixer.path_db(group));
-                let read = GameMix { compressor: mixer.master_compressor(), gunshots: 10f32.powf(gunshots / 20.0), movement: 10f32.powf(movement / 20.0) };
+                let speech = mixer.group("ClientPlayerSpeech").map_or(0.0, |group| mixer.path_db(group));
+                let self_speech = mixer.group("ClientPlayerSelfSpeechReverb").map_or(0.0, |group| mixer.path_db(group));
+                let gain = |db: f32| 10f32.powf(db / 20.0);
+                let read = GameMix { compressor: mixer.master_compressor(), gunshots: gain(gunshots), movement: gain(movement), speech: gain(speech), self_speech: gain(self_speech) };
                 info!(
                     "the game's mixer ({} groups, from its {} snapshot): the master's compressor {:?}, the gunshots' group {gunshots:+.1} dB, the player's movement's {movement:+.1} dB",
                     mixer.groups.len(),
@@ -522,8 +633,17 @@ pub fn start_reading(app: &mut App, install: trp_data::Install) {
         let kinds: Vec<i32> = Ui::ALL.iter().map(|ui| *ui as i32).collect();
         match trp_data::sound::ui_sounds(&install, &kinds) {
             Ok(clips) => {
-                for (kind, clip) in clips {
-                    let _ = send.send((Some(kind), clip.name.clone(), Samples::of_owned(clip)));
+                for (kind, clip) in clips.by_kind {
+                    let _ = send.send((Read::Ui(kind), Samples::of_owned(clip)));
+                }
+                for clip in clips.load {
+                    let _ = send.send((Read::Load, Samples::of_owned(clip)));
+                }
+                for clip in clips.unload {
+                    let _ = send.send((Read::Unload, Samples::of_owned(clip)));
+                }
+                if let Some(clip) = clips.notification {
+                    let _ = send.send((Read::Notification, Samples::of_owned(clip)));
                 }
             }
             Err(e) => eprintln!("the interface's sounds could not be read; it is silent: {e:#}"),
@@ -531,7 +651,7 @@ pub fn start_reading(app: &mut App, install: trp_data::Install) {
         match trp_data::sound::item_sounds(&install) {
             Ok(clips) => {
                 for (name, clip) in clips {
-                    let _ = send.send((None, name, Samples::of_owned(clip)));
+                    let _ = send.send((Read::Item(name), Samples::of_owned(clip)));
                 }
             }
             Err(e) => eprintln!("the things' sounds could not be read; they are silent: {e:#}"),
@@ -552,16 +672,17 @@ fn take_clips(mut sounds: ResMut<Sounds>) {
     if let Ok(receive) = coming.lock() {
         loop {
             match receive.try_recv() {
-                Ok((kind, name, frames)) => {
-                    match kind {
-                        Some(kind) => {
-                            sounds.ui.insert(kind, frames);
-                        }
-                        None => {
-                            sounds.items.insert(name, frames);
-                        }
+                Ok((read, frames)) => match read {
+                    Read::Ui(kind) => {
+                        sounds.ui.insert(kind, frames);
                     }
-                }
+                    Read::Item(name) => {
+                        sounds.items.insert(name, frames);
+                    }
+                    Read::Load => sounds.load.push(frames),
+                    Read::Unload => sounds.unload.push(frames),
+                    Read::Notification => sounds.notification = Some(frames),
+                },
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     done = true;
@@ -585,15 +706,36 @@ const IN_RAID: f32 = 0.15;
 /// raid's 0.15 for a thing's (its mixer group's own attenuation not read,
 /// `PROVISIONAL`). A thing's group with no clip for the way is silent, as
 /// the game's (`GetClip` finds none).
-fn play(mut asked: MessageReader<Sound>, sounds: Res<Sounds>, levels: Option<Res<Levels>>) {
+///
+/// A round's sound is one of its list, as a thing's is played
+/// (`PlaySound` as a common sound), chosen as the game's
+/// `UIClipSounds.GetRandomClip` chooses: `Random.Range(0, count - 1)`, which
+/// never takes the last.
+fn play(mut asked: MessageReader<Sound>, mut sounds: ResMut<Sounds>, levels: Option<Res<Levels>>) {
     let levels = levels.map_or(Levels { overall: 10, interface: 10 }, |levels| *levels);
     let interface = Levels::gain(levels.overall) * Levels::gain(levels.interface);
+    let sounds = &mut *sounds;
     for sound in asked.read() {
-        let (frames, gain) = match sound {
-            Sound::Ui(ui) => (sounds.ui.get(&(*ui as i32)), interface),
-            Sound::Item(group, Way::Open) => (sounds.items.get(&format!("{group}_open")).or_else(|| sounds.ui.get(&(Ui::OpenContainer as i32))), interface),
-            Sound::Item(group, way) => (sounds.items.get(&format!("{group}_{}", way.name())), Levels::gain(levels.overall) * IN_RAID),
+        let mut pick = |list: &Vec<Samples>| {
+            sounds.dice = sounds.dice.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let upto = list.len().saturating_sub(1).max(1);
+            list.get((sounds.dice >> 33) as usize % upto).cloned()
         };
+        let (frames, gain) = match sound {
+            Sound::Ui(ui) => (sounds.ui.get(&(*ui as i32)).cloned(), interface),
+            Sound::Item(group, Way::Open) => (sounds.items.get(&format!("{group}_open")).or_else(|| sounds.ui.get(&(Ui::OpenContainer as i32))).cloned(), interface),
+            Sound::Item(group, way) => (sounds.items.get(&format!("{group}_{}", way.name())).cloned(), Levels::gain(levels.overall) * IN_RAID),
+            Sound::Load => (pick(&sounds.load.clone()), Levels::gain(levels.overall) * IN_RAID),
+            Sound::Unload => (pick(&sounds.unload.clone()), Levels::gain(levels.overall) * IN_RAID),
+            Sound::Notification => (sounds.notification.clone(), interface),
+            Sound::Taken(group) => {
+                if let Some(clip) = sounds.items.get(&format!("{group}_{}", Way::Pickup.name())) {
+                    sounds.mixed.add_to(Group::Main, Voice::whole(clip, Levels::gain(levels.overall)));
+                }
+                continue;
+            }
+        };
+        let frames = frames.as_ref();
         if let Some(clip) = frames {
             sounds.mixed.add(Voice::whole(clip, gain));
         }
@@ -723,6 +865,25 @@ mod tests {
         let one: Pitch = Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits()));
         let out = first_block(vec![Voice::placed(&pair, [1.0, 0.0], one)]);
         assert_eq!(&out[..2], &[0.25, 0.0]);
+    }
+
+    /// A sound in a group follows the group's level as it plays, and its
+    /// own level besides (decibels summed): 6.02 dB down halves it, and the
+    /// interface's sounds, in no group, are untouched.
+    #[test]
+    fn a_sound_follows_its_group_s_and_its_own_level() {
+        let flat = Samples::of(&trp_data::sound::Clip { name: "f".into(), channels: 2, frequency: RATE, samples: vec![16384; 2 * BLOCK * 4] });
+        let mixed = Mixed::default();
+        let own: Level = Default::default();
+        set_level(&mixed.level(Group::Main), -20.0 * 2f32.log10());
+        set_level(&own, -20.0 * 2f32.log10());
+        mixed.add_to(Group::Main, Voice::whole(&flat, 1.0).following_level(own));
+        mixed.add_to(Group::Guns, Voice::whole(&flat, 1.0));
+        mixed.add(Voice::whole(&flat, 1.0));
+        let mut mixing = mixed.decoder();
+        let first: Vec<f32> = (0..2).map(|_| mixing.next().unwrap()).collect();
+        // A quarter, plus two whole.
+        assert!((first[0] - 0.5 * (0.25 + 1.0 + 1.0)).abs() < 1e-5, "{first:?}");
     }
 
     /// A loop scheduled at a frame of the mix plays from there round and

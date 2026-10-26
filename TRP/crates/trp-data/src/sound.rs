@@ -333,7 +333,7 @@ const IMA_STEPS: [i32; 89] = [
 ];
 
 /// A clip's fields as a type tree reads them, its bank given its bytes.
-fn clip_of(clip: &Value, bank: &dyn Fn(&str, usize, usize) -> Result<Vec<u8>>, setups: &mut VorbisSetups) -> Result<Clip> {
+pub(crate) fn clip_of(clip: &Value, bank: &dyn Fn(&str, usize, usize) -> Result<Vec<u8>>, setups: &mut VorbisSetups) -> Result<Clip> {
     let name = clip.get("m_Name").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
     let channels = clip.get("m_Channels").and_then(|v| v.as_i64()).unwrap_or(1).max(1) as u16;
     let frequency = clip.get("m_Frequency").and_then(|v| v.as_i64()).unwrap_or(44100).max(1) as u32;
@@ -362,13 +362,28 @@ fn clip_of(clip: &Value, bank: &dyn Fn(&str, usize, usize) -> Result<Vec<u8>>, s
     Ok(Clip { name, channels, frequency, samples })
 }
 
+/// The interface's sounds: those of the kinds asked, by kind, and the two
+/// lists a magazine's rounds are loaded and unloaded to (inventory spec,
+/// "Loading and unloading a magazine").
+pub struct UiSounds {
+    pub by_kind: HashMap<i32, Clip>,
+    /// `_loadSounds`, `_unloadSounds`, in their order.
+    pub load: Vec<Clip>,
+    pub unload: Vec<Clip>,
+    /// A notice's sound (`GUISounds.PlayNotificationSound`: the Resource
+    /// `Audio/Interface Sounds/notification_exp`), where it is had.
+    pub notification: Option<Clip>,
+}
+
 /// The interface's sounds of the kinds asked (`EUISoundType`'s numbers), by
 /// kind: the Resource `audio/uisoundswrapper` (`UISoundsWrapper`), whose
 /// fields after a script's own begin with its list of a kind and a clip's
 /// pointer each (`_UIAudioClips`), the clips read from `resources.assets`
 /// by an audio clip's type tree borrowed from the things' bundle, their
-/// banks from the file their resource names beside it.
-pub fn ui_sounds(install: &Install, kinds: &[i32]) -> Result<HashMap<i32, Clip>> {
+/// banks from the file their resource names beside it. After that list
+/// come two more of the same shape (the social network's, the game's end's)
+/// and then the load's and the unload's, each a list of clips' pointers.
+pub fn ui_sounds(install: &Install, kinds: &[i32]) -> Result<UiSounds> {
     let mut setups = VorbisSetups::new(install);
     let paths = crate::screen::resource_paths(install)?;
     let (_, file, id) = paths.iter().find(|(path, ..)| path == "audio/uisoundswrapper").context("no resource is at audio/uisoundswrapper")?;
@@ -408,7 +423,33 @@ pub fn ui_sounds(install: &Install, kinds: &[i32]) -> Result<HashMap<i32, Clip>>
             Err(e) => eprintln!("the interface's sound {kind} could not be read: {e:#}"),
         }
     }
-    Ok(out)
+    // Past the two lists of a kind and a clip each, the two of clips.
+    let mut lists = at + 16 * count;
+    for _ in 0..2 {
+        lists += 4 + 16 * int(lists)? as usize;
+    }
+    let mut clips_of = |at: &mut usize| -> Result<Vec<Clip>> {
+        let count = int(*at)? as usize;
+        let mut clips = Vec::new();
+        for n in 0..count {
+            let entry = *at + 4 + 12 * n;
+            if int(entry)? != 0 {
+                continue;
+            }
+            let clip_id = i64::from_le_bytes(bytes.get(entry + 4..entry + 12).context("the sounds' list is short")?.try_into()?);
+            let value = pictures.read_by(file, clip_id, AUDIO_CLIP, &tree)?;
+            clips.push(clip_of(&value, &bank, &mut setups)?);
+        }
+        *at += 4 + 12 * count;
+        Ok(clips)
+    };
+    let load = clips_of(&mut lists)?;
+    let unload = clips_of(&mut lists)?;
+    let notification = paths.iter().find(|(path, ..)| path == "audio/interface sounds/notification_exp").and_then(|(_, file, id)| {
+        let value = pictures.read_by(file, *id, AUDIO_CLIP, &tree).ok()?;
+        clip_of(&value, &bank, &mut setups).map_err(|e| eprintln!("the notices' sound could not be read: {e:#}")).ok()
+    });
+    Ok(UiSounds { by_kind: out, load, unload, notification })
 }
 
 /// The things' sounds (`ItemSounds`), every one, by its clip's name
@@ -663,6 +704,8 @@ pub struct MixerGroup {
     pub volume_db: f32,
     pub exposed: bool,
     pub effects: Vec<MixerEffect>,
+    /// Where its volume is among a snapshot's values.
+    pub volume_index: Option<usize>,
 }
 
 /// An effect of a group: its kind as the build numbers it (negative for the
@@ -674,6 +717,20 @@ pub struct MixerGroup {
 pub struct MixerEffect {
     pub kind: i64,
     pub parameters: Vec<f32>,
+    /// Where each parameter is among a snapshot's values.
+    pub indices: Vec<usize>,
+    /// For a send (-3), the group it sends to (`sendTargetEffectIndex`'s
+    /// effect's group), where it names one.
+    pub target: Option<usize>,
+}
+
+/// What an exposed parameter of the mixer sets: a group's volume, or a
+/// parameter of an effect of a group (a send's level, a filter's
+/// frequency).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Exposed {
+    Volume { group: usize },
+    Effect { group: usize, effect: usize, parameter: usize },
 }
 
 /// The bundle of the weapons' other sounds (`WeaponSounds`: the shells',
@@ -768,6 +825,10 @@ pub fn aiming_sounds(install: &Install) -> Result<Vec<(String, std::sync::Arc<Ai
 /// The game's mixer as it starts (`m_StartSnapshot`).
 #[derive(Debug, Clone, Default)]
 pub struct Mixer {
+    /// The exposed parameters (`exposedParameterNames`, each a CRC32 of
+    /// the name scripts set it by, and `exposedParameterIndices`, where its
+    /// value is).
+    pub exposed: Vec<(u32, usize)>,
     pub start_snapshot: String,
     pub groups: Vec<MixerGroup>,
 }
@@ -780,6 +841,24 @@ pub const COMPRESSOR: i64 = 16;
 impl Mixer {
     pub fn group(&self, name: &str) -> Option<usize> {
         self.groups.iter().position(|group| group.name == name)
+    }
+
+    /// What the exposed parameter of that name sets (`AudioMixer.SetFloat`'s
+    /// name, found by its CRC32), where the mixer has it.
+    pub fn exposed(&self, name: &str) -> Option<Exposed> {
+        let hash = crc32fast::hash(name.as_bytes());
+        let index = self.exposed.iter().find(|(named, _)| *named == hash)?.1;
+        for (g, group) in self.groups.iter().enumerate() {
+            if group.volume_index == Some(index) {
+                return Some(Exposed::Volume { group: g });
+            }
+            for (e, effect) in group.effects.iter().enumerate() {
+                if let Some(parameter) = effect.indices.iter().position(|&i| i == index) {
+                    return Some(Exposed::Effect { group: g, effect: e, parameter });
+                }
+            }
+        }
+        None
     }
 
     /// A group's volume with every group above it, in dB, as the start
@@ -859,19 +938,30 @@ pub fn master_mixer(install: &Install) -> Result<Mixer> {
                 volume_db: usize::try_from(volume).ok().and_then(|i| values.get(i)).copied().unwrap_or(0.0),
                 exposed: exposed.contains(&(volume as u32)),
                 effects: Vec::new(),
+                volume_index: usize::try_from(volume).ok(),
             }
         })
         .collect();
-    for effect in list("effects") {
-        let Some(group) = usize::try_from(int(effect, "groupConstantIndex")).ok().and_then(|g| groups.get_mut(g)) else { continue };
-        let parameters = match effect.get("parameterIndices") {
-            Some(Value::UInts(indices)) => indices.iter().map(|&i| values.get(i as usize).copied().unwrap_or(0.0)).collect(),
+    let effects = list("effects");
+    for effect in effects {
+        let group_of = |effect: &Value| usize::try_from(int(effect, "groupConstantIndex")).ok();
+        let Some(at) = group_of(effect) else { continue };
+        let indices: Vec<usize> = match effect.get("parameterIndices") {
+            Some(Value::UInts(indices)) => indices.iter().map(|&i| i as usize).collect(),
             _ => Vec::new(),
         };
-        group.effects.push(MixerEffect { kind: int(effect, "type"), parameters });
+        let parameters = indices.iter().map(|&i| values.get(i).copied().unwrap_or(0.0)).collect();
+        let target = usize::try_from(int(effect, "sendTargetEffectIndex")).ok().and_then(|e| effects.get(e)).and_then(group_of);
+        let Some(group) = groups.get_mut(at) else { continue };
+        group.effects.push(MixerEffect { kind: int(effect, "type"), parameters, indices, target });
     }
+    let names_hashed: Vec<u32> = match constant.get("exposedParameterNames") {
+        Some(Value::UInts(hashes)) => hashes.clone(),
+        _ => Vec::new(),
+    };
+    let exposed = names_hashed.into_iter().zip(exposed.iter().map(|&i| i as usize)).collect();
     let start_snapshot = start.and_then(|id| names.get(&id).cloned()).unwrap_or_default();
-    Ok(Mixer { start_snapshot, groups })
+    Ok(Mixer { exposed, start_snapshot, groups })
 }
 
 /// The bundle of the sounds of moving (`Sounds`, read by the game's
@@ -901,6 +991,17 @@ pub struct Bank {
     /// value moves from one list to the next.
     pub blend: Option<Vec<f32>>,
     pub lists: [Vec<usize>; 3],
+    /// The kind of source it plays from (`SourceType`, BetterAudio's
+    /// `AudioSourceGroupType`: 4, `Environment`, if the bank does not say).
+    pub source_type: i64,
+    /// Whether an effect plays it from afar (`Physical`:
+    /// `PlayAtPointDistant`), or limited near others of its kind
+    /// (`AllowLimitedPlay`).
+    pub physical: bool,
+    pub limited: bool,
+    /// Its clips' length as the bank keeps it (`ClipLength`: `CustomLength`
+    /// where it is not nought, else `_clipLiength`), in seconds.
+    pub clip_length: f32,
 }
 
 /// The banks of a surface (`SurfaceSet`), in its order.
@@ -908,6 +1009,37 @@ pub const SURFACE_BANKS: [&str; 9] = ["RunSoundBank", "SprintSoundBank", "StopSo
 
 /// The equipment's banks (`Sounds`), in that order.
 pub const GEAR_BANKS: [&str; 4] = ["Gear", "GearMedium", "GearFast", "BackpackDrop"];
+
+/// A surface's sound sets for the three moves over an obstacle
+/// (`SurfaceSet`; footsteps spec, "The vault's sounds"), in the order of
+/// the game's `EVaultingSoundType` less its none: a vault, a sprint's
+/// vault, a climb.
+pub const VAULT_SETS: [&str; 3] = ["VaultSoundSet", "SprintVaultSoundSet", "ClimbSoundSet"];
+
+/// The kit's bank for each of the three moves (`Sounds`), in the same order.
+pub const VAULT_GEAR_BANKS: [&str; 3] = ["GearVault", "GearSprintVault", "GearClimb"];
+
+/// The marks of a move at which a set's elements play
+/// (`EVaultingSoundState`, by number; its `Gear` is never looked up).
+pub const VAULT_MARKS: [&str; 4] = ["Start", "Grab", "Slide", "End"];
+
+/// One mark's sound of a move on a surface (`VaultingSoundElement`): its
+/// bank, if it names one (a place in `MovementSounds::banks`), and the
+/// range the obstacle's height places its volume in (`VolumeRange`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VaultElement {
+    pub bank: Option<usize>,
+    pub min_volume: f32,
+    pub max_volume: f32,
+}
+
+/// A surface's vault sounds: by move (`VAULT_SETS`' order) and mark
+/// (`VAULT_MARKS`' order); a mark a set does not list is `None`.
+#[derive(Debug, Clone)]
+pub struct VaultSounds {
+    pub surface: u8,
+    pub elements: [[Option<VaultElement>; 4]; 3],
+}
 
 /// A surface's banks, by `SURFACE_BANKS`' order, each by its place in
 /// `MovementSounds::banks` (a bank missing is `None`; one bank may serve
@@ -926,11 +1058,28 @@ pub struct MovementSounds {
     pub surfaces: Vec<SurfaceSounds>,
     /// By `GEAR_BANKS`' order, as places in `banks`.
     pub gear: Vec<Option<usize>>,
+    /// Each surface's sounds for the moves over an obstacle.
+    pub vault: Vec<VaultSounds>,
+    /// The kit's banks for those moves, by `VAULT_GEAR_BANKS`' order.
+    pub vault_gear: Vec<Option<usize>>,
     /// Every clip a bank names, read or not (one kept in a way not read, or
     /// left unread when only the figures were asked for, is `None`), with
     /// its name.
     pub clips: Vec<(String, Option<Clip>)>,
+    /// The switches on the head's clips, by `TOGGLE_SOUNDS`' order (its name
+    /// in the `Sounds`, the clip's own name, the clip if read).
+    pub toggles: Vec<(&'static str, String, Option<Clip>)>,
 }
+
+/// The `Sounds`' clips for a switch on the head turned on and off
+/// (`Player.PlayFaceShieldSound` and the rest; inventory spec, "A switch on
+/// the head"), and the player's tactical sound (`SwitchHeadlights`: Hold
+/// mode's toggles and the head light; tactical-devices spec, "The
+/// animation and the sound"), the last.
+pub const TOGGLE_SOUNDS: [&str; 7] = ["FaceShieldOn", "FaceShieldOff", "NightVisionOn", "NightVisionOff", "ThermalVisionOn", "ThermalVisionOff", "SwitchHeadlights"];
+
+/// The player's tactical sound's place in `TOGGLE_SOUNDS`.
+pub const TACTICAL_SOUND: usize = 6;
 
 impl MovementSounds {
     /// A surface's set, by its number.
@@ -942,13 +1091,19 @@ impl MovementSounds {
     pub fn bank(&self, surface: u8, way: usize) -> Option<&Bank> {
         self.surface(surface)?.banks.get(way).copied().flatten().map(|at| &self.banks[at])
     }
+
+    /// A surface's element for a move (`VAULT_SETS`' place) at a mark
+    /// (`VAULT_MARKS`' place), if its set lists one.
+    pub fn vault_element(&self, surface: u8, kind: usize, mark: usize) -> Option<VaultElement> {
+        self.vault.iter().find(|set| set.surface == surface)?.elements.get(kind)?.get(mark).copied().flatten()
+    }
 }
 
 /// The sounds of moving (`MOVEMENT_SOUNDS`' `Sounds`): every surface's
 /// banks and the equipment's, with their clips' samples if `samples`
 /// (else only their names), only of the surfaces listed if any are.
 pub fn movement_sounds(install: &Install, only: Option<&[u8]>, samples: bool) -> Result<MovementSounds> {
-    use crate::unity::{class, extract, ObjRef};
+    use crate::unity::{class, extract};
     let mut setups = VorbisSetups::new(install);
     let mut assets = crate::unity::Assets::new(install.clone())?;
     let files = assets.load(MOVEMENT_SOUNDS)?;
@@ -959,14 +1114,86 @@ pub fn movement_sounds(install: &Install, only: Option<&[u8]>, samples: bool) ->
         .context("no Sounds in the movement's bundle")?;
     let value = assets.read(sounds)?;
     let mut out = MovementSounds::default();
-    let mut clip_places: HashMap<ObjRef, usize> = HashMap::new();
-    let mut bank_places: HashMap<ObjRef, usize> = HashMap::new();
-    let mut unread = Vec::new();
-    // A bank by its pointer from `from`'s file, put in `out` with its
-    // clips if it is not there yet: its place there.
-    let mut bank_at = |from: usize, pointer: Option<&Value>, out: &mut MovementSounds| -> Result<Option<usize>> {
+    let mut reader = BankReader::new(samples);
+    for set in value.get("Sets").and_then(Value::as_array).unwrap_or(&[]) {
+        let surface = set.get("Surface").and_then(Value::as_i64).unwrap_or(0) as u8;
+        if only.is_some_and(|only| !only.contains(&surface)) {
+            continue;
+        }
+        let mut banks = Vec::new();
+        for name in SURFACE_BANKS {
+            banks.push(reader.bank_at(&assets, &mut setups, sounds.file, set.get(name), &mut out.banks, &mut out.clips)?);
+        }
+        out.surfaces.push(SurfaceSounds { surface, banks });
+        // The three moves' sets: each a list of elements, a mark's number
+        // each, with its bank and its volume's range.
+        let mut elements: [[Option<VaultElement>; 4]; 3] = Default::default();
+        for (kind, name) in VAULT_SETS.iter().enumerate() {
+            for element in set.get(name).and_then(|set| set.get("VaultingBanks")).and_then(Value::as_array).unwrap_or(&[]) {
+                let mark = element.get("SoundState").and_then(Value::as_i64).unwrap_or(-1);
+                let Some(slot) = usize::try_from(mark).ok().and_then(|mark| elements[kind].get_mut(mark)) else { continue };
+                let bank = reader.bank_at(&assets, &mut setups, sounds.file, element.get("SoundBank"), &mut out.banks, &mut out.clips)?;
+                let range = |name: &str, or: f32| element.get("VolumeRange").and_then(|range| range.get(name)).and_then(Value::as_f32).unwrap_or(or);
+                *slot = Some(VaultElement { bank, min_volume: range("MinVolume", 0.1), max_volume: range("MaxVolume", 0.7) });
+            }
+        }
+        out.vault.push(VaultSounds { surface, elements });
+    }
+    for name in GEAR_BANKS {
+        let bank = reader.bank_at(&assets, &mut setups, sounds.file, value.get(name), &mut out.banks, &mut out.clips)?;
+        out.gear.push(bank);
+    }
+    for name in VAULT_GEAR_BANKS {
+        let bank = reader.bank_at(&assets, &mut setups, sounds.file, value.get(name), &mut out.banks, &mut out.clips)?;
+        out.vault_gear.push(bank);
+    }
+    let mut unread = std::mem::take(&mut reader.unread);
+    for name in TOGGLE_SOUNDS {
+        let Some(at) = value.get(name).and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(sounds.file, p)) else { continue };
+        let clip = assets.read(at)?;
+        let clip_name = clip.get("m_Name").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let read = if samples {
+            let resource = |source: &str, offset: usize, size: usize| -> Result<Vec<u8>> { Ok(assets.resource(source, offset, size)?.to_vec()) };
+            match clip_of(&clip, &resource, &mut setups) {
+                Ok(clip) => Some(clip),
+                Err(e) => {
+                    unread.push(format!("{e:#}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        out.toggles.push((name, clip_name, read));
+    }
+    if !unread.is_empty() {
+        eprintln!("{} of the sounds of moving are not read and are silent: {}", unread.len(), unread.join("; "));
+    }
+    Ok(out)
+}
+
+/// Banks read from loaded files (`SoundBank`), each once, and their clips
+/// each once, with their samples if asked for: what could not be read kept
+/// to be told.
+struct BankReader {
+    samples: bool,
+    clip_places: HashMap<crate::unity::ObjRef, usize>,
+    bank_places: HashMap<crate::unity::ObjRef, usize>,
+    unread: Vec<String>,
+}
+
+impl BankReader {
+    fn new(samples: bool) -> Self {
+        Self { samples, clip_places: HashMap::new(), bank_places: HashMap::new(), unread: Vec::new() }
+    }
+
+    /// A bank by its pointer from `from`'s file, put in `banks` with its
+    /// clips (in `clips`) if it is not there yet: its place there. Only its
+    /// first environment's clips (`EnvironmentType.Outdoor`).
+    #[allow(clippy::too_many_arguments)]
+    fn bank_at(&mut self, assets: &crate::unity::Assets, setups: &mut VorbisSetups, from: usize, pointer: Option<&Value>, banks: &mut Vec<Bank>, clips: &mut Vec<(String, Option<Clip>)>) -> Result<Option<usize>> {
         let Some(at) = pointer.and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(from, p)) else { return Ok(None) };
-        if let Some(&place) = bank_places.get(&at) {
+        if let Some(&place) = self.bank_places.get(&at) {
             return Ok(Some(place));
         }
         let bank = assets.read(at)?;
@@ -983,32 +1210,32 @@ pub fn movement_sounds(install: &Install, only: Option<&[u8]>, samples: bool) ->
         for (list, variety) in lists.iter_mut().zip(varieties) {
             for pointer in variety.get("Clips").and_then(Value::as_array).unwrap_or(&[]) {
                 let Some(clip) = pointer.as_pptr().and_then(|p| assets.resolve_loaded(at.file, p)) else { continue };
-                let place = match clip_places.get(&clip) {
+                let place = match self.clip_places.get(&clip) {
                     Some(&place) => place,
                     None => {
                         let value = assets.read(clip)?;
                         let name = value.get("m_Name").and_then(Value::as_str).unwrap_or_default().to_owned();
-                        let read = if samples {
+                        let read = if self.samples {
                             let resource = |source: &str, offset: usize, size: usize| -> Result<Vec<u8>> { Ok(assets.resource(source, offset, size)?.to_vec()) };
-                            match clip_of(&value, &resource, &mut setups) {
+                            match clip_of(&value, &resource, setups) {
                                 Ok(clip) => Some(clip),
                                 Err(e) => {
-                                    unread.push(format!("{e:#}"));
+                                    self.unread.push(format!("{e:#}"));
                                     None
                                 }
                             }
                         } else {
                             None
                         };
-                        out.clips.push((name, read));
-                        clip_places.insert(clip, out.clips.len() - 1);
-                        out.clips.len() - 1
+                        clips.push((name, read));
+                        self.clip_places.insert(clip, clips.len() - 1);
+                        clips.len() - 1
                     }
                 };
                 list.push(place);
             }
         }
-        out.banks.push(Bank {
+        banks.push(Bank {
             name: bank.get("m_Name").and_then(Value::as_str).unwrap_or_default().to_owned(),
             base_volume: number("BaseVolume", 1.0),
             base_pitch: number("BasePitch", 1.0),
@@ -1017,27 +1244,376 @@ pub fn movement_sounds(install: &Install, only: Option<&[u8]>, samples: bool) ->
             rolloff: number("Rolloff", 100.0),
             blend,
             lists,
+            source_type: bank.get("SourceType").and_then(Value::as_i64).unwrap_or(4),
+            physical: bank.get("Physical").and_then(Value::as_bool).unwrap_or(false),
+            limited: bank.get("AllowLimitedPlay").and_then(Value::as_bool).unwrap_or(false),
+            clip_length: match number("CustomLength", 0.0) {
+                custom if custom != 0.0 => custom,
+                _ => number("_clipLiength", 0.0),
+            },
         });
-        bank_places.insert(at, out.banks.len() - 1);
-        Ok(Some(out.banks.len() - 1))
-    };
-    for set in value.get("Sets").and_then(Value::as_array).unwrap_or(&[]) {
-        let surface = set.get("Surface").and_then(Value::as_i64).unwrap_or(0) as u8;
-        if only.is_some_and(|only| !only.contains(&surface)) {
+        self.bank_places.insert(at, banks.len() - 1);
+        Ok(Some(banks.len() - 1))
+    }
+}
+
+/// The weapon's mount sound (`WeaponSounds.VerticalMountSounds`, a `SoundBank`
+/// in `WEAPON_SOUNDS`: `WeaponSoundPlayer.PlayMountSound`, the approach's time
+/// after any mount; mounting spec, "Sounds"): the bank and its clips, read
+/// whole.
+pub fn mount_sounds(install: &Install) -> Result<(Bank, Vec<(String, Clip)>)> {
+    use crate::unity::{class, extract};
+    let mut setups = VorbisSetups::new(install);
+    let mut assets = crate::unity::Assets::new(install.clone())?;
+    let files = assets.load(WEAPON_SOUNDS)?;
+    let sounds = files
+        .iter()
+        .flat_map(|&file| assets.objects_of(file, class::MONO_BEHAVIOUR).collect::<Vec<_>>())
+        .find(|&obj| extract::script_class(&assets, obj).as_deref() == Some("WeaponSounds"))
+        .context("no WeaponSounds in its bundle")?;
+    let value = assets.read(sounds)?;
+    let mut reader = BankReader::new(true);
+    let (mut banks, mut clips) = (Vec::new(), Vec::new());
+    let at = reader.bank_at(&assets, &mut setups, sounds.file, value.get("VerticalMountSounds"), &mut banks, &mut clips)?.context("no VerticalMountSounds")?;
+    let bank = banks.swap_remove(at);
+    let read = bank.lists[0].iter().filter_map(|&place| clips.get(place).and_then(|(name, clip)| Some((name.clone(), clip.clone()?)))).collect();
+    Ok((bank, read))
+}
+
+/// The ringing of a contusion (`Sounds.TinnitusSound`, in `MOVEMENT_SOUNDS`:
+/// `Player.TryStartContusion`'s clip), read whole.
+pub fn tinnitus_sound(install: &Install) -> Result<Clip> {
+    movement_clip(install, "TinnitusSound")
+}
+
+/// The folder of the voices' phrase bundles.
+pub const PHRASES: &str = "assets/content/audio/phrases";
+
+/// One clip of a voice's bank (`TaggedClip`): the tags it answers to
+/// (`ETagStatus` bits; nought answers to any), its volume, its falloff in
+/// metres, its length as the bank keeps it, and the sound itself.
+#[derive(Debug, Clone)]
+pub struct PhraseClip {
+    pub name: String,
+    pub mask: u32,
+    pub volume: f32,
+    pub falloff: f32,
+    pub length: f32,
+    pub clip: Option<Clip>,
+}
+
+/// One bank of a voice (`TagBank`): what it is said for (`EPhraseTrigger`),
+/// how much it matters against what is being said, whether its clips'
+/// tags count, and its clips (the spread groups' together, as the bank
+/// keeps them).
+#[derive(Debug, Clone)]
+pub struct PhraseBank {
+    pub trigger: i32,
+    pub importance: i32,
+    pub ignore_tags: bool,
+    pub clips: Vec<PhraseClip>,
+}
+
+/// A voice's banks for the triggers asked for (`Voice.Banks`), in the
+/// voice's order, and the bundle it was read from.
+#[derive(Debug, Clone, Default)]
+pub struct VoiceBanks {
+    pub name: String,
+    pub bundle: String,
+    pub banks: Vec<PhraseBank>,
+}
+
+/// A voice's banks by its name (`CustomizationSolver.GetVoice(...).Name`,
+/// `Bear_2_Eng`): its phrase bundle is the name in small letters and
+/// `_voice.bundle` for most (`InGameBundles.TakePhrasePath`); where that
+/// bundle is not there or holds another voice, every phrase bundle is
+/// looked through for the `Voice` of that name. Only the banks of
+/// `triggers` are read; their clips' sounds with `samples`.
+pub fn voice_banks(install: &Install, name: &str, triggers: &[i32], samples: bool) -> Result<VoiceBanks> {
+    use crate::unity::{class, extract};
+    let guess = format!("{PHRASES}/{}_voice.bundle", name.to_lowercase());
+    let mut keys = vec![guess.clone()];
+    if let Ok(dir) = std::fs::read_dir(install.bundle_path(PHRASES)) {
+        let mut others: Vec<String> = dir.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).filter(|f| f.ends_with(".bundle")).map(|f| format!("{PHRASES}/{f}")).filter(|k| *k != guess).collect();
+        others.sort();
+        keys.extend(others);
+    }
+    for key in keys {
+        if !install.bundle_path(&key).exists() {
             continue;
         }
-        let mut banks = Vec::new();
-        for name in SURFACE_BANKS {
-            banks.push(bank_at(sounds.file, set.get(name), &mut out)?);
+        let mut setups = VorbisSetups::new(install);
+        let mut assets = crate::unity::Assets::new(install.clone())?;
+        let Ok(files) = assets.load(&key) else { continue };
+        let voice = files.iter().flat_map(|&file| assets.objects_of(file, class::MONO_BEHAVIOUR).collect::<Vec<_>>()).find(|&obj| {
+            extract::script_class(&assets, obj).as_deref() == Some("Voice") && assets.read(obj).ok().and_then(|v| v.get("Name").and_then(Value::as_str).map(|n| n == name)).unwrap_or(false)
+        });
+        let Some(voice) = voice else { continue };
+        let value = assets.read(voice)?;
+        let mut out = VoiceBanks { name: name.to_owned(), bundle: key.clone(), banks: Vec::new() };
+        for pptr in value.get("Banks").and_then(Value::as_array).unwrap_or(&[]).iter().filter_map(Value::as_pptr) {
+            let Some(at) = assets.resolve_loaded(voice.file, pptr) else { continue };
+            let bank = assets.read(at)?;
+            let trigger = bank.get("Trigger").and_then(Value::as_i64).unwrap_or(-1) as i32;
+            if !triggers.contains(&trigger) {
+                continue;
+            }
+            let mut clips = Vec::new();
+            for tagged in bank.get("Clips").and_then(Value::as_array).unwrap_or(&[]) {
+                let f = |k: &str| tagged.get(k).and_then(Value::as_f32).unwrap_or(0.0);
+                let found = tagged.get("Clip").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(at.file, p));
+                let (clip_name, clip) = match found {
+                    Some(obj) => {
+                        let read = assets.read(obj)?;
+                        let clip_name = read.get("m_Name").and_then(Value::as_str).unwrap_or_default().to_owned();
+                        let clip = if samples {
+                            let resource = |source: &str, offset: usize, size: usize| -> Result<Vec<u8>> { Ok(assets.resource(source, offset, size)?.to_vec()) };
+                            match clip_of(&read, &resource, &mut setups) {
+                                Ok(clip) => Some(clip),
+                                Err(e) => {
+                                    eprintln!("the voice {name}'s {clip_name} could not be read; it is silent: {e:#}");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        (clip_name, clip)
+                    }
+                    None => (String::new(), None),
+                };
+                clips.push(PhraseClip {
+                    name: clip_name,
+                    mask: tagged.get("Mask").and_then(Value::as_i64).unwrap_or(0) as u32,
+                    volume: f("Volume"),
+                    falloff: f("Falloff"),
+                    length: f("Length"),
+                    clip,
+                });
+            }
+            out.banks.push(PhraseBank {
+                trigger,
+                importance: bank.get("Importance").and_then(Value::as_i64).unwrap_or(0) as i32,
+                ignore_tags: bank.get("IgnoreTags").and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|i| i != 0))).unwrap_or(false),
+                clips,
+            });
         }
-        out.surfaces.push(SurfaceSounds { surface, banks });
+        return Ok(out);
     }
-    for name in GEAR_BANKS {
-        let bank = bank_at(sounds.file, value.get(name), &mut out)?;
-        out.gear.push(bank);
+    bail!("no phrase bundle holds the voice {name}")
+}
+
+/// A clip the movement's `Sounds` names (`TinnitusSound`, `FractureSound`).
+fn movement_clip(install: &Install, field: &str) -> Result<Clip> {
+    use crate::unity::{class, extract};
+    let mut setups = VorbisSetups::new(install);
+    let mut assets = crate::unity::Assets::new(install.clone())?;
+    let files = assets.load(MOVEMENT_SOUNDS)?;
+    let sounds = files
+        .iter()
+        .flat_map(|&file| assets.objects_of(file, class::MONO_BEHAVIOUR).collect::<Vec<_>>())
+        .find(|&obj| extract::script_class(&assets, obj).as_deref() == Some("Sounds"))
+        .context("no Sounds in the movement's bundle")?;
+    let value = assets.read(sounds)?;
+    let at = value.get(field).and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(sounds.file, p)).with_context(|| format!("the Sounds name no {field}"))?;
+    let clip = assets.read(at)?;
+    let resource = |source: &str, offset: usize, size: usize| -> Result<Vec<u8>> { Ok(assets.resource(source, offset, size)?.to_vec()) };
+    clip_of(&clip, &resource, &mut setups)
+}
+
+/// A bone's breaking (`Sounds.FractureSound`, `bone_break`), which a
+/// fracture plays as it starts (`Player.OnHealthEffectAdded`).
+pub fn fracture_sound(install: &Install) -> Result<Clip> {
+    movement_clip(install, "FractureSound")
+}
+
+/// The bundle of the world's effects (`Effects`: each named effect's
+/// particles, decals and sounds, `EffectsArray`).
+pub const EFFECTS: &str = "assets/systems/effects/particlesystems/effects.bundle";
+
+/// Effects' sounds (`Effects.Effect.Sound`, the bank an effect plays where
+/// it is not seen in first person): each effect asked for by its name with
+/// its bank's place in `banks` (none where it has no sound or is not
+/// there), and the banks' clips.
+#[derive(Debug, Clone, Default)]
+pub struct EffectSounds {
+    pub banks: Vec<Bank>,
+    pub effects: Vec<(String, Option<usize>)>,
+    pub clips: Vec<(String, Option<Clip>)>,
+    /// The effects' other banks (`AdditionalSoundEffects`, in order: the
+    /// first a ricochet's), each by its place in `banks`.
+    pub additional: Vec<Option<usize>>,
+}
+
+impl EffectSounds {
+    /// An effect's bank by its name.
+    pub fn bank(&self, name: &str) -> Option<&Bank> {
+        self.effects.iter().find(|(effect, _)| effect == name).and_then(|(_, at)| *at).map(|at| &self.banks[at])
     }
-    if !unread.is_empty() {
-        eprintln!("{} of the sounds of moving are not read and are silent: {}", unread.len(), unread.join("; "));
+}
+
+/// The sounds of the effects named (`EFFECTS`), with their clips' samples
+/// if `samples`.
+pub fn effect_sounds(install: &Install, names: &[String], samples: bool) -> Result<EffectSounds> {
+    use crate::unity::{class, extract};
+    let mut setups = VorbisSetups::new(install);
+    let mut assets = crate::unity::Assets::new(install.clone())?;
+    let files = assets.load(EFFECTS)?;
+    let effects = files
+        .iter()
+        .flat_map(|&file| assets.objects_of(file, class::MONO_BEHAVIOUR).collect::<Vec<_>>())
+        .find(|&obj| extract::script_class(&assets, obj).as_deref() == Some("Effects"))
+        .context("no Effects in its bundle")?;
+    let value = assets.read(effects)?;
+    let all = value.get("EffectsArray").and_then(Value::as_array).context("the effects have no EffectsArray")?;
+    let mut out = EffectSounds::default();
+    let mut reader = BankReader::new(samples);
+    for name in names {
+        let entry = all.iter().find(|effect| effect.get("Name").and_then(Value::as_str) == Some(name.as_str()));
+        let bank = match entry {
+            Some(effect) => reader.bank_at(&assets, &mut setups, effects.file, effect.get("Sound"), &mut out.banks, &mut out.clips)?,
+            None => None,
+        };
+        out.effects.push((name.clone(), bank));
+    }
+    for extra in value.get("AdditionalSoundEffects").and_then(Value::as_array).unwrap_or(&[]) {
+        let bank = reader.bank_at(&assets, &mut setups, effects.file, Some(extra), &mut out.banks, &mut out.clips)?;
+        out.additional.push(bank);
+    }
+    if !reader.unread.is_empty() {
+        eprintln!("{} of the effects' sounds are not read and are silent: {}", reader.unread.len(), reader.unread.join("; "));
+    }
+    Ok(out)
+}
+
+/// The bundle of the weapons' sounds as they land (`ItemDropSounds`, which
+/// the game's `BetterAudio` loads as it begins).
+pub const ITEM_DROP_SOUNDS: &str = "assets/content/audio/prefabs/items/itemdropsounds.bundle";
+
+/// Each surface's banks for the kinds of weapon that sound as they land
+/// (`ItemDropSurfaceSet`), in the order of the game's `EItemDropSoundType`
+/// less its none: a pistol, a submachine gun, a rifle.
+pub const DROP_KINDS: [&str; 3] = ["PistolDropSoundBank", "SubGunDropSoundBank", "RiffleDropSoundBank"];
+
+/// A template's `DropSoundType` as the game numbers it (`EItemDropSoundType`):
+/// none 0, a pistol 1, a submachine gun 2, a rifle 3.
+pub fn drop_kind(name: &str) -> u8 {
+    match name {
+        "Pistol" => 1,
+        "SubMachineGun" => 2,
+        "Rifle" => 3,
+        _ => 0,
+    }
+}
+
+/// The weapons' landing sounds (`ITEM_DROP_SOUNDS`' `ItemDropSounds`).
+#[derive(Debug, Clone, Default)]
+pub struct DropSounds {
+    pub banks: Vec<Bank>,
+    /// The volume by the landing's energy (`EnergyToVolumeCurve`).
+    pub volume: crate::curve::Curve,
+    /// The surface taken for one with no set (`DefaultSurfaceSound`).
+    pub default_surface: u8,
+    /// Each surface's banks by `DROP_KINDS`' order, as places in `banks`;
+    /// a surface listed twice keeps its first set, as the game's map does.
+    pub surfaces: Vec<(u8, [Option<usize>; 3])>,
+    pub clips: Vec<(String, Option<Clip>)>,
+}
+
+impl DropSounds {
+    /// The bank a weapon of a kind (`drop_kind`'s number) plays landing on
+    /// a surface (`ItemDropSounds.GetSoundBank`): its surface's set, or the
+    /// default surface's where it has none; nothing for a kind of none, a
+    /// set without that bank, or no set for the default surface either
+    /// (the game's lookup fails there).
+    pub fn bank(&self, surface: u8, kind: u8) -> Option<usize> {
+        let set = |surface: u8| self.surfaces.iter().find(|(s, _)| *s == surface);
+        let (_, banks) = set(surface).or_else(|| set(self.default_surface))?;
+        banks.get(usize::from(kind).checked_sub(1)?).copied().flatten()
+    }
+}
+
+/// The weapons' landing sounds, with their clips' samples if `samples`.
+pub fn drop_sounds(install: &Install, samples: bool) -> Result<DropSounds> {
+    use crate::unity::{class, extract};
+    let mut setups = VorbisSetups::new(install);
+    let mut assets = crate::unity::Assets::new(install.clone())?;
+    let files = assets.load(ITEM_DROP_SOUNDS)?;
+    let sounds = files
+        .iter()
+        .flat_map(|&file| assets.objects_of(file, class::MONO_BEHAVIOUR).collect::<Vec<_>>())
+        .find(|&obj| extract::script_class(&assets, obj).as_deref() == Some("ItemDropSounds"))
+        .context("no ItemDropSounds in its bundle")?;
+    let value = assets.read(sounds)?;
+    let mut out = DropSounds {
+        volume: crate::player::curve(value.req("EnergyToVolumeCurve")?)?,
+        default_surface: value.get("DefaultSurfaceSound").and_then(Value::as_i64).unwrap_or(0) as u8,
+        ..DropSounds::default()
+    };
+    let mut reader = BankReader::new(samples);
+    for set in value.get("SurfaceSets").and_then(Value::as_array).unwrap_or(&[]) {
+        let surface = set.get("Surface").and_then(Value::as_i64).unwrap_or(0) as u8;
+        let mut banks = [None; 3];
+        for (bank, name) in banks.iter_mut().zip(DROP_KINDS) {
+            *bank = reader.bank_at(&assets, &mut setups, sounds.file, set.get(name), &mut out.banks, &mut out.clips)?;
+        }
+        if !out.surfaces.iter().any(|(s, _)| *s == surface) {
+            out.surfaces.push((surface, banks));
+        }
+    }
+    if !reader.unread.is_empty() {
+        eprintln!("{} of the weapons' landing sounds are not read and are silent: {}", reader.unread.len(), reader.unread.join("; "));
+    }
+    Ok(out)
+}
+
+/// The calibres' classes of a spent case's sounds (`ECaliber`, a round's
+/// `AmmoPoolObject._caliber`), by number, as `WeaponSounds` names them.
+pub const SHELL_CALIBERS: [&str; 4] = ["9mm", "12cal", "556mm", "Heavy"];
+
+/// The surfaces a spent case has sounds for, as `WeaponSounds` names them
+/// (which surface plays which: `trp_sim::shells::sound_surface`).
+pub const SHELL_SURFACES: [&str; 5] = ["Concrete", "Metal", "Soil", "Wood", "Plastic"];
+
+/// The spent cases' sounds (`WEAPON_SOUNDS`' `Shell<calibre><surface>`):
+/// every bank once, by calibre and surface (`SHELL_CALIBERS`,
+/// `SHELL_SURFACES`), with their clips.
+#[derive(Debug, Clone, Default)]
+pub struct ShellSounds {
+    pub banks: Vec<Bank>,
+    pub by: [[Option<usize>; 5]; 4],
+    pub clips: Vec<(String, Option<Clip>)>,
+}
+
+impl ShellSounds {
+    /// The bank of a calibre's class and a surface of `SHELL_SURFACES`.
+    pub fn bank(&self, caliber: u8, surface: usize) -> Option<usize> {
+        *self.by.get(caliber as usize)?.get(surface)?
+    }
+}
+
+/// The spent cases' sounds (`WeaponSounds`, `Firearms.PlayShellSound`),
+/// with their clips' samples if `samples`.
+pub fn shell_sounds(install: &Install, samples: bool) -> Result<ShellSounds> {
+    use crate::unity::{class, extract};
+    let mut setups = VorbisSetups::new(install);
+    let mut assets = crate::unity::Assets::new(install.clone())?;
+    let files = assets.load(WEAPON_SOUNDS)?;
+    let sounds = files
+        .iter()
+        .flat_map(|&file| assets.objects_of(file, class::MONO_BEHAVIOUR).collect::<Vec<_>>())
+        .find(|&obj| extract::script_class(&assets, obj).as_deref() == Some("WeaponSounds"))
+        .context("no WeaponSounds in its bundle")?;
+    let value = assets.read(sounds)?;
+    let mut out = ShellSounds::default();
+    let mut reader = BankReader::new(samples);
+    for (c, caliber) in SHELL_CALIBERS.iter().enumerate() {
+        for (s, surface) in SHELL_SURFACES.iter().enumerate() {
+            out.by[c][s] = reader.bank_at(&assets, &mut setups, sounds.file, value.get(&format!("Shell{caliber}{surface}")), &mut out.banks, &mut out.clips)?;
+        }
+    }
+    if !reader.unread.is_empty() {
+        eprintln!("{} of the spent cases' sounds are not read and are silent: {}", reader.unread.len(), reader.unread.join("; "));
     }
     Ok(out)
 }

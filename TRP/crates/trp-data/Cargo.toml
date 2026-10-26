@@ -16,3 +16,4 @@ png.workspace = true
 ttf-parser.workspace = true
 crc32fast.workspace = true
 lewton.workspace = true
+texture2ddecoder.workspace = true

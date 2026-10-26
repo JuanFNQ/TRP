@@ -12,6 +12,21 @@
 //! work in those numbers, their colours and pictures encoded as they are
 //! read, and the frame is decoded again after them. Where nothing is half
 //! clear the picture is the same either way. The world is untouched.
+//!
+//! The game's whole project is in gamma space (its `PlayerSettings`'
+//! `m_ActiveColorSpace` 0, Gamma): its camera's effects too work in the
+//! gamma-encoded numbers and read their pictures as stored. So while any of
+//! them is on (a hit's or the inventory's blur, blood, a contusion's and
+//! health's others, a shot's flash and smoke, the fumes, sparks and haze,
+//! the explosions' and hits' systems: `screen_blur`, `blood_view`,
+//! `contusion_view`, `muzzle_view`, `particles_view`, `explosion_view`; and
+//! the world's passes, on whenever their switches are: the ambient
+//! occlusion, the sky's scattering, the clouds) the
+//! frame is encoded before the first and decoded after the last, by the
+//! same two passes; with the screens composed so too, the effects' decode
+//! and the screens' encode would undo each other, and neither runs. The
+//! optic camera's picture goes both ways by the same power with a level's
+//! light (`KeepFigures`).
 
 use bevy::asset::{load_internal_asset, uuid_handle, AssetEvent};
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
@@ -60,20 +75,48 @@ fn gamma_numbers(c: vec4<f32>) -> vec4<f32> {
 #[derive(Component, Clone, Copy, Default, ExtractComponent)]
 pub struct GammaUi;
 
-pub struct GammaUiPlugin;
+/// On a camera lit by a level's light whose picture stays in the scene's
+/// figures after its effects, with no PRISM of its own to take it to the
+/// screen's (the optic camera: the main camera's lens reads its picture as
+/// the scene's own): its frame goes to the game's numbers by the power, as
+/// the main camera's, and back by the same power, so that the scene comes
+/// back as it went.
+#[derive(Component, Clone, Copy, Default, ExtractComponent)]
+pub struct KeepFigures;
+
+/// The camera's effects in gamma space, always; the screens too where `ui`
+/// (`TARKOV UI`). Added after the effects' own plugins, whose nodes it goes
+/// round.
+pub struct GammaUiPlugin {
+    pub ui: bool,
+}
 
 impl Plugin for GammaUiPlugin {
     fn build(&self, app: &mut App) {
         load_internal_asset!(app, GAMMA_UI_SHADER, "gamma_ui.wgsl", Shader::from_wgsl);
-        app.add_plugins(ExtractComponentPlugin::<GammaUi>::default()).add_systems(Startup, hold_shaders).add_systems(Update, patch_shaders);
+        app.add_plugins(ExtractComponentPlugin::<KeepFigures>::default());
+        if self.ui {
+            app.add_plugins(ExtractComponentPlugin::<GammaUi>::default()).add_systems(Startup, hold_shaders).add_systems(Update, patch_shaders);
+        }
+        let ui = self.ui;
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app
             .init_resource::<SpecializedRenderPipelines<GammaPipeline>>()
             .add_systems(RenderStartup, init_pipeline)
             .add_systems(Render, prepare.in_set(RenderSystems::PrepareResources))
-            .add_render_graph_node::<ViewNodeRunner<GammaNode<true>>>(Core3d, GammaLabel::Encode)
-            .add_render_graph_node::<ViewNodeRunner<GammaNode<false>>>(Core3d, GammaLabel::Decode)
-            .add_render_graph_edges(Core3d, (Node3d::EndMainPassPostProcessing, GammaLabel::Encode, NodeUi::UiPass, GammaLabel::Decode, Node3d::Upscaling));
+            .add_render_graph_node::<ViewNodeRunner<GammaNode<true, false>>>(Core3d, GammaLabel::EffectsEncode)
+            .add_render_graph_node::<ViewNodeRunner<GammaNode<false, false>>>(Core3d, GammaLabel::EffectsDecode)
+            .add_render_graph_edges(
+                Core3d,
+                (Node3d::Tonemapping, GammaLabel::EffectsEncode, crate::muzzle_view::DepthCopyLabel, crate::explosion_view::ExplosionLabel, crate::muzzle_view::JetLabel, crate::screen_blur::HitBlurLabel),
+            )
+            .add_render_graph_edges(Core3d, (crate::contusion_view::NearDeathLabel, GammaLabel::EffectsDecode, Node3d::EndMainPassPostProcessing));
+        if ui {
+            render_app
+                .add_render_graph_node::<ViewNodeRunner<GammaNode<true, true>>>(Core3d, GammaLabel::Encode)
+                .add_render_graph_node::<ViewNodeRunner<GammaNode<false, true>>>(Core3d, GammaLabel::Decode)
+                .add_render_graph_edges(Core3d, (Node3d::EndMainPassPostProcessing, GammaLabel::Encode, NodeUi::UiPass, GammaLabel::Decode, Node3d::Upscaling));
+        }
     }
 }
 
@@ -111,9 +154,11 @@ fn patch_shaders(held: Option<Res<HeldShaders>>, mut events: MessageReader<Asset
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-enum GammaLabel {
+pub(crate) enum GammaLabel {
     Encode,
     Decode,
+    EffectsEncode,
+    EffectsDecode,
 }
 
 #[derive(Resource)]
@@ -127,6 +172,9 @@ struct GammaPipeline {
 struct GammaKey {
     format: TextureFormat,
     encode: bool,
+    /// Encoded by a plain 2.2 power, not the sRGB curve: the scene lit by a
+    /// level's light (`lighting`), whose figures are made linear by it.
+    power: bool,
 }
 
 impl SpecializedRenderPipeline for GammaPipeline {
@@ -139,7 +187,13 @@ impl SpecializedRenderPipeline for GammaPipeline {
             vertex: self.fullscreen.to_vertex_state(),
             fragment: Some(FragmentState {
                 shader: GAMMA_UI_SHADER,
-                entry_point: Some(if key.encode { "encode" } else { "decode" }.into()),
+                entry_point: Some(match (key.encode, key.power) {
+                    (true, true) => "encode_power",
+                    (true, false) => "encode",
+                    (false, true) => "decode_power",
+                    (false, false) => "decode",
+                }
+                .into()),
                 targets: vec![Some(ColorTargetState { format: key.format, blend: None, write_mask: ColorWrites::ALL })],
                 ..default()
             }),
@@ -157,28 +211,80 @@ fn init_pipeline(mut commands: Commands, device: Res<RenderDevice>, fullscreen: 
     commands.insert_resource(GammaPipeline { layout, sampler, fullscreen: fullscreen.clone() });
 }
 
+/// The encoding, the decoding, and the encoding and decoding by a power.
 #[derive(Component)]
-struct GammaPipelines([CachedRenderPipelineId; 2]);
+struct GammaPipelines([CachedRenderPipelineId; 4]);
 
-fn prepare(mut commands: Commands, views: Query<(Entity, &ViewTarget), With<GammaUi>>, cache: Res<PipelineCache>, pipeline: Res<GammaPipeline>, mut pipelines: ResMut<SpecializedRenderPipelines<GammaPipeline>>) {
+fn prepare(mut commands: Commands, views: Query<(Entity, &ViewTarget)>, cache: Res<PipelineCache>, pipeline: Res<GammaPipeline>, mut pipelines: ResMut<SpecializedRenderPipelines<GammaPipeline>>) {
     for (entity, target) in &views {
         let format = target.main_texture_format();
-        let ids = [true, false].map(|encode| pipelines.specialize(&cache, &pipeline, GammaKey { format, encode }));
+        let ids = [(true, false), (false, false), (true, true), (false, true)].map(|(encode, power)| pipelines.specialize(&cache, &pipeline, GammaKey { format, encode, power }));
         commands.entity(entity).insert(GammaPipelines(ids));
     }
 }
 
-/// The frame encoded (`ENCODE`) before the screens, decoded after them.
+/// The frame encoded (`ENCODE`) before the screens (`UI`) or the camera's
+/// effects, decoded after them.
 #[derive(Default)]
-struct GammaNode<const ENCODE: bool>;
+struct GammaNode<const ENCODE: bool, const UI: bool>;
 
-impl<const ENCODE: bool> ViewNode for GammaNode<ENCODE> {
-    type ViewQuery = (&'static ViewTarget, &'static GammaPipelines);
+impl<const ENCODE: bool, const UI: bool> ViewNode for GammaNode<ENCODE, UI> {
+    type ViewQuery = (
+        &'static ViewTarget,
+        &'static GammaPipelines,
+        Has<GammaUi>,
+        Has<crate::screen_blur::ScreenBlur>,
+        Has<crate::blood_view::BloodScreen>,
+        Has<crate::contusion_view::ContusionScreen>,
+        Has<crate::muzzle_view::JetRig>,
+        Has<crate::muzzle_view::SmokeScreen>,
+        Has<crate::prism_view::PrismScreen>,
+        // The particles' effects, drawn on the frame in the game's numbers
+        // as the flash is.
+        (Has<crate::particles_view::FumeScreen>, Has<crate::particles_view::SparkScreen>, Has<crate::particles_view::HazeScreen>, Has<crate::explosion_view::ExplosionScreen>),
+        // The world's passes after the depth's copy, the game's image
+        // effects on its gamma-space frame: the ambient occlusion, the
+        // sky's scattering, the clouds. Each is extracted on every frame it
+        // is on, so the frame is in the game's numbers for it always, not
+        // only while another effect shows (the occlusion was darker while a
+        // shot or the inventory's blur was on, until 0.109.1).
+        (Has<crate::hbao_view::HbaoScreen>, Has<crate::scattering_view::ScatteringScreen>, Has<crate::clouds_view::CloudsScreen>),
+        Has<KeepFigures>,
+        // The face shield's mask, the camera's effect after pain's blur.
+        Has<crate::visor_view::VisorScreen>,
+    );
 
-    fn run(&self, _graph: &mut RenderGraphContext, context: &mut RenderContext, (target, ids): QueryItem<Self::ViewQuery>, world: &World) -> Result<(), NodeRunError> {
+    fn run(&self, _graph: &mut RenderGraphContext, context: &mut RenderContext, (target, ids, screens, blur, blood, effects, jets, smoke, prism, particles, passes, keep, visor): QueryItem<Self::ViewQuery>, world: &World) -> Result<(), NodeRunError> {
         let pipeline = world.resource::<GammaPipeline>();
         let cache = world.resource::<PipelineCache>();
-        let Some(drawn) = cache.get_render_pipeline(ids.0[usize::from(!ENCODE)]) else { return Ok(()) };
+        // Both of a pair, or neither: the frame is never left encoded.
+        let [Some(encode), Some(decode), Some(power), Some(power_back)] = ids.0.map(|id| cache.get_render_pipeline(id)) else { return Ok(()) };
+        // The camera's effects, each extracted only while it is on (PRISM
+        // always, with `CUSTOMS LIGHT`).
+        let (fumes, sparks, haze, explosions) = particles;
+        let (occlusion, scattering, clouds) = passes;
+        let effects = blur || blood || effects || jets || smoke || prism || fumes || sparks || haze || explosions || occlusion || scattering || clouds || visor;
+        let run = match (UI, ENCODE) {
+            (true, true) => screens && !effects,
+            (true, false) => screens,
+            (false, true) => effects,
+            (false, false) => effects && !screens,
+        };
+        if !run {
+            return Ok(());
+        }
+        // The scene lit by a level's light goes to the game's numbers by
+        // the power its figures were made linear by (`lighting`); the
+        // screens' and the way back by the sRGB curve the screen itself
+        // takes them by.
+        // A picture kept in the scene's figures (`KeepFigures`) comes back
+        // by the power it went by.
+        let drawn = match (ENCODE, UI) {
+            (true, false) if prism || keep => power,
+            (true, _) => encode,
+            (false, false) if keep && !prism => power_back,
+            _ => decode,
+        };
         let write = target.post_process_write();
         let group = context.render_device().create_bind_group("gamma_ui", &cache.get_bind_group_layout(&pipeline.layout), &BindGroupEntries::sequential((write.source, &pipeline.sampler)));
         let mut render = context.begin_tracked_render_pass(RenderPassDescriptor {

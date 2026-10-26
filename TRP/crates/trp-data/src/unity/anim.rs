@@ -130,6 +130,11 @@ pub struct Clip {
     dense_begin: f32,
     dense: Vec<f32>,
     constant: Vec<f32>,
+    /// Each streamed curve's keys in time order (a frame's time and the
+    /// cubic of the span that starts at it), made on the first sample:
+    /// none where the frames are not in time order, which are then walked
+    /// as they lie.
+    by_curve: std::sync::OnceLock<Option<Vec<Vec<(f32, [f32; 4])>>>>,
 }
 
 impl Clip {
@@ -197,6 +202,7 @@ impl Clip {
             dense_begin: dense_clip.req("m_BeginTime")?.as_f32().unwrap_or(0.0),
             dense: dense_clip.req("m_SampleArray")?.as_floats().unwrap_or(&[]).to_vec(),
             constant,
+            by_curve: std::sync::OnceLock::new(),
             others: Vec::new(),
         };
         if clip.dense.len() < clip.dense_frames * clip.dense_curves {
@@ -348,6 +354,7 @@ impl Clip {
             dense_begin: self.dense_begin,
             dense,
             constant,
+            by_curve: std::sync::OnceLock::new(),
             others: Vec::new(),
         }
     }
@@ -357,13 +364,33 @@ impl Clip {
     }
 
     /// Evaluates every curve at `time` seconds from the start of the clip.
-    pub fn sample(&self, time: f32, values: &mut Vec<f32>) {
-        let t = self.start_time + time.clamp(0.0, self.duration());
-        values.clear();
-        values.resize(self.curve_count(), 0.0);
+    /// Each streamed curve's keys in time order, where the frames lie in
+    /// it (they do in every clip read: the engine stores them so).
+    fn keys_by_curve(&self) -> Option<&Vec<Vec<(f32, [f32; 4])>>> {
+        self.by_curve
+            .get_or_init(|| {
+                let ordered = self.streamed.windows(2).all(|pair| pair[0].time <= pair[1].time);
+                ordered.then(|| {
+                    let mut by_curve = vec![Vec::new(); self.streamed_curves];
+                    for frame in &self.streamed {
+                        for key in &frame.keys {
+                            if let Some(list) = by_curve.get_mut(key.curve) {
+                                list.push((frame.time, key.coeff));
+                            }
+                        }
+                    }
+                    by_curve
+                })
+            })
+            .as_ref()
+    }
 
-        // Each key holds the cubic for the span that starts at it, so the
-        // value of a curve comes from its latest key at or before `t`.
+    /// Each streamed curve's latest key at or before `t`: by each curve's
+    /// keys where they are had, else by walking the frames up to `t`.
+    fn latest_keys(&self, t: f32) -> Vec<Option<(f32, [f32; 4])>> {
+        if let Some(by_curve) = self.keys_by_curve() {
+            return by_curve.iter().map(|keys| keys.partition_point(|(time, _)| *time <= t).checked_sub(1).map(|at| keys[at])).collect();
+        }
         let mut active: Vec<Option<(f32, [f32; 4])>> = vec![None; self.streamed_curves];
         for frame in &self.streamed {
             if frame.time > t {
@@ -375,6 +402,50 @@ impl Clip {
                 }
             }
         }
+        active
+    }
+
+    /// One curve's value at a time, as `sample` gives it among the rest
+    /// (the same keys and arithmetic), for a reader of a few curves (the
+    /// root's travel and turn).
+    pub fn sample_curve(&self, time: f32, curve: usize) -> f32 {
+        let t = self.start_time + time.clamp(0.0, self.duration());
+        if curve < self.streamed_curves {
+            let slot = match self.keys_by_curve() {
+                Some(by_curve) => by_curve.get(curve).and_then(|keys| keys.partition_point(|(time, _)| *time <= t).checked_sub(1).map(|at| keys[at])),
+                None => self.latest_keys(t).get(curve).copied().flatten(),
+            };
+            return match slot {
+                Some((key_time, c)) => {
+                    let dt = if key_time.is_finite() { t - key_time } else { 0.0 };
+                    ((c[0] * dt + c[1]) * dt + c[2]) * dt + c[3]
+                }
+                None => 0.0,
+            };
+        }
+        let dense = curve - self.streamed_curves;
+        if dense < self.dense_curves {
+            if self.dense_frames == 0 {
+                return 0.0;
+            }
+            let frame = ((t - self.dense_begin) * self.dense_rate).clamp(0.0, (self.dense_frames - 1) as f32);
+            let lo = frame.floor() as usize;
+            let hi = (lo + 1).min(self.dense_frames - 1);
+            let mix = frame - lo as f32;
+            let (a, b) = (lo * self.dense_curves, hi * self.dense_curves);
+            return self.dense[a + dense] + (self.dense[b + dense] - self.dense[a + dense]) * mix;
+        }
+        self.constant.get(dense - self.dense_curves).copied().unwrap_or(0.0)
+    }
+
+    pub fn sample(&self, time: f32, values: &mut Vec<f32>) {
+        let t = self.start_time + time.clamp(0.0, self.duration());
+        values.clear();
+        values.resize(self.curve_count(), 0.0);
+
+        // Each key holds the cubic for the span that starts at it, so the
+        // value of a curve comes from its latest key at or before `t`.
+        let active = self.latest_keys(t);
         for (value, slot) in values.iter_mut().zip(&active) {
             if let Some((key_time, c)) = slot {
                 // The opening frame sits at minus infinity and holds constants.
@@ -454,16 +525,30 @@ impl Clip {
                 after: [Option<(f32, f32)>; 2],
             }
             let mut around = vec![Around::default(); self.streamed_curves];
-            for frame in &self.streamed {
-                if frame.time > t + 2.0 * longest {
-                    break;
+            match self.keys_by_curve() {
+                // Each curve's two latest keys at or before `t` and its first
+                // two after it within the window, as the walk below finds.
+                Some(by_curve) => {
+                    for (slot, keys) in around.iter_mut().zip(by_curve) {
+                        let at = keys.partition_point(|(time, _)| *time <= t);
+                        slot.before = [at.checked_sub(2).map(|i| keys[i]), at.checked_sub(1).map(|i| keys[i])];
+                        let within = |i: usize| keys.get(i).filter(|(time, _)| *time <= t + 2.0 * longest).map(|(time, coeff)| (*time, coeff[3]));
+                        slot.after = [within(at), within(at).and(within(at + 1))];
+                    }
                 }
-                for key in &frame.keys {
-                    let Some(slot) = around.get_mut(key.curve) else { continue };
-                    if frame.time <= t {
-                        slot.before = [slot.before[1], Some((frame.time, key.coeff))];
-                    } else if let Some(free) = slot.after.iter_mut().find(|after| after.is_none()) {
-                        *free = Some((frame.time, key.coeff[3]));
+                None => {
+                    for frame in &self.streamed {
+                        if frame.time > t + 2.0 * longest {
+                            break;
+                        }
+                        for key in &frame.keys {
+                            let Some(slot) = around.get_mut(key.curve) else { continue };
+                            if frame.time <= t {
+                                slot.before = [slot.before[1], Some((frame.time, key.coeff))];
+                            } else if let Some(free) = slot.after.iter_mut().find(|after| after.is_none()) {
+                                *free = Some((frame.time, key.coeff[3]));
+                            }
+                        }
                     }
                 }
             }
@@ -567,6 +652,7 @@ mod tests {
             dense_begin: 0.0,
             dense: samples,
             constant: Vec::new(),
+            by_curve: std::sync::OnceLock::new(),
             others: Vec::new(),
         }
     }
@@ -642,6 +728,51 @@ mod tests {
     /// lines between is taken on the curve for drawing as samples are; a
     /// straight line across many samples, and a span that is a curve of
     /// its maker's, are left as they are.
+    /// One curve sampled alone is what the whole sample has for it, to the
+    /// bit, streamed, dense and constant.
+    #[test]
+    fn a_curve_sampled_alone_is_the_whole_sample_s() {
+        let clip = keyed(&[(0.0, 1.0, [0.0, 0.5]), (0.033, 2.0, [3.0, -1.0]), (0.45, 0.25, [-2.0, 0.0]), (1.0, 3.5, [0.5, 0.5])]);
+        let mut whole = Vec::new();
+        for step in -10..=1200 {
+            let t = step as f32 / 1000.0;
+            clip.sample(t, &mut whole);
+            for (curve, value) in whole.iter().enumerate() {
+                assert_eq!(clip.sample_curve(t, curve).to_bits(), value.to_bits(), "curve {curve} at {t}");
+            }
+        }
+        let mut dense = sampled(2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 8.0]);
+        dense.constant = vec![7.0];
+        for step in -10..=400 {
+            let t = step as f32 / 1000.0;
+            dense.sample(t, &mut whole);
+            for (curve, value) in whole.iter().enumerate() {
+                assert_eq!(dense.sample_curve(t, curve).to_bits(), value.to_bits(), "dense curve {curve} at {t}");
+            }
+        }
+    }
+
+    /// A curve's keys found by its own list (the frames in time order)
+    /// give every sample the walk of the frames gives, to the bit, both
+    /// ways of sampling, before, between, on and after the keys.
+    #[test]
+    fn keys_found_by_curve_are_the_walk_s() {
+        let clip = keyed(&[(0.0, 1.0, [0.0, 0.5]), (0.033, 2.0, [3.0, -1.0]), (0.1, -4.0, [0.0, 0.0]), (0.1, 7.0, [1.0, 1.0]), (0.45, 0.25, [-2.0, 0.0]), (0.5, 3.0, [0.0, 0.0]), (1.0, 3.5, [0.5, 0.5])]);
+        let walked = clip.clone();
+        walked.by_curve.set(None).expect("not yet made");
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for step in -10..=1200 {
+            let t = step as f32 / 1000.0;
+            clip.sample(t, &mut a);
+            walked.sample(t, &mut b);
+            assert_eq!(a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "sample at {t}");
+            clip.sample_smooth(t, &mut a);
+            walked.sample_smooth(t, &mut b);
+            assert_eq!(a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "smooth sample at {t}");
+        }
+        assert!(clip.by_curve.get().is_some_and(Option::is_some), "indexed");
+    }
+
     #[test]
     fn keys_at_every_sample_are_drawn_as_samples_are() {
         let parabola = |t: f32| 40.0 * t * t;
@@ -698,6 +829,7 @@ mod tests {
             dense_begin: 0.0,
             dense: vec![0.0, 10.0, 20.0],
             constant: vec![9.0],
+            by_curve: std::sync::OnceLock::new(),
             others: Vec::new(),
         };
         let mut v = Vec::new();

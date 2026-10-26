@@ -61,6 +61,11 @@ impl TextureSettings {
     }
 }
 
+/// The pictures' quality the app starts at until the options change it:
+/// HIGH (the user, 2026-10-22: "Start at HIGH instead"), streamed. The
+/// install's own is what `AS THE INSTALL HAS THEM` takes.
+pub const START_QUALITY: u8 = 2;
+
 /// The game's budget for streamed pictures: 1,024 MB at every quality
 /// (`RefreshStreamingMemoryBudget(1024f * Vector4.one, ...)`).
 pub const BUDGET: u64 = 1024 << 20;
@@ -138,7 +143,7 @@ pub fn add(images: &mut Assets<Image>, mut image: Image, source: Source) -> Hand
             Source::Bundle(again) => Whole::Read(again),
             Source::Kept | Source::Whole => Whole::Kept(Arc::new(data)),
         };
-        let streamed = Streamed { template: image, whole, levels, deepest, loaded: start, lower_since: None, first: first.clone(), current: None, pending: None, stuck: false };
+        let streamed = Streamed { template: image, whole, levels, deepest, loaded: start, lower_since: None, first: first.clone(), current: None, pending: None, arriving: None, stuck: false };
         if let Ok(mut added) = ADDED.lock() {
             added.push(streamed);
         }
@@ -181,6 +186,9 @@ struct Streamed {
     /// A copy being made away from the frame, from its level; and whether
     /// one could not be (left as it is from then).
     pending: Option<(u32, Task<Option<Image>>)>,
+    /// A copy made and added, from its level, on its way to the card: the
+    /// materials are pointed at it once it is there (`take_made`).
+    arriving: Option<(u32, Handle<Image>)>,
     stuck: bool,
 }
 
@@ -310,6 +318,9 @@ impl MipStreaming {
     fn forget(&mut self, picture: AssetId<Image>) {
         if let Some(streamed) = self.pictures.remove(&picture) {
             self.family.remove(&picture);
+            if let (Some((_, copy)), Ok(mut lists)) = (&streamed.arriving, ON_CARD.lock()) {
+                lists.0.retain(|id| *id != copy.id());
+            }
             if let Some(current) = &streamed.current {
                 self.family.remove(&current.id());
             }
@@ -420,26 +431,67 @@ fn texel_density(mesh: &Mesh) -> Option<f32> {
     (picture > 1e-12 && surface > 0.0).then(|| (surface / picture) as f32)
 }
 
-/// The levels the pictures want, worked out every `DECIDE_EVERY`, and the
-/// card's copies brought to them: a picture raised at once (within the
-/// upload a decision, the nearest first; its copy made away from the frame
-/// and taken in the frame it is ready), brought down once it has wanted that
-/// for `LOWER_AFTER`. A thing drawn is counted whether it is in a camera's
-/// sight or not, as long as it is shown (`PROVISIONAL`: Unity's streaming is
-/// said to go by distance alone).
-pub fn stream(
-    time: Res<Time<Real>>,
-    mut streaming: ResMut<MipStreaming>,
-    mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    cameras: Query<(&Camera, &GlobalTransform, &Projection)>,
-    drawn: Query<(&Mesh3d, &MeshMaterial3d<StandardMaterial>, &GlobalTransform, Option<&Aabb>, &InheritedVisibility)>,
-) {
+/// The copies added and not yet seen on the card, and those the renderer
+/// has seen there since (`see_on_card`).
+static ON_CARD: Mutex<(Vec<AssetId<Image>>, Vec<AssetId<Image>>)> = Mutex::new((Vec::new(), Vec::new()));
+
+/// In the renderer, after its pictures are readied: each copy waited for
+/// that is on the card now, said to be.
+pub fn see_on_card(images: Res<bevy::render::render_asset::RenderAssets<bevy::render::texture::GpuImage>>) {
+    let Ok(mut lists) = ON_CARD.lock() else { return };
+    if lists.0.is_empty() {
+        return;
+    }
+    let (asked, there) = &mut *lists;
+    asked.retain(|id| {
+        let on = images.get(*id).is_some();
+        if on {
+            there.push(*id);
+        }
+        !on
+    });
+}
+
+/// The renderer's side of the streaming: `see_on_card` after its pictures
+/// are readied.
+pub fn watch_card(app: &mut App) {
+    use bevy::render::{Render, RenderApp, RenderSystems};
+    if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+        render_app.add_systems(Render, see_on_card.after(RenderSystems::PrepareAssets).before(RenderSystems::Render));
+    }
+}
+
+/// Copies made away from the frame, taken as they come, and the materials
+/// drawing with a picture pointed at its copy once the copy is on the card.
+///
+/// A material changed is readied afresh by the engine, which lets go of
+/// the one it had first, and a material that names a picture not yet on
+/// the card is not ready and is not drawn (`unready`). The pictures
+/// go up to the card a few a frame (`main::warm_up`, `UPLOAD_BUDGET`), so a
+/// material pointed at its copy as the copy was added was not drawn until
+/// the copy was up: the models flashed out as one walked up to them (the
+/// user's report of 2026-10-26). Until it is there the material draws with
+/// the copy it had, as Unity's streaming draws with the levels it has.
+/// Pointed in `PostUpdate`, before the stores tell the renderer what
+/// changed (`AssetEventSystems`).
+pub fn take_made(mut streaming: ResMut<MipStreaming>, mut images: ResMut<Assets<Image>>, mut materials: ResMut<Assets<StandardMaterial>>) {
     let streaming = &mut *streaming;
     if !streaming.settings.streaming || streaming.pictures.is_empty() {
         return;
     }
-    // Copies made away from the frame, taken as they come.
+    // Copies on the card now: their materials pointed at them.
+    let there: Vec<AssetId<Image>> = ON_CARD.lock().map(|mut lists| std::mem::take(&mut lists.1)).unwrap_or_default();
+    if !there.is_empty() {
+        let up: Vec<(AssetId<Image>, u32, Handle<Image>)> = streaming
+            .pictures
+            .iter_mut()
+            .filter(|(_, streamed)| streamed.arriving.as_ref().is_some_and(|(_, copy)| there.contains(&copy.id())))
+            .filter_map(|(id, streamed)| streamed.arriving.take().map(|(level, copy)| (*id, level, copy)))
+            .collect();
+        for (id, level, copy) in up {
+            streaming.point_to(&mut materials, id, level, Some(copy));
+        }
+    }
     let made: Vec<(AssetId<Image>, u32, Option<Image>)> = streaming
         .pictures
         .iter_mut()
@@ -455,7 +507,19 @@ pub fn stream(
         match image {
             Some(image) => {
                 let copy = images.add(image);
-                streaming.point_to(&mut materials, id, level, Some(copy));
+                // `TRP_STREAM_AT_ONCE` in the environment points the
+                // materials at it at once, as before 0.140.1, to set the two
+                // beside each other.
+                if std::env::var_os("TRP_STREAM_AT_ONCE").is_some() {
+                    streaming.point_to(&mut materials, id, level, Some(copy));
+                    continue;
+                }
+                if let Ok(mut lists) = ON_CARD.lock() {
+                    lists.0.push(copy.id());
+                }
+                if let Some(streamed) = streaming.pictures.get_mut(&id) {
+                    streamed.arriving = Some((level, copy));
+                }
             }
             None => {
                 warn!("mip streaming: a picture's levels could not be had again from its bundle; it is left as it is");
@@ -464,6 +528,26 @@ pub fn stream(
                 }
             }
         }
+    }
+}
+
+/// The levels the pictures want, worked out every `DECIDE_EVERY`, and the
+/// card's copies brought to them: a picture raised at once (within the
+/// upload a decision, the nearest first; its copy made away from the frame
+/// and taken as it is ready, `take_made`), brought down once it has wanted
+/// that for `LOWER_AFTER`. A thing drawn is counted whether it is in a
+/// camera's sight or not, as long as it is shown (`PROVISIONAL`: Unity's
+/// streaming is said to go by distance alone).
+pub fn stream(
+    time: Res<Time<Real>>,
+    mut streaming: ResMut<MipStreaming>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    cameras: Query<(&Camera, &GlobalTransform, &Projection)>,
+    drawn: Query<(&Mesh3d, &MeshMaterial3d<StandardMaterial>, &GlobalTransform, Option<&Aabb>, &InheritedVisibility)>,
+) {
+    let streaming = &mut *streaming;
+    if !streaming.settings.streaming || streaming.pictures.is_empty() {
+        return;
     }
     let dt = time.delta_secs();
     streaming.clock += dt;
@@ -566,7 +650,7 @@ pub fn stream(
     let mut changed = Vec::new();
     for (id, level, _) in order {
         let streamed = streaming.pictures.get_mut(&id).expect("a picture");
-        if streamed.pending.is_some() || streamed.stuck {
+        if streamed.pending.is_some() || streamed.arriving.is_some() || streamed.stuck {
             continue;
         }
         if level < streamed.loaded {

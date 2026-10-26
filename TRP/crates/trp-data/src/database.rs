@@ -20,6 +20,9 @@ pub struct ItemTemplate {
     pub parent: String,
     #[serde(rename = "_props", default)]
     pub props: Json,
+    /// `Item` for an item the game makes, `Node` for a class of them.
+    #[serde(rename = "_type", default)]
+    pub node_type: String,
 }
 
 impl ItemTemplate {

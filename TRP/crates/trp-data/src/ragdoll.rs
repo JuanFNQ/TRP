@@ -42,6 +42,13 @@ pub struct ColliderData {
     /// one on the bone itself.
     pub local: Option<([f32; 3], [f32; 4])>,
     pub shape: Shape,
+    /// The body part its object's hit collider is of (`BodyPartCollider.
+    /// BodyPartType`: the game's numbers, head 0 to right leg 6).
+    pub part: Option<u8>,
+    /// The surface its hit collider says it is (`BaseBallistic.
+    /// SurfaceSound`, `ESurfaceSound`'s number), which a thing landing on
+    /// it plays by (`LootItem.CheckSurface`).
+    pub surface: u8,
 }
 
 /// A rigid body of the ragdoll (`RigidbodySpawner`).
@@ -127,45 +134,152 @@ struct Node {
     components: Vec<ObjRef>,
 }
 
+/// Every object of the player prefab by its own game object, with what it
+/// hangs from.
+fn prefab_nodes(assets: &mut Assets) -> Result<HashMap<ObjRef, Node>> {
+    let files = assets.load(PLAYER_BUNDLE)?;
+    let mut nodes: HashMap<ObjRef, Node> = HashMap::new();
+    let mut of_transform: HashMap<ObjRef, ObjRef> = HashMap::new();
+    let game_objects: Vec<ObjRef> = files.iter().flat_map(|&f| assets.objects_of(f, class::GAME_OBJECT)).collect();
+    let mut fathers = Vec::new();
+    for object in game_objects {
+        let v = assets.read(object)?;
+        let components: Vec<ObjRef> = v
+            .get("m_Component")
+            .and_then(Value::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|c| c.get("component")?.as_pptr())
+            .filter_map(|p| assets.resolve_loaded(object.file, p))
+            .collect();
+        let Some(transform) = components.iter().copied().find(|c| assets.class_id(*c) == Some(class::TRANSFORM)) else { continue };
+        let t = assets.read(transform)?;
+        of_transform.insert(transform, object);
+        if let Some(father) = t.get("m_Father").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(transform.file, p)) {
+            fathers.push((object, father));
+        }
+        nodes.insert(object, Node {
+            name: v.get("m_Name").and_then(Value::as_str).unwrap_or("").to_owned(),
+            parent: None,
+            place: vec3(&t, "m_LocalPosition")?,
+            turn: t.req("m_LocalRotation")?.as_vec4().context("a turn")?,
+            components,
+        });
+    }
+    for (object, father) in fathers {
+        let parent = of_transform.get(&father).copied();
+        if let Some(node) = nodes.get_mut(&object) {
+            node.parent = parent;
+        }
+    }
+    Ok(nodes)
+}
+
+/// A collider component's shape, none for another kind of component or a
+/// trigger.
+fn shape_of(assets: &Assets, component: ObjRef) -> Result<Option<Shape>> {
+    let kind = assets.class_id(component);
+    if !matches!(kind, Some(BOX_COLLIDER | SPHERE_COLLIDER | CAPSULE_COLLIDER)) {
+        return Ok(None);
+    }
+    let c = assets.read(component)?;
+    if c.get("m_IsTrigger").and_then(Value::as_i64).unwrap_or(0) != 0 {
+        return Ok(None);
+    }
+    Ok(Some(match kind {
+        Some(BOX_COLLIDER) => Shape::Box { centre: vec3(&c, "m_Center")?, size: vec3(&c, "m_Size")? },
+        Some(SPHERE_COLLIDER) => Shape::Sphere { centre: vec3(&c, "m_Center")?, radius: float(&c, "m_Radius")? },
+        _ => Shape::Capsule {
+            centre: vec3(&c, "m_Center")?,
+            radius: float(&c, "m_Radius")?,
+            height: float(&c, "m_Height")?,
+            direction: c.get("m_Direction").and_then(Value::as_i64).unwrap_or(1) as u32,
+        },
+    }))
+}
+
+/// One of a character's hit colliders as the player prefab has it (body
+/// hits spec, "The hit colliders"): a body part's (`BodyPartCollider`) or a
+/// plate's (`ArmorPlateCollider`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HitColliderData {
+    /// The object it is on.
+    pub object: String,
+    /// The skeleton's bone it is on or hangs under (a `Base Human` bone).
+    pub bone: String,
+    /// Its object's place and turn (`xyzw`) in that bone: none for one on
+    /// the bone itself.
+    pub local: Option<([f32; 3], [f32; 4])>,
+    pub shape: Shape,
+    /// Its body part (`BodyPartType`: head 0 to right leg 6), collider type
+    /// (`EBodyPartColliderType`) and plate (`EArmorPlateCollider`: 0 for a
+    /// body part's own).
+    pub part: u8,
+    pub collider_type: u8,
+    pub plate: u16,
+    /// The prefab's figures (`BallisticCollider`): penetration level,
+    /// penetration chance, ricochet chance, fragmentation chance,
+    /// deviation chance, deviation; and the damage share
+    /// (`penetrationDamageMod`). A body part's level, chance and share are
+    /// set again from the globals as a character is made (not here).
+    pub figures: [f32; 6],
+    pub damage_mod: f32,
+}
+
 impl RagdollData {
-    pub fn load(assets: &mut Assets) -> Result<Self> {
-        let files = assets.load(PLAYER_BUNDLE)?;
-        // Every object of the prefab by its own game object, with what it
-        // hangs from.
-        let mut nodes: HashMap<ObjRef, Node> = HashMap::new();
-        let mut of_transform: HashMap<ObjRef, ObjRef> = HashMap::new();
-        let game_objects: Vec<ObjRef> = files.iter().flat_map(|&f| assets.objects_of(f, class::GAME_OBJECT)).collect();
-        let mut fathers = Vec::new();
-        for object in game_objects {
-            let v = assets.read(object)?;
-            let components: Vec<ObjRef> = v
-                .get("m_Component")
-                .and_then(Value::as_array)
-                .unwrap_or(&[])
-                .iter()
-                .filter_map(|c| c.get("component")?.as_pptr())
-                .filter_map(|p| assets.resolve_loaded(object.file, p))
-                .collect();
-            let Some(transform) = components.iter().copied().find(|c| assets.class_id(*c) == Some(class::TRANSFORM)) else { continue };
-            let t = assets.read(transform)?;
-            of_transform.insert(transform, object);
-            if let Some(father) = t.get("m_Father").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(transform.file, p)) {
-                fathers.push((object, father));
-            }
-            nodes.insert(object, Node {
-                name: v.get("m_Name").and_then(Value::as_str).unwrap_or("").to_owned(),
-                parent: None,
-                place: vec3(&t, "m_LocalPosition")?,
-                turn: t.req("m_LocalRotation")?.as_vec4().context("a turn")?,
-                components,
+    /// Every hit collider of the player prefab, body parts' and plates',
+    /// by their objects' names.
+    pub fn hit_colliders(assets: &mut Assets) -> Result<Vec<HitColliderData>> {
+        let nodes = prefab_nodes(assets)?;
+        let mut out = Vec::new();
+        for (&object, node) in &nodes {
+            let script = node.components.iter().copied().find(|c| {
+                assets.class_id(*c) == Some(class::MONO_BEHAVIOUR) && matches!(script_class(assets, *c).as_deref(), Some("BodyPartCollider" | "ArmorPlateCollider"))
             });
-        }
-        for (object, father) in fathers {
-            let parent = of_transform.get(&father).copied();
-            if let Some(node) = nodes.get_mut(&object) {
-                node.parent = parent;
+            let Some(script) = script else { continue };
+            let v = assets.read(script)?;
+            let int = |name: &str| v.get(name).and_then(Value::as_i64).unwrap_or(0);
+            let number = |name: &str| v.get(name).and_then(Value::as_f32).unwrap_or(0.0);
+            // Up to the bone: the object's place in it gathered on the way.
+            let (mut at, mut place, mut turn) = (object, [0.0f32; 3], [0.0, 0.0, 0.0, 1.0f32]);
+            while !nodes[&at].name.starts_with("Base Human") {
+                let here = &nodes[&at];
+                let moved = rotate(here.turn, place);
+                place = [here.place[0] + moved[0], here.place[1] + moved[1], here.place[2] + moved[2]];
+                turn = quat_mul(here.turn, turn);
+                match here.parent {
+                    Some(parent) => at = parent,
+                    None => break,
+                }
+            }
+            for component in &node.components {
+                let Some(shape) = shape_of(assets, *component)? else { continue };
+                out.push(HitColliderData {
+                    object: node.name.clone(),
+                    bone: nodes[&at].name.clone(),
+                    local: (at != object).then_some((place, turn)),
+                    shape,
+                    part: int("BodyPartType") as u8,
+                    collider_type: int("BodyPartColliderType") as u8,
+                    plate: int("ArmorPlateColliderType") as u16,
+                    figures: [
+                        number("PenetrationLevel"),
+                        number("PenetrationChance"),
+                        number("RicochetChance"),
+                        number("FragmentationChance"),
+                        number("TrajectoryDeviationChance"),
+                        number("TrajectoryDeviation"),
+                    ],
+                    damage_mod: number("penetrationDamageMod"),
+                });
             }
         }
+        out.sort_by(|a, b| a.object.cmp(&b.object));
+        Ok(out)
+    }
+
+    pub fn load(assets: &mut Assets) -> Result<Self> {
+        let nodes = prefab_nodes(assets)?;
         let script_on = |assets: &Assets, node: &Node, wanted: &str| -> Option<ObjRef> {
             node.components.iter().copied().find(|c| assets.class_id(*c) == Some(class::MONO_BEHAVIOUR) && script_class(assets, *c).as_deref() == Some(wanted))
         };
@@ -228,9 +342,10 @@ impl RagdollData {
         // Each hit collider to the nearest body at or above it, with its
         // place in that body's bone.
         for (&object, node) in &nodes {
-            if script_on(assets, node, "BodyPartCollider").is_none() {
-                continue;
-            }
+            let Some(script) = script_on(assets, node, "BodyPartCollider") else { continue };
+            let read = assets.read(script)?;
+            let part = read.get("BodyPartType").and_then(Value::as_i64).and_then(|part| u8::try_from(part).ok());
+            let surface = read.get("SurfaceSound").and_then(Value::as_i64).and_then(|surface| u8::try_from(surface).ok()).unwrap_or(0);
             let (mut at, mut place, mut turn) = (object, [0.0f32; 3], [0.0, 0.0, 0.0, 1.0f32]);
             let body = loop {
                 if let Some(&body) = body_of.get(&at) {
@@ -251,26 +366,9 @@ impl RagdollData {
             };
             let Some(body) = body else { continue };
             for component in &node.components {
-                let kind = assets.class_id(*component);
-                if !matches!(kind, Some(BOX_COLLIDER | SPHERE_COLLIDER | CAPSULE_COLLIDER)) {
-                    continue;
-                }
-                let c = assets.read(*component)?;
-                if c.get("m_IsTrigger").and_then(Value::as_i64).unwrap_or(0) != 0 {
-                    continue;
-                }
-                let shape = match kind {
-                    Some(BOX_COLLIDER) => Shape::Box { centre: vec3(&c, "m_Center")?, size: vec3(&c, "m_Size")? },
-                    Some(SPHERE_COLLIDER) => Shape::Sphere { centre: vec3(&c, "m_Center")?, radius: float(&c, "m_Radius")? },
-                    _ => Shape::Capsule {
-                        centre: vec3(&c, "m_Center")?,
-                        radius: float(&c, "m_Radius")?,
-                        height: float(&c, "m_Height")?,
-                        direction: c.get("m_Direction").and_then(Value::as_i64).unwrap_or(1) as u32,
-                    },
-                };
+                let Some(shape) = shape_of(assets, *component)? else { continue };
                 let local = (at != object).then_some((place, turn));
-                bodies[body].colliders.push(ColliderData { object: node.name.clone(), local, shape });
+                bodies[body].colliders.push(ColliderData { object: node.name.clone(), local, shape, part, surface });
             }
         }
         bodies.sort_by(|a, b| a.bone.cmp(&b.bone));

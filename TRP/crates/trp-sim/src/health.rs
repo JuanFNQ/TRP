@@ -17,6 +17,9 @@ use trp_data::Database;
 
 use crate::recoil::Rng;
 
+mod stimulator;
+pub use stimulator::{BuffDef, BuffKind, BuffRun, StimWork, StimulatorSettings};
+
 /// A body part (`EBodyPart`), in the game's order, which ranks them where
 /// nothing else does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -82,6 +85,8 @@ pub enum DamageKind {
     HeavyBleeding,
     Dehydration,
     Exhaustion,
+    /// A stimulator's buff taking health away (`EDamageType.Stimulator`).
+    Stimulator,
 }
 
 impl DamageKind {
@@ -103,16 +108,17 @@ impl DamageKind {
             DamageKind::HeavyBleeding => "HeavyBleeding",
             DamageKind::Dehydration => "Dehydration",
             DamageKind::Exhaustion => "Exhaustion",
+            DamageKind::Stimulator => "Stimulator",
         }
     }
 
     /// `DamageHelper.SelfInflictedDamage`.
-    fn self_inflicted(self) -> bool {
-        matches!(self, DamageKind::LightBleeding | DamageKind::HeavyBleeding | DamageKind::Dehydration | DamageKind::Exhaustion | DamageKind::Existence)
+    pub(crate) fn self_inflicted(self) -> bool {
+        matches!(self, DamageKind::LightBleeding | DamageKind::HeavyBleeding | DamageKind::Dehydration | DamageKind::Exhaustion | DamageKind::Existence | DamageKind::Stimulator)
     }
 
     /// `DamageHelper.WeaponDamage`.
-    fn weapon(self) -> bool {
+    pub fn weapon(self) -> bool {
         matches!(self, DamageKind::Bullet | DamageKind::Melee | DamageKind::Blunt)
     }
 
@@ -244,6 +250,8 @@ pub struct HealthSettings {
     pub fall_overweight: f32,
     /// A use cut short before this many seconds of work costs nothing.
     pub interruption_time: f32,
+    /// The stimulators' sets of buffs (health spec, "Buffs").
+    pub stimulator: StimulatorSettings,
 }
 
 fn num(v: &Json, name: &str) -> Result<f32> {
@@ -355,6 +363,7 @@ impl HealthSettings {
             fall_damage_per_meter: num(falling, "DamagePerMeter")?,
             fall_overweight: num(at(config, "Stamina")?, "FallDamageMultiplier")?,
             interruption_time: config.pointer("/ItemsCommonSettings/ItemRemoveAfterInterruptionTime").and_then(Json::as_f64).map(|f| f as f32).context("no ItemsCommonSettings.ItemRemoveAfterInterruptionTime")?,
+            stimulator: StimulatorSettings::read(effects)?,
         })
     }
 }
@@ -409,6 +418,7 @@ impl Cure {
             Cure::LightBleeding => Kind::LightBleeding,
             Cure::Fracture => Kind::Fracture,
             Cure::Pain => Kind::Pain,
+            Cure::Contusion => Kind::Contusion,
             _ => return None,
         })
     }
@@ -570,10 +580,20 @@ pub enum Kind {
     Encumbered,
     OverEncumbered,
     MedEffect,
+    Contusion,
+    Stun,
+    Flash,
+    /// A stimulator or a buffed food's set at work (`Stimulator`), and what
+    /// its buffs make: the weight's limits raised (`Endurance`), the damage
+    /// taken changed (`DamageModifier`), the tunnel vision.
+    Stimulator,
+    Endurance,
+    DamageModifier,
+    TunnelVision,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 15] = [
+    pub const ALL: [Kind; 22] = [
         Kind::LightBleeding,
         Kind::HeavyBleeding,
         Kind::Wound,
@@ -589,6 +609,13 @@ impl Kind {
         Kind::Encumbered,
         Kind::OverEncumbered,
         Kind::MedEffect,
+        Kind::Contusion,
+        Kind::Stun,
+        Kind::Flash,
+        Kind::Stimulator,
+        Kind::Endurance,
+        Kind::DamageModifier,
+        Kind::TunnelVision,
     ];
 
     /// The kind by the game's class name for it.
@@ -614,17 +641,24 @@ impl Kind {
             Kind::Encumbered => "Encumbered",
             Kind::OverEncumbered => "OverEncumbered",
             Kind::MedEffect => "MedEffect",
+            Kind::Contusion => "Contusion",
+            Kind::Stun => "Stun",
+            Kind::Flash => "Flash",
+            Kind::Stimulator => "Stimulator",
+            Kind::Endurance => "Endurance",
+            Kind::DamageModifier => "DamageModifier",
+            Kind::TunnelVision => "TunnelVision",
         }
     }
 
     /// `IStackable`: a second is a second, not the first lengthened.
     fn stacks(self) -> bool {
-        matches!(self, Kind::Tremor | Kind::MedEffect)
+        matches!(self, Kind::Tremor | Kind::MedEffect | Kind::Contusion)
     }
 
     /// `IStackableFromDifferentTemplates`: one for each item.
     fn stacks_by_item(self) -> bool {
-        self == Kind::PainKiller
+        matches!(self, Kind::PainKiller | Kind::Stimulator)
     }
 
     fn bleeding(self) -> bool {
@@ -634,7 +668,7 @@ impl Kind {
     /// Neither wanted (`IDesirable`) nor for good (`IPermanent`): what
     /// `RemoveNegativeEffects` takes away.
     pub fn negative(self) -> bool {
-        !matches!(self, Kind::PainKiller | Kind::Existence | Kind::MedEffect)
+        !matches!(self, Kind::PainKiller | Kind::Existence | Kind::MedEffect | Kind::Stimulator)
     }
 }
 
@@ -698,6 +732,8 @@ pub struct Effect {
     /// Pain's count to its tremor.
     tremor_after: Option<f32>,
     pub med: Option<Box<MedWork>>,
+    /// A stimulator's own state (its set, its buffs).
+    pub stim: Option<Box<StimWork>>,
 }
 
 impl Effect {
@@ -726,6 +762,13 @@ impl Effect {
 
     fn calculate_strength(&mut self, dt: f32) {
         match self.stage {
+            // A stun holds to a fifth of its time past its build-up, then
+            // falls straight to nothing at its end
+            // (`Stun.CalculateCurrentStrength`).
+            Stage::Started if self.kind == Kind::Stun && self.state_current >= self.build_up + 0.2 * self.work => {
+                let held = self.build_up + 0.2 * self.work;
+                self.current_strength = self.strength * (self.state_left() / (self.work - held)).clamp(0.0, 1.0);
+            }
             Stage::Started => {
                 let (gap, left) = (self.strength - self.current_strength, self.build_up - self.state_current);
                 if self.build_up != 0.0 && left > 0.0 {
@@ -942,12 +985,31 @@ pub struct HealthSkills {
     /// share drawn that far toward all.
     pub surgery_speed: f32,
     pub surgery_penalty: f32,
+    /// Vitality's elite (`VitalityBuffBleedStop`): a bleeding works for its
+    /// `EliteVitalityDuration` (light 22 s, heavy 33 s here) and stops.
+    pub bleed_stop: bool,
+    /// Metabolism's elite (`MetabolismEliteBuffNoDyhydration`): strong
+    /// dehydration and exhaustion do no damage.
+    pub no_starvation_damage: bool,
+    /// Metabolism's `MetabolismMiscDebuffTime`, 0.01 a level: a stimulator's
+    /// side effects' time cut by it; Immunity's elite
+    /// `ImmunityAvoidMiscEffectsChance` (0.9): the share of side effects
+    /// dodged (health spec, "Buffs").
+    pub metabolism_debuff: f32,
+    pub immunity_avoid: f32,
 }
 
 impl HealthSkills {
-    /// The buffs from the skills' levels, by the game's names (`ESkillId`).
+    /// The buffs from the character's skills.
+    pub fn of(levels: &crate::skills::SkillLevels) -> Self {
+        Self::of_levels(|name| levels.level_of(name))
+    }
+
+    /// The buffs from the skills' levels, by the game's names (`ESkillId`):
+    /// each rule worked with the level held at 50 (`Skill.UpdateRules`),
+    /// the elites above it.
     pub fn of_levels(level: impl Fn(&str) -> u32) -> Self {
-        let at = |name: &str| level(name).min(51) as f32;
+        let at = |name: &str| level(name).min(50) as f32;
         let elite = |name: &str| level(name) > 50;
         Self {
             stress_pain: at("StressResistance") * 0.01,
@@ -960,6 +1022,10 @@ impl HealthSkills {
             immunity_painkiller: at("Immunity") * 0.006,
             surgery_speed: if elite("Surgery") { 0.4 } else { at("Surgery") * 0.2 / 50.0 },
             surgery_penalty: if elite("Surgery") { 1.0 } else { at("Surgery") * 0.01 },
+            bleed_stop: elite("Vitality"),
+            no_starvation_damage: elite("Metabolism"),
+            metabolism_debuff: at("Metabolism") * 0.01,
+            immunity_avoid: if elite("Immunity") { 0.9 } else { 0.0 },
         }
     }
 }
@@ -1013,7 +1079,12 @@ fn defaults(kind: Kind, s: &HealthSettings) -> [f32; 4] {
         Kind::LowHealth => [s.low_health.delay, inf, s.low_health.residue, 1.0],
         Kind::Exhaustion => [s.exhaustion.delay, inf, s.exhaustion.residue, 1.0],
         Kind::Dehydration => [s.dehydration.delay, inf, s.dehydration.residue, 1.0],
-        Kind::PainKiller | Kind::Existence | Kind::ChronicFatigue | Kind::Encumbered | Kind::OverEncumbered | Kind::MedEffect => [0.0, inf, 0.0, 1.0],
+        Kind::PainKiller | Kind::Existence | Kind::ChronicFatigue | Kind::Encumbered | Kind::OverEncumbered | Kind::MedEffect | Kind::Contusion | Kind::Flash => [0.0, inf, 0.0, 1.0],
+        Kind::Stimulator | Kind::Endurance | Kind::DamageModifier => [0.0, inf, 0.0, 1.0],
+        // `TunnelVision.DefaultBuildUpTime`, `DefaultResidueTime`.
+        Kind::TunnelVision => [0.0, inf, 2.0, 2.0],
+        // `Stun.StunBuildUpTime`, `DefaultResidueTime`.
+        Kind::Stun => [0.0, inf, 2.0, 0.2],
     }
 }
 
@@ -1104,11 +1175,11 @@ impl Health {
                     [e.figures[2], -s.energy_damage / s.energy_loop, 0.0]
                 }
                 Kind::Dehydration => {
-                    let [damage, every] = self.settings.dehydration_damage;
+                    let [damage, every] = self.starving(self.settings.dehydration_damage);
                     [-damage * parts / every, 0.0, 0.0]
                 }
                 Kind::Exhaustion => {
-                    let [damage, every] = self.settings.exhaustion_damage;
+                    let [damage, every] = self.starving(self.settings.exhaustion_damage);
                     [-damage * parts / every, 0.0, 0.0]
                 }
                 Kind::Existence => {
@@ -1219,8 +1290,7 @@ impl Health {
         for id in residual {
             self.force_remove(id);
         }
-        let s = &self.settings;
-        let [default_delay, default_work, default_residue, default_build] = defaults(kind, s);
+        let [default_delay, default_work, default_residue, default_build] = self.defaults(kind);
         let (mut work, mut residue, mut strength) = (work, residue, strength.unwrap_or(1.0));
         if kind == Kind::Pain {
             // `Pain.Init`: cut by the Stress Resistance skill's pain buff.
@@ -1253,6 +1323,7 @@ impl Health {
             item: None,
             tremor_after: None,
             med: None,
+            stim: None,
         };
         init(&mut effect);
         let id = effect.id;
@@ -1301,8 +1372,8 @@ impl Health {
 
     fn add_work_time(&mut self, id: u32, time: Option<f32>, reset: bool) {
         let Some(i) = self.index_of(id) else { return };
-        let default_work = defaults(self.effects[i].kind, &self.settings)[1];
-        let default_build = defaults(self.effects[i].kind, &self.settings)[3];
+        let default_work = self.defaults(self.effects[i].kind)[1];
+        let default_build = self.defaults(self.effects[i].kind)[3];
         let e = &mut self.effects[i];
         if e.stage > Stage::Started {
             return;
@@ -1346,7 +1417,7 @@ impl Health {
         let Some(i) = self.index_of(id) else { return };
         match self.effects[i].kind {
             // A forced residue lasts two seconds (`DEFAULT_FORCE_RESIDUE_TIME`).
-            Kind::Pain => self.set_residue_time(id, 2.0),
+            Kind::Pain | Kind::Contusion => self.set_residue_time(id, 2.0),
             Kind::MedEffect => {
                 if let Some(med) = self.effects[i].med.as_mut() {
                     med.interrupted = true;
@@ -1444,7 +1515,7 @@ impl Health {
                 for b in bleedings {
                     self.reset_bleeding(b, true);
                 }
-                let damage = self.settings.dehydration_damage[0];
+                let damage = self.starving(self.settings.dehydration_damage)[0];
                 if let Some(i) = self.index_of(id) {
                     self.effects[i].figures[0] = damage;
                 }
@@ -1467,6 +1538,16 @@ impl Health {
                 }
             }
             Kind::MedEffect => self.med_started(id),
+            Kind::Stimulator => self.stim_started(id),
+            // The damage taken changed by its strength while it works,
+            // kept to be undone (`DamageModifier.Started`).
+            Kind::DamageModifier => {
+                if let Some(i) = self.index_of(id) {
+                    let s = self.effects[i].strength;
+                    self.effects[i].figures[0] = s;
+                    self.damage_multiplier *= 1.0 + s;
+                }
+            }
             _ => {}
         }
     }
@@ -1480,6 +1561,12 @@ impl Health {
                 }
             }
             Kind::MedEffect => self.med_residue(id),
+            Kind::Stimulator => self.stim_residue(id),
+            Kind::DamageModifier => {
+                if let Some(i) = self.index_of(id) {
+                    self.damage_multiplier /= 1.0 + self.effects[i].figures[0];
+                }
+            }
             _ => {}
         }
         let _ = part;
@@ -1491,12 +1578,33 @@ impl Health {
         }
     }
 
+    /// A kind's default figures (`defaults`), a bleeding's working time
+    /// the elite Vitality buff's where it has one (`Bleeding.
+    /// DefaultWorkTime`: `EliteVitalityDuration`, if above 0).
+    fn defaults(&self, kind: Kind) -> [f32; 4] {
+        let mut figures = defaults(kind, &self.settings);
+        if kind.bleeding() && self.skills.bleed_stop {
+            let s = if kind == Kind::HeavyBleeding { self.settings.heavy } else { self.settings.light };
+            if s.elite_duration > 0.0 {
+                figures[1] = s.elite_duration;
+            }
+        }
+        figures
+    }
+
+    /// Strong dehydration's or exhaustion's damage and how often: no
+    /// damage with the elite Metabolism buff (`Dehydration.Damage`,
+    /// `Exhaustion.Damage`).
+    fn starving(&self, [damage, every]: [f32; 2]) -> [f32; 2] {
+        [if self.skills.no_starvation_damage { 0.0 } else { damage }, every]
+    }
+
     /// `Bleeding.ResetParameters`: the figures with or without
     /// dehydration.
     fn reset_bleeding(&mut self, id: u32, dehydrated: bool) {
         let Some(i) = self.index_of(id) else { return };
         let s = if self.effects[i].kind == Kind::HeavyBleeding { self.settings.heavy } else { self.settings.light };
-        let default_work = f32::INFINITY;
+        let default_work = self.defaults(self.effects[i].kind)[1];
         let life = if dehydrated && s.life_dehydrated > 0.0 { s.life_dehydrated.min(default_work) } else { default_work };
         self.add_work_time(id, Some(life), true);
         let Some(i) = self.index_of(id) else { return };
@@ -1611,7 +1719,7 @@ impl Health {
                 }
             }
             Kind::Exhaustion => {
-                let [damage, every] = self.settings.exhaustion_damage;
+                let [damage, every] = self.starving(self.settings.exhaustion_damage);
                 let e = &mut self.effects[i];
                 e.loops[0] += dt;
                 if e.loops[0] >= every {
@@ -1625,7 +1733,7 @@ impl Health {
                 }
             }
             Kind::Dehydration => {
-                let [damage, every] = self.settings.dehydration_damage;
+                let [damage, every] = self.starving(self.settings.dehydration_damage);
                 let e = &mut self.effects[i];
                 e.loops[0] += dt;
                 if e.loops[0] < every {
@@ -1693,7 +1801,8 @@ impl Health {
                 }
             }
             Kind::MedEffect => self.med_update(id, dt),
-            Kind::Wound | Kind::Fracture | Kind::Tremor | Kind::PainKiller | Kind::Encumbered | Kind::OverEncumbered => {}
+            Kind::Stimulator => self.stim_update(id, dt),
+            Kind::Wound | Kind::Fracture | Kind::Tremor | Kind::PainKiller | Kind::Encumbered | Kind::OverEncumbered | Kind::Contusion | Kind::Stun | Kind::Flash | Kind::Endurance | Kind::DamageModifier | Kind::TunnelVision => {}
         }
         let _ = part;
     }
@@ -1767,6 +1876,21 @@ impl Health {
     }
 
     pub fn apply_damage_biased(&mut self, part: Part, damage: f32, kind: DamageKind, bias: [f32; 2]) -> f32 {
+        self.apply_damage_info(part, damage, kind, bias, false)
+    }
+
+    /// A character taken up as it stands (a replay's victim): each part's
+    /// health now and at most, a part at nought destroyed.
+    pub fn take_up_parts(&mut self, current: [f32; 7], maximum: [f32; 7]) {
+        for k in 0..7 {
+            self.parts[k] = PartState { current: current[k], maximum: maximum[k], destroyed: current[k] <= 0.0 };
+        }
+    }
+
+    /// `ApplyDamage` with the hit's figures (`DamageInfo`): the round's
+    /// bleedings' deltas, and whether light armour blocks a bleeding
+    /// (`BleedBlock`, body hits spec).
+    pub fn apply_damage_info(&mut self, part: Part, damage: f32, kind: DamageKind, bias: [f32; 2], bleed_block: bool) -> f32 {
         if !self.alive {
             return 0.0;
         }
@@ -1809,10 +1933,11 @@ impl Health {
                 self.do_pain(part, 0.0, 0.0, (15.0 * damage / maximum).clamp(1.0, 10.0), (damage / maximum * 2.0).clamp(0.33, 2.0));
             }
             let x = damage / maximum;
-            // No stimulator here stops blood loss, and no armour blocks it.
-            // The odds' top raised by the Vitality skill's buff.
+            // A stimulator at work may stop blood loss; light armour may
+            // block it. The odds' top raised by the Vitality skill's buff.
             let top = 1.0 + self.skills.bleed_chance;
-            if (kind.weapon() || kind == DamageKind::GrenadeFragment) && self.chance(Chance::HeavyBleeding, part, self.settings.heavy.odds, x, top, bias[0]) {
+            if bleed_block || self.blood_loss_blocked() {
+            } else if (kind.weapon() || kind == DamageKind::GrenadeFragment) && self.chance(Chance::HeavyBleeding, part, self.settings.heavy.odds, x, top, bias[0]) {
                 self.do_bleed(true, part);
             } else if self.existing(Kind::HeavyBleeding, Some(part)).is_none() && self.chance(Chance::LightBleeding, part, self.settings.light.odds, x, top, bias[1]) {
                 self.do_bleed(false, part);
@@ -1849,6 +1974,49 @@ impl Health {
             }
         }
         self.add(kind, part, None, None, None, None);
+    }
+
+    /// `DoContusion`: a contusion on the head for so many seconds, from
+    /// 0.1 s on, fading for half of them (health spec, "A contusion").
+    pub fn do_contusion(&mut self, time: f32, strength: f32) {
+        if self.alive {
+            self.add(Kind::Contusion, Part::Head, Some(0.1), Some(time), Some(time / 2.0), Some(strength));
+        }
+    }
+
+    /// `BluntContusion` (after a hit's damage, `Player.ApplyDamageInfo`):
+    /// a hit to the head whose armour took 10 or more off it concusses,
+    /// alive: a contusion on the head after 0.1 s, at half strength,
+    /// working a quarter of what the armour took and fading over as long
+    /// (health spec, "A blunt hit's concussion").
+    pub fn blunt_contusion(&mut self, part: Part, absorbed: f32) {
+        if self.alive && part == Part::Head && absorbed >= 10.0 {
+            let quarter = absorbed / 4.0;
+            self.add(Kind::Contusion, Part::Head, Some(0.1), Some(quarter), Some(quarter), Some(0.5));
+        }
+    }
+
+    /// `DoStun`: a stun on the head at once (grenade spec, "A flash"),
+    /// working its build-up and the flash's time by how hard it struck and
+    /// the eyes' cover (`BlindnessDuration`), at that strength.
+    pub fn do_stun(&mut self, max_time: f32, strength: f32, blindness: f32) {
+        if self.alive {
+            self.add(Kind::Stun, Part::Head, Some(0.0), Some(0.2 + max_time * strength * blindness), None, Some(strength));
+        }
+    }
+
+    /// `DoBurnEyes`: the eyes burnt, a `Flash` on the head at once working
+    /// its build-up and the flash's time by the distance's share and the
+    /// eyes' cover twice, at the strength the flash struck with. Whether it
+    /// was added (the camera then told, `BurnEyesEvent`), and the distance's
+    /// share as the camera is told it.
+    pub fn do_burn_eyes(&mut self, distance_strength: f32, strength: f32, max_time: f32, blindness: f32) -> Option<f32> {
+        if !self.alive {
+            return None;
+        }
+        let distance_strength = distance_strength * blindness;
+        self.add(Kind::Flash, Part::Head, Some(0.0), Some(0.2 + max_time * distance_strength * blindness), None, Some(strength));
+        Some(distance_strength)
     }
 
     /// `DoFracture`: an arm or a leg, not destroyed, breaks at once.
@@ -1900,7 +2068,7 @@ impl Health {
             let wound_part = self.effects[i].part;
             self.effects[i].figures[1] += value;
             let [threshold, tally, ..] = self.effects[i].figures;
-            if tally > threshold && self.existing(Kind::LightBleeding, Some(wound_part)).is_none() && self.existing(Kind::HeavyBleeding, Some(wound_part)).is_none() {
+            if tally > threshold && !self.blood_loss_blocked() && self.existing(Kind::LightBleeding, Some(wound_part)).is_none() && self.existing(Kind::HeavyBleeding, Some(wound_part)).is_none() {
                 self.do_bleed(false, wound_part);
             }
         }
@@ -2012,6 +2180,9 @@ impl Health {
         }
         let [common, most] = self.common();
         movement.stamina.set_health(self.energy_share(), self.hydration_share(), if most > 0.0 { common / most } else { 0.0 });
+        // Stimulators' capacity and refill (health spec, "Buffs").
+        let (capacity, refill) = self.stamina_buffs();
+        movement.stamina.set_buffs(capacity, refill);
     }
 
     // ---- Medicine, food and drink -------------------------------------
@@ -2361,6 +2532,11 @@ impl Health {
                     resource -= spec.cost;
                 }
             }
+            // The item's set of buffs, at the share used (`MedEffect.Residue`:
+            // only a use not cut short; health spec, "Buffs").
+            if let Some(set) = m.buffs.as_deref() {
+                self.add_stimulator(&m.template, set, med.amount);
+            }
             if kit && m.hp_resource_rate == 0.0 {
                 resource = (resource - 1.0).round();
             }
@@ -2420,6 +2596,7 @@ fn cure_of(kind: Kind) -> Option<Cure> {
         Kind::LightBleeding => Cure::LightBleeding,
         Kind::Fracture => Cure::Fracture,
         Kind::Pain => Cure::Pain,
+        Kind::Contusion => Cure::Contusion,
         _ => return None,
     })
 }
@@ -2509,6 +2686,7 @@ pub(crate) mod tests {
             fall_damage_per_meter: 9.0,
             fall_overweight: 3.9,
             interruption_time: 2.0,
+            stimulator: StimulatorSettings::default(),
         })
     }
 
@@ -2552,6 +2730,63 @@ pub(crate) mod tests {
         assert!(h.part(Part::LeftLeg).destroyed && h.part(Part::RightLeg).destroyed);
         assert!(h.alive);
         assert!(h.common()[0] < 440.0 - 130.0);
+    }
+
+    /// A contusion on the head: started after 0.1 s, working its time,
+    /// fading for half of it; a second is a second (`IStackable`).
+    #[test]
+    fn a_contusion_works_its_time_and_stacks() {
+        let mut h = Health::new(settings(), 1);
+        h.do_contusion(10.0, 1.0);
+        h.do_contusion(4.0, 1.0);
+        let contusions = |h: &Health| h.effects.iter().filter(|e| e.kind == Kind::Contusion).map(|e| (e.part, e.stage)).collect::<Vec<_>>();
+        assert_eq!(contusions(&h), [(Part::Head, Stage::Added), (Part::Head, Stage::Added)]);
+        for _ in 0..12 {
+            h.step(1.0 / 100.0);
+        }
+        assert_eq!(contusions(&h), [(Part::Head, Stage::Started), (Part::Head, Stage::Started)]);
+        // The shorter one's 4 s, then its 2 s of fading.
+        for _ in 0..500 {
+            h.step(1.0 / 100.0);
+        }
+        assert_eq!(contusions(&h), [(Part::Head, Stage::Started), (Part::Head, Stage::Residual)]);
+        for _ in 0..200 {
+            h.step(1.0 / 100.0);
+        }
+        assert_eq!(contusions(&h), [(Part::Head, Stage::Started)]);
+    }
+
+    #[test]
+    fn a_stun_builds_holds_and_falls_and_a_flash_works_its_time() {
+        let mut h = Health::new(settings(), 1);
+        // The Zarya's 40 s at full strength, no cover: 40.2 s working.
+        h.do_stun(40.0, 1.0, 1.0);
+        let stun = |h: &Health| h.effects.iter().find(|e| e.kind == Kind::Stun).map(|e| (e.stage, e.current_strength));
+        let at = |h: &mut Health, seconds: f32| {
+            for _ in 0..(seconds * 100.0).round() as usize {
+                h.step(1.0 / 100.0);
+            }
+        };
+        at(&mut h, 0.1);
+        let (stage, strength) = stun(&h).expect("the stun");
+        assert_eq!(stage, Stage::Started);
+        assert!(strength > 0.2 && strength < 0.8, "half its build-up: {strength}");
+        // Held whole to 0.2 + a fifth of 40.2 s.
+        at(&mut h, 7.0);
+        assert!((stun(&h).expect("the stun").1 - 1.0).abs() < 1e-4);
+        // Then down straight: half way through the fall, half its strength.
+        let held = 0.2 + 0.2 * 40.2;
+        at(&mut h, (held + 40.2) / 2.0 - 7.1);
+        assert!((stun(&h).expect("the stun").1 - 0.5).abs() < 0.02, "{:?}", stun(&h));
+        // Its 2 s of residue, then gone.
+        at(&mut h, 25.0);
+        assert!(stun(&h).is_none_or(|(stage, _)| stage == Stage::Removed));
+        // The eyes burnt by a flash 15 m off (its share of 20 m, a quarter):
+        // 0.2 + 40 × 0.25 s.
+        let share = h.do_burn_eyes(0.25, 0.8, 40.0, 1.0);
+        assert_eq!(share, Some(0.25));
+        let flash = h.effects.iter().find(|e| e.kind == Kind::Flash).expect("the flash");
+        assert!((flash.work - 10.2).abs() < 1e-5 && (flash.strength - 0.8).abs() < 1e-6);
     }
 
     #[test]

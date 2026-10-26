@@ -24,6 +24,12 @@ enum Field {
     Curve(Curve),
     /// A list of small numbers: the game's own numbers for movement states, mostly.
     Bytes(Vec<u8>),
+    /// A vector (`RollCheckShift`).
+    Vec3([f32; 3]),
+    /// A list of vectors (`BleedingCenters`).
+    Vec3s(Vec<[f32; 3]>),
+    /// The ballistic presets (`ColliderPresets`).
+    Presets(Vec<BallisticPreset>),
     Other,
 }
 
@@ -71,14 +77,11 @@ impl HardSettings {
                     Field::Number(v as f64)
                 }
                 "vec2" => Field::Vec2([r.f32()?, r.f32()?]),
-                "vec3" => {
-                    r.skip(12)?;
-                    Field::Other
-                }
+                "vec3" => Field::Vec3([r.f32()?, r.f32()?, r.f32()?]),
                 "vec3s" => {
                     let count = r.u32()? as usize;
-                    r.skip(count * 12)?;
-                    Field::Other
+                    anyhow::ensure!(count < 4096, "vec3s {name}: {count} vectors");
+                    Field::Vec3s((0..count).map(|_| Ok([r.f32()?, r.f32()?, r.f32()?])).collect::<Result<_>>()?)
                 }
                 "bytes" => {
                     let count = r.u32()? as usize;
@@ -104,18 +107,21 @@ impl HardSettings {
                     if count > 4096 {
                         bail!("{count} ballistic presets is not plausible");
                     }
+                    let mut presets = Vec::with_capacity(count);
                     for _ in 0..count {
                         let len = r.u32()? as usize;
-                        r.skip(len)?;
+                        let preset_name = String::from_utf8_lossy(r.bytes(len)?).into_owned();
                         r.align(4);
-                        r.skip(4)?;
+                        let material = r.i32()?;
                         let figures = r.u32()? as usize;
-                        r.skip(figures * 4)?;
-                        r.u8()?;
+                        anyhow::ensure!(figures < 64, "a preset of {name} with {figures} figures");
+                        let figures = (0..figures).map(|_| r.f32()).collect::<Result<Vec<_>>>()?;
+                        let depend_on_scale = r.u8()? != 0;
                         r.align(4);
-                        read_curve(&mut r).with_context(|| format!("a preset of {name}"))?;
+                        let scale_curve = read_curve(&mut r).with_context(|| format!("a preset of {name}"))?;
+                        presets.push(BallisticPreset { name: preset_name, material, figures, depend_on_scale, scale_curve });
                     }
-                    Field::Other
+                    Field::Presets(presets)
                 }
                 other => bail!("layout has an unknown kind {other}"),
             };
@@ -164,10 +170,47 @@ impl HardSettings {
         }
     }
 
+    pub fn vec3(&self, name: &str) -> Result<[f32; 3]> {
+        match self.fields.get(name) {
+            Some(Field::Vec3(v)) => Ok(*v),
+            _ => Err(anyhow!("settings have no vector {name}")),
+        }
+    }
+
+    /// Every vector, by name.
+    pub fn vectors(&self) -> Vec<(&str, [f32; 3])> {
+        let mut out: Vec<_> = self
+            .fields
+            .iter()
+            .filter_map(|(name, f)| match f {
+                Field::Vec3(v) => Some((name.as_str(), *v)),
+                _ => None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
+    }
+
+    pub fn vec3s(&self, name: &str) -> Result<&[[f32; 3]]> {
+        match self.fields.get(name) {
+            Some(Field::Vec3s(v)) => Ok(v),
+            _ => Err(anyhow!("settings have no list of vectors {name}")),
+        }
+    }
+
     pub fn curve(&self, name: &str) -> Result<&Curve> {
         match self.fields.get(name) {
             Some(Field::Curve(c)) => Ok(c),
             _ => Err(anyhow!("settings have no curve {name}")),
+        }
+    }
+
+    /// The ballistic presets, by the material's number (`ColliderPresets`:
+    /// ballistics spec, "Surfaces").
+    pub fn ballistic_presets(&self) -> Result<&[BallisticPreset]> {
+        match self.fields.get("ColliderPresets") {
+            Some(Field::Presets(list)) => Ok(list),
+            _ => Err(anyhow!("settings have no ballistic presets")),
         }
     }
 
@@ -206,6 +249,20 @@ impl HardSettings {
         out.sort_by(|a, b| a.0.cmp(b.0));
         out
     }
+}
+
+/// A material's ballistic figures (`BallisticPreset`): its name, the
+/// material's number (`MaterialType`), the six figures (penetration level,
+/// penetration chance, ricochet chance, fragmentation chance, deviation
+/// chance, deviation), and whether the level goes by an object's scale and
+/// the curve it does so by.
+#[derive(Debug, Clone)]
+pub struct BallisticPreset {
+    pub name: String,
+    pub material: i32,
+    pub figures: Vec<f32>,
+    pub depend_on_scale: bool,
+    pub scale_curve: Curve,
 }
 
 fn read_curve(r: &mut Reader) -> Result<Curve> {

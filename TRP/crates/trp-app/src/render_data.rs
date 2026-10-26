@@ -97,6 +97,14 @@ impl Converted {
             metallic_roughness_texture,
             ..default()
         });
+        // The game's stencil type for hands (`_StencilType` 2), which the
+        // ambient highlight lights again (`highlight_view`).
+        if data.floats.get("_StencilType") == Some(&2.0) {
+            crate::highlight_view::note_hands(&handle);
+        }
+        // And every stencil type but the world's, which decals keep off
+        // (`decal_view`).
+        crate::decal_view::note_stencil(&handle, data.floats.get("_StencilType").map_or(0, |s| *s as u8));
         self.materials.insert(obj, handle.clone());
         handle
     }
@@ -132,7 +140,7 @@ impl Converted {
                 });
                 let mut add = |picture: Option<trp_data::custom::Picture>, format: TextureFormat| picture.map(|picture| crate::streaming::add(images, picture_image(picture, format), crate::streaming::Source::Kept));
                 let surface = add(pictures.surface, TextureFormat::Rgba8Unorm);
-                materials.add(StandardMaterial {
+                let handle = materials.add(StandardMaterial {
                     base_color_texture: add(pictures.colour, TextureFormat::Rgba8UnormSrgb),
                     normal_map_texture: add(pictures.normal, TextureFormat::Rg8Unorm),
                     // The picture's own roughness and metal, at full scale.
@@ -141,7 +149,13 @@ impl Converted {
                     occlusion_texture: surface.clone(),
                     metallic_roughness_texture: surface,
                     ..default()
-                })
+                });
+                // A weapon of one's own, of the hands' stencil type as the
+                // game's weapons are (`PROVISIONAL`: its materials are not
+                // the game's).
+                crate::highlight_view::note_hands(&handle);
+                crate::decal_view::note_stencil(&handle, 2);
+                handle
             })
             .collect()
     }
@@ -178,7 +192,7 @@ fn stalker_picture(picture: &trp_data::xray::Picture) -> (TextureFormat, Texture
         Packing::Bc7 => TextureFormat::Bc7RgbaUnormSrgb,
         Packing::Rgba => TextureFormat::Rgba8UnormSrgb,
     };
-    (format, TextureData { name: String::new(), width: picture.width, height: picture.height, format: 0, mip_count: picture.levels, srgb: true, data: Vec::new(), streaming_mipmaps: false, point: false, clamp: [false; 2] })
+    (format, TextureData { name: String::new(), width: picture.width, height: picture.height, format: 0, mip_count: picture.levels, srgb: true, data: Vec::new(), streaming_mipmaps: false, point: false, clamp: [false; 2], faces: 1 })
 }
 
 /// A material made ready away from the engine's own thread: what a
@@ -196,6 +210,17 @@ pub struct PreparedMaterial {
     fallback: bool,
     /// How rough it is, where that is not what its pictures say.
     roughness: Option<f32>,
+    /// The game's stencil type (`_StencilType`): 2 the hands' (the ambient
+    /// highlight's, `highlight_view`), 1 characters', 0 the world's (which
+    /// alone takes decals, `decal_view`).
+    stencil: u8,
+    /// How it is blended: opaque but for a level's things drawn after the
+    /// opaque ones (`scene_props`).
+    alpha: AlphaMode,
+    /// The sights' own shader it is drawn with in the game, where it is one
+    /// (`trp_data::sight::lens_shader`): what a model's lens, glass or
+    /// collimator piece is, to leave out where the game draws nothing.
+    lens: Option<&'static str>,
 }
 
 /// Meshes, pictures and materials made ready on another thread, as the
@@ -217,19 +242,21 @@ pub struct PreparedLooks {
 }
 
 impl PreparedLooks {
-    /// A mesh of the install's, one for each submesh: their places in
-    /// `meshes`.
-    pub fn mesh(&mut self, unity: &UnityAssets, obj: ObjRef) -> Result<Vec<usize>> {
-        let data = read_mesh(unity, obj)?;
-        Ok(self.custom_mesh(&data))
-    }
-
-    /// The same, with the mesh's bind poses, for a mesh to be drawn on
-    /// bones (one for each bone, in its order).
+    /// A mesh of the install's, one for each submesh (their places in
+    /// `meshes`), with its bind poses, for a mesh drawn on bones (one for
+    /// each bone, in its order).
     pub fn mesh_with_poses(&mut self, unity: &UnityAssets, obj: ObjRef) -> Result<(Vec<usize>, Vec<Mat4>)> {
         let data = read_mesh(unity, obj)?;
         let poses = data.bind_poses.iter().map(|m| convert::matrix(*m)).collect();
         Ok((self.custom_mesh(&data), poses))
+    }
+
+    /// One mesh posed on its bones where they lie, then drawn without them
+    /// (`pose_on_bones`).
+    pub fn pose_on_bones(&mut self, mesh: usize, matrices: &[Mat4]) {
+        if let Some(mesh) = self.meshes.get_mut(mesh) {
+            pose_on_bones(mesh, matrices);
+        }
     }
 
     /// One mesh without the bones it would be skinned to (`unskinned`).
@@ -275,12 +302,48 @@ impl PreparedLooks {
                 };
                 let (base, normal, gloss) = (texture("_MainTex", Role::Color), texture("_BumpMap", Role::Normal), texture("_SpecMap", Role::Gloss));
                 let tint = data.colors.get("_Color").copied().unwrap_or([1.0; 4]);
-                PreparedMaterial { base_color: Color::srgb(tint[0], tint[1], tint[2]), base, normal, gloss, surface: None, fallback: false, roughness: None }
+                let stencil = data.floats.get("_StencilType").map_or(0, |s| *s as u8);
+                let lens = trp_data::sight::lens_shader(&data);
+                PreparedMaterial { base_color: Color::srgb(tint[0], tint[1], tint[2]), base, normal, gloss, surface: None, fallback: false, roughness: None, stencil, alpha: AlphaMode::Opaque, lens }
             }
-            _ => PreparedMaterial { base_color: Color::srgb(0.8, 0.1, 0.8), base: None, normal: None, gloss: None, surface: None, fallback: true, roughness: None },
+            _ => PreparedMaterial { base_color: Color::srgb(0.8, 0.1, 0.8), base: None, normal: None, gloss: None, surface: None, fallback: true, roughness: None, stencil: 0, alpha: AlphaMode::Opaque, lens: None },
         };
         self.materials.push(material);
         self.by_material.insert(obj, self.materials.len() - 1);
+        self.materials.len() - 1
+    }
+
+    /// A material of a level's thing (`trp_data::scene_props`), as
+    /// `material` makes one of the install's bundles: its colour, normal
+    /// and gloss pictures (each made once, by its place in `pictures`, kept
+    /// in `made`), its tint, and the world's stencil; drawn after the opaque
+    /// ones (its queue past 2450: `AlphaTest` and beyond) see-through by
+    /// its colour's alpha, cut at a half (`ESTIMATE`: the shaders' own
+    /// cut-offs are not read) under 3000, blended from 3000 (`Transparent`).
+    /// Its place in the list.
+    pub fn prop_material(&mut self, material: &trp_data::scene_props::PropMaterial, pictures: &[TextureData], made: &mut HashMap<(usize, Role), Option<usize>>) -> usize {
+        let mut picture = |at: Option<usize>, role: Role| -> Option<usize> {
+            let at = at?;
+            *made.entry((at, role)).or_insert_with(|| match build_image(&pictures[at], role) {
+                Ok(image) => {
+                    self.images.push(image);
+                    self.again.push(crate::streaming::Source::Kept);
+                    Some(self.images.len() - 1)
+                }
+                Err(e) => {
+                    warn!("a picture of {}: {e:#}", material.name);
+                    None
+                }
+            })
+        };
+        let (base, normal, gloss) = (picture(material.base, Role::Color), picture(material.normal, Role::Normal), picture(material.gloss, Role::Gloss));
+        let tint = material.color;
+        let alpha = match material.queue {
+            queue if queue >= 3000 => AlphaMode::Blend,
+            queue if queue > 2450 => AlphaMode::Mask(0.5),
+            _ => AlphaMode::Opaque,
+        };
+        self.materials.push(PreparedMaterial { base_color: Color::srgba(tint[0], tint[1], tint[2], tint[3]), base, normal, gloss, surface: None, fallback: false, roughness: None, stencil: 0, alpha, lens: None });
         self.materials.len() - 1
     }
 
@@ -304,7 +367,7 @@ impl PreparedLooks {
                 };
                 let surface = add(pictures.surface, TextureFormat::Rgba8Unorm);
                 let (base, normal) = (add(pictures.colour, TextureFormat::Rgba8UnormSrgb), add(pictures.normal, TextureFormat::Rg8Unorm));
-                self.materials.push(PreparedMaterial { base_color: Color::WHITE, base, normal, gloss: None, surface, fallback: false, roughness: None });
+                self.materials.push(PreparedMaterial { base_color: Color::WHITE, base, normal, gloss: None, surface, fallback: false, roughness: None, stencil: 2, alpha: AlphaMode::Opaque, lens: None });
                 self.materials.len() - 1
             })
             .collect()
@@ -316,7 +379,9 @@ impl PreparedLooks {
         let (format, size) = stalker_picture(picture);
         self.images.push(image(&size, format, picture.levels as usize, picture.data.clone()));
         self.again.push(crate::streaming::Source::Kept);
-        self.materials.push(PreparedMaterial { base_color: Color::WHITE, base: Some(self.images.len() - 1), normal: None, gloss: None, surface: None, fallback: false, roughness: Some(CLOTH) });
+        // The other game's outfit, worn by a character (`PROVISIONAL`: a
+        // character's stencil type, as the game's characters).
+        self.materials.push(PreparedMaterial { base_color: Color::WHITE, base: Some(self.images.len() - 1), normal: None, gloss: None, surface: None, fallback: false, roughness: Some(CLOTH), stencil: 1, alpha: AlphaMode::Opaque, lens: None });
         self.materials.len() - 1
     }
 
@@ -331,6 +396,12 @@ impl PreparedLooks {
     /// Whether a material is the stand-in for one that could not be read.
     pub fn is_fallback(&self, material: usize) -> bool {
         self.materials.get(material).is_some_and(|m| m.fallback)
+    }
+
+    /// The sights' own shader a material is drawn with in the game, where
+    /// it is one (`PreparedMaterial::lens`).
+    pub fn lens(&self, material: usize) -> Option<&'static str> {
+        self.materials.get(material).and_then(|m| m.lens)
     }
 
     /// How many pictures it has.
@@ -410,7 +481,7 @@ impl PreparedLooks {
             .materials
             .iter()
             .map(|m| {
-                materials.add(StandardMaterial {
+                let handle = materials.add(StandardMaterial {
                     base_color: m.base_color,
                     base_color_texture: picture(m.base),
                     normal_map_texture: picture(m.normal),
@@ -421,8 +492,14 @@ impl PreparedLooks {
                     metallic: if m.surface.is_some() { 1.0 } else { 0.0 },
                     occlusion_texture: picture(m.surface),
                     metallic_roughness_texture: picture(m.gloss.or(m.surface)),
+                    alpha_mode: m.alpha,
                     ..default()
-                })
+                });
+                if m.stencil == 2 {
+                    crate::highlight_view::note_hands(&handle);
+                }
+                crate::decal_view::note_stencil(&handle, m.stencil);
+                handle
             })
             .collect();
         let meshes = self
@@ -523,6 +600,39 @@ pub struct Shared {
 pub fn unskin(mesh: &mut Mesh) {
     mesh.remove_attribute(Mesh::ATTRIBUTE_JOINT_INDEX);
     mesh.remove_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT);
+}
+
+/// A mesh carried by its bones as the engine skins it, then without them:
+/// each point, normal and tangent by its bones' matrices (each a bone's
+/// place in the mesh's own object's axes, times the bone's inverse bind
+/// pose) by their weights. For a model drawn still (a picture, a thing on
+/// the ground), where its bones lie in the prefab: the F-1's tripwire kit
+/// hangs on bones the prefab shrinks to a hundredth, out of sight. A mesh
+/// with no joints is left as it is.
+pub fn pose_on_bones(mesh: &mut Mesh, matrices: &[Mat4]) {
+    let (Some(VertexAttributeValues::Uint16x4(joints)), Some(VertexAttributeValues::Float32x4(weights))) = (mesh.attribute(Mesh::ATTRIBUTE_JOINT_INDEX), mesh.attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT)) else { return };
+    let blended: Vec<Mat4> = joints
+        .iter()
+        .zip(weights)
+        .map(|(joint, weight)| (0..4).filter(|k| weight[*k] != 0.0).filter_map(|k| matrices.get(joint[k] as usize).map(|bone| *bone * weight[k])).fold(Mat4::ZERO, |sum, part| sum + part))
+        .collect();
+    if let Some(VertexAttributeValues::Float32x3(points)) = mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION) {
+        for (point, by) in points.iter_mut().zip(&blended) {
+            *point = by.transform_point3(Vec3::from(*point)).to_array();
+        }
+    }
+    if let Some(VertexAttributeValues::Float32x3(normals)) = mesh.attribute_mut(Mesh::ATTRIBUTE_NORMAL) {
+        for (normal, by) in normals.iter_mut().zip(&blended) {
+            *normal = by.transform_vector3(Vec3::from(*normal)).normalize_or_zero().to_array();
+        }
+    }
+    if let Some(VertexAttributeValues::Float32x4(tangents)) = mesh.attribute_mut(Mesh::ATTRIBUTE_TANGENT) {
+        for (tangent, by) in tangents.iter_mut().zip(&blended) {
+            let turned = by.transform_vector3(Vec3::new(tangent[0], tangent[1], tangent[2])).normalize_or_zero();
+            *tangent = [turned.x, turned.y, turned.z, tangent[3]];
+        }
+    }
+    unskin(mesh);
 }
 
 /// Meshes in the store drawn as they lie (`unskin`); one with no bones is
@@ -701,7 +811,7 @@ fn picture_image(picture: trp_data::custom::Picture, format: TextureFormat) -> I
         (Some(Blocks::Bc5), _) => TextureFormat::Bc5RgUnorm,
         (None, format) => format,
     };
-    let size = TextureData { name: String::new(), width: picture.width, height: picture.height, format: 0, mip_count: picture.mips, srgb: false, data: Vec::new(), streaming_mipmaps: false, point: false, clamp: [false; 2] };
+    let size = TextureData { name: String::new(), width: picture.width, height: picture.height, format: 0, mip_count: picture.mips, srgb: false, data: Vec::new(), streaming_mipmaps: false, point: false, clamp: [false; 2], faces: 1 };
     image(&size, format, picture.mips as usize, picture.data)
 }
 

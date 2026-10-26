@@ -62,6 +62,16 @@ impl ArmRig {
         self.below[3]
     }
 
+    /// The upper arm's bone.
+    pub fn upper(&self) -> Entity {
+        self.upper
+    }
+
+    /// The forearm's first bone, at the elbow.
+    pub fn elbow(&self) -> Entity {
+        self.below[0]
+    }
+
     /// Finds one arm in an assembled weapon. `side` is `L` or `R`.
     pub fn find(hierarchy: &Hierarchy, entities: &[Entity], side: char) -> Option<Self> {
         let node = |path: &str| (0..hierarchy.nodes.len()).find(|&i| hierarchy.path(i) == path);

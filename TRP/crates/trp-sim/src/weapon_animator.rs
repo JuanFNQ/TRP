@@ -129,6 +129,17 @@ pub struct WeaponAnimator {
 }
 
 impl WeaponAnimator {
+    /// Takes another's running state, its machines' and its marks' (`Animator::
+    /// take_state`), where both are of the same shape. Whether it could.
+    pub fn take_state(&mut self, from: &WeaponAnimator) -> bool {
+        let mut marks = self.marks.clone();
+        if !marks.take_state(&from.marks) || !self.animator.take_state(&from.animator) {
+            return false;
+        }
+        self.marks = marks;
+        true
+    }
+
     /// The animator as the prefab has it: every layer in its first state.
     pub fn new(data: &WeaponAnimatorData) -> Self {
         let mut made = Self {
@@ -170,6 +181,11 @@ impl WeaponAnimator {
 
     pub fn has(&self, parameter: &str) -> bool {
         self.animator.controller.parameter(parameter).is_some()
+    }
+
+    /// Whether the hands' layer has a state of this full name.
+    pub fn has_state(&self, state: &str) -> bool {
+        self.animator.controller.state(self.hands, state).is_some()
     }
 
     /// Sets a parameter by name; one the controller lacks is let be, as

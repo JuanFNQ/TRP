@@ -1,2 +1,4 @@
 # Windows' command scripts need Windows' line ends, in a clone and in GitHub's zip alike.
 *.bat text eol=crlf
+# Shell scripts (the skills' tools) need Unix line ends, whatever the checkout's setting.
+*.sh text eol=lf

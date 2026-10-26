@@ -11,6 +11,7 @@
 //! probe fbx <file> [records|view|slice ...]   a binary FBX file: its models, a drawing, a slab
 //! probe overlay <weapon> <fbx> <trigger model> <out.png>   a weapon with such a model over it
 //! probe custom [id]                 the weapons that are not the install's, and one as built
+//! probe muzzles [calibre]           every weapon's muzzle effects, where they are from its fireport
 //! ```
 
 use std::collections::BTreeMap;
@@ -50,6 +51,13 @@ fn main() -> Result<()> {
         // The game's window that shows a thing (`infowindow [width]`): each
         // of its objects as the prefab has it, placed in a screen that wide
         // and 1080 high by its own anchors, with its picture and its words.
+        (Some("staticicons"), _) => {
+            let attributes = trp_data::screen::attribute_icons(&assets.install)?;
+            println!("attributes: {}", attributes.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(" "));
+            for (what, table) in ["health effects", "damage effects", "buffs"].iter().zip(trp_data::screen::figure_icons(&assets.install)?) {
+                println!("{what}: {}", table.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(" "));
+            }
+        }
         (Some("infowindow"), width) => {
             let window = trp_data::screen::info_window(&assets.install)?;
             let screen = [width.and_then(|w| w.parse().ok()).unwrap_or(1920.0), 1080.0];
@@ -61,13 +69,30 @@ fn main() -> Result<()> {
                     line += &format!("  image {:?} kind {} sprite {:?}", image.color, image.kind, image.sprite);
                 }
                 if let Some(text) = &node.text {
-                    line += &format!("  text {:?} size {} {:?} colour {:?} style {} align {}/{}", text.text, text.size, text.auto_size, text.color, text.style, text.horizontal, text.vertical);
+                    line += &format!("  text {:?} size {} {:?} colour {:?} style {} align {}/{} wraps {} overflow {}", text.text, text.size, text.auto_size, text.color, text.style, text.horizontal, text.vertical, text.wraps, text.overflow);
                 }
                 let scripts: Vec<&str> = node.scripts.iter().map(|(name, _)| name.as_str()).collect();
                 if !scripts.is_empty() {
                     line += &format!("  [{}]", scripts.join(", "));
                 }
                 println!("{line}");
+            }
+            // A slot of its parts' panel (`ModSlotView`), at 64 square.
+            if let Some(slot) = trp_data::screen::info_rows(&assets.install, &window)?.mod_slot {
+                println!("a part's slot: {} ({} objects)", slot.file, slot.nodes.len());
+                for (index, node) in slot.nodes.iter().enumerate() {
+                    let [x, y, w, h] = slot.rect(index, [64.0, 64.0]);
+                    let mut line = format!("  {:60} {} ({x:.1}, {y:.1}) {w:.1} x {h:.1}", node.path, if node.active { "on " } else { "off" });
+                    if let Some(text) = &node.text {
+                        line += &format!("  text {:?} size {} colour {:?} style {} align {}/{} wraps {} overflow {} margin {:?}", text.text, text.size, text.color, text.style, text.horizontal, text.vertical, text.wraps, text.overflow, text.margin);
+                    }
+                    if let Some(image) = &node.image {
+                        line += &format!("  image {:?} kind {}", image.color, image.kind);
+                    }
+                    let scripts: Vec<&str> = node.scripts.iter().map(|(name, _)| name.as_str()).collect();
+                    line += &format!("  [{}]", scripts.join(", "));
+                    println!("{line}");
+                }
             }
         }
         // Each font asset the GEAR tab's panels and the things' views draw
@@ -86,7 +111,7 @@ fn main() -> Result<()> {
                     let Some(text) = &node.text else { continue };
                     let Some(file) = panel.file_of(text.font.0) else { continue };
                     if std::env::var("FONTSCALE_TEXTS").is_ok() {
-                        println!("text {:70} size {} style {} spacing {} kerning {} margin {:?} font {} material {:?}", node.path, text.size, text.style, text.spacing, text.kerning, text.margin, text.font.1, text.material);
+                        println!("text {:70} size {} style {} spacing {} kerning {} margin {:?} font {} material {:?} align {}/{} wraps {} overflow {}", node.path, text.size, text.style, text.spacing, text.kerning, text.margin, text.font.1, text.material, text.horizontal, text.vertical, text.wraps, text.overflow);
                         continue;
                     }
                     if !seen.insert((file.clone(), text.font.1)) {
@@ -374,6 +399,9 @@ fn main() -> Result<()> {
                 }
                 if let Some(image) = &node.image {
                     line += &format!("  image {:?} kind {}", image.color, image.kind);
+                    if image.kind == 3 {
+                        line += &format!(" fill method {} origin {} amount {} clockwise {}", image.fill_method, image.fill_origin, image.fill_amount, image.fill_clockwise);
+                    }
                     if let Some((outside, id)) = image.sprite {
                         let name = if outside == 0 { file.to_owned() } else { panel.externals.get(outside as usize - 1).map(|n| n.rsplit('/').next().unwrap_or(n).to_owned()).unwrap_or_default() };
                         match pictures.sprite(&name, id) {
@@ -418,6 +446,11 @@ fn main() -> Result<()> {
                 if let Some(text) = &node.text {
                     line += &format!("  text {:?} size {} colour {:?} align {}/{} style {} font {:?}", text.text, text.size, text.color, text.horizontal, text.vertical, text.style, text.font);
                 }
+                // `PROBE_LAYOUT=1`: its own layout as kept.
+                if std::env::var_os("PROBE_LAYOUT").is_some() {
+                    let l = &node.layout;
+                    line += &format!("\n      anchors {:?}-{:?} at {:?} size {:?} pivot {:?} scale {:?}", l.anchor_min, l.anchor_max, l.offset, l.size_delta, l.pivot, l.scale);
+                }
                 println!("{line}");
             }
         }
@@ -448,6 +481,28 @@ fn main() -> Result<()> {
                 println!("part {part}: {}", health(Some(*image)));
             }
             println!("effects {} grid {:?} icon {} count {}", health(views.effects), views.effects_grid, health(views.effect_template), health(views.stack_count));
+            match &views.action {
+                Some(action) => {
+                    let at = |index: usize| action.panel.nodes[index].path.clone();
+                    println!("action panel: pointer {}, line {} / {}, list {}, name {} / {}, error {} / {}", at(action.cursor), at(action.line_ground), at(action.line_text), at(action.list_ground), at(action.name_ground), at(action.name_text), at(action.error_ground), at(action.error_text));
+                    println!("  sprites: hover {:?}, unavailable {:?}, sense {:?}; aiming shift {:?}", action.hover_sprite, action.unavailable_sprite, action.sense_sprite, action.aiming_shift);
+                    for node in [action.line_text, action.name_text, action.error_text] {
+                        println!("  {}: {:?}", at(node), action.panel.nodes[node].text);
+                    }
+                    for node in [action.line_ground, action.list_ground, action.name_ground, action.error_ground] {
+                        let parent = action.panel.nodes[node].parent.unwrap_or(0);
+                        println!("  {}: image {:?}; its parent {} group {:?} element {:?}", at(node), action.panel.nodes[node].image.map(|image| image.color), at(parent), action.panel.nodes[parent].group, action.panel.nodes[parent].element);
+                    }
+                }
+                None => println!("action panel: none ({})", views.action_missing.as_deref().unwrap_or("-")),
+            }
+            match &views.mount {
+                Some(mount) => {
+                    let sides: Vec<String> = mount.directions.iter().map(|(object, side)| format!("{} {side}", stance(Some(*object)))).collect();
+                    println!("mount icon {} unavailable {} directions [{}] highlight {} s", stance(Some(mount.image)), stance(Some(mount.unavailable)), sides.join(", "), mount.highlight);
+                }
+                None => println!("mount icon: none"),
+            }
             let quick = trp_data::screen::QuickViews::load_battle(&assets.install, &gear.file)?;
             let rect = quick.quick_in([1920.0, 1080.0]);
             println!("quick bar {rect:?}");
@@ -459,6 +514,21 @@ fn main() -> Result<()> {
                 println!("{} image {:?}", node.path, node.image.map(|image| image.sprite));
                 let _ = index;
             }
+        }
+        // The game's window of a container's grids as the app reads it:
+        // its objects the script works and its colours.
+        // How wide and high TextMeshPro makes words in a font asset at a
+        // size (`textwidth resources.assets 34142 11 SEARCH`).
+        (Some("textwidth"), _) => {
+            let (file, id, size, said) = (args.get(1).cloned().unwrap_or_default(), args.get(2).and_then(|v| v.parse().ok()).unwrap_or(0), args.get(3).and_then(|v| v.parse().ok()).unwrap_or(11.0), args.get(4..).unwrap_or_default().join(" "));
+            let font = trp_data::screen::TmpFont::read(&assets.install, &file, id)?;
+            println!("{said:?} at {size}: {} wide, {} high (point size {}, scale {}, ascent {}, descent {}, spacing {})", font.width(&said, size, 0.0, false), font.height(size), font.point_size, font.scale, font.ascent, font.descent, font.normal_spacing);
+        }
+        (Some("gridwindow"), _) => {
+            let look = trp_data::screen::grid_window(&assets.install)?;
+            let at = |index: usize| look.panel.nodes[index].path.clone();
+            println!("{}: {} objects; caption panel {}, icon {}, caption {}, close {}, priority {:?}", look.panel.file, look.panel.nodes.len(), at(look.caption_panel), at(look.icon), at(look.caption), at(look.close), look.priority.map(at));
+            println!("icon colours {:?}; header colours {:?}", look.icon_colors, look.header_colors);
         }
         (Some("quick"), _) => {
             let gear = trp_data::screen::GearPanel::load(&assets.install)?;
@@ -533,10 +603,67 @@ fn main() -> Result<()> {
                 let parts = scene.parts_of(index);
                 let classes: Vec<String> = parts.iter().map(|(_, class)| class.to_string()).collect();
                 println!("{} [{}]", scene.path(index).trim_start_matches(&top_path), classes.join(" "));
-                for (id, class) in parts.iter().filter(|(_, class)| *class == 223) {
+                for (id, class) in parts.iter().filter(|(_, class)| *class == 223 || *class == 65) {
                     let (_, bytes) = trp_data::screen::object_bytes(&assets.install, file, *id)?;
                     let words: Vec<String> = bytes.chunks(4).map(|w| format!("{:?}", w)).collect();
                     println!("    canvas {class} {id}: {}", words.join(" "));
+                }
+            }
+        }
+        // The edit build screen's preview as its scene has it: the camera's
+        // figures, the preview's height and its lights.
+        (Some("editbuild"), _) => {
+            let screen = trp_data::edit_build::EditBuildScene::load(&assets.install)?;
+            println!("camera: field of view {} degrees, planes {} to {} m; the preview at a height of {} m; {} objects", screen.fov, screen.near, screen.far, screen.height, screen.panel.nodes.len());
+            for light in &screen.lights {
+                println!("  {:16} kind {} on {} colour {:?} intensity {} range {} spot {} at {:?} turned {:?} layers {:#x}", light.name, light.kind, light.on, light.color, light.intensity, light.range, light.spot_angle, light.position, light.rotation, light.culling_mask);
+            }
+        }
+        // Things laid in a level's scene, as `scene_props` reads them to be
+        // drawn elsewhere (`sceneprops bunker_2.unity 10_workbench/level3`):
+        // each object, what it draws (its meshes' corners and parts, their
+        // materials), and what could not be read.
+        (Some("sceneprops"), Some(scene)) => {
+            let path = arg(2).unwrap_or("");
+            let keep: Vec<&str> = arg(3).into_iter().collect();
+            let props = trp_data::scene_props::read(&assets.install, scene, path, &["StaticDeferredDecal"], &[], &keep)?;
+            println!("{} objects, {} meshes, {} materials, {} pictures; the object read at {:?}, turned {:?}", props.nodes.len(), props.meshes.len(), props.materials.len(), props.pictures.len(), props.root.0, props.root.1);
+            for node in props.nodes.iter().filter(|node| !node.drawn.is_empty()) {
+                let drawn: Vec<String> = node.drawn.iter().map(|&(mesh, material)| {
+                    let (mesh, material) = (&props.meshes[mesh], &props.materials[material]);
+                    format!("{} ({} corners) in {} (queue {}, base {:?})", mesh.name, mesh.positions.len(), material.name, material.queue, material.base.map(|p| &props.pictures[p].name))
+                }).collect();
+                println!("{}{}: {}", node.name, if node.in_root { " [joined]" } else { "" }, drawn.join("; "));
+            }
+            for skipped in &props.skipped {
+                println!("skipped: {skipped}");
+            }
+            let (low, high) = props.bounds();
+            println!("all of it lies from {low:?} to {high:?}");
+            for (index, node) in props.nodes.iter().enumerate().filter(|(_, node)| !node.boxes.is_empty() && (node.name.contains("raycast") || node.name.contains("trigger"))) {
+                for (centre, size, trigger) in &node.boxes {
+                    let corners: Vec<[f32; 3]> = (0..8).map(|k| props.in_root(index, [centre[0] + size[0] / 2.0 * if k & 1 == 0 { -1.0 } else { 1.0 }, centre[1] + size[1] / 2.0 * if k & 2 == 0 { -1.0 } else { 1.0 }, centre[2] + size[2] / 2.0 * if k & 4 == 0 { -1.0 } else { 1.0 }])).collect();
+                    let lo: Vec<f32> = (0..3).map(|k| corners.iter().map(|c| c[k]).fold(f32::MAX, f32::min)).collect();
+                    let hi: Vec<f32> = (0..3).map(|k| corners.iter().map(|c| c[k]).fold(f32::MIN, f32::max)).collect();
+                    println!("box of {} (trigger {trigger}): middle {centre:?} size {size:?}; in the object read's axes from {lo:?} to {hi:?}", node.name);
+                }
+            }
+            // Each object right under the second level (the area's things),
+            // the box of what it draws.
+            for (index, node) in props.nodes.iter().enumerate().filter(|(_, node)| node.parent.is_some_and(|p| props.nodes[p].parent == Some(0))) {
+                let mut stack = vec![index];
+                let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                while let Some(at) = stack.pop() {
+                    stack.extend((0..props.nodes.len()).filter(|&c| props.nodes[c].parent == Some(at)));
+                    for &(mesh, _) in &props.nodes[at].drawn {
+                        for p in &props.meshes[mesh].positions {
+                            let w = if props.nodes[at].in_root { *p } else { props.in_root(at, *p) };
+                            for k in 0..3 { lo[k] = lo[k].min(w[k]); hi[k] = hi[k].max(w[k]); }
+                        }
+                    }
+                }
+                if lo[0] <= hi[0] {
+                    println!("  {:40} x {:6.2}..{:6.2}  y {:5.2}..{:5.2}  z {:6.2}..{:6.2}", node.name, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
                 }
             }
         }
@@ -570,6 +697,75 @@ fn main() -> Result<()> {
         // `read`, every clip decoded too and a count of those not read; with
         // a folder after `read`, the clips of the surfaces given (by number,
         // `stepsounds read local\x 0 2`) written there as WAVE files.
+        // The things' sounds of a map's scenes (`thingsounds [level8
+        // level10 ...]`; the app's two unless told): every door, container
+        // and trunk with its object's path, the clips its script names for
+        // its opening, its squeak and its shutting with their rolloffs, its
+        // shut shift and its angles, whether it has a handle, and a door's
+        // breach and hit clips; then every clip named, once, with how it is
+        // kept. `thingsounds read <folder> [levels]` decodes the clips and
+        // writes them out as WAVE files.
+        (Some("thingsounds"), first) => {
+            let read = first.as_deref() == Some("read");
+            let from = if read { 3 } else { 2 };
+            let levels: Vec<&str> = (from..16).filter_map(|n| arg(n)).collect();
+            let levels = if levels.is_empty() { trp_data::thing_sound::SCENES.to_vec() } else { levels };
+            let sounds = trp_data::thing_sound::thing_sounds(&assets.install, &levels, read)?;
+            let names = |list: &[usize]| list.iter().map(|&at| sounds.clip_name(at).to_owned()).collect::<Vec<_>>().join(", ");
+            for set in &sounds.sets {
+                println!("{} {} [{}] {}", set.scene, set.kind.name(), set.name, set.path);
+                println!("  open [{}] rolloff {}; squeak [{}] rolloff {}; shut [{}] rolloff {}", names(&set.open), set.rolloffs[0], names(&set.squeak), set.rolloffs[1], names(&set.shut), set.rolloffs[2]);
+                println!("  shut shift {}, angles {:?}, handle {}", set.shut_shift, set.angles, set.has_handle);
+                if set.kind == trp_data::thing_sound::ThingKind::Door {
+                    println!("  breach [{}] rolloff {}; hit [{}] rolloff {}", set.breach.map_or("", |at| sounds.clip_name(at)), set.breach_rolloff, set.hit.map_or("", |at| sounds.clip_name(at)), set.hit_rolloff);
+                }
+            }
+            println!("{} things, {} clips named", sounds.sets.len(), sounds.clips.len());
+            for (name, clip) in &sounds.clips {
+                match clip {
+                    Some(clip) => println!("  {name}: {} channels at {} Hz, {:.3} s", clip.channels, clip.frequency, clip.samples.len() as f32 / clip.channels.max(1) as f32 / clip.frequency.max(1) as f32),
+                    None => println!("  {name}"),
+                }
+            }
+            if let Some(folder) = arg(2).filter(|_| read) {
+                let folder = std::path::Path::new(folder);
+                std::fs::create_dir_all(folder)?;
+                for (name, clip) in &sounds.clips {
+                    if let Some(clip) = clip {
+                        std::fs::write(folder.join(format!("{name}.wav")), clip.wav())?;
+                    }
+                }
+                println!("written to {}", folder.display());
+            }
+        }
+        (Some("dropsounds"), read) => {
+            // The weapons' landing sounds: the energy's curve, the default
+            // surface, each surface's three banks.
+            let sounds = trp_data::sound::drop_sounds(&assets.install, read.as_deref() == Some("read"))?;
+            let name = |surface: u8| trp_data::sound::SURFACES.get(surface as usize).copied().unwrap_or("?");
+            println!("volume by energy: {:?}", sounds.volume.keys.iter().map(|k| (k.time, k.value, k.in_slope, k.out_slope)).collect::<Vec<_>>());
+            for energy in [0.0f32, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0] {
+                print!("  {energy}: {:.2}", sounds.volume.evaluate(energy));
+            }
+            println!();
+            println!("default surface {} ({})", name(sounds.default_surface), sounds.default_surface);
+            for (surface, banks) in &sounds.surfaces {
+                let said: Vec<String> = trp_data::sound::DROP_KINDS
+                    .iter()
+                    .zip(banks)
+                    .map(|(kind, bank)| match bank {
+                        Some(at) => {
+                            let bank = &sounds.banks[*at];
+                            format!("{kind}: {} volume {:.2} -{:.2} pitch {:.2} +-{:.2} rolloff {:.0} blend {:?} clips {:?} source {}", bank.name, bank.base_volume, bank.delta_volume, bank.base_pitch, bank.delta_pitch, bank.rolloff, bank.blend, bank.lists.iter().map(Vec::len).collect::<Vec<_>>(), bank.source_type)
+                        }
+                        None => format!("{kind}: none"),
+                    })
+                    .collect();
+                println!("{} ({surface}):\n  {}", name(*surface), said.join("\n  "));
+            }
+            let decoded = sounds.clips.iter().filter(|(_, clip)| clip.is_some()).count();
+            println!("{} banks, {} clips named, {decoded} read", sounds.banks.len(), sounds.clips.len());
+        }
         (Some("stepsounds"), read) => {
             let read = read.as_deref() == Some("read");
             let only: Vec<u8> = (3..16).filter_map(|n| arg(n).and_then(|s| s.parse().ok())).collect();
@@ -594,6 +790,29 @@ fn main() -> Result<()> {
                 }
             }
             for (name, bank) in trp_data::sound::GEAR_BANKS.iter().zip(&sounds.gear) {
+                println!("{name:22} {}", bank.map_or("none".to_owned(), |bank| say(&sounds.banks[bank])));
+            }
+            // The vault's: each surface's elements by move and mark, and
+            // the three moves' kit banks.
+            let banks = &sounds.banks;
+            for set in &sounds.vault {
+                let listed: Vec<String> = trp_data::sound::VAULT_SETS
+                    .iter()
+                    .zip(&set.elements)
+                    .flat_map(|(kind, marks)| {
+                        trp_data::sound::VAULT_MARKS.iter().zip(marks).filter_map(move |(mark, element)| {
+                            let element = (*element)?;
+                            let bank = element.bank.map_or("no bank".to_owned(), |bank| {
+                                let bank = &banks[bank];
+                                format!("{} (volume {:.2} -{:.2}, clips {:?}, blend {:?})", bank.name, bank.base_volume, bank.delta_volume, bank.lists.iter().map(Vec::len).collect::<Vec<_>>(), bank.blend)
+                            });
+                            Some(format!("{kind}.{mark}: {bank} at {:.2}-{:.2}", element.min_volume, element.max_volume))
+                        })
+                    })
+                    .collect();
+                println!("{} ({}) vault: {}", trp_data::sound::SURFACES.get(set.surface as usize).unwrap_or(&"?"), set.surface, if listed.is_empty() { "nothing".to_owned() } else { listed.join("; ") });
+            }
+            for (name, bank) in trp_data::sound::VAULT_GEAR_BANKS.iter().zip(&sounds.vault_gear) {
                 println!("{name:22} {}", bank.map_or("none".to_owned(), |bank| say(&sounds.banks[bank])));
             }
             let mut kinds: std::collections::BTreeMap<(u16, u32), (usize, f32)> = std::collections::BTreeMap::new();
@@ -681,6 +900,38 @@ fn main() -> Result<()> {
         // The things' sounds kept as Vorbis: each sample's channels,
         // frequency, frames, packets and the CRC32 of its setup header,
         // and whether that header was found in the game's engine.
+        (Some("voice"), _) => {
+            // A voice's health banks (the profile's, or the one named), each
+            // clip with its tags, volume, falloff, length and level; with a
+            // folder, each written there as a WAVE file.
+            let name = match arg(1).filter(|a| !a.contains(['/', '\\'])) {
+                Some(name) => name.to_owned(),
+                None => anyhow::Context::context(assets.install.profile_voice(), "the profile names no voice")?,
+            };
+            let folder = arg(1).filter(|a| a.contains(['/', '\\'])).or(arg(2)).map(std::path::PathBuf::from);
+            let voice = trp_data::sound::voice_banks(&assets.install, &name, &[9, 15, 16, 26, 27, 29], true)?;
+            println!("{} from {}: {} banks", voice.name, voice.bundle, voice.banks.len());
+            for bank in &voice.banks {
+                println!("trigger {} importance {} ignore tags {}: {} clips", bank.trigger, bank.importance, bank.ignore_tags, bank.clips.len());
+                for c in &bank.clips {
+                    let (rms, peak) = c.clip.as_ref().map_or((f64::NAN, f64::NAN), |clip| {
+                        let sum: f64 = clip.samples.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+                        let rms = (sum / clip.samples.len().max(1) as f64).sqrt() / 32768.0;
+                        let peak = clip.samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0) as f64 / 32768.0;
+                        (20.0 * rms.max(1e-9).log10(), 20.0 * peak.max(1e-9).log10())
+                    });
+                    let read = c.clip.as_ref().map_or("not read".to_owned(), |clip| format!("{} Hz x{}, {:.3} s", clip.frequency, clip.channels, clip.samples.len() as f32 / clip.channels.max(1) as f32 / clip.frequency.max(1) as f32));
+                    println!("  {}: mask {:#06x}, volume {}, falloff {}, length {:.3} ({read}), rms {rms:.1} dBFS, peak {peak:.1} dBFS", c.name, c.mask, c.volume, c.falloff, c.length);
+                    if let (Some(folder), Some(clip)) = (&folder, &c.clip) {
+                        std::fs::create_dir_all(folder)?;
+                        std::fs::write(folder.join(format!("{}_{}.wav", bank.trigger, c.name)), clip.wav())?;
+                    }
+                }
+            }
+            if let Ok(clip) = trp_data::sound::fracture_sound(&assets.install) {
+                println!("fracture: {} {} Hz x{}, {:.3} s", clip.name, clip.frequency, clip.channels, clip.samples.len() as f32 / clip.channels.max(1) as f32 / clip.frequency.max(1) as f32);
+            }
+        }
         (Some("vorbis"), _) => {
             let clips = trp_data::sound::item_vorbis(&assets.install)?;
             let wanted: Vec<u32> = clips.iter().map(|(_, sample)| sample.setup_crc).collect();
@@ -712,7 +963,9 @@ fn main() -> Result<()> {
             let ui = trp_data::sound::ui_sounds(&assets.install, &(0..64).collect::<Vec<i32>>())?;
             let items = trp_data::sound::item_sounds(&assets.install)?;
             let group = arg(2).unwrap_or("weap_ar");
-            let mut all: Vec<(String, &trp_data::sound::Clip)> = ui.iter().map(|(kind, clip)| (format!("ui{kind}"), clip)).collect();
+            let mut all: Vec<(String, &trp_data::sound::Clip)> = ui.by_kind.iter().map(|(kind, clip)| (format!("ui{kind}"), clip)).collect();
+            all.extend(ui.load.iter().enumerate().map(|(n, clip)| (format!("load{n}"), clip)));
+            all.extend(ui.unload.iter().enumerate().map(|(n, clip)| (format!("unload{n}"), clip)));
             all.extend(items.iter().filter(|(name, _)| name.starts_with(group)).map(|(name, clip)| (name.clone(), clip)));
             for (name, clip) in &all {
                 std::fs::write(folder.join(format!("{name}_{}.wav", clip.name)), clip.wav())?;
@@ -777,6 +1030,26 @@ fn main() -> Result<()> {
             for (key, value) in colors {
                 println!("  {key} = {value:?}");
             }
+        }
+        // `build-objects <file> <class>`: the numbers of a class's objects in
+        // one of the build's own files.
+        (Some("build-objects"), Some(file)) => {
+            let class: i32 = arg(2).ok_or_else(|| anyhow::anyhow!("a class needed"))?.parse()?;
+            let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+            println!("{:?}", pictures.objects(file, class)?);
+        }
+        // `typed <file> <number> <class> [bundle] [depth]`: an object of one
+        // of the build's own files (which keep no trees) read by its class's
+        // tree borrowed from a bundle (the effects bundle unless told; the
+        // shaders' for a shader), and printed.
+        (Some("typed"), Some(file)) => {
+            let id: i64 = arg(2).ok_or_else(|| anyhow::anyhow!("the object's number needed"))?.parse()?;
+            let class: i32 = arg(3).ok_or_else(|| anyhow::anyhow!("its class needed"))?.parse()?;
+            let key = arg(4).unwrap_or(trp_data::sound::EFFECTS);
+            let depth = arg(5).map_or(Ok(8), str::parse)?;
+            let tree = trp_data::screen::tree_of(&assets.install, key, class)?;
+            let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+            println!("{}", pictures.read_by(file, id, class, &tree)?.pretty(depth, 40));
         }
         // The files a build's file points into, by their numbers in its
         // pointers (`externals resources.assets`: 1 is the first).
@@ -866,6 +1139,80 @@ fn main() -> Result<()> {
         // The inventory screen's bar of tabs as the app reads it: each tab
         // with what its scripts name, its words in the install's English
         // and how wide they are in their font.
+        // A sprite of the build's resources by its path (`rsprite <path>
+        // <out.png>`): its cut and size, written as a picture, its top up.
+        (Some("rsprite"), Some(path)) => {
+            let (file, id) = trp_data::screen::resource_sprite(&assets.install, path).ok_or_else(|| anyhow::anyhow!("no resource sprite at {path}"))?;
+            let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+            let cut = pictures.sprite(&file, id)?;
+            println!("{path}: {file} {id}, {:?} {:?} border {:?}", cut.name, cut.rect, cut.border);
+            if let Some(out_path) = arg(2) {
+                let texture = pictures.texture(&cut.texture.0, cut.texture.1)?;
+                let levels = trp_data::unity::texture::mips(&texture)?;
+                let pixels = trp_data::unity::texture::decode_rgba(&texture, *levels.first().ok_or_else(|| anyhow::anyhow!("no levels"))?)?;
+                let [x, y, w, h] = cut.rect.map(|v| v.round().max(0.0) as usize);
+                let width = texture.width as usize;
+                let mut out = Vec::with_capacity(w * h * 4);
+                for row in (y..y + h).rev() {
+                    out.extend_from_slice(&pixels[(row * width + x) * 4..(row * width + x + w) * 4]);
+                }
+                let mut encoder = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(out_path)?), w as u32, h as u32);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder.write_header()?.write_image_data(&out)?;
+            }
+        }
+        (Some("skillspage"), _) => {
+            let gear = trp_data::screen::GearPanel::load(&assets.install)?;
+            let page = trp_data::screen::SkillsScreen::load(&assets.install, &gear.file)?;
+            println!("{}: {} objects; a skill's view {} objects, a thumb {}", gear.file, page.panel.nodes.len(), page.detailed.nodes.len(), page.thumb.nodes.len());
+            println!("list grid {:?}", page.list_grid);
+            println!("thumb grid {:?}", page.thumb_grid);
+            println!("fills {:?}, buff grounds {:?}", page.fill_sprites, page.buff_grounds);
+            println!("line {:?} objects, tints {:?}, highlight {:?}, most seen {:?}", page.line.as_ref().map(|line| line.nodes.len()), page.line_tints, page.dropdown_highlight, page.dropdown_most_seen);
+            println!("list scroll {:?}", page.list_scroll.map(|s| (s.sensitivity, s.bar.is_some())));
+            println!("view scroll {:?}", page.view_scroll.map(|s| (s.sensitivity, s.bar.is_some(), s.content.map(|c| page.panel.nodes[c].path.clone()))));
+            for (index, key, case) in &page.localized {
+                println!("  localized {} {key:?} case {case}", page.panel.nodes[*index].path);
+            }
+            // What each script's pointers lead to, the last `count` of its
+            // fields.
+            let pointed = |panel: &trp_data::screen::ScenePanel, node: usize, class: &str, count: usize| {
+                let Some(fields) = panel.script(node, class) else { return println!("  {class}: none") };
+                let start = fields.len().saturating_sub(count * 12);
+                let to: Vec<String> = (0..count).map(|n| panel.pointer_at(fields, start + n * 12).map_or("-".to_owned(), |at| panel.nodes[at].path.clone())).collect();
+                println!("  {class} at {}: {to:?}", panel.nodes[node].path);
+            };
+            pointed(&page.detailed, 0, "SkillPanel", 15);
+            pointed(&page.detailed, 0, "SkillIcon", 7);
+            pointed(&page.thumb, 0, "SkillIcon", 7);
+            for (panel, name) in [(&page.detailed, "detailed"), (&page.thumb, "thumb")] {
+                for (index, node) in panel.nodes.iter().enumerate() {
+                    if let Some(fields) = panel.script(index, "HoverTooltipArea") {
+                        let len = fields.get(..4).map_or(0, |b| u32::from_le_bytes(b.try_into().expect("four")) as usize);
+                        println!("  {name} {} HoverTooltipArea message {:?}", node.path, fields.get(4..4 + len).map(String::from_utf8_lossy));
+                    }
+                }
+            }
+            // The views' tabs' (`Tab`: seven pointers first).
+            for tab in ["BottomPanel/SkillsPanel/Options/Tabs/List Tab", "BottomPanel/SkillsPanel/Options/Tabs/Grid Tab", "Caption Bar/Tabs/Skills"] {
+                let Some(node) = page.panel.find(tab) else { continue };
+                let class = if page.panel.script(node, "Tab").is_some() { "Tab" } else { "TabFont" };
+                let Some(fields) = page.panel.script(node, class) else { continue };
+                let to: Vec<String> = (0..7).map(|n| page.panel.pointer_at(fields, n * 12).map_or("-".to_owned(), |at| page.panel.nodes[at].path.clone())).collect();
+                println!("  {class} at {tab}: {to:?} ({} bytes)", fields.len());
+            }
+            let at = |path: &str| page.panel.find(path).map(|index| page.panel.placed_in(index, [1920.0, 1080.0]).rect);
+            for path in ["", "Caption Bar", "TopPanel", "BottomPanel", "BottomPanel/SkillsPanel/Lower Part/Scrollview", "BottomPanel/SkillsPanel/Options/Sort"] {
+                println!("  placed in 1920 x 1080: {path:?} {:?}", at(path));
+            }
+            let tooltip = trp_data::screen::skill_tooltip(&assets.install)?;
+            println!("tooltip {} objects, fills {:?}, buff line {:?} objects, grounds {:?}", tooltip.panel.nodes.len(), tooltip.fill_sprites, tooltip.buff_line.as_ref().map(|line| line.nodes.len()), tooltip.buff_grounds);
+            let skills = trp_data::screen::skill_icons(&assets.install)?;
+            let buffs = trp_data::screen::buff_icons(&assets.install)?;
+            println!("{} skill icons: {:?}", skills.len(), skills.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>());
+            println!("{} buff icons: {:?}", buffs.len(), buffs.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>());
+        }
         (Some("tabs"), _) => {
             let gear = trp_data::screen::GearPanel::load(&assets.install)?;
             let bar = trp_data::screen::TabBar::load(&assets.install, &gear.file)?;
@@ -971,7 +1318,8 @@ fn main() -> Result<()> {
                     let mut r = trp_data::unity::reader::Reader::new(&fields[start..]);
                     if let (Ok(to_file), Ok(to)) = (r.i32(), r.i64()) {
                         if (0..64).contains(&to_file) && to > 0 && to < 1 << 40 {
-                            println!("  {class} at {start}: file {to_file} ({}) object {to}", panel.file_of(to_file).unwrap_or_default());
+                            let named = panel.pointer_at(fields, start).or_else(|| panel.transform_at(fields, start)).map(|node| panel.nodes[node].path.clone()).unwrap_or_default();
+                            println!("  {class} at {start}: file {to_file} ({}) object {to} {named:?}", panel.file_of(to_file).unwrap_or_default());
                         }
                     }
                 }
@@ -983,6 +1331,9 @@ fn main() -> Result<()> {
                 let mut line = format!("{:55} {} ({x:.1}, {y:.1}) {w:.1} x {h:.1} [{}]", node.path, if node.active { "on " } else { "off" }, classes.join(", "));
                 if let Some(image) = &node.image {
                     line += &format!("  image {:?} kind {}", image.color, image.kind);
+                    if image.kind == 3 {
+                        line += &format!(" fill method {} origin {} amount {} clockwise {}", image.fill_method, image.fill_origin, image.fill_amount, image.fill_clockwise);
+                    }
                     if let Some((outside, sprite)) = image.sprite {
                         let name = if outside == 0 { file.clone() } else { panel.externals.get(outside as usize - 1).map(|n| n.rsplit('/').next().unwrap_or(n).to_owned()).unwrap_or_default() };
                         match pictures.sprite(&name, sprite) {
@@ -1010,6 +1361,20 @@ fn main() -> Result<()> {
                 }
                 if let Some(text) = &node.text {
                     line += &format!("  text {:?} size {} colour {:?} align {}/{} style {} font {:?}", text.text, text.size, text.color, text.horizontal, text.vertical, text.style, text.font);
+                }
+                // `PROBE_LAYOUT=1`: its own layout as kept, its row and what
+                // it asks of the row it is in; a grid's own figures (padding,
+                // corner, axis, cell, spacing, constraint and its count).
+                if std::env::var_os("PROBE_LAYOUT").is_some() {
+                    let l = &node.layout;
+                    line += &format!("\n      anchors {:?}-{:?} at {:?} size {:?} pivot {:?} turn {} group {:?} element {:?}", l.anchor_min, l.anchor_max, l.offset, l.size_delta, l.pivot, l.turn, node.group, node.element);
+                    for (class, fields) in node.scripts.iter().filter(|(class, _)| class.ends_with("GridLayoutGroup")) {
+                        let word = |at: usize| fields.get(at..at + 4).map(|b| [b[0], b[1], b[2], b[3]]);
+                        let ints: Vec<i32> = [0, 4, 8, 12, 16, 20, 24].iter().filter_map(|&at| word(at).map(i32::from_le_bytes)).collect();
+                        let floats: Vec<f32> = [28, 32, 36, 40].iter().filter_map(|&at| word(at).map(f32::from_le_bytes)).collect();
+                        let tail: Vec<i32> = [44, 48].iter().filter_map(|&at| word(at).map(i32::from_le_bytes)).collect();
+                        line += &format!("\n      {class}: padding and corner {ints:?} cell and spacing {floats:?} constraint {tail:?}");
+                    }
                 }
                 println!("{line}");
             }
@@ -1073,6 +1438,84 @@ fn main() -> Result<()> {
         }
         // The build's scenes, each with the file it is, and the inventory
         // screen's equipment panel as the install lays it out.
+        // Customs' clouds and moon as the install has them (`clouds`, its
+        // settings, remap and map; the moon's sphere and picture), and the
+        // remap at a cloudiness if one is given (`clouds -0.1949`).
+        (Some("clouds"), cloudiness) => {
+            let level = trp_data::tod::TimeOfDayLevel::customs(&assets.install)?;
+            let clouds = trp_data::clouds::LevelClouds::read(&assets.install, &level)?;
+            println!("{:#?}", clouds.settings);
+            println!("ambient colour: {:?}", clouds.ambient_color);
+            println!("map {} {}x{} format {} clamp {:?} point {}", clouds.map.name, clouds.map.width, clouds.map.height, clouds.map.format, clouds.map.clamp, clouds.map.point);
+            for (n, curve) in [&clouds.remap.r, &clouds.remap.g, &clouds.remap.b, &clouds.remap.a].into_iter().enumerate() {
+                println!("remap {}: {:?}", "RGBA".as_bytes()[n] as char, curve.keys.iter().map(|k| (k.time, k.value)).collect::<Vec<_>>());
+            }
+            if let Some(c) = cloudiness.and_then(|c| c.parse::<f32>().ok()) {
+                println!("at {c}: normalised {} opacities {:?}", (c + 1.0) / 2.0, clouds.remap.at((c + 1.0) / 2.0));
+            }
+            let moon = trp_data::clouds::LevelMoon::read(&assets.install, &level)?;
+            println!("moon mesh {}: {} vertices, {} triangles, {} normals, {} uvs; picture {} {}x{} format {} srgb {}; tiling {:?}", moon.mesh.name, moon.mesh.positions.len(), moon.mesh.triangles.len() / 3, moon.mesh.normals.len(), moon.mesh.uvs.len(), moon.picture.name, moon.picture.width, moon.picture.height, moon.picture.format, moon.picture.srgb, moon.tiling);
+            for (v, p) in moon.mesh.positions.iter().enumerate().step_by((moon.mesh.positions.len() / 40).max(1)) {
+                println!("  {v}: {:?} uv {:?}", p, moon.mesh.uvs.get(v));
+            }
+        }
+        // A level's light as its scene sets it up (Factory by day's unless a
+        // scene's path end is given): its sun, its level settings, its simple
+        // sky's figures and its dome (`docs/spec/lighting.md`).
+        (Some("level-light"), scene) => {
+            let scene = scene.filter(|s| !s.starts_with("--"));
+            let light = match scene {
+                Some(scene) => trp_data::level_light::LevelLight::of_scene(&assets.install, scene)?,
+                None => trp_data::level_light::LevelLight::factory_day(&assets.install)?,
+            };
+            let sun = &light.sun;
+            println!("{}: the sun {} (rotation {:?}, its light going {:?})", light.file, sun.path, sun.rotation, sun.forward);
+            println!("  colour {:?}, intensity {}, shadows {} at {}, layers {:#x}", sun.color, sun.intensity, sun.shadows, sun.shadow_strength, sun.culling_mask);
+            let s = &light.settings;
+            println!("level settings: ambient mode {}, sky {:?}, equator {:?}, ground {:?}, intensity {}", s.ambient_mode, s.sky_color, s.equator_color, s.ground_color, s.ambient_intensity);
+            println!("  fog {} mode {} colour {:?} density {} from {} to {}", s.fog, s.fog_mode, s.fog_color, s.fog_density, s.fog_start, s.fog_end);
+            println!("  sun colour {:?}, direction light shadow {}, min smoke ambient {:?}, height falloff {}, zero level {}, skybox {:?}", s.sun_color, s.direction_light_shadow, s.min_smoke_ambient, s.height_falloff, s.zero_level, s.skybox);
+            let k = &light.sky;
+            println!("simple sky: atmosphere {:?}, cloudness {:?}, harmonics daylight {}", k.atmosphere, k.cloudness, k.harmonics_daylight);
+            for (name, g) in [("light colour", &k.light_color), ("add top ambient", &k.add_top_ambient), ("add ambient", &k.add_ambient)] {
+                println!("  {name}: colours {:?} alphas {:?}{}", g.colors, g.alphas, if g.stepped { " stepped" } else { "" });
+            }
+            for (name, c) in [("bounce", &k.bounce), ("brightness", &k.brightness), ("saturation", &k.saturation), ("contrast", &k.contrast)] {
+                println!("  {name}: {:?}", c.keys.iter().map(|key| (key.time, key.value, key.in_slope, key.out_slope)).collect::<Vec<_>>());
+            }
+            println!("dome: {:?}", light.dome);
+            println!("outdoor: {:?}", light.outdoor);
+            let camera_file = light.file_of(light.settings.camera)?;
+            println!("the level's camera ({camera_file} {}): {:?}", light.settings.camera.1, trp_data::prism::PrismSettings::of_camera(&assets.install, &camera_file, light.settings.camera.1));
+            println!("Cam2: {:?}", trp_data::prism::PrismSettings::of_cam2(&assets.install));
+            match light.dome_sky(&assets.install) {
+                Ok(sky) => {
+                    let c = &sky.cubemap;
+                    println!("dome sky: {} {}x{} format {} mips {} ({} bytes), tint {:?}, exposure {}, rotation {}", c.name, c.width, c.height, c.format, c.mip_count, c.data.len(), sky.tint, sky.exposure, sky.rotation);
+                    // Each face's largest level as a picture, rows as stored
+                    // (`--faces <folder>`).
+                    let faces = (1..6).find(|&n| arg(n) == Some("--faces")).and_then(|n| arg(n + 1));
+                    if let Some(folder) = faces {
+                        std::fs::create_dir_all(folder)?;
+                        let face_bytes = c.data.len() / 6;
+                        for face in 0..6 {
+                            let blocks = &c.data[face * face_bytes..face * face_bytes + (c.width as usize * c.height as usize / 2)];
+                            let rgba = trp_data::compress::bc1_decoded(c.width, c.height, blocks);
+                            let path = std::path::Path::new(folder).join(format!("face{face}.png"));
+                            let mut encoder = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(&path)?), c.width, c.height);
+                            encoder.set_color(png::ColorType::Rgba);
+                            encoder.set_depth(png::BitDepth::Eight);
+                            encoder.write_header()?.write_image_data(&rgba)?;
+                        }
+                        println!("  its faces written to {folder}");
+                    }
+                }
+                Err(e) => println!("dome sky: {e:#}"),
+            }
+            for (n, outside) in light.externals.iter().enumerate() {
+                println!("  file {}: {outside}", n + 1);
+            }
+        }
         (Some("scenes"), filter) => {
             let wanted = filter.unwrap_or("").to_lowercase();
             for (index, path) in trp_data::screen::scene_paths(&assets.install)?.iter().enumerate().filter(|(_, path)| path.to_lowercase().contains(&wanted)) {
@@ -1176,7 +1619,7 @@ fn main() -> Result<()> {
                 for behaviour in scene.behaviours.iter().filter(|behaviour| behaviour.node == index) {
                     let fields = scene.fields(behaviour);
                     println!("  the script {}: {} bytes of fields", behaviour.id, fields.len());
-                    for (n, word) in fields.chunks(4).take(160).enumerate() {
+                    for (n, word) in fields.chunks(4).take(400).enumerate() {
                         let mut bytes = [0u8; 4];
                         bytes[..word.len()].copy_from_slice(word);
                         println!("    {:3}: {:02x?}  {}  {}", n * 4, bytes, i32::from_le_bytes(bytes), f32::from_le_bytes(bytes));
@@ -1208,6 +1651,31 @@ fn main() -> Result<()> {
         // Every script of a class on the player prefab: the object it is on,
         // that object's parent and layer, and the colliders on it
         // (`player-scripts BodyPartCollider`).
+        // `popper`: the hideout range's popper as `range_targets` reads it:
+        // its objects with their places and what they draw, and its sounds.
+        (Some("popper"), _) => {
+            let model = trp_data::range_targets::popper(&assets.install)?;
+            for (index, node) in model.props.nodes.iter().enumerate() {
+                println!("{index:2} {} under {:?} at {:?} turned {:?}, draws {}", node.name, node.parent, node.translation, node.rotation, node.drawn.len());
+            }
+            println!("plate {}, roller {}; {} meshes, {} materials, {} pictures; skipped {:?}", model.plate, model.roller, model.props.meshes.len(), model.props.materials.len(), model.props.pictures.len(), model.props.skipped);
+            for (name, clip) in trp_data::range_targets::popper_clips(&assets.install)? {
+                println!("{name}: {} channels at {} Hz, {:.2} s", clip.channels, clip.frequency, clip.samples.len() as f32 / clip.channels.max(1) as f32 / clip.frequency.max(1) as f32);
+            }
+        }
+        // `player-script-values <class>`: each script of that class on the
+        // player's prefab, its fields whole as the type tree reads them
+        // (the hit reaction's curves, the full-body IK's settings).
+        (Some("player-script-values"), Some(wanted)) => {
+            let files = assets.load(trp_data::player::PLAYER_BUNDLE)?;
+            let objects: Vec<_> = files.iter().flat_map(|&f| assets.objects_of(f, trp_data::unity::class::MONO_BEHAVIOUR)).collect();
+            for obj in objects {
+                if trp_data::unity::extract::script_class(&assets, obj).as_deref() != Some(wanted) {
+                    continue;
+                }
+                println!("{:?}: {:#?}", obj, assets.read(obj)?);
+            }
+        }
         (Some("player-scripts"), Some(wanted)) => {
             use trp_data::unity::{class, Value};
             let files = assets.load(trp_data::player::PLAYER_BUNDLE)?;
@@ -1219,7 +1687,7 @@ fn main() -> Result<()> {
                 let v = assets.read(obj)?;
                 let Some(owner) = v.get("m_GameObject").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(obj.file, p)) else { continue };
                 let go = assets.read(owner)?;
-                let name = go.get("m_Name").and_then(Value::as_str).unwrap_or("").to_owned();
+                let name = go.get("m_Name").and_then(trp_data::unity::Value::as_str).unwrap_or("").to_owned();
                 let layer = go.get("m_Layer").and_then(Value::as_i64).unwrap_or(0);
                 let mut parent = String::new();
                 let mut shapes = Vec::new();
@@ -1242,7 +1710,12 @@ fn main() -> Result<()> {
                         shapes.push(format!("class {} centre {} size {} radius {} height {} dir {} trigger {}", class_id.unwrap_or(0), get("m_Center"), get("m_Size"), get("m_Radius"), get("m_Height"), get("m_Direction"), get("m_IsTrigger")));
                     }
                 }
-                let fields: Vec<String> = ["BodyPartType", "BodyPartColliderType"].iter().filter_map(|f| v.get(f).and_then(Value::as_i64).map(|x| format!("{f} {x}"))).collect();
+                let mut fields: Vec<String> = ["BodyPartType", "BodyPartColliderType", "ArmorPlateColliderType", "_typeOfMaterial", "_presetId", "HitType"].iter().filter_map(|f| v.get(f).and_then(Value::as_i64).map(|x| format!("{f} {x}"))).collect();
+                // A ballistic collider's own figures (`BallisticCollider`).
+                let figures: Vec<String> = ["PenetrationLevel", "PenetrationChance", "RicochetChance", "FragmentationChance", "TrajectoryDeviationChance", "TrajectoryDeviation", "penetrationDamageMod"].iter().filter_map(|f| v.get(f).and_then(Value::as_f32).map(|x| x.to_string())).collect();
+                if !figures.is_empty() {
+                    fields.push(format!("figures [{}]", figures.join(", ")));
+                }
                 println!("{name} (layer {layer}) under {parent} {}: {}", fields.join(" "), shapes.join("; "));
             }
         }
@@ -1251,6 +1724,30 @@ fn main() -> Result<()> {
         // collide with which (`PhysicsManager.m_LayerCollisionMatrix`, found
         // as 32 masks after their count that agree with one another), and
         // the physics settings' first figures (`layers`).
+        // `bundle-layers [bundle]`: how many of a bundle's game objects are
+        // on each layer (the effects' bundle unless told), with a few names:
+        // which cameras' masks take them.
+        (Some("bundle-layers"), key) => {
+            use trp_data::unity::Value;
+            let key = key.unwrap_or(trp_data::particles::EFFECTS);
+            let files = assets.load(key)?;
+            let mut layers: BTreeMap<i64, (usize, Vec<String>)> = BTreeMap::new();
+            for file in files {
+                let objects: Vec<ObjRef> = assets.objects_of(file, class::GAME_OBJECT).collect();
+                for object in objects {
+                    let go = assets.read(object)?;
+                    let layer = go.get("m_Layer").and_then(Value::as_i64).unwrap_or(-1);
+                    let entry = layers.entry(layer).or_default();
+                    entry.0 += 1;
+                    if entry.1.len() < 6 {
+                        entry.1.push(go.get("m_Name").and_then(Value::as_str).unwrap_or("").to_owned());
+                    }
+                }
+            }
+            for (layer, (count, names)) in &layers {
+                println!("layer {layer}: {count} objects ({})", names.join(", "));
+            }
+        }
         (Some("layers"), _) => {
             let path = assets.install.root.join("EscapeFromTarkov_Data").join("globalgamemanagers");
             let data = std::fs::read(&path)?;
@@ -1310,7 +1807,7 @@ fn main() -> Result<()> {
             for body in &ragdoll.bodies {
                 println!("body {}: mass {} drag {} angular drag {}", body.bone, body.mass, body.drag, body.angular_drag);
                 for collider in &body.colliders {
-                    println!("    {} {:?} at {:?}", collider.object, collider.shape, collider.local);
+                    println!("    {} (part {:?}, surface {}) {:?} at {:?}", collider.object, collider.part, collider.surface, collider.shape, collider.local);
                 }
             }
             for joint in &ragdoll.joints {
@@ -1375,7 +1872,9 @@ fn main() -> Result<()> {
                 let _layer = r.u32()?;
                 let len = r.u32()? as usize;
                 let name = String::from_utf8_lossy(r.bytes(len)?).into_owned();
-                if !name.to_lowercase().contains(&wanted) {
+                // `#<number>`: the game object of that number.
+                let by_number = wanted.strip_prefix('#').and_then(|n| n.parse::<i64>().ok());
+                if by_number.map_or(!name.to_lowercase().contains(&wanted), |n| n != object.path_id) {
                     continue;
                 }
                 println!("{name} (game object {}):", object.path_id);
@@ -1435,6 +1934,96 @@ fn main() -> Result<()> {
         // An item's icon settings as its prefab has them (`icon::pose_in`):
         // the object they are on, its renderers, and for a weapon the
         // object its hands hold.
+        // The right click's menu as the install keeps it
+        // (`screen::context_menu`): each object of the button templates, its
+        // place and size, its layout element and its picture's flags.
+        // The game's window that edits a tag (`screen::tag_window`): each
+        // object, its place, size, layout element, picture and words.
+        (Some("tagwindow"), Some("placed")) => {
+            let panel = trp_data::screen::tag_window(&assets.install)?;
+            let [_, _, w, h] = panel.placed_in(0, [1920.0, 1080.0]).rect;
+            println!("the window {w} x {h}");
+            for (index, node) in panel.nodes.iter().enumerate() {
+                let [x, y, rw, rh] = panel.rect(index, [w, h]);
+                println!("[{index}] {} {:60} ({x:.1}, {y:.1}) {rw:.1} x {rh:.1}", if node.active { "on " } else { "off" }, node.path);
+            }
+        }
+        (Some("tagwindow"), _) => {
+            let panel = trp_data::screen::tag_window(&assets.install)?;
+            for (index, node) in panel.nodes.iter().enumerate() {
+                let l = &node.layout;
+                let image = node.image.as_ref().map(|image| format!(" image kind {} color {:?} sprite {:?}", image.kind, image.color, image.sprite)).unwrap_or_default();
+                let text = node.text.as_ref().map(|text| format!(" text {:?} size {} color {:?} align {}/{} margin {:?} spacing {}", text.text, text.size, text.color, text.horizontal, text.vertical, text.margin, text.spacing)).unwrap_or_default();
+                println!(
+                    "[{index}] {} {} anchors {:?}-{:?} at {:?} size {:?} pivot {:?} element {:?} group {:?} scripts {:?}{image}{text}",
+                    if node.active { "on " } else { "off" }, node.path, l.anchor_min, l.anchor_max, l.offset, l.size_delta, l.pivot, node.element, node.group, node.scripts.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>()
+                );
+            }
+        }
+        // One object's script's stored fields, as bytes in fours with
+        // what each would be as an integer and a float
+        // (`scriptbytes tagwindow <object> <script>`).
+        (Some("scriptbytes"), Some("tagwindow")) => {
+            let panel = trp_data::screen::tag_window(&assets.install)?;
+            let index: usize = arg(2).ok_or_else(|| anyhow::anyhow!("an object's number"))?.parse()?;
+            let script = arg(3).ok_or_else(|| anyhow::anyhow!("a script's name"))?;
+            let fields = panel.script(index, script).ok_or_else(|| anyhow::anyhow!("no {script} on it"))?;
+            for (at, word) in fields.chunks(4).enumerate() {
+                let mut four = [0u8; 4];
+                four[..word.len()].copy_from_slice(word);
+                println!("{:4} {:02x?} {:12} {}", at * 4, word, i32::from_le_bytes(four), f32::from_le_bytes(four));
+            }
+        }
+        // A prefab's script read as a run of the game's enum dictionaries
+        // (`SerializableEnumDictionary`: a list of key names, then a list
+        // of pointers): `prefabdicts sharedassets44.assets:11223
+        // InteractionButtonsContainer SimpleSpecifiedContextButtons`.
+        (Some("prefabdicts"), Some(wanted)) => {
+            let (file, id) = wanted.split_once(':').ok_or_else(|| anyhow::anyhow!("file:id"))?;
+            let scene = trp_data::screen::Scene::load_prefab_of_script(&assets.install, file, id.parse()?)?;
+            let panel = trp_data::screen::ScenePanel::of(&scene, 0);
+            let end = arg(2).unwrap_or("");
+            let class = arg(3).ok_or_else(|| anyhow::anyhow!("a script's name"))?;
+            let index = (0..panel.nodes.len()).find(|&index| panel.nodes[index].path.ends_with(end)).ok_or_else(|| anyhow::anyhow!("no object's path ends with {end:?}"))?;
+            let fields = panel.script(index, class).ok_or_else(|| anyhow::anyhow!("no {class} there"))?;
+            let mut at = 0usize;
+            let word = |at: usize| fields.get(at..at + 4).map(|w| i32::from_le_bytes(w.try_into().unwrap_or_default()));
+            while let Some(count) = word(at).filter(|count| (0..64).contains(count)) {
+                at += 4;
+                let mut keys = Vec::new();
+                for _ in 0..count {
+                    let len = word(at).unwrap_or(0).max(0) as usize;
+                    keys.push(String::from_utf8_lossy(fields.get(at + 4..at + 4 + len).unwrap_or_default()).into_owned());
+                    at += 4 + len.div_ceil(4) * 4;
+                }
+                let values = word(at).unwrap_or(0).max(0) as usize;
+                at += 4;
+                let mut pointers = Vec::new();
+                for _ in 0..values {
+                    let to_file = word(at).unwrap_or(0);
+                    let to = fields.get(at + 4..at + 12).map_or(0, |w| i64::from_le_bytes(w.try_into().unwrap_or_default()));
+                    let inside = panel.pointer_at(fields, at).map(|node| panel.nodes[node].path.clone());
+                    pointers.push(format!("({to_file}, {to}{})", inside.map(|path| format!(" = {path}")).unwrap_or_default()));
+                    at += 12;
+                }
+                println!("{} keys: {:?}\n  values: {}", keys.len(), keys, pointers.join(", "));
+            }
+            println!("read {at} of {} bytes", fields.len());
+        }
+        (Some("contextmenu"), _) => {
+            let panel = trp_data::screen::context_menu(&assets.install)?;
+            for (index, node) in panel.nodes.iter().enumerate() {
+                if !node.path.contains("Template") {
+                    continue;
+                }
+                let l = &node.layout;
+                let image = node.image.as_ref().map(|image| format!(" image kind {} keep {} sprite {:?}", image.kind, image.preserve_aspect, image.sprite)).unwrap_or_default();
+                println!(
+                    "[{index}] {} anchors {:?}-{:?} at {:?} size {:?} pivot {:?} element {:?} group {:?}{image}",
+                    node.path, l.anchor_min, l.anchor_max, l.offset, l.size_delta, l.pivot, node.element, node.group
+                );
+            }
+        }
         (Some("icon"), Some(wanted)) => {
             let db = trp_data::Database::load(&assets.install)?;
             let item = db.item(wanted)?;
@@ -1451,6 +2040,15 @@ fn main() -> Result<()> {
                 }
                 None => println!("  no PreviewPivot"),
             }
+            // The pivot's own picture, where it has one (`overrideIcon`).
+            for &file in &files {
+                for behaviour in assets.objects_of(file, trp_data::unity::class::MONO_BEHAVIOUR) {
+                    if trp_data::unity::extract::script_class(&assets, behaviour).as_deref() == Some("PreviewPivot") {
+                        let value = assets.read(behaviour)?;
+                        println!("  overrideIcon: {:?}", value.get("Icon").and_then(|icon| icon.get("overrideIcon")));
+                    }
+                }
+            }
             if let Ok(weapon) = trp_data::weapon::assemble(&mut assets, &db, &item.id) {
                 println!("  assembled: root {} ({} nodes)", weapon.hierarchy.nodes[0].name, weapon.hierarchy.nodes.len());
             }
@@ -1459,6 +2057,16 @@ fn main() -> Result<()> {
         // name: what it weighs, the cells it takes, its slots and grids.
         // An item's properties in the install's database, whole or those
         // named (`props 590c678286f77426c9660122 UsePrefab medUseTime`).
+        // Every item that has a property, with its value: `probe with
+        // ExplosionEffectType`.
+        (Some("with"), Some(prop)) => {
+            let db = trp_data::Database::load(&assets.install)?;
+            let mut found: Vec<_> = db.items.values().filter_map(|item| Some((item.name.as_str(), item.id.as_str(), item.props.get(prop)?.to_string()))).collect();
+            found.sort();
+            for (name, id, value) in found {
+                println!("{id} {name} {value}");
+            }
+        }
         (Some("props"), Some(wanted)) => {
             let db = trp_data::Database::load(&assets.install)?;
             let item = db.items.get(wanted).ok_or_else(|| anyhow::anyhow!("no item {wanted}"))?;
@@ -1616,6 +2224,181 @@ fn main() -> Result<()> {
                 }
             }
         }
+        // Each shader of a bundle by its name (`shaders`, the game's own
+        // shaders bundle, unless another is given with `--bundle <key>`
+        // first); with a part of a name and a folder, those shaders' DirectX
+        // 11 programs written there as they are kept (`<name>_<n>.dxbc`,
+        // each cut from the decompressed blob at its own `DXBC` header),
+        // for the SDK's `fxc /dumpbin` to read.
+        (Some("shaders"), wanted) => {
+            use trp_data::unity::Value;
+            // `--uses <name>`: the shaders whose programs name that
+            // property (their parsed form's name table).
+            if wanted == Some("--uses") {
+                let property = arg(2).ok_or_else(|| anyhow::anyhow!("a property's name needed"))?;
+                for file in assets.load("shaders")? {
+                    for obj in assets.objects_of(file, 48).collect::<Vec<_>>() {
+                        let shader = assets.read(obj)?;
+                        let name = shader.get("m_ParsedForm").and_then(|form| form.get("m_Name")).and_then(Value::as_str).unwrap_or("").to_owned();
+                        if format!("{shader:?}").contains(&format!("{property:?}")) {
+                            println!("{} {name}", obj.path_id);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            // `--stencil`: each shader's passes that write the stencil
+            // (their state's reference, by figure or by the property that
+            // sets it, its write mask and front comparison and pass
+            // operation).
+            if wanted == Some("--stencil") {
+                for file in assets.load("shaders")? {
+                    for obj in assets.objects_of(file, 48).collect::<Vec<_>>() {
+                        let shader = assets.read(obj)?;
+                        let Some(form) = shader.get("m_ParsedForm") else { continue };
+                        let name = form.get("m_Name").and_then(Value::as_str).unwrap_or("").to_owned();
+                        for sub in form.get("m_SubShaders").and_then(Value::as_array).unwrap_or(&[]) {
+                            for (p, pass) in sub.get("m_Passes").and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+                                let Some(state) = pass.get("m_State") else { continue };
+                                let figure = |v: Option<&Value>| -> (f32, String) {
+                                    let Some(v) = v else { return (0.0, String::new()) };
+                                    (v.get("val").and_then(Value::as_f32).unwrap_or(0.0), v.get("name").and_then(Value::as_str).unwrap_or("").to_owned())
+                                };
+                                let (reference, by) = figure(state.get("stencilRef"));
+                                let (write, _) = figure(state.get("stencilWriteMask"));
+                                let (comp, _) = figure(state.get("stencilOpFront").and_then(|o| o.get("comp")));
+                                let (op, op_by) = figure(state.get("stencilOpFront").and_then(|o| o.get("pass")));
+                                if reference != 0.0 || (!by.is_empty() && by != "<noninit>") || op != 0.0 {
+                                    let lightmode = format!("{:?}", pass.get("m_Tags"));
+                                    let mode = lightmode.split("LIGHTMODE").nth(1).and_then(|s| s.split('"').nth(4)).unwrap_or("");
+                                    println!("{} {name} pass {p} {mode}: ref {reference} ({by}) write mask {write} comp {comp} pass op {op} ({op_by})", obj.path_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            // A shader's DirectX 11 programs written out by their blob
+            // entries, and the blob itself.
+            let write_programs = |shader: &Value, name: &str, folder: &str| -> Result<()> {
+                let platforms = shader.get("platforms").and_then(Value::as_uints).unwrap_or(&[]);
+                let Some(at) = platforms.iter().position(|&p| p == 4) else {
+                    println!("  no DirectX 11 programs ({platforms:?})");
+                    return Ok(());
+                };
+                // Every segment of the platform's blob unpacked: the first
+                // holds the table (and in some shaders the programs too), a
+                // later one the programs whose entries name it (`Hidden/HBAO`).
+                let all = |name: &str| shader.get(name).and_then(Value::as_array).and_then(|all| all.get(at)).and_then(Value::as_uints).map(|v| v.iter().map(|&n| n as usize).collect::<Vec<_>>()).unwrap_or_default();
+                let (offsets, packed, sizes) = (all("offsets"), all("compressedLengths"), all("decompressedLengths"));
+                let blob = shader.get("compressedBlob").and_then(Value::as_bytes).unwrap_or(&[]);
+                let segments = offsets.iter().zip(&packed).zip(&sizes).map(|((&offset, &packed), &size)| lz4_flex::block::decompress(&blob[offset..offset + packed], size)).collect::<Result<Vec<_>, _>>()?;
+                let plain = segments.first().cloned().unwrap_or_default();
+                std::fs::create_dir_all(folder)?;
+                std::fs::write(std::path::Path::new(folder).join(format!("{}.blob", name.replace(['/', ' '], "_"))), &plain)?;
+                // The blob's table: how many entries, then each one's
+                // place, length and segment; a pass's programs name
+                // their entry (`m_BlobIndex`). Each program is written
+                // by its entry, cut at its own `DXBC` header.
+                let word = |at: usize| plain.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().expect("four")) as usize);
+                let entries = word(0).unwrap_or(0);
+                let mut n = 0;
+                for entry in 0..entries {
+                    let (Some(start), Some(length), Some(segment)) = (word(4 + 12 * entry), word(8 + 12 * entry), word(12 + 12 * entry)) else { break };
+                    let Some(bytes) = segments.get(segment).and_then(|s| s.get(start..start + length)) else { continue };
+                    // The whole entry: a program's, or the parameters a program's variant
+                    // names (`m_ParameterBlobIndices`): `local/blob_params_s92.pl <file>`.
+                    std::fs::write(std::path::Path::new(folder).join(format!("{}_b{entry}.entry", name.replace(['/', ' '], "_"))), bytes)?;
+                    let Some(at) = bytes.windows(4).position(|w| w == b"DXBC") else { continue };
+                    let Some(size) = bytes.get(at + 24..at + 28).map(|b| u32::from_le_bytes(b.try_into().expect("four")) as usize) else { continue };
+                    let Some(program) = bytes.get(at..at + size) else { continue };
+                    std::fs::write(std::path::Path::new(folder).join(format!("{}_b{entry}.dxbc", name.replace(['/', ' '], "_"))), program)?;
+                    n += 1;
+                }
+                println!("  {n} programs written to {folder}, by their blob entries (of {entries})");
+                Ok(())
+            };
+            // `--build <file> <number> [folder] [depth]`: a shader of one of
+            // the build's own files (`globalgamemanagers.assets`), read by
+            // the shader's tree borrowed from the shaders bundle; its parsed
+            // form printed to the depth asked.
+            if wanted == Some("--build") {
+                let file = arg(2).ok_or_else(|| anyhow::anyhow!("a file of the build needed"))?;
+                let id: i64 = arg(3).ok_or_else(|| anyhow::anyhow!("the shader's number needed"))?.parse()?;
+                let tree = trp_data::screen::tree_of(&assets.install, "shaders", 48)?;
+                let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+                let shader = pictures.read_by(file, id, 48, &tree)?;
+                let name = shader.get("m_ParsedForm").and_then(|form| form.get("m_Name")).and_then(Value::as_str).unwrap_or("").to_owned();
+                println!("{id} {name}");
+                let depth = arg(5).map_or(Ok(0), str::parse)?;
+                if depth > 0 {
+                    println!("{}", shader.get("m_ParsedForm").map(|form| form.pretty(depth, 40)).unwrap_or_default());
+                }
+                if let Some(folder) = arg(4) {
+                    write_programs(&shader, &name, folder)?;
+                }
+                return Ok(());
+            }
+            let (key, wanted, folder) = match wanted {
+                Some("--bundle") => (arg(2).unwrap_or("shaders").to_owned(), arg(3), arg(4)),
+                _ => ("shaders".to_owned(), wanted, arg(2)),
+            };
+            for file in assets.load(&key)? {
+                for obj in assets.objects_of(file, 48).collect::<Vec<_>>() {
+                    let shader = assets.read(obj)?;
+                    let name = shader.get("m_ParsedForm").and_then(|form| form.get("m_Name")).and_then(trp_data::unity::Value::as_str).unwrap_or("").to_owned();
+                    if wanted.is_some_and(|wanted| !name.to_lowercase().contains(&wanted.to_lowercase())) {
+                        continue;
+                    }
+                    println!("{} {name}", obj.path_id);
+                    // With `TRP_PROBE_FIGURES` set, its properties' names (what
+                    // a material of it keeps).
+                    if std::env::var("TRP_PROBE_FIGURES").is_ok() {
+                        let props = shader.at("m_ParsedForm.m_PropInfo.m_Props").and_then(trp_data::unity::Value::as_array).map(|props| props.iter().filter_map(|p| p.get("m_Name")?.as_str().map(str::to_owned)).collect::<Vec<_>>()).unwrap_or_default();
+                        println!("  properties: {}", props.join(" "));
+                    }
+                    if let Some(folder) = folder {
+                        write_programs(&shader, &name, folder)?;
+                    }
+                }
+            }
+        }
+        // A compute shader of one of the build's own files
+        // (`compute resources.assets 2569 [folder] [depth]`), read by the
+        // tree of the shaders bundle's: its form printed to the depth asked,
+        // and each variant's program for DirectX 11 written to the folder
+        // as `<name>_<kernel>_<n>.dxbc`, by the name of the kernel it is.
+        (Some("compute"), Some(file)) => {
+            use trp_data::unity::Value;
+            let id: i64 = arg(2).ok_or_else(|| anyhow::anyhow!("the compute shader's number needed"))?.parse()?;
+            let tree = trp_data::screen::tree_of(&assets.install, "shaders", 72)?;
+            let mut pictures = trp_data::screen::ScenePictures::new(&assets.install)?;
+            let compute = pictures.read_by(file, id, 72, &tree)?;
+            let name = compute.get("m_Name").and_then(Value::as_str).unwrap_or("").to_owned();
+            println!("{id} {name}");
+            let depth = arg(4).map_or(Ok(4), str::parse)?;
+            println!("{}", compute.pretty(depth, 40));
+            if let Some(folder) = arg(3).filter(|folder| *folder != "-") {
+                std::fs::create_dir_all(folder)?;
+                let variants: &[Value] = compute.get("variants").and_then(Value::as_array).unwrap_or(&[]);
+                for variant in variants {
+                    for kernel in variant.get("kernels").and_then(Value::as_array).unwrap_or(&[]) {
+                        let kernel_name = kernel.get("name").and_then(Value::as_str).unwrap_or("kernel").to_owned();
+                        for (n, unique) in kernel.get("uniqueVariants").and_then(Value::as_array).unwrap_or(&[]).iter().enumerate() {
+                            let Some(code) = unique.get("code").and_then(Value::as_bytes) else { continue };
+                            // The program from its own `DXBC` header, as long as it says.
+                            let Some(at) = code.windows(4).position(|w| w == b"DXBC") else { continue };
+                            let size = code.get(at + 24..at + 28).map_or(code.len() - at, |b| u32::from_le_bytes(b.try_into().expect("four")) as usize);
+                            let program = &code[at..(at + size).min(code.len())];
+                            let path = std::path::Path::new(folder).join(format!("{name}_{kernel_name}_{n}.dxbc"));
+                            std::fs::write(&path, program)?;
+                            println!("  written {} ({} bytes)", path.display(), program.len());
+                        }
+                    }
+                }
+            }
+        }
         (Some("dump"), Some(key)) => {
             let path_id: i64 = arg(2).ok_or_else(|| anyhow::anyhow!("path id needed"))?.parse()?;
             let depth = arg(3).map_or(Ok(6), str::parse)?;
@@ -1664,10 +2447,197 @@ fn main() -> Result<()> {
                 );
             }
         }
+        // A build's sights as `trp_data::sight` reads them (`sights <template
+        // or build key>`): each part that is a sight, its item's figures,
+        // its prefab's modes; the sights that fold; every aim bone.
+        // The inspect window's preview as the game makes it
+        // (`trp_data::edit_build::InspectPreview`).
+        // The notifier's notice and the malfunction glow as the app reads
+        // them (`trp_data::screen::notice`, `malfunction_glow`).
+        (Some("notice"), _) => {
+            let notice = trp_data::screen::notice(&assets.install)?;
+            for (index, node) in notice.panel.nodes.iter().enumerate() {
+                println!("{index} {:?}: {:?} text {:?} group {:?} element {:?}", node.path, node.layout, node.text.as_ref().map(|t| (t.font, t.size, t.style, t.horizontal, t.vertical, t.margin, t.color)), node.group, node.element);
+            }
+            println!("box {}, text {}, icon {}, padding {:?}, below {}, alert {:?}", notice.content, notice.text, notice.icon, notice.padding, notice.below, notice.alert);
+        }
+        // A build's parts that glow with its heat (`trp_data::heat`).
+        (Some("hot"), Some(key)) => {
+            let db = trp_data::Database::load(&assets.install)?;
+            let weapon = trp_data::weapon::assemble_key(&mut assets, &db, key)?;
+            for part in &weapon.hot {
+                let node = &weapon.hierarchy.nodes[part.node];
+                println!("{} ({}): centre {:?} size {:?} visible {} skinned {:?}; glowing slots {:?}", node.name, part.node, part.center, part.size, part.visible, node.renderer.as_ref().map(|r| r.skinned), part.slots);
+            }
+        }
+        // The game's repair window's prefab (`trp_data::screen::repair_window`):
+        // every object, its place on 1920 by 1080, its picture, text and
+        // scripts.
+        (Some("repairwindow"), _) => {
+            let panel = trp_data::screen::repair_window(&assets.install)?;
+            println!("{} objects, from {}", panel.nodes.len(), panel.file);
+            println!("figures {:?}", trp_data::screen::repair_figures(&panel));
+            for index in 0..panel.nodes.len() {
+                if let Some((key, case)) = trp_data::screen::localized(&panel, index) {
+                    println!("localized {index} {:?}: {key:?} case {case}", panel.nodes[index].path);
+                }
+            }
+            for (index, node) in panel.nodes.iter().enumerate() {
+                let size = std::env::var("PROBE_SIZE").ok().and_then(|s| s.split_once('x').and_then(|(w, h)| Some([w.parse().ok()?, h.parse().ok()?]))).unwrap_or([700.0, 800.0]);
+                let placed = panel.placed(index, size).rect;
+                let scripts: Vec<&str> = node.scripts.iter().map(|(name, _)| name.as_str()).collect();
+                let image = node.image.map(|image| (image.sprite, image.color, image.kind));
+                let text = node.text.as_ref().map(|t| (t.text.clone(), t.font, t.size, t.style, t.horizontal, t.vertical, t.color));
+                println!("{index} {:?}{}: at {:?} size {:?} anchors {:?}-{:?} pivot {:?}; image {:?}; text {:?}; group {:?}; element {:?}; scripts {:?}", node.path, if node.active { "" } else { " (off)" }, placed, node.layout.size_delta, node.layout.anchor_min, node.layout.anchor_max, node.layout.pivot, image, text, node.group, node.element, scripts);
+            }
+        }
+        (Some("glow"), _) => {
+            let glow = trp_data::screen::malfunction_glow(&assets.install)?;
+            println!("{:?} placed on 1920 by 1080 {:?}", glow.panel.nodes[0].layout, glow.panel.placed_in(0, [1920.0, 1080.0]).rect);
+
+            for (kind, sprite, curve) in &glow.glows {
+                let last = curve.keys.last().map_or(0.0, |key| key.time);
+                println!("kind {kind}: {sprite:?}, {} keys over {last:.4} s; at 0.11 {:.3}, 0.25 {:.3}", curve.keys.len(), curve.evaluate(0.11), curve.evaluate(0.25));
+            }
+        }
+        (Some("inspectpreview"), _) => {
+            let preview = trp_data::edit_build::InspectPreview::load(&assets.install)?;
+            println!("camera: fov {} near {} far {} at {:?}; photographic exposure {:?}", preview.fov, preview.near, preview.far, preview.camera_position, preview.exposure);
+            for light in &preview.lights {
+                println!("  {:?}: kind {} on {} colour {:?} intensity {} range {} at {:?} turned {:?} mask {:#x}", light.name, light.kind, light.on, light.color, light.intensity, light.range, light.position, light.rotation, light.culling_mask);
+            }
+        }
+        // A build's tactical devices (`trp_data::tactical`): a preset by its
+        // id or name, or a weapon's key; or one device's template alone.
+        (Some("devices"), Some(wanted)) => {
+            let db = trp_data::Database::load(&assets.install)?;
+            let preset = db.presets.iter().find(|p| p.id == wanted || p.name == wanted).cloned();
+            let (devices, hierarchy) = if let Some(preset) = preset {
+                let weapon = trp_data::weapon::assemble_preset(&mut assets, &db, &preset)?;
+                println!("{} ({}) with {} nodes", preset.name, weapon.name, weapon.hierarchy.nodes.len());
+                (weapon.devices.clone(), weapon.hierarchy.clone())
+            } else if trp_data::tactical::DeviceClass::of(&db, wanted).is_some() {
+                let device = trp_data::tactical::read_alone(&mut assets, &db, wanted)?;
+                (vec![device], trp_data::unity::extract::Hierarchy::default())
+            } else {
+                let weapon = trp_data::weapon::assemble_key(&mut assets, &db, wanted)?;
+                println!("{} with {} nodes", weapon.name, weapon.hierarchy.nodes.len());
+                (weapon.devices.clone(), weapon.hierarchy.clone())
+            };
+            let name = |node: usize| hierarchy.nodes.get(node).map(|n| n.name.clone()).unwrap_or_else(|| format!("#{node}"));
+            for d in &devices {
+                let item = db.items.get(&d.template).map(|t| t.name.as_str()).unwrap_or("?");
+                println!("{} {item}: {:?}, {} modes, root {}, off {:?}, modes {:?}, gun shadow hidden {}", d.template, d.class, d.modes, name(d.root), d.off_node.map(name), d.mode_nodes.iter().map(|&n| name(n)).collect::<Vec<_>>(), d.hides_gun_shadow);
+                for l in &d.lights {
+                    println!(
+                        "  light {} mode {:?}: {} on {} colour {:?} intensity {} range {} angle {}/{} shadows {} res {} strength {} bias {} normal {} near {} cookie {:?} mask {:#x} ir {} flare {} shaft {:?}",
+                        name(l.node), l.mode, if l.spot { "spot" } else { "point" }, l.enabled, l.color, l.intensity, l.range, l.spot_angle, l.inner_spot_angle, l.shadows, l.shadow_resolution, l.shadow_strength, l.shadow_bias, l.shadow_normal_bias, l.shadow_near,
+                        l.cookie.as_ref().map(|c| (c.name.clone(), c.width, c.height, c.format)), l.culling_mask, l.infrared, l.flare, l.shaft
+                    );
+                }
+                for b in &d.lasers {
+                    println!(
+                        "  laser {} mode {:?}: start {} max {} point light {} mask {} size {} dot {:?} offset {} light range {} intensity {} factor {} angles {:?} cookie {:?} ir {}",
+                        name(b.node), b.mode, b.ray_start, b.max_distance, b.use_point_light, b.mask, b.beam_size, b.point_size, b.surface_offset, b.light_range, b.light_intensity, b.intensity_factor, b.angle_close_far, b.cookie.as_ref().map(|c| c.name.clone()), b.infrared
+                    );
+                    if let Some(m) = &b.beam {
+                        println!("    beam colour {:?} factor {} ik {} noise scale {} main {:?} noise {:?}", m.color, m.factor, m.ik_factor, m.noise_scale, m.main.as_ref().map(|t| (t.name.clone(), t.width, t.height, t.format)), m.noise.as_ref().map(|v| (v.name.clone(), v.size, v.format, v.data.len())));
+                        // The pictures' figures: the noise's bytes, and the soft
+                        // spot's middle row (its first level) by channel.
+                        if let Some(v) = &m.noise {
+                            let n = v.data.len().max(1) as f64;
+                            let mean = v.data.iter().map(|&b| b as f64).sum::<f64>() / n;
+                            let cube = v.data.iter().map(|&b| (b as f64 / 255.0).powi(3)).sum::<f64>() / n;
+                            println!("      noise bytes {}..{} mean {mean:.1}, mean of the cube {cube:.4}", v.data.iter().min().unwrap_or(&0), v.data.iter().max().unwrap_or(&0));
+                        }
+                        if let Some(t) = &m.main {
+                            if let Ok(mips) = trp_data::unity::texture::mips(t) {
+                                if let Some(first) = mips.first() {
+                                    if let Ok(rgba) = trp_data::unity::texture::decode_rgba(t, *first) {
+                                        let row = (t.height / 2) as usize * t.width as usize * 4;
+                                        let across: Vec<String> = (0..8).map(|i| {
+                                            let at = row + (i * t.width as usize / 8) * 4;
+                                            format!("{:?}", &rgba[at..at + 4])
+                                        }).collect();
+                                        println!("      main's middle row: {}", across.join(" "));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(m) = &b.point {
+                        println!("    dot colour {:?} factor {} ik {} min fov {} size by view {:?} max dist {} main {:?} noise {:?}", m.color, m.factor, m.ik_factor, m.min_fov, m.size_view, m.max_dist, m.main.as_ref().map(|t| (t.name.clone(), t.width, t.height, t.format)), m.noise.as_ref().map(|t| (t.name.clone(), t.width, t.height, t.format)));
+                    }
+                }
+                for (node, mode) in &d.flares {
+                    println!("  flare {} mode {mode:?}", name(*node));
+                }
+            }
+        }
+        (Some("sights"), Some(wanted)) => {
+            let db = trp_data::Database::load(&assets.install)?;
+            let weapon = trp_data::weapon::assemble_key(&mut assets, &db, wanted)?;
+            let h = &weapon.hierarchy;
+            println!("{} with {} nodes", weapon.name, h.nodes.len());
+            for s in &weapon.skipped {
+                println!("  SKIPPED {s}");
+            }
+            for part in &weapon.sights {
+                let name = db.items.get(&part.template).map(|t| t.name.as_str()).unwrap_or("?");
+                println!("{} {name} on {} (root [{}] {}){}{}", part.template, h.nodes[part.slot_bone].name, part.root, h.nodes[part.root].name, if part.iron { " iron" } else { "" }, if part.on_sight { " on a sight" } else { "" });
+                for (s, scope) in part.scopes.iter().enumerate() {
+                    println!("  scope {s}: {} modes, zooms {:?}, sensitivity {:?}, distances {:?}", scope.modes, scope.zooms, scope.sensitivity, scope.calibration);
+                }
+                if let Some(a) = &part.adjustable {
+                    println!("  adjustable: fov {:?} speed {} zoom sensitivity {} aiming sensitivity {:?}", a.fov, a.speed, a.zoom_sensitivity, a.sensitivity);
+                }
+                if !part.custom_aim_plane.is_empty() {
+                    println!("  custom aim plane {:?}", part.custom_aim_plane);
+                }
+                println!("  prefab cache {}, eyecup shift {}", part.has_prefab_cache, part.eye_guard_shift);
+                if let Some(turned) = &part.angle_by_range {
+                    println!("  turns [{}] {} by the zeroing distance: {:?}", turned.axis, h.nodes[turned.axis].name, turned.table);
+                }
+                if let Some(curve) = &part.zoom_curve {
+                    println!("  zoom curve {:?}", curve.keys);
+                }
+                if let Some(ring) = &part.zoom_ring {
+                    println!("  zoom ring [{}] {}: start {:?} end {:?} inverse {}", ring.node, h.nodes[ring.node].name, ring.start, ring.end, ring.inverse);
+                }
+                for (m, mode) in part.modes.iter().enumerate() {
+                    let node = |n: Option<usize>| n.map(|n| format!("[{n}] {}", h.nodes[n].name)).unwrap_or_else(|| "-".into());
+                    let optic = mode.optic.as_ref().map(|o| format!("optic {} bone {} distance {} fov {:?} camera {}", node(Some(o.node)), node(o.bone), o.distance_to_camera, o.field_of_view, node(o.camera))).unwrap_or_else(|| "no optic".into());
+                    println!("  mode {m}: object {} {optic} collimator {} ignore-plane {}", node(mode.node), node(mode.collimator), mode.ignore_optics_for_camera_plane);
+                    if let Some(o) = &mode.optic {
+                        println!("    near {:?}, lens {}, aberration {}{}", o.near, node(o.lens), o.aberration, if o.thermal_at_45 { ", thermal at 45" } else { "" });
+                        if let Some(r) = &o.reticle {
+                            let moved = r.shape.as_ref().map_or(0, |s| s.iter().filter(|d| d.iter().any(|c| *c != 0.0)).count());
+                            println!("    reticle: {} vertices, {} triangles, {} moved by its blend shape, at {:?} turned {:?}, scale {}, colour {:?}", r.positions.len(), r.triangles.len() / 3, moved, r.position, r.rotation, r.scale, r.color);
+                        }
+                    }
+                }
+                for lens in &part.lenses {
+                    println!("  lens piece [{}] {} slot {}: {:?}", lens.node, h.nodes[lens.node].name, lens.slot, lens.kind);
+                }
+            }
+            for fold in &weapon.folding_sights {
+                println!("folds: [{}] {} mode {}", fold.node, h.path(fold.node), if fold.mode_on { "On" } else { "Off" });
+            }
+            for (i, node) in h.nodes.iter().enumerate() {
+                if node.name.contains("aim_camera") {
+                    println!("aim bone [{i}] {} active {}", h.path(i), node.active);
+                }
+            }
+        }
         (Some("weapon"), Some(template)) => {
             use trp_data::unity::extract::{read_material, read_mesh, read_texture};
             let db = trp_data::Database::load(&assets.install)?;
-            let weapon = trp_data::weapon::assemble_named(&mut assets, &db, template)?;
+            // The materials' shaders are in the shaders' bundle.
+            if std::env::var("TRP_PROBE_FIGURES").is_ok() {
+                assets.load("shaders")?;
+            }
+            // A template or a name, or a build by its key (`5447...[mod_...]`).
+            let weapon = if template.contains('[') { trp_data::weapon::assemble_key(&mut assets, &db, template)? } else { trp_data::weapon::assemble_named(&mut assets, &db, template)? };
             println!("{} with {} nodes", weapon.name, weapon.hierarchy.nodes.len());
             for s in &weapon.skipped {
                 println!("  SKIPPED {s}");
@@ -1677,7 +2647,11 @@ fn main() -> Result<()> {
                 for (i, node) in weapon.hierarchy.nodes.iter().enumerate() {
                     let path = weapon.hierarchy.path(i);
                     if path.contains(filter) {
-                        println!("  [{i}] {path}  at {:?} rot {:?}", node.translation, node.rotation);
+                        println!("  [{i}] {path}  at {:?} rot {:?} scale {:?} active {}", node.translation, node.rotation, node.scale, node.active);
+                        // A skinned mesh's bones, by their places in the tree.
+                        if let Some(renderer) = node.renderer.as_ref().filter(|renderer| renderer.skinned) {
+                            println!("      on bones {:?}", renderer.bones);
+                        }
                     }
                 }
                 return Ok(());
@@ -1698,13 +2672,22 @@ fn main() -> Result<()> {
                 let mesh = read_mesh(&assets, r.mesh)?;
                 let tris: usize = mesh.submeshes.iter().map(|s| s.len() / 3).sum();
                 println!(
-                    "  [{i}] {}  mesh={} verts={} tris={} skinned={}",
+                    "  [{i}] {}  mesh={} verts={} tris={} skinned={} (weights {}, joints {}, bind poses {}, bones {})",
                     weapon.hierarchy.path(i),
                     mesh.name,
                     mesh.positions.len(),
                     tris,
-                    r.skinned
+                    r.skinned,
+                    mesh.weights.len(),
+                    mesh.joints.len(),
+                    mesh.bind_poses.len(),
+                    r.bones.len()
                 );
+                // Each submesh's topology and index count, as stored.
+                if let Some(sub) = assets.read(r.mesh).ok().and_then(|value| value.get("m_SubMeshes").and_then(|subs| subs.as_array().map(|subs| subs.to_vec()))) {
+                    let told: Vec<String> = sub.iter().map(|sm| format!("{:?}/{:?}", sm.get("topology").and_then(|t| t.as_i64()), sm.get("indexCount").and_then(|c| c.as_i64()))).collect();
+                    println!("      submeshes (topology/indices): {}", told.join(" "));
+                }
                 for m in r.materials.iter().flatten() {
                     let mat = read_material(&assets, *m)?;
                     let mut textures: Vec<String> = Vec::new();
@@ -1714,6 +2697,21 @@ fn main() -> Result<()> {
                     }
                     textures.sort();
                     println!("        material {}: {}", mat.name, textures.join("; "));
+                    // With `TRP_PROBE_FIGURES` set, its floats and colours too
+                    // (what tells which shader it was drawn by).
+                    if std::env::var("TRP_PROBE_FIGURES").is_ok() {
+                        let mut figures: Vec<String> = mat.floats.iter().map(|(k, v)| format!("{k}={v}")).chain(mat.colors.iter().map(|(k, v)| format!("{k}={v:?}"))).collect();
+                        figures.sort();
+                        let value = assets.read(*m)?;
+                        let shader = value
+                            .get("m_Shader")
+                            .and_then(trp_data::unity::Value::as_pptr)
+                            .and_then(|p| assets.resolve_loaded(m.file, p))
+                            .and_then(|s| assets.read(s).ok()?.get("m_ParsedForm")?.get("m_Name")?.as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "?".into());
+                        let queue = value.get("m_CustomRenderQueue").and_then(trp_data::unity::Value::as_i64).unwrap_or(-1);
+                        println!("          shader {shader:?}, queue {queue}; {} {}", mat.keywords.join(" "), figures.join(" "));
+                    }
                 }
             }
         }
@@ -1861,6 +2859,18 @@ fn main() -> Result<()> {
                     }
                     Err(e) => println!("{class:<16} {:<52} {} not read: {e:#}", item.name, item.id),
                 }
+            }
+        }
+        (Some("grenade"), Some(bundle)) => {
+            // A grenade's prefab beyond the hands: the parts a throw lets go
+            // of, and the grenade thrown with its body and colliders.
+            let rig = trp_data::weapon::assemble_prefab(&mut assets, bundle)?;
+            let data = trp_data::grenade::GrenadeData::read(&assets, &rig)?;
+            println!("throwing parts {:?}", data.throwing_parts);
+            println!("offset {:?}, collision sound {}", data.offset, data.collision_sound);
+            println!("body {:?}", data.body);
+            for (index, node) in data.thrown.nodes.iter().enumerate() {
+                println!("[{index}] {} under {:?} at {:?} turned {:?} scaled {:?}, drawn {}, colliders {:?}", node.name, node.parent, node.translation, node.rotation, node.scale, node.renderer.is_some(), node.colliders);
             }
         }
         (Some("states"), Some(template)) => {
@@ -2013,6 +3023,11 @@ fn main() -> Result<()> {
             for (name, value) in settings.numbers() {
                 if wanted(name) {
                     println!("{name} = {value}");
+                }
+            }
+            for (name, [x, y, z]) in settings.vectors() {
+                if wanted(name) {
+                    println!("{name} = ({x}, {y}, {z})");
                 }
             }
             for (name, curve) in settings.curves() {
@@ -2472,6 +3487,16 @@ fn main() -> Result<()> {
                             clips.join(", "),
                             state.blend_parameter.as_ref().map_or(String::new(), |p| format!("  by {p}"))
                         );
+                        // The script's own curve by the state's time
+                        // (`SmoothLerpAnimCurve`), each key with its slopes.
+                        if let Some(curve) = state.movement.as_ref().and_then(|m| m.curve.as_ref()) {
+                            let keys: Vec<String> = curve
+                                .keys
+                                .iter()
+                                .map(|k| format!("{:.4}: {:.4} (in {:.4}, out {:.4})", k.time, k.value, k.in_slope, k.out_slope))
+                                .collect();
+                            println!("      curve {}", keys.join(", "));
+                        }
                         if let Some(pose) = state.movement.as_ref().and_then(|m| m.first_person_pose.as_ref()) {
                             let keys: Vec<String> =
                                 pose.blend.keys.iter().map(|k| format!("{:.3}: {:.3}", k.time, k.value)).collect();
@@ -2694,6 +3719,18 @@ fn main() -> Result<()> {
                     let [x, y, w, h] = panel.placed(index, size).rect;
                     let text = node.text.as_ref().map(|t| format!(" text {:?} size {} align {}/{} margin {:?}", t.text, t.size, t.horizontal, t.vertical, t.margin)).unwrap_or_default();
                     println!("  {:50} {} ({x:.1}, {y:.1}) {w:.1} x {h:.1}{text}", node.path, if node.active { "on " } else { "off" });
+                    // The tag's and the caption's own placing, and the
+                    // tag's picture (`tags` as the third word).
+                    let wanted = match arg(3) {
+                        Some("tags") => node.path.contains("Tag") || node.path.contains("Caption"),
+                        Some("wish") => node.path.contains("Wishlist") || node.path.contains("BottomLeft") || node.path.contains("ArmorClass") || node.path.contains("ModIcon"),
+                        _ => false,
+                    };
+                    if wanted {
+                        let l = &node.layout;
+                        let image = node.image.as_ref().map(|image| format!(" image kind {} color {:?} sprite {:?}", image.kind, image.color, image.sprite)).unwrap_or_default();
+                        println!("      anchors {:?}-{:?} at {:?} size {:?} pivot {:?} element {:?} group {:?}{image}", l.anchor_min, l.anchor_max, l.offset, l.size_delta, l.pivot, node.element, node.group);
+                    }
                 }
             }
         }
@@ -2761,6 +3798,25 @@ fn main() -> Result<()> {
                 }
             }
             println!("the master's compressor: {:?}", mixer.master_compressor());
+            println!("{} exposed parameters", mixer.exposed.len());
+            // The names the game sets (`AudioMixerDataContainer`), or those asked.
+            let asked: Vec<String> = std::env::args().skip(2).collect();
+            let names: Vec<String> = if asked.is_empty() {
+                ["GunsVolume", "MainVolume", "InGame", "WorldVolume", "WorldLowpassFreq", "Tinnitus1", "Tinnitus2", "ReverbVolume", "OutEnvironmentVolume", "MasterVolume", "UIVolume"].map(str::to_owned).to_vec()
+            } else {
+                asked
+            };
+            for name in names {
+                match mixer.exposed(&name) {
+                    Some(trp_data::sound::Exposed::Volume { group }) => println!("  {name}: the volume of {}", mixer.groups[group].name),
+                    Some(trp_data::sound::Exposed::Effect { group, effect, parameter }) => {
+                        let e = &mixer.groups[group].effects[effect];
+                        let target = e.target.map(|t| mixer.groups[t].name.clone());
+                        println!("  {name}: parameter {parameter} ({:?}) of effect {effect} (kind {}) of {}, sending to {target:?}", e.parameters.get(parameter), e.kind, mixer.groups[group].name);
+                    }
+                    None => println!("  {name}: not found"),
+                }
+            }
         }
         (Some("tree"), Some(key)) => {
             for file in assets.load(key)? {
@@ -2883,6 +3939,144 @@ fn main() -> Result<()> {
         // A weapon that is not the install's (`trp_data::custom`), by its
         // item template: what its file made of it. `custom` alone lists
         // them, with whatever was left out and why.
+        // A particle system and every one below it: each one's object, the
+        // modules it has on, its shape's kind, its bursts, how its renderer
+        // draws and with what shader (particles spec). `probe particles
+        // <bundle> <the system's id>`.
+        (Some("particles"), Some(key)) => {
+            let id: i64 = arg(2).ok_or_else(|| anyhow::anyhow!("a system's id needed"))?.parse()?;
+            assets.load("shaders")?;
+            let files = assets.load(key)?;
+            let Some(&file) = files.iter().find(|&&f| assets.info(ObjRef { file: f, path_id: id }).is_some()) else { bail!("no object {id} in {key}") };
+            let system = ObjRef { file, path_id: id };
+            let game_object_of = |assets: &Assets, obj: ObjRef| assets.read(obj).ok()?.get("m_GameObject")?.as_pptr().and_then(|p| assets.resolve_loaded(obj.file, p));
+            let components_of = |assets: &Assets, go: ObjRef| -> Vec<ObjRef> {
+                assets.read(go).ok().and_then(|g| g.get("m_Component")?.as_array().map(|all| all.iter().filter_map(|pair| pair.get("component")?.as_pptr()).filter_map(|p| assets.resolve_loaded(go.file, p)).collect())).unwrap_or_default()
+            };
+            let mut stack = vec![(game_object_of(&assets, system).ok_or_else(|| anyhow::anyhow!("no game object"))?, 0usize)];
+            while let Some((go, depth)) = stack.pop() {
+                let name = assets.read(go)?.get("m_Name").and_then(|n| n.as_str()).unwrap_or("").to_owned();
+                let components = components_of(&assets, go);
+                let mut line = format!("{}{name}", "  ".repeat(depth));
+                for &c in &components {
+                    match assets.info(c).map(|i| i.class_id) {
+                        Some(class::PARTICLE_SYSTEM) => {
+                            let s = assets.read(c)?;
+                            let on: Vec<&str> = s.entries().filter(|(k, v)| k.ends_with("Module") && v.get("enabled").and_then(|e| e.as_bool()) == Some(true)).map(|(k, _)| k.trim_end_matches("Module")).collect();
+                            let shape = s.get("ShapeModule").filter(|m| m.get("enabled").and_then(|e| e.as_bool()) == Some(true)).and_then(|m| m.get("type")).and_then(|t| t.as_i64());
+                            let bursts = s.at("EmissionModule.m_Bursts").and_then(|b| b.as_array()).map_or(0, |b| b.len());
+                            let rate = s.at("EmissionModule.rateOverTime.scalar").and_then(|r| r.as_f32()).unwrap_or(0.0);
+                            line += &format!(" [{}: {} space, shape {shape:?}, {bursts} bursts, rate {rate}, {} s{}]", c.path_id, ["local", "world", "custom"].get(s.get("moveWithTransform").and_then(|m| m.as_i64()).unwrap_or(0) as usize).unwrap_or(&"?"), s.get("lengthInSec").and_then(|l| l.as_f32()).unwrap_or(0.0), if s.get("looping").and_then(|l| l.as_bool()) == Some(true) { " looping" } else { "" });
+                            line += &format!(" {}", on.join(" "));
+                        }
+                        Some(class::PARTICLE_SYSTEM_RENDERER) => {
+                            let r = assets.read(c)?;
+                            let shader = r
+                                .get("m_Materials")
+                                .and_then(|m| m.as_array())
+                                .and_then(|all| all.first())
+                                .and_then(|m| m.as_pptr())
+                                .and_then(|p| assets.resolve_loaded(c.file, p))
+                                .and_then(|m| assets.read(m).ok()?.get("m_Shader")?.as_pptr().and_then(|p| assets.resolve_loaded(m.file, p)))
+                                .and_then(|s| assets.read(s).ok()?.get("m_ParsedForm")?.get("m_Name")?.as_str().map(str::to_owned))
+                                .unwrap_or_default();
+                            line += &format!(" | drawn {} with {shader}", r.get("m_RenderMode").and_then(|m| m.as_i64()).unwrap_or(-1));
+                        }
+                        Some(class::MONO_BEHAVIOUR) => {
+                            if let Some(script) = trp_data::unity::extract::script_class(&assets, c) {
+                                line += &format!(" <{script}>");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                println!("{line}");
+                // Its transform's children, in their order.
+                if let Some(&transform) = components.first() {
+                    let children: Vec<ObjRef> = assets.read(transform)?.get("m_Children").and_then(|c| c.as_array()).map(|all| all.iter().filter_map(|c| c.as_pptr()).filter_map(|p| assets.resolve_loaded(transform.file, p)).collect()).unwrap_or_default();
+                    for child in children.into_iter().rev() {
+                        if let Some(child_go) = game_object_of(&assets, child) {
+                            stack.push((child_go, depth + 1));
+                        }
+                    }
+                }
+            }
+        }
+        // Every weapon's muzzle effects as the game chooses them (the
+        // deepest `MuzzleEffect`s and `extractor_smoke`): each object's
+        // path, its jets and smokes, and where it is from the fireport in
+        // the weapon bone's axes, in centimetres. `probe muzzles [part of
+        // a caliber's name]`.
+        (Some("muzzles"), wanted) => {
+            let db = trp_data::Database::load(&assets.install)?;
+            let mut all: Vec<_> = db
+                .items
+                .values()
+                .filter(|item| item.name.starts_with("weapon_") && db.is_a(item, "Weapon") && db.default_preset(&item.id).is_ok())
+                .filter(|item| wanted.is_none_or(|w| item.props.get("ammoCaliber").and_then(|c| c.as_str()).is_some_and(|c| c.contains(w))))
+                .map(|item| (item.name.clone(), item.id.clone(), item.props.get("ammoCaliber").and_then(|c| c.as_str()).unwrap_or("").to_owned()))
+                .collect();
+            all.sort();
+            let rotate = |q: [f32; 4], v: [f32; 3]| {
+                let u = [q[0], q[1], q[2]];
+                let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+                let t = cross(u, v).map(|c| 2.0 * c);
+                let c = cross(u, t);
+                [v[0] + q[3] * t[0] + c[0], v[1] + q[3] * t[1] + c[1], v[2] + q[3] * t[2] + c[2]]
+            };
+            let back = |q: [f32; 4]| [-q[0], -q[1], -q[2], q[3]];
+            for (name, id, caliber) in all {
+                let weapon = match trp_data::weapon::assemble(&mut assets, &db, &id) {
+                    Ok(weapon) => weapon,
+                    Err(e) => {
+                        println!("{name} {caliber}: not assembled: {e:#}");
+                        continue;
+                    }
+                };
+                let h = &weapon.hierarchy;
+                let from_root = |mut node: usize| {
+                    let (mut place, mut turn) = ([0.0f32; 3], [0.0f32, 0.0, 0.0, 1.0]);
+                    loop {
+                        let n = &h.nodes[node];
+                        let scaled = [place[0] * n.scale[0], place[1] * n.scale[1], place[2] * n.scale[2]];
+                        let turned = rotate(n.rotation, scaled);
+                        place = [turned[0] + n.translation[0], turned[1] + n.translation[1], turned[2] + n.translation[2]];
+                        turn = trp_data::unity::extract::quat_mul(n.rotation, turn);
+                        match n.parent {
+                            Some(up) => node = up,
+                            None => return (place, turn),
+                        }
+                    }
+                };
+                let bone = (0..h.nodes.len()).find(|&i| h.path(i) == trp_data::custom::WEAPON_BONE);
+                let fireport = (0..h.nodes.len()).find(|&i| h.nodes[i].name == "fireport");
+                let in_weapon = |node: usize| {
+                    let (at, turn) = from_root(node);
+                    let (bone_at, bone_turn) = bone.map(from_root).unwrap_or(([0.0; 3], [0.0, 0.0, 0.0, 1.0]));
+                    let fire_at = fireport.map(|f| from_root(f).0).unwrap_or(bone_at);
+                    (rotate(back(bone_turn), [at[0] - fire_at[0], at[1] - fire_at[1], at[2] - fire_at[2]]).map(|c| c * 100.0), trp_data::unity::extract::quat_mul(back(bone_turn), turn))
+                };
+                let muzzle = weapon.muzzle.as_ref();
+                println!("{name} {id} {caliber}: fireport {}", fireport.map_or("none".to_owned(), |f| h.path(f)));
+                for node in trp_data::muzzle::effect_objects(h) {
+                    let jets = muzzle.map_or(0, |m| m.jets.iter().filter(|jet| jet.node == node).count());
+                    let smokes = muzzle.map_or(0, |m| m.smokes.iter().filter(|smoke| smoke.node == node).count());
+                    let (at, turn) = in_weapon(node);
+                    println!(
+                        "  {} ({}): {jets} jets, {smokes} smokes, at {:.2} {:.2} {:.2} from the fireport, turned {:.3} {:.3} {:.3} {:.3}",
+                        h.path(node),
+                        h.nodes[node].scripts.join(" "),
+                        at[0],
+                        at[1],
+                        at[2],
+                        turn[0],
+                        turn[1],
+                        turn[2],
+                        turn[3]
+                    );
+                }
+            }
+        }
         (Some("custom"), which) => {
             let db = trp_data::Database::load(&assets.install)?;
             for note in &db.custom_notes {
@@ -2898,6 +4092,65 @@ fn main() -> Result<()> {
                 "{}: {:.3} kg loaded, ergonomics {}, {} cells wide, a magazine of {:?}, held closer {}",
                 weapon.name, weapon.total_weight, weapon.total_ergonomics, weapon.cell_width, weapon.magazine_capacity, weapon.held_closer
             );
+            // What the effects of a shot and a magazine's rounds find on it.
+            let rounds = weapon.hierarchy.nodes.iter().filter(|node| node.name.starts_with("patron_")).count();
+            println!(
+                "  shell port {:?}, extraction {}, muzzle {}, rounds' points {rounds}",
+                weapon.shell_port.map(|node| weapon.hierarchy.path(node)),
+                weapon.extraction.is_some(),
+                weapon.muzzle.as_ref().map_or("none".to_owned(), |m| format!("{} jets, {} smokes", m.jets.len(), m.smokes.len()))
+            );
+            // The magazine's mesh's bounds and its rounds' points, in the
+            // axes of the weapon bone at rest (the part's), in centimetres.
+            let h = &weapon.hierarchy;
+            let rotate = |q: [f32; 4], v: [f32; 3]| {
+                let u = [q[0], q[1], q[2]];
+                let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+                let t = cross(u, v).map(|c| 2.0 * c);
+                let c = cross(u, t);
+                [v[0] + q[3] * t[0] + c[0], v[1] + q[3] * t[1] + c[1], v[2] + q[3] * t[2] + c[2]]
+            };
+            let magazine = custom.parts.iter().find(|part| h.path(part.node).contains("/mod_magazine/"));
+            for index in (0..h.nodes.len()).filter(|&index| h.nodes[index].name.starts_with("patron_")) {
+                let mut at = [0.0f32; 3];
+                let mut node = index;
+                let mut inside = false;
+                while let Some(parent) = h.nodes[node].parent {
+                    let n = &h.nodes[node];
+                    at = rotate(n.rotation, at);
+                    at = [at[0] + n.translation[0], at[1] + n.translation[1], at[2] + n.translation[2]];
+                    if magazine.is_some() && h.path(parent) == trp_data::custom::WEAPON_BONE {
+                        inside = true;
+                        break;
+                    }
+                    node = parent;
+                }
+                if inside {
+                    println!("    {} at {:.2} {:.2} {:.2} in the magazine's axes", h.nodes[index].name, at[0] * 100.0, at[1] * 100.0, at[2] * 100.0);
+                } else {
+                    println!("    {}", h.path(index));
+                }
+            }
+            if let Some(part) = magazine {
+                let (mut low, mut high) = ([f32::MAX; 3], [f32::MIN; 3]);
+                for p in &part.mesh.positions {
+                    (0..3).for_each(|k| (low[k], high[k]) = (low[k].min(p[k]), high[k].max(p[k])));
+                }
+                println!("    its mesh from {:.2} {:.2} {:.2} to {:.2} {:.2} {:.2}", low[0] * 100.0, low[1] * 100.0, low[2] * 100.0, high[0] * 100.0, high[1] * 100.0, high[2] * 100.0);
+                // Its top, slab by slab: where its walls are at each height.
+                // (The weapon bone's axes: x across, -y along the barrel,
+                // z up.)
+                for slab in 0..8 {
+                    let top = high[2] - slab as f32 * 0.005;
+                    let (mut l, mut r) = ([f32::MAX; 3], [f32::MIN; 3]);
+                    for p in part.mesh.positions.iter().filter(|p| p[2] <= top && p[2] > top - 0.005) {
+                        (0..3).for_each(|k| (l[k], r[k]) = (l[k].min(p[k]), r[k].max(p[k])));
+                    }
+                    if l[0] <= r[0] {
+                        println!("    {:.2} to {:.2} up: across {:.2} to {:.2}, along {:.2} to {:.2}", (top - 0.005) * 100.0, top * 100.0, l[0] * 100.0, r[0] * 100.0, l[1] * 100.0, r[1] * 100.0);
+                    }
+                }
+            }
             for part in &custom.parts {
                 let triangles: usize = part.mesh.submeshes.iter().map(|s| s.len() / 3).sum();
                 println!("  {} on {}: {} vertices, {triangles} triangles", part.mesh.name, weapon.hierarchy.path(weapon.hierarchy.nodes[part.node].parent.unwrap_or(0)), part.mesh.positions.len());
@@ -3160,13 +4413,19 @@ fn print_node(assets: &Assets, transform: ObjRef, depth: usize) -> Result<()> {
     if let Some(go_ref) = assets.resolve_loaded(transform.file, go_ptr) {
         let go = assets.read(go_ref)?;
         name = go.get("m_Name").and_then(|n| n.as_str()).unwrap_or("").to_owned();
+        // An object switched off, and a component that is (`m_Enabled` 0):
+        // each marked.
+        if go.get("m_IsActive").and_then(|v| v.as_i64()).is_some_and(|on| on == 0) {
+            name += " [off]";
+        }
         for c in go.req("m_Component")?.as_array().unwrap_or(&[]) {
             let Some(ptr) = c.get("component").and_then(|p| p.as_pptr()) else { continue };
             let Some(obj) = assets.resolve_loaded(go_ref.file, ptr) else { continue };
+            let off = || assets.read(obj).ok().and_then(|v| v.get("m_Enabled").and_then(|e| e.as_i64())).is_some_and(|on| on == 0);
             match assets.class_id(obj) {
                 Some(class::TRANSFORM) | None => {}
-                Some(class::MONO_BEHAVIOUR) => components.push(script_name(assets, obj)),
-                Some(id) => components.push(class_label(id)),
+                Some(class::MONO_BEHAVIOUR) => components.push(script_name(assets, obj) + if off() { " (off)" } else { "" }),
+                Some(id) => components.push(class_label(id).to_string() + if off() { " (off)" } else { "" }),
             }
         }
     }

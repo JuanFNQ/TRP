@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use trp_data::curve::Curve;
 use trp_data::states::{AnimState, FirstPersonPose};
 use trp_data::unity::Assets;
 
@@ -56,6 +57,15 @@ pub const FINGER_BONES: usize = 15;
 /// elbows bend toward, right then left. They hang from the last spine bone.
 const BEND_GOALS: usize = LEFT_FINGERS + FINGER_BONES;
 const BEND_GOAL_NAMES: [&str; 2] = ["Bend_Goal_Right", "Bend_Goal_Left"];
+/// Then the object the first-person camera hangs in (`Player.CameraContainer`,
+/// whose child `Cam` is the camera): beside the ribcage on the last spine
+/// bone, at the ribcage's own rest place, never animated. Where a clip
+/// shifts the ribcage on its spine (blind fire's), the camera stays here
+/// (blind-fire spec, "The weapon and the camera").
+const CAMERA_CONTAINER: usize = BEND_GOALS + BEND_GOAL_NAMES.len();
+const CAMERA_CONTAINER_NAME: &str = "CameraContainer";
+/// The bones a host asked to have posed come after it.
+const DRAWN_FROM: usize = CAMERA_CONTAINER + 1;
 
 /// The paths of a hand's finger bones below its palm, in that order. The
 /// skeleton numbers the fingers 1 to 5 and each one's bones 1 to 3.
@@ -99,7 +109,8 @@ pub struct ArmPose {
 }
 
 /// The states whose clips are read: standing, walking, sprinting, jumping,
-/// lying down and vaulting on the base layer, the layers that bend the
+/// lying down, vaulting and blind fire on the base layer, the layers that
+/// shift the ribcage for blind fire and that bend the
 /// body with the view, the layer of the hands' gestures on the world
 /// and of the open inventory's pose (`docs/spec/interactions.md`), and
 /// what only a character seen from outside plays: the body's own part in
@@ -109,7 +120,17 @@ pub struct ArmPose {
 /// are left out until the movement reaches them; the animator never
 /// enters a state that was left out.
 fn wanted(state: &AnimState) -> bool {
-    const READ: [&str; 30] = [
+    const READ: [&str; 35] = [
+        // The left shoulder's layer (left-shoulder spec, "The body").
+        "LS.",
+        // Blind fire's four states, and the layer that shifts the ribcage
+        // for it in one's own eyes (`docs/spec/blind-fire.md`, "The body").
+        // (`FP_TurnTorsoOnDeltaRotation`, which no transition enters, is
+        // left out.)
+        "Base Layer.Stand.BlindFire_",
+        "Additive_FP_Offsets.INACTIVE",
+        "Additive_FP_Offsets.FP_BlindFire_RibcageOffset TOP",
+        "Additive_FP_Offsets.FP_BlindFire_RibcageOffset R",
         // Seen from outside only.
         "Weapon.INACTIVE",
         "Weapon.INACTIVE_PRONE",
@@ -171,6 +192,7 @@ pub mod movement_state {
     pub const CLIMB_UP: i32 = 25;
     pub const VAULTING_FALL_DOWN: i32 = 26;
     pub const VAULTING_LANDING: i32 = 27;
+    pub const BLIND_FIRE: i32 = 28;
 }
 
 /// The kind of thing in the hands, as the body's animator is told it: the
@@ -273,6 +295,12 @@ struct Ids {
     third_person_float: Option<usize>,
     first_action: Option<usize>,
     speed_draw: Option<usize>,
+    blind_fire: Option<usize>,
+    blind_fire_float: Option<usize>,
+    prone_bipods: Option<usize>,
+    left_stance: Option<usize>,
+    force_left_stance: Option<usize>,
+    left_stance_curve: Option<usize>,
 }
 
 /// The two layers of the body's animator the game weighs by who is
@@ -307,11 +335,19 @@ pub struct BodyData {
     /// When in its state the gesture of a backpack's drop has the mark
     /// for the pack leaving the shoulders, as a share of the state.
     backpack_drop: Option<f32>,
+    /// When in each of the bipod's states its toggle's mark comes.
+    bipod_marks: [Option<f32>; 4],
+    /// When in its state each move over an obstacle has each of its four
+    /// sound marks, as a share of the state (`VAULT_STATES`, `VAULT_MARKS`).
+    vault_marks: [[Option<f32>; 4]; 3],
     /// Which of the further bones asked for are the neck and the head,
     /// and the share of the free look's turn each takes
     /// (`PlayerBones.NeckChain`, `HeadChain`).
     head_bones: [Option<usize>; 2],
     head_shares: [f32; 2],
+    /// Blind fire's curves by the state's time (`SmoothLerpAnimCurve`), by
+    /// part (the way in, the way out) and side (over the top, to the right).
+    blind_curves: [[Option<Curve>; 2]; 2],
 }
 
 /// The neck and the head, by the ends of their paths on the skeleton.
@@ -338,6 +374,30 @@ pub type Pose = Vec<([f32; 3], [f32; 4])>;
 /// mark in it the game's logic waits for.
 const BACKPACK_DROP: &str = "InteractionsLayer.10 Backpack Drop";
 const BACKPACK_DROP_MARK: &str = "OnBackpackDrop";
+
+/// The interactions layer's four states for the bipod, and the mark in each
+/// the bipod's toggle ends on (`probe bodystates bipod`: at 0.5 putting it
+/// out, 0.6 folding it; mounting spec, "The bipod").
+const BIPOD_STATES: [&str; 4] = [
+    "InteractionsLayer.31 Bipod Forward On",
+    "InteractionsLayer.32 Bipod Forward Off",
+    "InteractionsLayer.33 Bipod Backward On ",
+    "InteractionsLayer.34 Bipod Backward Off",
+];
+const BIPOD_MARK: &str = "OnBipodToggle";
+
+/// The three moves over an obstacle, by the states that play them, in the
+/// order of the game's `EVaultingSoundType` less its none: a vault, a
+/// sprint's vault, a climb (footsteps spec, "The vault's sounds").
+pub const VAULT_STATES: [&str; 3] = ["Base Layer.Vaulting.Vault", "Base Layer.Vaulting.Sprint_vault", "Base Layer.Vaulting.Climb_on"];
+
+/// Each move's four marks, events of its state (`IVaultingSoundsEvents`):
+/// start, grab, slide, end, in the order of `EVaultingSoundState`.
+pub const VAULT_MARKS: [[&str; 4]; 3] = [
+    ["OnVaultStart", "OnVaultGrab", "OnVaultSlide", "OnVaultEnd"],
+    ["OnSprintVaultStart", "OnSprintVaultGrab", "OnSprintVaultSlide", "OnSprintVaultEnd"],
+    ["OnClimbStart", "OnClimbGrab", "OnClimbSlide", "OnClimbEnd"],
+];
 
 impl BodyData {
     pub fn load(assets: &mut Assets) -> Result<Self> {
@@ -367,6 +427,7 @@ impl BodyData {
         let mut paths: Vec<String> = BONES.iter().map(|path| (*path).to_owned()).collect();
         paths.extend(finger_paths(BONES[ARMS[1][5]], 'L'));
         paths.extend(BEND_GOAL_NAMES.iter().map(|name| format!("{}/{name}", BONES[4])));
+        paths.push(format!("{}/{CAMERA_CONTAINER_NAME}", BONES[4]));
         paths.extend(drawn.iter().cloned());
         let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
         let bones = trp_data::body::bones(assets, &paths)?
@@ -374,6 +435,11 @@ impl BodyData {
             .map(|b| BoneRest { path: b.path, position: b.position, rotation: b.rotation, scale: None })
             .collect();
         let backpack_drop = table.states.iter().find(|state| state.full_name == BACKPACK_DROP).and_then(|state| state.event_time(BACKPACK_DROP_MARK));
+        let bipod_marks = BIPOD_STATES.map(|name| table.states.iter().find(|state| state.full_name == name).and_then(|state| state.event_time(BIPOD_MARK)));
+        let vault_marks = std::array::from_fn(|kind| {
+            let state = table.states.iter().find(|state| state.full_name == VAULT_STATES[kind]);
+            std::array::from_fn(|mark| state.and_then(|state| state.event_time(VAULT_MARKS[kind][mark])))
+        });
         let mut controller = Controller::load(assets, &table, bones, &wanted)?;
         // The first bone followed is the one the clips move along the ground.
         controller.root_bone = Some(0);
@@ -436,6 +502,12 @@ impl BodyData {
             third_person_float: id("ThirdPersonFloat"),
             first_action: id("FirstAction"),
             speed_draw: id("SpeedDraw"),
+            blind_fire: id("BlindFire"),
+            blind_fire_float: id("BlindFireFloat"),
+            prone_bipods: id("ProneBipodsOn"),
+            left_stance: id("LeftStance"),
+            force_left_stance: id("ForceLeftStanceInOneFrame"),
+            left_stance_curve: id("Leftstance_curve"),
         };
         let base = controller.layers.first().map_or(0, |layer| layer.machine);
         let sidestep_length = controller
@@ -446,6 +518,16 @@ impl BodyData {
             .filter_map(|state| state.movement.as_ref())
             .find(|script| script.state == movement_state::SIDESTEP && script.kind == part::IN)
             .map_or(0.0, |script| script.length);
+        // Blind fire's curves, from the scripts of its four states.
+        let mut blind_curves: [[Option<Curve>; 2]; 2] = Default::default();
+        for script in controller.machines.get(base).into_iter().flat_map(|machine| &machine.states).filter_map(|state| state.movement.as_ref()) {
+            if script.state != movement_state::BLIND_FIRE {
+                continue;
+            }
+            let part = usize::from(script.kind == part::OUT);
+            let side = usize::from(script.direction == 1);
+            blind_curves[part][side] = script.curve.clone();
+        }
         let drawn_root = drawn.iter().position(|path| path == BONES[0]);
         let head_bones = HEAD_BONES.map(|end| drawn.iter().position(|path| path.ends_with(end)));
         // The prefab's own shares; a half each where they cannot be read
@@ -459,8 +541,11 @@ impl BodyData {
             drawn: drawn.len(),
             drawn_root,
             backpack_drop,
+            bipod_marks,
+            vault_marks,
             head_bones,
             head_shares,
+            blind_curves,
         })
     }
 
@@ -574,6 +659,20 @@ pub struct BodyInput {
     pub kick: bool,
     pub kick_succeeds: bool,
     pub approached: bool,
+    /// Blind fire as the animator is told it: the side asked, 1 over the
+    /// top, -1 to the right, 0 none (`BlindFire`), and the float its state
+    /// works out each frame (`BlindFireFloat`; blind-fire spec, "The body").
+    pub blind_fire: f32,
+    pub blind_fire_float: f32,
+    /// Mounted lying down (`ProneBipodsOn`, `PlayerAnimator.
+    /// SetProneBipodMount`; mounting spec, "The bipod"): the aiming layer's
+    /// prone state gives way to `Prone_Bipods`.
+    pub prone_bipods: bool,
+    /// The left shoulder as its controller tells the animator (`LeftStance`,
+    /// `ForceLeftStanceInOneFrame`; left-shoulder spec): the `LS` layer
+    /// plays the stance in, from a sprint at once, and out.
+    pub left_stance: bool,
+    pub force_left_stance: bool,
 }
 
 /// The layer of the body's animator that plays the hands' gestures on the
@@ -594,6 +693,16 @@ pub struct Body {
     backpack_drop: Option<f32>,
     backpack_passed: bool,
     backpack_dropped: bool,
+    /// The bipod's marks, the same way.
+    bipod_marks: [Option<f32>; 4],
+    bipod_passed: bool,
+    bipod_toggled: bool,
+    /// The marks of the moves over an obstacle: when in its state each
+    /// comes, which the state playing has passed, and which have passed
+    /// since they were last asked for (each the move and the mark).
+    vault_marks: [[Option<f32>; 4]; 3],
+    vault_passed: [[bool; 4]; 3],
+    vault_due: Vec<(usize, usize)>,
     /// The crawl's sound marks the clips have passed and not yet told
     /// (`PlaySoundBank("Prone")`, `docs/spec/footsteps.md`).
     crawl_marks: usize,
@@ -623,9 +732,17 @@ pub struct Body {
     head_bones: [Option<usize>; 2],
     head_shares: [f32; 2],
     head_turn: [f32; 3],
+    blind_curves: [[Option<Curve>; 2]; 2],
 }
 
 impl Body {
+    /// Blind fire's curve by the state's time for a part (`part::IN`,
+    /// `part::OUT`) and a side (1 over the top, -1 to the right), as the
+    /// install's state script has it (`SmoothLerpAnimCurve`).
+    pub fn blind_fire_curve(&self, part: i32, side: f32) -> Option<&Curve> {
+        self.blind_curves[usize::from(part == part::OUT)][usize::from(side < 0.0)].as_ref()
+    }
+
     /// The gestures that came to their end since this was last asked, by
     /// number.
     pub fn take_finished_interactions(&mut self) -> Vec<u8> {
@@ -638,12 +755,25 @@ impl Body {
         std::mem::take(&mut self.backpack_dropped)
     }
 
+    /// Whether a bipod's gesture has passed its toggle's mark since this was
+    /// last asked (`OnBipodToggle`).
+    pub fn take_bipod_toggled(&mut self) -> bool {
+        std::mem::take(&mut self.bipod_toggled)
+    }
+
     /// How many of the crawl's sound marks the body's clips have passed
     /// since this was last asked: their events calling `PlaySoundBank`
     /// with `Prone`, which the player's `GenericEventTranslator` hands on
     /// (`docs/spec/footsteps.md`).
     pub fn take_crawl_marks(&mut self) -> usize {
         std::mem::take(&mut self.crawl_marks)
+    }
+
+    /// The marks of the moves over an obstacle the body's states have
+    /// passed since this was last asked, in order: each the move
+    /// (`VAULT_STATES`' place) and the mark (`VAULT_MARKS`' place).
+    pub fn take_vault_marks(&mut self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut self.vault_due)
     }
 
     /// Puts the interactions' layer back to rest outright, whatever it
@@ -663,6 +793,21 @@ impl Body {
         Some((current.name.as_str(), self.animator.progress(layer).0, next.map(|state| state.name.as_str())))
     }
 
+    /// A parameter of the body's animator by its name, as the last update
+    /// left it: for looking at.
+    pub fn parameter(&self, name: &str) -> Option<f32> {
+        self.animator.controller.parameter(name).map(|id| self.animator.get(id))
+    }
+
+    /// The state a layer of the body's animator is in, how far through it,
+    /// and the state it is on its way into, by the layer's name: for
+    /// looking at.
+    pub fn layer_state(&self, layer: &str) -> Option<(&str, f32, Option<&str>)> {
+        let layer = self.animator.controller.layer(layer)?;
+        let (current, next) = self.animator.state(layer);
+        Some((current.name.as_str(), self.animator.progress(layer).0, next.map(|state| state.name.as_str())))
+    }
+
     /// A body standing still. `weapon_width` is the weapon's width in
     /// inventory cells, which picks how the body carries it.
     pub fn new(data: &BodyData, weapon_width: f32) -> Self {
@@ -678,6 +823,12 @@ impl Body {
             backpack_drop: data.backpack_drop,
             backpack_passed: false,
             backpack_dropped: false,
+            bipod_marks: data.bipod_marks,
+            bipod_passed: false,
+            bipod_toggled: false,
+            vault_marks: data.vault_marks,
+            vault_passed: [[false; 4]; 3],
+            vault_due: Vec::new(),
             crawl_marks: 0,
             animator,
             ids: data.ids,
@@ -695,6 +846,7 @@ impl Body {
             head_bones: data.head_bones,
             head_shares: data.head_shares,
             head_turn: [0.0; 3],
+            blind_curves: data.blind_curves.clone(),
         };
         // A character is made for its own eyes until told otherwise: the
         // layer of the body's own part in the weapon's handling is off.
@@ -884,6 +1036,11 @@ impl Body {
         set(ids.kick, flag(input.kick));
         set(ids.kick_succeed, flag(input.kick_succeeds));
         set(ids.approached, flag(input.approached));
+        set(ids.blind_fire, input.blind_fire);
+        set(ids.blind_fire_float, input.blind_fire_float);
+        set(ids.prone_bipods, flag(input.prone_bipods));
+        set(ids.left_stance, flag(input.left_stance));
+        set(ids.force_left_stance, flag(input.force_left_stance));
         // The game fades one layer by a curve of the clips playing.
         let fade = ids.aiming_layer.map_or(0.0, |id| a.get(id));
         a.set_layer_weight(self.faded_layer, 1.0 - fade);
@@ -917,6 +1074,49 @@ impl Body {
                 Some(time) if time >= at && !self.backpack_passed => (self.backpack_passed, self.backpack_dropped) = (true, true),
                 Some(_) => {}
                 None => self.backpack_passed = false,
+            }
+        }
+        // So does each of the bipod's gestures its toggle's mark.
+        if let Some((layer, _)) = self.interactions {
+            let (current, next) = self.animator.state(layer);
+            let found = BIPOD_STATES.iter().zip(self.bipod_marks).find_map(|(name, at)| {
+                let at = at?;
+                if current.name == *name {
+                    Some((self.animator.progress(layer).0, at))
+                } else if next.is_some_and(|next| next.name == *name) {
+                    self.animator.next_progress(layer).map(|time| (time, at))
+                } else {
+                    None
+                }
+            });
+            match found {
+                Some((time, at)) if time >= at && !self.bipod_passed => (self.bipod_passed, self.bipod_toggled) = (true, true),
+                Some(_) => {}
+                None => self.bipod_passed = false,
+            }
+        }
+        // The marks of a move over an obstacle come as its state plays
+        // past each, entering or entered, once each while it plays.
+        {
+            let (current, next) = self.animator.state(0);
+            for (kind, marks) in self.vault_marks.iter().enumerate() {
+                let time = if current.name == VAULT_STATES[kind] {
+                    Some(self.animator.progress(0).0)
+                } else if next.is_some_and(|next| next.name == VAULT_STATES[kind]) {
+                    self.animator.next_progress(0)
+                } else {
+                    None
+                };
+                let Some(time) = time else {
+                    self.vault_passed[kind] = [false; 4];
+                    continue;
+                };
+                for (mark, at) in marks.iter().enumerate() {
+                    if at.is_some_and(|at| time >= at) && !self.vault_passed[kind][mark] {
+                        self.vault_passed[kind][mark] = true;
+                        self.vault_due.push((kind, mark));
+                    }
+                }
             }
         }
         let named = |machine: &usize, state: &usize| {
@@ -1119,7 +1319,7 @@ impl Body {
         // for a second time it is a bone like any other and keeps them.
         let bone = |index: usize| match self.drawn_root {
             Some(root) if root == index => self.animator.bone(0),
-            _ => self.animator.bone(BEND_GOALS + BEND_GOAL_NAMES.len() + index),
+            _ => self.animator.bone(DRAWN_FROM + index),
         };
         let mut bones: Vec<([f32; 3], [f32; 4])> = (0..self.drawn).map(bone).collect();
         // The free look's turn of the neck and the head, where it is more
@@ -1135,10 +1335,39 @@ impl Body {
         bones
     }
 
+    /// The left shoulder's curve, which its `LS` layer's clips ramp from 0
+    /// to 1 as the stance comes in (`PlayerAnimator.LEFT_STANCE_CURVE`): the
+    /// weapon goes to the shoulder by it (`hands::LeftShoulder`).
+    pub fn left_stance_curve(&self) -> f32 {
+        self.ids.left_stance_curve.map_or(0.0, |id| self.animator.get(id))
+    }
+
+    /// The ribcage's own place in its parent, the last spine bone, as the
+    /// animation has it (`PlayerBones.Ribcage.Original.localPosition`).
+    pub fn ribcage_local(&self) -> [f32; 3] {
+        self.animator.bone(RIBCAGE).0
+    }
+
     /// Where the ribcage is, from the feet, in the body's axes. The
-    /// first-person rig and camera hang there.
+    /// first-person rig hangs there, and the camera beside it
+    /// (`camera_container`).
     pub fn ribcage(&self) -> [f32; 3] {
         self.through(&TO_RIBCAGE).0
+    }
+
+    /// Where the second spine bone is, from the feet, in the body's axes:
+    /// the head's lying capsule is put over it (`PlayerOverlapManager.
+    /// _proneColliderPivot`; movement spec, "The head's push out of walls").
+    pub fn spine2(&self) -> [f32; 3] {
+        self.through(&[0, 1, 2, 3]).0
+    }
+
+    /// Where the first-person camera's own object is, from the feet, in the
+    /// body's axes (`Player.CameraContainer`): on the last spine bone at the
+    /// ribcage's rest place, so at the ribcage itself unless a clip has
+    /// shifted the ribcage along its spine.
+    pub fn camera_container(&self) -> [f32; 3] {
+        self.through(&[0, 1, 2, 3, 4, CAMERA_CONTAINER]).0
     }
 
     /// The angle from the body round to the view, and the view's pitch,
@@ -1190,19 +1419,23 @@ impl Body {
     /// weapon's rig hangs in: at the ribcage, turned to where the player
     /// looks. `Movement::body_in_view` gives it.
     pub fn carried(&self, into_view: [f32; 4]) -> Option<Carried> {
+        Some(self.weapon_root_third(into_view)).filter(|carried| carried.authority > 0.0)
+    }
+
+    /// The body's own weapon bone (`PlayerBones.Weapon_Root_Third`) in the
+    /// same frame as `carried`, whatever its authority: the left shoulder
+    /// puts the weapon there by its own curve (`hands::LeftShoulder`).
+    pub fn weapon_root_third(&self, into_view: [f32; 4]) -> Carried {
         let curve = |id: Option<usize>| id.map_or(0.0, |id| self.animator.get(id));
         let authority = (curve(self.ids.weapon_3rd) * self.first_person_weight()).clamp(0.0, 1.0);
-        if authority <= 0.0 {
-            return None;
-        }
         let spine = self.spine();
         let (weapon, ribcage) = (self.animator.bone(WEAPON), self.animator.bone(RIBCAGE));
         let offset: [f32; 3] = std::array::from_fn(|k| weapon.0[k] - ribcage.0[k]);
-        Some(Carried {
+        Carried {
             position: quat_rotate(into_view, quat_rotate(spine, offset)),
             rotation: quat_mul(into_view, quat_mul(spine, weapon.1)),
             authority,
-        })
+        }
     }
 
     /// An arm as the body's animation has it, while that animation takes

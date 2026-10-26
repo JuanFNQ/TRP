@@ -19,6 +19,16 @@
 //! nothing else is on, and **only when something has changed** (what it
 //! wears, the window's size): a few frames and it is off again. The game's
 //! screens let the animator run on; the user asked for it still.
+//!
+//! The OVERALL tab has it too (`overall_view`), drawn by a camera of its
+//! own as the game's scene has it (`trp_data::screen::ModelCamera`, the
+//! scene's `Camera_inventory`: 28 degrees up and down, 0.3 to 25 m, from a
+//! place before the model the scene gives), onto a picture twice the
+//! view's size in the screen's units (`CameraImage.RecreateTexture`), and
+//! turned by a drag across it (`XCoordRotation`). The two are drawn one
+//! after the other, each with the model turned as its page has it; with
+//! `TARKOV UI` the gear page has no model, and only the OVERALL tab's is
+//! drawn.
 
 use std::collections::HashMap;
 
@@ -55,7 +65,16 @@ const MARGIN: f32 = 0.04;
 /// without shadows. `ESTIMATE`: the game's screens light the model in a
 /// scene of their own, not read.
 const LIGHT_LUX: f32 = 12_000.0;
+/// Its ambient, the range's own (the world's camera's light with `FACTORY
+/// LIGHT` off; with it on the world has none of Bevy's, and the figure
+/// keeps this). `ESTIMATE`, as its light.
+const FIGURE_AMBIENT: f32 = 400.0;
 const LIGHT_FROM: Vec3 = Vec3::new(3.0, 8.0, 4.0);
+/// The layers the two shots' lights are on, each seen by its own camera
+/// alone (a camera takes the directional lights whose layers it shares):
+/// the gear page's light, and the OVERALL tab's.
+const GEAR_LIGHTS: usize = 29;
+const OVERALL_LIGHTS: usize = 30;
 /// The camera stays on so many frames at the least for a drawing, and
 /// until the renderer has nothing left to build; at most so many.
 const DRAW_FRAMES: u32 = 2;
@@ -72,33 +91,173 @@ pub struct Twin(pub Entity);
 #[derive(Resource, Default)]
 pub struct FigureImage(pub Option<Handle<Image>>);
 
-/// The figure as built: its camera, what it is drawn with (to wait for it
-/// on the graphics card), and where its drawing stands.
+/// The OVERALL tab's view of the figure (`PlayerModelView`): the picture it
+/// is drawn onto; what the page says of it: the view's size in the screen's
+/// units, the scene's camera, and the model's turn about the vertical in
+/// degrees, the engine's (`XCoordRotation.CurrentYaw`: 180 as the model is
+/// put in, `PlayerModelLoader.CreatePlayerBody`).
+#[derive(Resource)]
+pub struct OverallFigure {
+    pub image: Option<Handle<Image>>,
+    pub rect: Option<[f32; 2]>,
+    pub camera: Option<trp_data::screen::ModelCamera>,
+    pub yaw: f32,
+}
+
+impl Default for OverallFigure {
+    fn default() -> Self {
+        Self { image: None, rect: None, camera: None, yaw: YAW }
+    }
+}
+
+/// The model's own turn as it is put in, in degrees about the vertical
+/// (`TURN`).
+pub const YAW: f32 = 180.0;
+
+/// The figure as built: its two cameras' drawings, what it is drawn with
+/// (to wait for it on the graphics card), its skeleton, and where its
+/// drawing stands.
 #[derive(Resource)]
 pub struct Figure {
-    camera: Entity,
+    /// The gear page's, and the OVERALL tab's.
+    shots: [Shot; 2],
     meshes: Vec<Handle<Mesh>>,
     materials: Vec<Handle<StandardMaterial>>,
     /// Asked to wait for its meshes and pictures, and they are there.
     waiting: bool,
     on_card: bool,
-    /// Something changed since it was last drawn; the frames the camera has
-    /// been on for this drawing; the picture's size in pixels.
-    wanted: bool,
-    drawing: Option<u32>,
-    size: UVec2,
+    /// The drawing under way: which, and the frames its camera has been on.
+    drawing: Option<(usize, u32)>,
+    /// What later pieces are put on (a suit chosen, `clothing`).
+    pub skeleton: Skeleton,
 }
+
+/// One of the figure's drawings: its camera (the OVERALL tab's made when it
+/// is first wanted), whether something changed since it was last drawn, its
+/// picture's size in pixels, and the turn the model was last drawn at.
+struct Shot {
+    camera: Option<Entity>,
+    wanted: bool,
+    size: UVec2,
+    yaw: f32,
+}
+
+const GEAR: usize = 0;
+const OVERALL: usize = 1;
+
+impl Figure {
+    /// Asks for a drawing: something of it has moved.
+    pub fn ask(&mut self) {
+        for shot in &mut self.shots {
+            shot.wanted = true;
+        }
+    }
+
+    /// New meshes and materials of it (a suit put on): drawn once they are
+    /// on the graphics card as well.
+    pub fn wait_for(&mut self, meshes: &[Handle<Mesh>], materials: &[Handle<StandardMaterial>]) {
+        for mesh in meshes {
+            if !self.meshes.contains(mesh) {
+                self.meshes.push(mesh.clone());
+            }
+        }
+        for material in materials {
+            if !self.materials.contains(material) {
+                self.materials.push(material.clone());
+            }
+        }
+        (self.waiting, self.on_card) = (false, false);
+        self.ask();
+    }
+}
+
+/// A skeleton of the figure's or the corpse's: its root, its bones by path,
+/// and what its pieces are drawn as. Kept once built, for pieces put on
+/// later (`clothing`).
+pub struct Skeleton {
+    made: Made,
+    root: Entity,
+    by_path: HashMap<String, usize>,
+    bones: Vec<Entity>,
+}
+
+impl Skeleton {
+    /// The render layer its pieces are drawn on.
+    fn layer(&self) -> RenderLayers {
+        match self.made {
+            Made::Figure => RenderLayers::layer(LAYER),
+            Made::Corpse | Made::Dummy(_) => RenderLayers::layer(crate::body_view::SEEN),
+        }
+    }
+
+    /// A piece of it marked as the twin of a piece of the body, out of the
+    /// engine's work while hidden as that one is (`park`).
+    fn twin(&self, commands: &mut Commands, piece: Entity, original: Entity) {
+        match self.made {
+            Made::Figure => commands.entity(piece).insert((Twin(original), crate::park::Park)),
+            Made::Corpse => commands.entity(piece).insert((crate::death::CorpseTwin(original), crate::park::Park)),
+            Made::Dummy(_) => commands.entity(piece).insert((crate::dummy::DummyTwin { original }, crate::park::Park)),
+        };
+    }
+
+    /// The bone a mesh's bone is drawn on: that one, or the nearest above it
+    /// the skeleton has.
+    fn at(&self, path: &str) -> Option<usize> {
+        let mut path = path;
+        loop {
+            if let Some(index) = self.by_path.get(path) {
+                return Some(*index);
+            }
+            path = &path[..path.rfind('/')?];
+        }
+    }
+
+    fn joint(&self, path: &str) -> Entity {
+        self.at(path).map_or(self.root, |index| self.bones[index])
+    }
+
+    /// A skinned piece of the body, on the bones it names.
+    pub fn skinned(&self, commands: &mut Commands, original: Entity, drawn: (&Handle<Mesh>, &Handle<StandardMaterial>), poses: &Handle<SkinnedMeshInverseBindposes>, bone_paths: &[String], hidden: bool) -> Entity {
+        let joints = bone_paths.iter().map(|path| self.joint(path)).collect();
+        self.skinned_on(commands, original, drawn, poses, joints, hidden)
+    }
+
+    /// A skinned piece on joints of its own (an outfit's, `Builder::outfit`).
+    pub fn skinned_on(&self, commands: &mut Commands, original: Entity, (mesh, material): (&Handle<Mesh>, &Handle<StandardMaterial>), poses: &Handle<SkinnedMeshInverseBindposes>, joints: Vec<Entity>, hidden: bool) -> Entity {
+        let visibility = if hidden { Visibility::Hidden } else { Visibility::Inherited };
+        let name = match self.made {
+            Made::Corpse => "Corpse, a piece",
+            Made::Dummy(_) => "Dummy, a piece",
+            Made::Figure => "Character model, a piece",
+        };
+        let piece = commands
+            .spawn((
+                Name::new(name),
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                SkinnedMesh { inverse_bindposes: poses.clone(), joints },
+                NoFrustumCulling,
+                self.layer(),
+                visibility,
+            ))
+            .id();
+        self.twin(commands, piece, original);
+        commands.entity(self.root).add_child(piece);
+        piece
+    }
+}
+
+/// The corpse's skeleton, kept once built (`Skeleton`).
+#[derive(Resource)]
+pub struct CorpseSkeleton(pub Skeleton);
 
 /// Builds the figure beside the body, piece by piece as `body_view::
 /// spawn_body` makes the body's own. The corpse the character becomes
 /// (`death`) is built the same way: the same meshes on a skeleton of its
 /// own, hidden until it is wanted.
 pub struct Builder {
-    made: Made,
-    root: Entity,
-    by_path: HashMap<String, usize>,
+    skeleton: Skeleton,
     paths: Vec<String>,
-    bones: Vec<Entity>,
     /// Each bone in the root's axes, in the engine's.
     world: Vec<Affine3A>,
     meshes: Vec<Handle<Mesh>>,
@@ -115,6 +274,8 @@ enum Made {
     Figure,
     /// The corpse, in the world with the body.
     Corpse,
+    /// A dummy on the range (`dummy`), in the world: which of them.
+    Dummy(usize),
 }
 
 impl Builder {
@@ -128,14 +289,27 @@ impl Builder {
     /// The corpse's skeleton, at the world's origin and hidden: its bones
     /// are given the body's pose when the character dies.
     pub fn corpse(commands: &mut Commands, paths: &[String]) -> Self {
-        let root = commands.spawn((Name::new("Corpse"), Transform::default(), Visibility::Hidden)).id();
+        // Hidden until a death, and out of the engine's work till then
+        // (`park`).
+        let root = commands.spawn((Name::new("Corpse"), Transform::default(), Visibility::Hidden, crate::park::Park)).id();
         Self::on(Made::Corpse, commands, root, paths, |_| Transform::default())
+    }
+
+    /// A dummy's skeleton (`dummy`, the `which`th), standing as the figure
+    /// stands, at `place` in the world, until its character poses it.
+    pub fn dummy(commands: &mut Commands, paths: &[String], pose: &trp_sim::body::Pose, place: Transform, which: usize) -> Self {
+        let root = commands.spawn((Name::new(format!("Dummy {which}")), place, Visibility::default())).id();
+        Self::on(Made::Dummy(which), commands, root, paths, |index| convert::transform(pose[index].0, pose[index].1, [1.0; 3]))
     }
 
     fn on(made: Made, commands: &mut Commands, root: Entity, paths: &[String], local_of: impl Fn(usize) -> Transform) -> Self {
         let mut by_path = HashMap::with_capacity(paths.len());
         let (mut bones, mut world) = (Vec::with_capacity(paths.len()), Vec::with_capacity(paths.len()));
-        let whose = if made == Made::Corpse { "the corpse's" } else { "the model's" };
+        let whose = match made {
+            Made::Corpse => "the corpse's",
+            Made::Dummy(_) => "the dummy's",
+            Made::Figure => "the model's",
+        };
         for (index, path) in paths.iter().enumerate() {
             let local = local_of(index);
             let parent = path.rfind('/').and_then(|at| by_path.get(&path[..at]).copied());
@@ -146,70 +320,26 @@ impl Builder {
             bones.push(entity);
             by_path.insert(path.clone(), index);
         }
-        Self { made, root, by_path, paths: paths.to_vec(), bones, world, meshes: Vec::new(), materials: Vec::new(), pieces: 0, outfits: Vec::new() }
-    }
-
-    /// The render layer its pieces are drawn on.
-    fn layer(&self) -> RenderLayers {
-        match self.made {
-            Made::Figure => RenderLayers::layer(LAYER),
-            Made::Corpse => RenderLayers::layer(crate::body_view::SEEN),
-        }
-    }
-
-    /// A piece of it marked as the twin of a piece of the body.
-    fn twin(&self, commands: &mut Commands, piece: Entity, original: Entity) {
-        match self.made {
-            Made::Figure => commands.entity(piece).insert(Twin(original)),
-            Made::Corpse => commands.entity(piece).insert(crate::death::CorpseTwin(original)),
-        };
-    }
-
-    /// The bone a mesh's bone is drawn on: that one, or the nearest above it
-    /// the figure has.
-    fn at(&self, path: &str) -> Option<usize> {
-        let mut path = path;
-        loop {
-            if let Some(index) = self.by_path.get(path) {
-                return Some(*index);
-            }
-            path = &path[..path.rfind('/')?];
-        }
-    }
-
-    fn joint(&self, path: &str) -> Entity {
-        self.at(path).map_or(self.root, |index| self.bones[index])
+        let skeleton = Skeleton { made, root, by_path, bones };
+        Self { skeleton, paths: paths.to_vec(), world, meshes: Vec::new(), materials: Vec::new(), pieces: 0, outfits: Vec::new() }
     }
 
     /// The bone whose path ends so, if the figure has it.
     pub fn bone(&self, end: &str) -> Option<Entity> {
-        self.paths.iter().position(|path| path.ends_with(end)).map(|at| self.bones[at])
+        self.paths.iter().position(|path| path.ends_with(end)).map(|at| self.skeleton.bones[at])
     }
 
     /// A skinned piece of the body, on the bones it names.
     pub fn skinned(&mut self, commands: &mut Commands, original: Entity, drawn: (&Handle<Mesh>, &Handle<StandardMaterial>), poses: &Handle<SkinnedMeshInverseBindposes>, bone_paths: &[String], hidden: bool) -> Entity {
-        let joints = bone_paths.iter().map(|path| self.joint(path)).collect();
-        self.skinned_on(commands, original, drawn, poses, joints, hidden)
+        let piece = self.skeleton.skinned(commands, original, drawn, poses, bone_paths, hidden);
+        self.keep(drawn.0, drawn.1);
+        piece
     }
 
     /// A skinned piece on joints of its own (an outfit's, `outfit`).
-    pub fn skinned_on(&mut self, commands: &mut Commands, original: Entity, (mesh, material): (&Handle<Mesh>, &Handle<StandardMaterial>), poses: &Handle<SkinnedMeshInverseBindposes>, joints: Vec<Entity>, hidden: bool) -> Entity {
-        let visibility = if hidden { Visibility::Hidden } else { Visibility::Inherited };
-        let name = if self.made == Made::Corpse { "Corpse, a piece" } else { "Character model, a piece" };
-        let piece = commands
-            .spawn((
-                Name::new(name),
-                Mesh3d(mesh.clone()),
-                MeshMaterial3d(material.clone()),
-                SkinnedMesh { inverse_bindposes: poses.clone(), joints },
-                NoFrustumCulling,
-                self.layer(),
-                visibility,
-            ))
-            .id();
-        self.twin(commands, piece, original);
-        commands.entity(self.root).add_child(piece);
-        self.keep(mesh, material);
+    pub fn skinned_on(&mut self, commands: &mut Commands, original: Entity, drawn: (&Handle<Mesh>, &Handle<StandardMaterial>), poses: &Handle<SkinnedMeshInverseBindposes>, joints: Vec<Entity>, hidden: bool) -> Entity {
+        let piece = self.skeleton.skinned_on(commands, original, drawn, poses, joints, hidden);
+        self.keep(drawn.0, drawn.1);
         piece
     }
 
@@ -231,18 +361,19 @@ impl Builder {
     /// (`death`).
     pub fn outfit(&mut self, commands: &mut Commands, item: &str, rig: &trp_data::outfit::Rig, rest: &[Affine3A]) -> Vec<Entity> {
         use trp_data::outfit::Move;
-        if self.made == Made::Corpse {
+        let root = self.skeleton.root;
+        if self.skeleton.made == Made::Corpse {
             let ours: Vec<Entity> = rig
                 .bones
                 .iter()
                 .map(|bone| {
                     let name = bone.path.rsplit('/').next().unwrap_or(&bone.path);
                     let entity = commands.spawn((Name::new(format!("{name}, the corpse's outfit's")), Transform::default(), Visibility::default())).id();
-                    commands.entity(self.root).add_child(entity);
+                    commands.entity(root).add_child(entity);
                     entity
                 })
                 .collect();
-            let theirs = rig.bones.iter().map(|bone| self.at(&bone.path)).collect();
+            let theirs = rig.bones.iter().map(|bone| self.skeleton.at(&bone.path)).collect();
             self.outfits.push(crate::death::CorpseOutfit { item: item.to_owned(), rig: rig.clone(), theirs, rest: rest.to_vec(), ours: ours.clone() });
             return ours;
         }
@@ -251,21 +382,28 @@ impl Builder {
             .iter()
             .zip(rest)
             .map(|(bone, rest)| {
-                let moved = self.at(&bone.path).map_or(Affine3A::IDENTITY, |index| self.world[index]) * *rest;
+                let moved = self.skeleton.at(&bone.path).map_or(Affine3A::IDENTITY, |index| self.world[index]) * *rest;
                 Move { axes: [moved.matrix3.x_axis.to_array(), moved.matrix3.y_axis.to_array(), moved.matrix3.z_axis.to_array()], shift: moved.translation.to_array() }
             })
             .collect();
-        rig.pose(&theirs)
+        let ours: Vec<Entity> = rig
+            .pose(&theirs)
             .into_iter()
             .zip(&rig.bones)
             .map(|(moved, bone)| {
                 let turn = Quat::from_mat3(&Mat3::from_cols(moved.axes[0].into(), moved.axes[1].into(), moved.axes[2].into())).normalize();
                 let name = bone.path.rsplit('/').next().unwrap_or(&bone.path);
                 let entity = commands.spawn((Name::new(format!("{name}, the model's outfit's")), Transform { translation: moved.shift.into(), rotation: turn, scale: Vec3::ONE }, Visibility::default())).id();
-                commands.entity(self.root).add_child(entity);
+                commands.entity(root).add_child(entity);
                 entity
             })
-            .collect()
+            .collect();
+        // The dummy's stood once, and kept to be posed as it falls.
+        if matches!(self.skeleton.made, Made::Dummy(_)) {
+            let theirs = rig.bones.iter().map(|bone| self.skeleton.at(&bone.path)).collect();
+            self.outfits.push(crate::death::CorpseOutfit { item: item.to_owned(), rig: rig.clone(), theirs, rest: rest.to_vec(), ours: ours.clone() });
+        }
+        ours
     }
 
     /// An object of a model hung on a bone (what rides on the head), with
@@ -274,29 +412,43 @@ impl Builder {
     pub fn hung(&mut self, commands: &mut Commands, parent: Option<Entity>, transform: Transform, visibility: Visibility, original: Option<Entity>) -> Entity {
         let entity = commands.spawn((transform, visibility)).id();
         if let Some(original) = original {
-            self.twin(commands, entity, original);
+            self.skeleton.twin(commands, entity, original);
         }
-        commands.entity(parent.unwrap_or(self.root)).add_child(entity);
+        commands.entity(parent.unwrap_or(self.skeleton.root)).add_child(entity);
         entity
     }
 
     /// A mesh drawn as it lies, on such an object.
     pub fn rigid(&mut self, commands: &mut Commands, on: Entity, mesh: &Handle<Mesh>, material: &Handle<StandardMaterial>) -> Entity {
-        let piece = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), Transform::default(), self.layer())).id();
+        let piece = commands.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), Transform::default(), self.skeleton.layer())).id();
         commands.entity(on).add_child(piece);
         self.keep(mesh, material);
         piece
     }
 
     /// The corpse as built, for `death`: its skeleton by path, and its
-    /// outfits.
+    /// outfits; and the skeleton kept for pieces put on later.
     pub fn finish_corpse(self, commands: &mut Commands) {
-        let parents = self.paths.iter().map(|path| path.rfind('/').and_then(|at| self.by_path.get(&path[..at]).copied())).collect();
-        info!("the corpse: {} bones, {} pieces, {} outfits", self.bones.len(), self.pieces, self.outfits.len());
-        commands.insert_resource(crate::death::Corpse { root: self.root, paths: self.paths, bones: self.bones, parents, outfits: self.outfits });
+        let skeleton = self.skeleton;
+        let parents = self.paths.iter().map(|path| path.rfind('/').and_then(|at| skeleton.by_path.get(&path[..at]).copied())).collect();
+        info!("the corpse: {} bones, {} pieces, {} outfits", skeleton.bones.len(), self.pieces, self.outfits.len());
+        commands.insert_resource(crate::death::Corpse { root: skeleton.root, paths: self.paths, bones: skeleton.bones.clone(), parents, outfits: self.outfits });
+        commands.insert_resource(CorpseSkeleton(skeleton));
     }
 
-    /// Its camera and light, and the resource that draws it.
+    /// A dummy as built, for `dummy`: its skeleton by path with each bone's
+    /// place in its parent as it stands, and its outfits; and the skeleton,
+    /// kept for pieces put on later.
+    pub fn finish_dummy(self) -> (crate::dummy::DummyRig, Skeleton) {
+        let skeleton = self.skeleton;
+        let parents: Vec<Option<usize>> = self.paths.iter().map(|path| path.rfind('/').and_then(|at| skeleton.by_path.get(&path[..at]).copied())).collect();
+        let rest = parents.iter().zip(&self.world).map(|(parent, world)| Transform::from_matrix(Mat4::from(parent.map_or(Affine3A::IDENTITY, |p| self.world[p]).inverse() * *world))).collect();
+        info!("a dummy: {} bones, {} pieces, {} outfits", skeleton.bones.len(), self.pieces, self.outfits.len());
+        (crate::dummy::DummyRig { root: skeleton.root, paths: self.paths, bones: skeleton.bones.clone(), parents, rest, outfits: self.outfits }, skeleton)
+    }
+
+    /// Its camera for the gear page and its light, and the resource that
+    /// draws it (the OVERALL tab's camera is made when first wanted).
     pub fn finish(self, commands: &mut Commands) {
         let layer = RenderLayers::layer(LAYER);
         // The view takes in the whole of it, the camera level with a point
@@ -315,6 +467,9 @@ impl Builder {
                 // As the world's own camera draws but for its picture: the
                 // same kinds of pipelines, built once for both.
                 Camera { is_active: false, order: -4, clear_color: ClearColorConfig::Custom(Color::NONE), ..default() },
+                // The range's own ambient (`FIGURE_AMBIENT`), whatever lights
+                // the range.
+                AmbientLight { color: Color::WHITE, brightness: FIGURE_AMBIENT, ..default() },
                 // Bevy's own clipping plane at the near plane too (it is
                 // 0.1 m unless told).
                 Projection::Perspective(PerspectiveProjection {
@@ -325,64 +480,108 @@ impl Builder {
                     ..default()
                 }),
                 Transform::from_translation(eye).looking_at(PLACE + Vec3::Y * UP, Vec3::Y),
-                layer.clone(),
+                RenderLayers::from_layers(&[LAYER, GEAR_LIGHTS]),
             ))
             .id();
+        let _ = layer;
         commands.spawn((
             Name::new("Character model's light"),
             DirectionalLight { illuminance: LIGHT_LUX, shadows_enabled: false, ..default() },
             Transform::from_translation(LIGHT_FROM).looking_at(Vec3::ZERO, Vec3::Y),
-            layer,
+            RenderLayers::layer(GEAR_LIGHTS),
         ));
-        info!("the character model: {} bones, {} pieces, {} meshes and {} materials of the body's own", self.bones.len(), self.pieces, self.meshes.len(), self.materials.len());
+        info!("the character model: {} bones, {} pieces, {} meshes and {} materials of the body's own", self.skeleton.bones.len(), self.pieces, self.meshes.len(), self.materials.len());
+        let shot = |camera: Option<Entity>| Shot { camera, wanted: true, size: UVec2::ZERO, yaw: YAW };
         commands.insert_resource(Figure {
-            camera,
+            shots: [shot(Some(camera)), shot(None)],
             meshes: self.meshes,
             materials: self.materials,
             waiting: false,
             on_card: false,
-            wanted: true,
             drawing: None,
-            size: UVec2::ZERO,
+            skeleton: self.skeleton,
         });
     }
+}
+
+/// Where the OVERALL tab's view puts the model, in the view's own axes:
+/// 1 m below it and 5 m on (`PlayerModelView.Show`, its `position` unless
+/// told).
+const MODEL_AT: [f32; 3] = [0.0, -1.0, 5.0];
+
+/// The model turned about the vertical by so many degrees, the engine's
+/// (`Quaternion.Euler(0, yaw, 0)`), in the engine's axes.
+fn turned(yaw: f32) -> Quat {
+    let (sin, cos) = (yaw.to_radians() / 2.0).sin_cos();
+    convert::rotation([0.0, sin, 0.0, cos])
+}
+
+/// The OVERALL tab's camera where the scene has it, the model standing as
+/// it is put in (`MODEL_AT`, `TURN`): the scene's place and turn in the
+/// view's axes taken into the model's, and those into the figure's place.
+fn overall_camera(camera: &trp_data::screen::ModelCamera) -> Transform {
+    let model = Quat::from_array(TURN);
+    let from_model = Vec3::from_array(camera.place) - Vec3::from_array(MODEL_AT);
+    let place = model.inverse() * from_model;
+    let turn = model.inverse() * Quat::from_array(camera.turn);
+    let root = convert::rotation(TURN);
+    Transform { translation: PLACE + root * convert::position(place.to_array()), rotation: root * convert::rotation(turn.to_array()), scale: Vec3::ONE }
 }
 
 pub struct FigurePlugin;
 
 impl Plugin for FigurePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<FigureImage>().add_systems(Update, (mirror, draw).chain().after(crate::body_view::show_outfit).after(crate::body_view::show_worn));
+        app.init_resource::<FigureImage>()
+            .init_resource::<OverallFigure>()
+            .add_systems(Update, (mirror, draw).chain().after(crate::body_view::show_outfit).after(crate::body_view::show_torso).after(crate::body_view::show_worn).after(crate::body_view::show_head_parts).after(crate::body_view::turn_hinges));
     }
 }
 
 /// Shows each piece of the figure as its piece of the body is shown, and
 /// asks for a drawing when that changes.
-fn mirror(figure: Option<ResMut<Figure>>, originals: Query<&Visibility, Without<Twin>>, mut twins: Query<(&Twin, &mut Visibility)>) {
+fn mirror(figure: Option<ResMut<Figure>>, originals: Query<&Visibility, (Without<Twin>, crate::park::EvenParked)>, mut twins: Query<(&Twin, &mut Visibility), crate::park::EvenParked>) {
     let Some(mut figure) = figure else { return };
     for (twin, mut visibility) in &mut twins {
         let Ok(original) = originals.get(twin.0) else { continue };
         if *visibility != *original {
             *visibility = *original;
-            figure.wanted = true;
+            figure.ask();
         }
     }
 }
 
-/// The picture the size of the gear page's panel in the window's pixels;
-/// and a drawing, when one is wanted and the figure is all on the graphics
-/// card: the camera on for a few frames, and then off.
+/// A picture with nothing in it to send, so that it is on the card at once
+/// (`icons.rs`, `ANSWER_FRAMES_AT_MOST`); the camera clears it.
+fn target(images: &mut Assets<Image>, size: UVec2) -> Handle<Image> {
+    let mut target = Image::new_uninit(Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 }, TextureDimension::D2, TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::default());
+    target.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
+    images.add(target)
+}
+
+/// The pictures: the gear page's the size of its panel in the window's
+/// pixels (without `TARKOV UI`, whose gear page has no model), the OVERALL
+/// tab's twice its view's size in the screen's units; and a drawing, when
+/// one is wanted and the figure is all on the graphics card: one camera on
+/// for a few frames, the model turned as its page has it, and then off;
+/// the OVERALL tab's kept on while its turn changes (a drag).
 #[allow(clippy::too_many_arguments)]
 fn draw(
+    mut commands: Commands,
     figure: Option<ResMut<Figure>>,
     mut image: ResMut<FigureImage>,
+    mut overall: ResMut<OverallFigure>,
     mut images: ResMut<Assets<Image>>,
     materials: Res<Assets<StandardMaterial>>,
     uploads: Res<UploadWatch>,
     waiting: Res<crate::PipelinesWaiting>,
     carried: Res<Carried>,
+    features: Res<crate::options_view::Features>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut cameras: Query<(&mut Camera, &mut RenderTarget)>,
+    mut transforms: Query<&mut Transform>,
+    game: Res<crate::GameData>,
+    mut inspect: Local<Option<Option<std::sync::Arc<trp_data::edit_build::InspectPreview>>>>,
 ) {
     let Some(mut figure) = figure else { return };
     let figure = &mut *figure;
@@ -394,39 +593,123 @@ fn draw(
     if !figure.on_card && !uploads.take(|name| name == ON_CARD).is_empty() {
         figure.on_card = true;
     }
-    let Ok((mut camera, mut render_target)) = cameras.get_mut(figure.camera) else { return };
-    // A picture of the panel's size in the window's own pixels: made again
-    // when that changes, and drawn on.
-    if let Ok(window) = window.single() {
+    // The gear page's: of the panel's size in the window's own pixels,
+    // made again when that changes.
+    if let (Ok(window), Some(camera), false) = (window.single(), figure.shots[GEAR].camera, features.tarkov_ui) {
         let panel = crate::inventory_view::gear_panel(&carried);
         let scale = window.height() / crate::inventory_view::SCREEN_HEIGHT * window.scale_factor();
         let size = UVec2::new((panel[0] * scale).round().max(1.0) as u32, (panel[1] * scale).round().max(1.0) as u32);
-        if size != figure.size {
-            figure.size = size;
-            // With nothing in it to send, so that it is on the card at once
-            // (`icons.rs`, `ANSWER_FRAMES_AT_MOST`); the camera clears it.
-            let mut target = Image::new_uninit(Extent3d { width: size.x, height: size.y, depth_or_array_layers: 1 }, TextureDimension::D2, TextureFormat::Rgba8UnormSrgb, RenderAssetUsages::default());
-            target.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::RENDER_ATTACHMENT;
-            let target = images.add(target);
-            if let Some(old) = image.0.replace(target.clone()) {
+        if size != figure.shots[GEAR].size {
+            let made = target(&mut images, size);
+            if let Some(old) = image.0.replace(made.clone()) {
                 images.remove(&old);
             }
-            *render_target = RenderTarget::Image(target.into());
-            figure.wanted = true;
+            if let Ok((_, mut render_target)) = cameras.get_mut(camera) {
+                *render_target = RenderTarget::Image(made.into());
+            }
+            figure.shots[GEAR].size = size;
+            figure.shots[GEAR].wanted = true;
         }
     }
-    if figure.wanted && figure.on_card && image.0.is_some() {
-        figure.wanted = false;
-        figure.drawing = Some(0);
+    // The OVERALL tab's, once its page has said where it is: its camera as
+    // the scene's (`Camera_inventory`: no antialiasing), its picture twice
+    // the view's whole units across and down (`CameraImage`).
+    if let (Some(rect), Some(scene_camera)) = (overall.rect, overall.camera) {
+        let size = UVec2::new(2 * (rect[0].max(1.0) as u32), 2 * (rect[1].max(1.0) as u32));
+        if figure.shots[OVERALL].camera.is_none() {
+            // Lit as the inspect window's model is (the user, 2026-10-24:
+            // "our character in the overall screen needs one as well", chosen
+            // over the game's own eight lights and PRISM's filmic curve:
+            // `decisions.md`): its two lights, no ambient, its photographic
+            // tonemap; where that preview cannot be read, the gear page's
+            // light and ambient.
+            let inspect = inspect
+                .get_or_insert_with(|| match trp_data::edit_build::InspectPreview::load(&game.unity.install) {
+                    Ok(inspect) => Some(std::sync::Arc::new(inspect)),
+                    Err(e) => {
+                        warn!("the inspect window's own preview could not be read; the OVERALL tab's character keeps the gear page's light: {e:#}");
+                        None
+                    }
+                })
+                .clone();
+            let ambient = if inspect.is_some() { 0.0 } else { FIGURE_AMBIENT };
+            let lights = if inspect.is_some() { OVERALL_LIGHTS } else { GEAR_LIGHTS };
+            let camera = commands
+                .spawn((
+                    Name::new("Character model's camera, the OVERALL tab's"),
+                    Camera3d::default(),
+                    Camera { is_active: false, order: -5, clear_color: ClearColorConfig::Custom(Color::NONE), ..default() },
+                    AmbientLight { color: Color::WHITE, brightness: ambient, ..default() },
+                    bevy::render::view::Msaa::Off,
+                    Projection::Perspective(PerspectiveProjection {
+                        fov: scene_camera.fov.to_radians(),
+                        near: scene_camera.near,
+                        near_clip_plane: Vec4::new(0.0, 0.0, -1.0, -scene_camera.near),
+                        far: scene_camera.far,
+                        ..default()
+                    }),
+                    overall_camera(&scene_camera),
+                    RenderLayers::from_layers(&[LAYER, lights]),
+                ))
+                .id();
+            if let Some(inspect) = &inspect {
+                crate::info_preview::inspect_lights(&mut commands, inspect, &RenderLayers::layer(OVERALL_LIGHTS));
+                commands.entity(camera).insert(bevy::camera::Exposure { ev100: 0.0 });
+                if let Some(exposure) = inspect.exposure {
+                    commands.entity(camera).insert((bevy::render::view::Hdr, bevy::core_pipeline::tonemapping::Tonemapping::None, crate::preview_tonemap::PhotographicTonemap::of(exposure)));
+                }
+            }
+            figure.shots[OVERALL].camera = Some(camera);
+        }
+        if size != figure.shots[OVERALL].size {
+            let made = target(&mut images, size);
+            if let Some(old) = overall.image.replace(made.clone()) {
+                images.remove(&old);
+            }
+            // (Made this frame: set as it comes, on the next.)
+            if let Some(camera) = figure.shots[OVERALL].camera {
+                commands.entity(camera).insert(RenderTarget::Image(made.into()));
+            }
+            figure.shots[OVERALL].size = size;
+            figure.shots[OVERALL].wanted = true;
+        }
+        if figure.shots[OVERALL].yaw != overall.yaw {
+            figure.shots[OVERALL].wanted = true;
+        }
     }
-    let Some(frames) = figure.drawing.as_mut() else { return };
+    // A drawing begun: the gear page's first; the model turned for it.
+    if figure.drawing.is_none() && figure.on_card {
+        let ready = |shot: &Shot| shot.wanted && shot.camera.is_some() && shot.size != UVec2::ZERO;
+        if let Some(index) = [GEAR, OVERALL].into_iter().find(|&index| ready(&figure.shots[index])) {
+            figure.shots[index].wanted = false;
+            figure.drawing = Some((index, 0));
+        }
+    }
+    let Some((index, frames)) = figure.drawing.as_mut() else { return };
+    let index = *index;
+    let yaw = if index == OVERALL { overall.yaw } else { YAW };
+    // Turned since: drawn on.
+    if figure.shots[index].yaw != yaw {
+        figure.shots[index].yaw = yaw;
+        *frames = 0;
+    }
+    if let Ok(mut root) = transforms.get_mut(figure.skeleton.root) {
+        let rotation = turned(yaw);
+        if root.rotation != rotation {
+            root.rotation = rotation;
+        }
+    }
     *frames += 1;
     let done = (*frames > DRAW_FRAMES && waiting.0.load(std::sync::atomic::Ordering::Relaxed) == 0) || *frames > DRAW_FRAMES_AT_MOST;
     if done {
         figure.drawing = None;
     }
-    if camera.is_active == done {
-        camera.is_active = !done;
+    for (at, shot) in figure.shots.iter().enumerate() {
+        let Some(Ok((mut camera, _))) = shot.camera.map(|camera| cameras.get_mut(camera)) else { continue };
+        let on = at == index && !done;
+        if camera.is_active != on {
+            camera.is_active = on;
+        }
     }
 }
 

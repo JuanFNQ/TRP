@@ -208,8 +208,9 @@ struct Letter<'a> {
     bold: bool,
 }
 
-/// Lays out and draws the words.
-pub fn draw(face: &TmpFace, material: &TmpMaterial, runs: &[TmpRun], layout: &TmpLayout) -> TmpImage {
+/// Lays out the words: each glyph placed, the widest line's width and the
+/// last line's bottom (the text's height), in pixels.
+fn lay_out<'a>(face: &'a TmpFace, runs: &[TmpRun], layout: &TmpLayout) -> (Vec<Placed<'a>>, f32, f32) {
     // The lines, each its letters at their pens and its width as it is
     // aligned by, ascender, descender. A line is aligned by where its last
     // letter that shows ends (`lineInfo.maxAdvance`: that letter's advance
@@ -290,6 +291,19 @@ pub fn draw(face: &TmpFace, material: &TmpMaterial, runs: &[TmpRun], layout: &Tm
         }
         bottom = baseline - descender;
     }
+    (placed, widest, bottom)
+}
+
+/// The words' size as laid out, without drawing them: the widest line's
+/// width and the text's height (its last line's bottom), in pixels.
+pub fn measure(face: &TmpFace, runs: &[TmpRun], layout: &TmpLayout) -> [f32; 2] {
+    let (_, widest, bottom) = lay_out(face, runs, layout);
+    [widest, bottom]
+}
+
+/// Lays out and draws the words.
+pub fn draw(face: &TmpFace, material: &TmpMaterial, runs: &[TmpRun], layout: &TmpLayout) -> TmpImage {
+    let (placed, widest, bottom) = lay_out(face, runs, layout);
     // Each quad with room round it for what the shader draws outside the
     // glyph: the atlas's padding (its gradient's scale less one).
     let pad = material.gradient_scale - 1.0;

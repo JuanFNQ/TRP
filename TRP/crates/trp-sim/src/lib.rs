@@ -4,41 +4,86 @@
 //! host steps it with input and reads back where the character, the weapon
 //! and the camera are.
 
+pub mod ambient;
 pub mod animator;
+pub mod armor;
 pub mod arms;
+pub mod ballistics;
 pub mod bindings;
+pub mod blast;
+pub mod blind_fire;
+pub mod blood;
+pub mod clouds;
 pub mod body;
 pub mod breath;
 pub mod collision;
+pub mod decals;
+pub mod emitters;
 pub mod empty_hands;
 pub mod firearm;
+pub mod grenade_hands;
 pub mod hands;
+pub mod hbao;
 pub mod health;
+pub mod impacts;
 pub mod health_replay;
+pub mod hysteresis;
 pub mod head_look;
 pub mod interactions;
 pub mod inventory;
 pub mod item_menu;
+pub mod knife_hands;
+pub mod rangefinder;
+pub mod landing;
+pub mod left_stance;
+pub mod magazine_process;
+pub mod magazine_view;
+pub mod malfunction;
+pub mod repair;
 pub mod marks;
 pub mod meds_hands;
 pub mod math;
+pub mod mounting;
 pub mod movement;
+pub mod muzzle;
 pub mod pacing;
+pub mod popper;
+pub mod particles;
+pub mod prism;
+pub mod quick_draw;
+pub mod speaker;
+pub mod edit_build;
+pub mod item_attributes;
+pub mod puppet;
 pub mod recoil;
 pub mod rig;
+pub mod screen_effects;
 pub mod script;
 pub mod settings;
+pub mod shading;
+pub mod shells;
+pub mod sights;
+pub mod skills;
+pub mod sparks;
 pub mod stamina;
 pub mod steps;
 pub mod systems;
+pub mod tactical;
 pub mod things;
+pub mod tod;
+pub mod unity_random;
 pub mod vaulting;
+pub mod visor;
 pub mod weapon_animator;
 
 pub use body::{ArmPose, Body};
 pub use breath::Wind;
 pub use empty_hands::EmptyHands;
 pub use firearm::{Event as FirearmEvent, FireMode, Firearm, FirearmSettings};
+pub use grenade_hands::{GrenadeEvent, GrenadeHands};
+pub use knife_hands::{KnifeEvent, KnifeHands, KnifeSettings, Stroke};
+pub use rangefinder::{RangefinderEvent, RangefinderHands};
+pub use magazine_process::MagazineProcess;
 pub use hands::{AimPoint, CameraPose, Carried, Hands, HandsInput, HandsSettings, Held, SightLine};
 pub use interactions::Interaction;
 pub use meds_hands::{MedsEvent, MedsHands};
@@ -109,6 +154,8 @@ pub fn load_movement_settings(
     // The kinds of moving's multipliers for its sounds are the client's
     // settings', not the globals' (`steps.rs`).
     settings.steps.read_client(&db.client);
+    // The head's capsules, from the player prefab (`PlayerOverlapManager`).
+    settings.head = Some(trp_data::player::HeadCollidersData::load(assets)?);
     Ok(settings)
 }
 
@@ -187,10 +234,20 @@ pub fn hands_settings(
             number(template, "HipAccuracyRestorationSpeed").unwrap_or(data.breath.gain_speed),
         ],
         seed: view.seed,
+        aim_punch: number(&db.config, "AimPunchMagnitude")?,
         field_of_view: view.field_of_view,
         head_bobbing: view.head_bobbing,
         aim_speed_bonus: view.aim_speed_bonus,
+        ergonomics_buff: 0.0,
         aim_plane_depth: aim_plane_depth(weapon)?,
+        sights: sights::Sights::of_weapon(weapon).map(|mut sights| {
+            // The zeroing points (`RecalculateOpticCalibrationPoints`): the
+            // weapon's default round at the build's speed factor.
+            let round = template.get("defAmmo").and_then(Json::as_str).and_then(|id| db.items.get(id)).and_then(ballistics::Round::of);
+            let launcher = template.get("AdjustCollimatorsToTrajectory").and_then(Json::as_bool).unwrap_or(false);
+            sights.set_ballistics(round.as_ref(), weapon.speed_factor, engine.gravity, launcher);
+            sights
+        }),
         weapon_length: weapon_length(weapon)?,
         weapon_root: weapon_root(weapon)?,
         // What the turn-away from an obstacle goes by (`TurnAway.IsPistol`).
@@ -198,6 +255,21 @@ pub fn hands_settings(
         held_closer: weapon.held_closer,
         rotation_center_no_stock: triple(template, "RotationCenterNoStock").unwrap_or(triple(template, "RotationCenter")?),
         folded,
+        recoil_force: Some(hands::RecoilForce {
+            up: number(template, "RecoilForceUp")?,
+            back: number(template, "RecoilForceBack")?,
+            vert_bonus: number(aiming, "RecoilVertBonus")?,
+            back_bonus: number(aiming, "RecoilBackBonus")?,
+            multiplier: data.recoil.incoming_strength_multiplier,
+            rotation_range: data.recoil.rotation_strength_range,
+            position_range: data.recoil.position_strength_range,
+            parts: (1.0 + weapon.recoil_delta).max(0.0),
+            folded_parts: weapon.fold.map(|fold| (1.0 + fold.recoil_delta).max(0.0)),
+        }),
+        recoil_suppression: 0.0,
+        mount: crate::mounting::WeaponMount::of_weapon(db, weapon)?,
+        mount_settings: crate::mounting::Settings::from_config(&db.config)?,
+        mount_ergonomics: 0.0,
         data,
     })
 }
@@ -251,16 +323,24 @@ pub fn empty_hands_settings(
         intensity_by_pose: triple(aiming, "ProceduralIntensityByPose")?,
         breath_gain: [data.breath.gain_per_shot, data.breath.gain_delay, data.breath.gain_speed],
         seed: view.seed,
+        aim_punch: number(&db.config, "AimPunchMagnitude")?,
         field_of_view: view.field_of_view,
         head_bobbing: view.head_bobbing,
         aim_speed_bonus: view.aim_speed_bonus,
+        ergonomics_buff: 0.0,
         aim_plane_depth: aim_plane_depth(hands)?,
+        sights: None,
         weapon_length: 0.0,
         weapon_root: weapon_root(hands)?,
         pistol: false,
         held_closer: false,
         rotation_center_no_stock: data.rotation_center,
         folded: None,
+        recoil_force: None,
+        recoil_suppression: 0.0,
+        mount: crate::mounting::WeaponMount::default(),
+        mount_settings: crate::mounting::Settings::from_config(&db.config).unwrap_or_default(),
+        mount_ergonomics: 0.0,
         data,
     })
 }
@@ -268,8 +348,6 @@ pub fn empty_hands_settings(
 /// The bone the weapon's clips move, which the bone the procedural motion
 /// moves hangs from.
 const WEAPON_ROOT: &str = "Weapon_root";
-/// The scripts that make an object one of the game's muzzle effects.
-const MUZZLE_EFFECTS: [&str; 4] = ["MuzzleEffect", "MuzzleJet", "MuzzleParticlePivot", "MuzzleFume"];
 
 /// Where that bone is and how it is turned in the frame the weapon's rig
 /// hangs in, at rest.
@@ -333,20 +411,8 @@ pub fn weapon_line_ends(weapon: &Weapon) -> Result<Vec<usize>> {
     let muzzle = (0..hierarchy.nodes.len())
         .find(|&i| hierarchy.nodes[i].name == "fireport")
         .context("the weapon has no muzzle")?;
-    let depth = |mut node: usize| {
-        let mut depth = 0;
-        while let Some(parent) = hierarchy.nodes[node].parent {
-            (depth, node) = (depth + 1, parent);
-        }
-        depth
-    };
-    let effects: Vec<usize> = (0..hierarchy.nodes.len())
-        .filter(|&i| hierarchy.nodes[i].scripts.iter().any(|script| MUZZLE_EFFECTS.contains(&script.as_str())))
-        .collect();
-    let smoke = |node: &usize| hierarchy.nodes[*node].name == "extractor_smoke";
-    let deepest = effects.iter().filter(|node| !smoke(node)).map(|&node| depth(node)).max();
-    let counted = effects.iter().filter(|node| smoke(node) || Some(depth(**node)) == deepest);
-    Ok(counted.copied().chain([muzzle]).collect())
+    // The muzzle effects that count (`UpdateJetsAndFumes`'s choice).
+    Ok(trp_data::muzzle::effect_objects(hierarchy).into_iter().chain([muzzle]).collect())
 }
 
 /// The clip the weapon's animator plays at rest: the one its resting
@@ -557,14 +623,15 @@ fn recoil_settings(data: &HandsData, aiming: &Json, template: &Json, recoil_delt
 pub fn firearm_settings(_assets: &Assets, db: &Database, hard: &HardSettings, weapon: &Weapon) -> Result<FirearmSettings> {
     let template = &db.item(&weapon.template)?.props;
     let preset = db.default_preset(&weapon.template)?;
-    // Which of a state's clips plays depends on the magazine fitted.
-    let magazine_variant = preset
-        .items
-        .iter()
-        .find(|i| i.slot.as_deref() == Some("mod_magazine"))
-        .and_then(|i| db.items.get(&i.template))
-        .and_then(|t| t.props.get("magAnimationIndex")?.as_i64())
-        .unwrap_or(0) as i32;
+    // Which of a state's clips plays depends on the magazine fitted
+    // (`magAnimationIndex`): the build's, else its stock preset's.
+    let magazine_variant = weapon
+        .magazine_animation
+        .or_else(|| {
+            let magazine = preset.items.iter().find(|i| i.slot.as_deref() == Some("mod_magazine"))?;
+            db.items.get(&magazine.template)?.props.get("magAnimationIndex")?.as_i64().map(|n| n as i32)
+        })
+        .unwrap_or(0);
     let modes: Vec<FireMode> = template
         .get("weapFireType")
         .and_then(Json::as_array)
@@ -616,6 +683,7 @@ pub fn firearm_settings(_assets: &Assets, db: &Database, hard: &HardSettings, we
         open_bolt_reload: flag("MustBoltBeOpennedForInternalReload"),
         must_open_bolt: flag("MustBoltBeOpennedForInternalReload") || flag("MustBoltBeOpennedForExternalReload"),
         manual_bolt_catch: flag("ManualBoltCatch"),
+        chamber_load: template.get("isChamberLoad").and_then(Json::as_bool).unwrap_or(true),
         foldable: weapon.fold.is_some(),
         // The character's, not the weapon's: a host that knows its skill
         // with this class of weapon sets them (`weapon_skill_speeds`).
@@ -629,6 +697,13 @@ pub fn firearm_settings(_assets: &Assets, db: &Database, hard: &HardSettings, we
         barrels,
         fast_reload: flag("isFastReload"),
         rocket_launcher: db.item(&weapon.template).ok().is_some_and(|item| db.is_a(item, "RocketLauncher")),
+        // No chamber at all: none listed, a detachable magazine, and not a
+        // cylinder's (`Weapon.HasChambers`).
+        no_chamber: template.get("Chambers").and_then(Json::as_array).is_some_and(|chambers| chambers.is_empty())
+            && template.get("ReloadMode").and_then(Json::as_str) == Some("ExternalMagazine")
+            && cylinder.is_none(),
+        mountable: flag("IsMountable"),
+        bipod: weapon.bipod.as_ref().map(|bipod| bipod.forward),
     })
 }
 

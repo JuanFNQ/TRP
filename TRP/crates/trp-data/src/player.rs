@@ -129,6 +129,9 @@ pub struct BreathData {
     /// The highest a broken arm lets the hands' level count
     /// (`EnergyFractureLimit`).
     pub fracture_limit: f32,
+    /// The lowest the hands' level counts (`EnergyLowerLimit`): mounted, the
+    /// breath runs only with the hands at it (mounting spec, "Breath").
+    pub lower_limit: f32,
 }
 
 /// One component of a turn-away pose: a curve of the effector's value
@@ -186,6 +189,19 @@ pub mod effector {
     pub const HAND_SHAKE: u32 = 128;
 }
 
+/// The aim sway's figures (`ProceduralWeaponAnimation`): the box its
+/// direction is drawn in, lowest and highest each way; how fast it fades
+/// (`SwayFalloff`, over the aiming speed); and the weight, ergonomics taken
+/// off, at which it starts and is whole.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AimSwayData {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub falloff: f32,
+    pub starts: f32,
+    pub full: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct HandsData {
     pub turn_away: TurnAwayData,
@@ -225,6 +241,10 @@ pub struct HandsData {
     pub camera_smooth_recoil: f32,
     pub camera_smooth_blend_speed: f32,
     pub aiming_displacement_str: f32,
+    /// A heavy weapon's sway as the sights come up (`ProceduralWeaponAnimation`
+    /// `AimSwayMin`, `AimSwayMax`, `SwayFalloff`, `AimSwayStartsThreshold`,
+    /// `AimSwayMaxThreshold`; weapon-handling spec, "Aim sway").
+    pub aim_sway: AimSwayData,
 
     pub recoil: RecoilData,
     pub breath: BreathData,
@@ -237,6 +257,39 @@ pub struct HandsData {
     /// `aim_pose_speed` a second.
     pub aim_pose: Vec<WalkEntry>,
     pub aim_pose_speed: f32,
+    /// The force reaction (`ForceReact`, a `ForceEffector`).
+    pub force_react: ForceReactData,
+    /// Blind fire's figures (blind-fire spec, "The weapon and the camera").
+    pub blind_fire: BlindFireData,
+}
+
+/// Blind fire's figures on the player prefab's `ProceduralWeaponAnimation`:
+/// its blender's speed a second (`BlindfireBlender.Speed`), the camera's
+/// turn over the top and to the right at full value before it is halved
+/// (`BlindFireCamera`, `SideFireCamera`, degrees), and the end points the
+/// weapon's line is first cast from, over the top and to the right
+/// (`BlindFireOffset`, `SideFireOffset`, metres).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlindFireData {
+    pub speed: f32,
+    pub camera: [[f32; 3]; 2],
+    pub end: [[f32; 3]; 2],
+}
+
+/// The force reaction's figures (`ForceEffector`): its intensity, what it
+/// pushes (each value from a component of the force, `From`, into a
+/// spring's component, `To`: 0 the camera's rotation, 1 the camera's
+/// position, which the game's `Initialize` passes where it names the
+/// hands' position, 2 the hands' rotation), and its noise's reach about x
+/// and y and about z (`_eulersNoiseXYMaxValue`, `_eulersNoiseZMaxValue`).
+#[derive(Debug, Clone, Default)]
+pub struct ForceReactData {
+    pub intensity: f32,
+    pub vals: Vec<EffectorVal>,
+    pub noise_xy: f32,
+    pub noise_z: f32,
+    /// How much shorter a hit's push may be drawn (`_deltaRandom`).
+    pub delta_random: f32,
 }
 
 impl HandsData {
@@ -335,6 +388,8 @@ impl HandsData {
             shot_hardness: float(breath, "_shotHardness")?,
             tremor: [random("TremorXRandom")?, random("TremorYRandom")?, random("TremorZRandom")?],
             fracture_limit: float(breath, "EnergyFractureLimit")?,
+            // The class's figure where the prefab has none (0.05).
+            lower_limit: float(breath, "EnergyLowerLimit").unwrap_or(0.05),
         };
 
         let custom = pwa.req("CustomEffector")?;
@@ -407,11 +462,36 @@ impl HandsData {
             camera_smooth_recoil: float(&pwa, "CameraSmoothRecoil")?,
             camera_smooth_blend_speed: float(pwa.req("CameraSmoothBlender")?, "Speed")?,
             aiming_displacement_str: float(&pwa, "AimingDisplacementStr")?,
+            aim_sway: AimSwayData {
+                min: pwa.req("AimSwayMin")?.as_vec3().context("AimSwayMin")?,
+                max: pwa.req("AimSwayMax")?.as_vec3().context("AimSwayMax")?,
+                falloff: float(&pwa, "SwayFalloff")?,
+                starts: float(&pwa, "AimSwayStartsThreshold")?,
+                full: float(&pwa, "AimSwayMaxThreshold")?,
+            },
             recoil: recoil_data(pwa.req("Shootingg")?)?,
             breath,
             mask: pwa.req("Mask")?.as_i64().context("the weapon motion's mask is not a number")? as u32,
             aim_pose,
             aim_pose_speed: float(custom.req("PoseBlender")?, "Speed")?,
+            force_react: {
+                let force = pwa.req("ForceReact")?;
+                ForceReactData {
+                    intensity: float(force, "Intensity")?,
+                    vals: vals(force.req("Vals")?)?,
+                    noise_xy: float(force, "_eulersNoiseXYMaxValue")?,
+                    noise_z: float(force, "_eulersNoiseZMaxValue")?,
+                    delta_random: float(force, "_deltaRandom")?,
+                }
+            },
+            blind_fire: {
+                let vector = |name: &str| pwa.req(name).ok().and_then(Value::as_vec3).with_context(|| name.to_owned());
+                BlindFireData {
+                    speed: float(pwa.req("BlindfireBlender")?, "Speed")?,
+                    camera: [vector("BlindFireCamera")?, vector("SideFireCamera")?],
+                    end: [vector("BlindFireOffset")?, vector("SideFireOffset")?],
+                }
+            },
         })
     }
 }
@@ -496,6 +576,78 @@ impl CameraBoxData {
             return Ok(Self { size: vec3("m_Size")?, centre: vec3("m_Center")? });
         }
         Err(anyhow!("the player prefab's camera has no collider"))
+    }
+}
+
+/// One of the head's capsules (`PlayerOverlapManager._headColliders`): the
+/// capsule collider's own figures, and its object's place and turn in its
+/// parent (Unity's `CapsuleCollider`: `direction` 0 x, 1 y, 2 z).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeadCapsuleData {
+    pub radius: f32,
+    pub height: f32,
+    pub direction: usize,
+    pub centre: [f32; 3],
+    pub position: [f32; 3],
+    pub rotation: [f32; 4],
+}
+
+/// The capsule about the head that the movement keeps out of walls
+/// (movement spec, "The head's push out of walls"): standing, the one on
+/// `playercollider` under the camera's container; lying, the one on
+/// `ProneCollisionTest` under the player, which is moved over the bone
+/// named `lying_pivot` (`_proneColliderPivot`) as it is used.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeadCollidersData {
+    pub standing: HeadCapsuleData,
+    pub lying: HeadCapsuleData,
+    pub lying_pivot: String,
+}
+
+impl HeadCollidersData {
+    pub fn load(assets: &mut Assets) -> Result<Self> {
+        let files = assets.load(PLAYER_BUNDLE)?;
+        for obj in files.iter().flat_map(|&f| assets.objects_of(f, class::MONO_BEHAVIOUR)).collect::<Vec<_>>() {
+            if script_class(assets, obj).as_deref() != Some("PlayerOverlapManager") {
+                continue;
+            }
+            let script = assets.read(obj)?;
+            let resolve = |v: &Value| v.as_pptr().and_then(|p| assets.resolve_loaded(obj.file, p));
+            let colliders: Vec<ObjRef> =
+                script.req("_headColliders")?.as_array().unwrap_or(&[]).iter().filter_map(resolve).collect();
+            anyhow::ensure!(colliders.len() >= 2, "the head has {} colliders, not two", colliders.len());
+            let transform_of = |owner: &Value| -> Result<Value> {
+                let go = owner.get("m_GameObject").and_then(resolve).ok_or_else(|| anyhow!("a collider without its object"))?;
+                let go_value = assets.read(go)?;
+                let transform = crate::unity::extract::components(assets, go, &go_value)
+                    .into_iter()
+                    .find(|c| assets.info(*c).is_some_and(|i| i.class_id == class::TRANSFORM))
+                    .ok_or_else(|| anyhow!("an object without its transform"))?;
+                assets.read(transform)
+            };
+            let capsule = |at: ObjRef| -> Result<HeadCapsuleData> {
+                let c = assets.read(at)?;
+                let t = transform_of(&c)?;
+                let float = |name: &str| c.req(name)?.as_f32().with_context(|| format!("{name} is not a number"));
+                Ok(HeadCapsuleData {
+                    radius: float("m_Radius")?,
+                    height: float("m_Height")?,
+                    direction: c.req("m_Direction")?.as_i64().context("m_Direction")? as usize,
+                    centre: c.req("m_Center")?.as_vec3().context("m_Center")?,
+                    position: t.req("m_LocalPosition")?.as_vec3().context("position")?,
+                    rotation: t.req("m_LocalRotation")?.as_vec4().context("rotation")?,
+                })
+            };
+            let pivot = script.get("_proneColliderPivot").and_then(resolve).ok_or_else(|| anyhow!("no pivot for the lying capsule"))?;
+            let pivot = assets.read(pivot)?;
+            let pivot_go = pivot.get("m_GameObject").and_then(resolve).ok_or_else(|| anyhow!("the pivot without its object"))?;
+            return Ok(Self {
+                standing: capsule(colliders[0])?,
+                lying: capsule(colliders[1])?,
+                lying_pivot: assets.read(pivot_go)?.get("m_Name").and_then(Value::as_str).unwrap_or_default().to_owned(),
+            });
+        }
+        Err(anyhow!("the player prefab has no PlayerOverlapManager"))
     }
 }
 

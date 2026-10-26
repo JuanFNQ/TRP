@@ -10,8 +10,10 @@
 //! drawn with a twin of its standard material whose fragment shader keeps
 //! no pixel (`shadow_only.wgsl`); the shadow pass, which runs no fragment
 //! shader of the material for an opaque one and the standard one for a
-//! masked one, writes its depth as before. The drawing alone: nothing of the
-//! simulation changes.
+//! masked one, writes its depth as before. With the camera's normal prepass
+//! (the ambient occlusion's, `hbao_view`) its prepass keeps no pixel either
+//! (`shadow_only_prepass.wgsl`), where a depth prepass of it would hide
+//! what is behind it. The drawing alone: nothing of the simulation changes.
 
 use std::collections::HashMap;
 
@@ -22,6 +24,7 @@ use bevy::render::render_resource::AsBindGroup;
 use bevy::shader::ShaderRef;
 
 const SHADOW_ONLY_SHADER: Handle<Shader> = uuid_handle!("2b7d3e51-8c4a-4f0e-9a61-3d5e7c2b9f14");
+const SHADOW_ONLY_PREPASS_SHADER: Handle<Shader> = uuid_handle!("6f1c8a93-2d54-4b7e-a0c3-91e5d7b42f68");
 
 /// The standard material, its pixels never drawn: its shadow alone.
 pub type ShadowOnlyMaterial = ExtendedMaterial<StandardMaterial, NoPixels>;
@@ -32,6 +35,10 @@ pub struct NoPixels {}
 impl MaterialExtension for NoPixels {
     fn fragment_shader() -> ShaderRef {
         SHADOW_ONLY_SHADER.into()
+    }
+
+    fn prepass_fragment_shader() -> ShaderRef {
+        SHADOW_ONLY_PREPASS_SHADER.into()
     }
 }
 
@@ -50,7 +57,7 @@ pub struct Drawn(Handle<StandardMaterial>);
 /// back to the material itself.
 pub fn apply(
     mut commands: Commands,
-    meshes: Query<(Entity, &ShadowOnly, Option<&MeshMaterial3d<StandardMaterial>>, Option<&Drawn>)>,
+    meshes: Query<(Entity, &ShadowOnly, Option<&MeshMaterial3d<StandardMaterial>>, Option<&Drawn>), crate::park::EvenParked>,
     standard: Res<Assets<StandardMaterial>>,
     mut shadows: ResMut<Assets<ShadowOnlyMaterial>>,
     mut twins: Local<HashMap<AssetId<StandardMaterial>, Handle<ShadowOnlyMaterial>>>,
@@ -75,6 +82,7 @@ pub struct ShadowOnlyPlugin;
 impl Plugin for ShadowOnlyPlugin {
     fn build(&self, app: &mut App) {
         load_internal_asset!(app, SHADOW_ONLY_SHADER, "shadow_only.wgsl", Shader::from_wgsl);
+        load_internal_asset!(app, SHADOW_ONLY_PREPASS_SHADER, "shadow_only_prepass.wgsl", Shader::from_wgsl);
         app.add_plugins(MaterialPlugin::<ShadowOnlyMaterial>::default()).add_systems(PostUpdate, apply);
     }
 }
