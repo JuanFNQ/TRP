@@ -345,3 +345,40 @@ fn a_folded_stock_sizes_its_weapon_as_the_game_did() {
     }
     assert_eq!(off(&list), Vec::new());
 }
+
+/// An armoured rig worn keeps body armour off, and body armour worn keeps
+/// an armoured rig off (inventory spec, "What a slot accepts", 4 and 7);
+/// a rig with no armour asks nothing of either. Set against the install:
+/// which of its rigs block the body armour's slot, and that nothing else
+/// does. Read from the game's code, not compared with a recording.
+#[test]
+fn an_armoured_rig_and_body_armour_keep_each_other_off() {
+    use trp_data::character::inventory::Loadout;
+    use trp_sim::items::inventory::{slot_to_wear, Equipment, Item, Kind, Refusal};
+    let Some(db) = crate::fixture::database() else { return };
+    let blocks = |id: &str| db.items[id].blocked_slots().iter().any(|slot| slot == "ArmorVest");
+    let armoured = |id: &str| Kind::of(db, id).is_ok_and(|kind| kind.slots.iter().any(|slot| slot.armour));
+    let rigs: Vec<&str> = db.items.values().filter(|template| db.is_a(template, "Vest") && template.props.get("BlocksArmorVest").is_some()).map(|template| template.id.as_str()).collect();
+    let blocking: Vec<&str> = rigs.iter().copied().filter(|id| blocks(id)).collect();
+    let (with_armour, plain_with) = (blocking.iter().filter(|id| armoured(id)).count(), rigs.iter().filter(|id| !blocks(id) && armoured(id)).count());
+    println!("{} rigs: {} block the body armour's slot ({with_armour} of them with armour slots of their own); {plain_with} with armour slots do not", rigs.len(), blocking.len());
+    assert_eq!((rigs.len(), blocking.len(), with_armour, plain_with), (66, 30, 30, 0));
+    assert!(db.items.values().filter(|template| blocks(&template.id)).all(|template| db.is_a(template, "Vest")), "only a rig blocks the body armour");
+    // Whole, as the game's presets have them: the Bagariy (armoured) and a
+    // body armour; and a rig that blocks nothing.
+    let whole = |template: &str| Loadout::of_preset(db, template).and_then(|list| Item::of_list(db, &list)).expect(template).0;
+    let rig = whole("628d0618d1ba6e4fa07ce5a4");
+    let armour = db.items.values().find(|template| db.is_a(template, "Armor") && db.default_preset(&template.id).is_ok()).map(|template| whole(&template.id)).expect("a body armour");
+    let plain = rigs.iter().find(|id| !blocks(id)).map(|id| Item::new(std::sync::Arc::new(Kind::of(db, id).expect("its kind")))).expect("a rig that blocks nothing");
+    let mut worn = Equipment::empty(db).expect("the equipment's template");
+    assert!(slot_to_wear(&worn.item, &armour).is_some() && slot_to_wear(&worn.item, &rig).is_some(), "each goes on alone");
+    worn.wear("TacticalVest", rig.clone()).expect("the armoured rig goes on");
+    assert_eq!(worn.can_wear("ArmorVest", &armour), Err(Refusal::Blocked("TacticalVest".into())));
+    assert_eq!(slot_to_wear(&worn.item, &armour), None, "nor is it put on from a crate");
+    // The other way round.
+    worn.take_off("TacticalVest");
+    worn.wear("ArmorVest", armour.clone()).expect("the body armour goes on");
+    assert_eq!(worn.can_wear("TacticalVest", &rig), Err(Refusal::WouldBlock("ArmorVest".into())));
+    assert_eq!(slot_to_wear(&worn.item, &rig), None);
+    assert_eq!(worn.can_wear("TacticalVest", &plain), Ok(()));
+}

@@ -185,6 +185,32 @@ fn what_is_worn_on_the_head_is_set_against_the_rest() {
     assert_eq!(move_item(&mut roots, armour_id, worn_id, Spot::Slot(2), &RAID), Ok(()));
 }
 
+/// An armoured rig blocks the body armour's slot: worn, it keeps armour
+/// off; armour worn keeps the rig off, and a rig that blocks nothing
+/// goes on beside it.
+#[test]
+fn an_armoured_rig_and_body_armour_are_not_worn_together() {
+    let slots = vec![holder("TacticalVest", [0, 0], &["vest"], &[]), holder("ArmorVest", [0, 0], &["armor"], &[])];
+    let mut worn = Item::new(Arc::new(Kind { slots, ..kind(EQUIPMENT_TEMPLATE, "inventory", 0.0, [1, 1]) }));
+    let worn_id = worn.id;
+    let rig = Item::new(Arc::new(Kind { blocks: vec!["ArmorVest".into()], ..kind("armoured rig", "vest", 6.0, [2, 2]) }));
+    let (armour, plain) = (thing("armour", "armor", 4.0, [2, 2]), thing("rig", "vest", 1.0, [2, 2]));
+    let (rig_id, armour_id, plain_id) = (rig.id, armour.id, plain.id);
+    let mut box_ = a_box();
+    let box_id = box_.id;
+    for item in [rig, armour, plain] {
+        box_.stow(item).unwrap();
+    }
+    let mut roots = [&mut worn, &mut box_];
+    assert_eq!(move_item(&mut roots, rig_id, worn_id, Spot::Slot(0), &RAID), Ok(()));
+    assert_eq!(move_item(&mut roots, armour_id, worn_id, Spot::Slot(1), &RAID), Err(Refusal::Blocked("TacticalVest".into())));
+    // The other way round: the rig off, the armour on.
+    assert_eq!(move_item(&mut roots, rig_id, box_id, Spot::Cell(0, Place { x: 6, y: 6, turned: false }), &RAID), Ok(()));
+    assert_eq!(move_item(&mut roots, armour_id, worn_id, Spot::Slot(1), &RAID), Ok(()));
+    assert_eq!(move_item(&mut roots, rig_id, worn_id, Spot::Slot(0), &RAID), Err(Refusal::WouldBlock("ArmorVest".into())));
+    assert_eq!(move_item(&mut roots, plain_id, worn_id, Spot::Slot(0), &RAID), Ok(()));
+}
+
 /// With the raid's limits, no more of a kind comes onto the character
 /// from elsewhere than its limit leaves room for, by a move, a split or
 /// a stack put on a stack; a thing moved within what the character has

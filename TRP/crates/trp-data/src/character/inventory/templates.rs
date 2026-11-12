@@ -145,12 +145,16 @@ impl ItemTemplate {
         self.props.get("RaidModdable").and_then(Json::as_bool).unwrap_or(true)
     }
 
-    /// The equipment slots it blocks while worn, by name: the template's
+    /// The equipment slots it blocks while worn, by name, in the order of
+    /// the game's blocker (`SlotBlockerComponent`): the template's
     /// `BlocksEarpiece`, `BlocksEyewear`, `BlocksFaceCover` and
-    /// `BlocksHeadwear`.
+    /// `BlocksHeadwear`, then `BlocksArmorVest`, by which an armoured rig
+    /// keeps body armour off. The game reads the first four of armour and
+    /// head things and the last of what is searched; the install sets
+    /// each only there (inventory spec, "What a slot accepts", 4).
     pub fn blocked_slots(&self) -> Vec<String> {
         let blocks = |slot: &str| self.props.get(format!("Blocks{slot}")).and_then(Json::as_bool) == Some(true);
-        ["Earpiece", "Eyewear", "FaceCover", "Headwear"].into_iter().filter(|slot| blocks(slot)).map(str::to_owned).collect()
+        ["Earpiece", "Eyewear", "FaceCover", "Headwear", "ArmorVest"].into_iter().filter(|slot| blocks(slot)).map(str::to_owned).collect()
     }
 
     /// The equipment slots it is not taken out of in a raid, by name

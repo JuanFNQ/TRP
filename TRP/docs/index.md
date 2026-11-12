@@ -31,7 +31,7 @@ To find where something lives, search this file for a word (`grep -i "quick bar"
 - `icons.md` (48 KB): How the game makes the picture of an item in its inventory, read from its code on 2026-10-14 (`IconCreatorBase`, `ItemIconCreator`, `ItemIconCache`, `ItemViewFactory`, `PreviewPivot`, `IconShadow`, `ShaderReplacer`, `Wea...
 - `inspect-window.md` (45 KB): The window that shows a thing (`InfoWindow`, `ItemSpecificationPanel`, `ItemInfoWindowLabels`;
 - `interactions.md` (68 KB): How the character works a door, searches a container, opens a car's trunk and takes a thing up: what it can look at, which animation the left hand makes, whether the character is held for it, and what the thing itself do...
-- `inventory.md` (405 KB): What the character carries, where each thing sits, and the screen that shows it.
+- `inventory.md` (406 KB): What the character carries, where each thing sits, and the screen that shows it.
 - `left-shoulder.md` (18 KB): The weapon moved to the left shoulder.
 - `lighting.md` (75 KB): How the game lights a level and how its camera brings that light to the screen, read for Factory by day, and how the range takes both.
 - `malfunctions.md` (44 KB): What a shot does to the weapon and what the weapon then does: the wear of each shot, the chance of a malfunction and which one comes, what each does to the rounds and the hands, the look that tells its kind and the repai...
@@ -794,7 +794,7 @@ To find where something lives, search this file for a word (`grep -i "quick bar"
 
 - `mod.rs` (261): What a starting character carries, and what SPT's database says of an item as something to carry.
 - `locale.rs` (128): The locale's words, items' short names and texts.
-- `templates.rs` (173): Item templates' holders, slots, grids and cells.
+- `templates.rs` (177): Item templates' holders, slots, grids and cells.
 
 ### crates/trp-data/src/character/outfit
 
@@ -1335,7 +1335,7 @@ To find where something lives, search this file for a word (`grep -i "quick bar"
 - `grids.rs` (202): Tests of item grids, the room found, an item's size from its parts and folding.
 - `moves.rs` (324): Tests of equipment slots, moving, stacking, splitting, putting on and binding things.
 - `reloads.rs` (334): Tests of cylinders, tubes, reloads and magazines loaded and swapped.
-- `rules.rs` (285): Tests of room for things sent over, conflicts, locked slots, raid limits and weight.
+- `rules.rs` (311): Tests of room for things sent over, conflicts, locked slots, raid limits and weight.
 - `weapons.rs` (173): Tests of weapons coming apart, magazines' rounds and chambers.
 
 ### crates/trp-sim/src/items/item_attributes
@@ -1723,7 +1723,7 @@ To find where something lives, search this file for a word (`grep -i "quick bar"
 - `controls.rs` (260): Commands, slow leans, looking a weapon over, and the mouse bindings.
 - `doors.rs` (192): Kicking a door and the door's menu.
 - `empty_hands.rs` (179): Empty hands read like a weapon, and fists in a sprint.
-- `equipment.rs` (347): Starting equipment, the equipment panel, crates and recorded equipment lists.
+- `equipment.rs` (384): Starting equipment, the equipment panel, crates and recorded equipment lists.
 - `falls.rs` (313): Falling off ledges, foot motion, crouched walks and the ribcage lag.
 - `hand_actions.rs` (364): The Model 700's bolt and magazine and the Five-seveN's slide lock.
 - `legs_dry.rs` (201): Sprints that run the legs dry.

@@ -73,4 +73,4 @@ The install's path comes from `SPT_DIR` or `local/spt_dir.txt`. A run writes its
 
 ## Status
 
-Version 0.262.0. `docs/features.md` lists what is built and what is not.
+Version 0.262.2. `docs/features.md` lists what is built and what is not.

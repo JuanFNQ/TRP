@@ -14,7 +14,7 @@ publish = false
 # One number for the whole of TRP, raised with every change (docs/manual.md, "Versions";
 # tools/check.sh reads and bumps it). trp-app's build.rs reads it from here and the app prints
 # it first (`TRP_VERSION`).
-version = "0.262.0"
+version = "0.262.2"
 
 [workspace.dependencies]
 anyhow = "1"

@@ -2,6 +2,10 @@
 
 One number covers the whole of TRP. It is raised with every change. Versions before 0.251.0 are not listed here.
 
+## 0.262.2
+
+- Body armour and an armoured rig can no longer be worn together, as in Tarkov. With an armoured rig on, the BODY ARMOR slot takes nothing, and with body armour on, an armoured rig is refused. A rig with no armour of its own still goes on over body armour.
+
 ## 0.262.0
 
 - The SPT folder is now named by the `SPT_DIR` environment variable, or kept in `TRP/local/spt_dir.txt`. If you set TRP up with an earlier release, run `Install.bat` once more: it asks for your folders again.
