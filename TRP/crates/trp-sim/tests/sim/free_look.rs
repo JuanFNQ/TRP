@@ -1,15 +1,15 @@
-//! The head's free look, measured with the real install's data and the
-//! stock AKM (`docs/spec/free-look.md`). These pass trivially, with a
+//! Tests of the head's free look, measured with the real install's data and the stock AKM.
+//! After `docs/spec/free-look.md`. These pass trivially, with a
 //! note, where no install is configured.
 //!
 //! Run with `cargo test -p trp-sim --test sim free_look:: -- --nocapture` for
 //! the numbers.
 
-use trp_data::engine::EngineSettings;
-use trp_data::hard_settings::HardSettings;
-use trp_data::player::HandsData;
+use trp_data::setup::engine::EngineSettings;
+use trp_data::setup::hard_settings::HardSettings;
+use trp_data::character::player::HandsData;
 use trp_data::unity::Assets;
-use trp_sim::math::quat_rotate;
+use trp_sim::base::math::quat_rotate;
 use trp_sim::{Flat, Hands, HandsInput, Input, Movement, ViewSettings};
 
 const AKM: &str = "59d6088586f774275f37482f";
@@ -25,13 +25,13 @@ fn rig() -> Option<(Hands, Movement)> {
     let hard = HardSettings::load(&install).expect("settings object");
     let engine = EngineSettings::load(&install).expect("engine settings");
     let mut assets = Assets::new(install).expect("manifest");
-    let weapon = trp_data::weapon::assemble(&mut assets, &db, AKM).expect("weapon");
+    let weapon = trp_data::weapons::weapon::assemble(&mut assets, &db, AKM).expect("weapon");
     let data = HandsData::load(&mut assets).expect("player prefab");
     let hands = Hands::new(
         trp_sim::hands_settings(data, &db, &hard, &engine, &weapon, ViewSettings::default()).expect("hands settings"),
     );
     let drawn = [format!("{SPINE}/Base HumanNeck"), format!("{SPINE}/Base HumanNeck/Base HumanHead")];
-    let body = trp_sim::body::BodyData::load_with(&mut assets, &drawn).expect("body animator");
+    let body = trp_sim::locomotion::body::BodyData::load_with(&mut assets, &drawn).expect("body animator");
     let movement = Movement::new(
         trp_sim::load_movement_settings(&mut assets, &db, &hard, &engine, 0.0).expect("movement"),
         trp_sim::Body::new(&body, weapon.cell_width as f32),
@@ -46,7 +46,7 @@ fn angle(q: [f32; 4]) -> f32 {
 /// The turn from one rotation to another, in degrees.
 fn between(a: [f32; 4], b: [f32; 4]) -> f32 {
     let back = [-a[0], -a[1], -a[2], a[3]];
-    angle(trp_sim::math::quat_mul(back, b))
+    angle(trp_sim::base::math::quat_mul(back, b))
 }
 
 fn still() -> HandsInput {
@@ -115,7 +115,7 @@ fn the_head_turns_and_comes_back() {
 #[test]
 fn the_camera_takes_the_head_s_turn() {
     let Some((mut hands, _)) = rig() else { return };
-    let animated = trp_sim::math::quat_euler([-90.0, 0.0, 0.0]);
+    let animated = trp_sim::base::math::quat_euler([-90.0, 0.0, 0.0]);
     for _ in 0..60 {
         hands.advance(DT, &still());
         hands.frame(DT, animated, None);
@@ -162,8 +162,8 @@ fn the_camera_takes_the_head_s_turn() {
     assert!((settle(&mut hands, &still()) - hip).abs() < 0.05);
 }
 
-/// The user's recording of the free look (recorder 0.8.0, course 8 of
-/// `local/traces/courses1`, 2026-10-15): its keys put through the game's
+/// The recording of the free look (recorder 0.8.0, course 8 of
+/// `local/traces/courses1`): its keys put through the game's
 /// input manager by the install's bindings, its mouse axes given to the
 /// look or the turn by them, the look's share to the head. On every frame
 /// the head's rotation is the game's within a hundredth of a degree, and
@@ -172,14 +172,14 @@ fn the_camera_takes_the_head_s_turn() {
 /// the recording or the install is not there.
 #[test]
 fn the_recorded_free_look_is_followed() {
-    use trp_sim::bindings::{code, Code, Preset, LOOK_BINDING};
-    use trp_sim::head_look::{HeadLook, HeadLookInput, HeadLookSettings};
+    use trp_sim::base::bindings::{code, Code, Preset, LOOK_BINDING};
+    use trp_sim::locomotion::head_look::{HeadLook, HeadLookInput, HeadLookSettings};
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../local/traces/courses1/8-free-look/free-look.jsonl");
     let (Ok(text), Ok(install)) = (std::fs::read_to_string(path), crate::fixture::install().ok_or(())) else {
         eprintln!("skipped: no recording of course 8 or no install");
         return;
     };
-    let controls = trp_sim::bindings::install_controls(&install);
+    let controls = trp_sim::base::bindings::install_controls(&install);
     let axis = |name: &str| install.axis_sensitivity(name).unwrap_or(5.0);
     let (look, turn) = ([axis("LookX"), axis("LookY")], [axis("TurnX"), axis("TurnY")]);
     let sensitivity = install.player_settings().mouse_sensitivity.unwrap_or(1.0);

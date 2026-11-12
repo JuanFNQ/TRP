@@ -1,0 +1,56 @@
+{
+  "about": "The ZF4 and its steel mount for the StG 44: parts that are not the install's, each a piece of a second model of the rifle that has them (its file in local/, never in the repository). That file was exported from a viewer: it is read in the axes of its node RootNode (centimetres, y up, the barrel along -x) and turned a quarter about y, to have the barrel along -z. Both parts are drawn at 0.9 of the model's size (at full size they are very slightly too large beside the rest of the weapon), each about its own point, so that the scope still lies in the mount's rings. Every figure here is accounted for in docs/spec/custom-weapons.md, 'The ZF4 and its mount'.",
+  "model": {
+    "file": "local/ExperimentalWeapon/STG44V2/STG-44_Assault_Rifle.fbx",
+    "frame": "RootNode",
+    "turn": [0.0, -90.0, 0.0],
+    "textures": "local/ExperimentalWeapon/STG44V2/images",
+    "texture": "{material}_{map}.png",
+    "texture_size": 2048,
+    "normal_green_down": false
+  },
+  "items": [
+    {
+      "about": "The scope: the pieces of the scope's mesh that lie wholly within its tube's reach (1.95 cm of the axis at x 0, y 9.53 across, z 2.0 to 21.1 along) or within its drum on the right (x 1.40 to 2.50, y 8.40 to 11.05, z 10.95 to 13.60), but for four of the bracket's below the tube on the right (40, 48, 65, 216) and the eyepiece's glass (74), where the donor's lens is drawn. The donor is the PU 3.5x, the install's scope of the ZF4's kind and age: its optic (camera, field of view, zeroing, aiming sensitivity) works this scope. Its lens lies 11.0 cm behind its root, 0.1 cm to the left and 0.2 above: the root is put so far ahead of the bottom of the eyepiece's opening (0, 9.53, 20.40 of the model) at the scope's 0.9 of the model's size, 12.22 model centimetres, and the lens and its back made 1.071 times their size (the opening's wall 1.56 cm from the axis, 1.404 at 0.9; the donor's rim 1.3143 cm from its middle) to fill it. Its reticle is the ZF4's (drawn from a picture of the ZF4's: a T with a thin horizontal line and a larger middle one): a post 18 pixels of 1024 wide rising from the bottom to the middle, flat on top, and a thin line 3 pixels high across the whole, its middle 18 pixels below the post's top, where the PU's has a pointed post and two thick bars. Seen through it, the post is about a fiftieth of the view across and six times the line, as in the user's picture. The magnification the HUD shows is the ZF4's 4.",
+      "id": "66f0a5740000000000000047",
+      "name": "scope_stg44_zf4_4x",
+      "short_name": "ZF4",
+      "donor": "5b3f7c1c5acfc40dc5296b1d",
+      "meshes": [
+        {
+          "model": "Stg44_scope_LOD00_Scope_0",
+          "inside": [[[-1.95, 7.55, 2.0], [1.95, 12.0, 21.1]], [[1.40, 8.40, 10.95], [2.50, 11.05, 13.60]]],
+          "except": [40, 48, 65, 74, 216]
+        }
+      ],
+      "at_slot": [0.111, 9.308, 8.178],
+      "scale": 0.9,
+      "kept": [
+        { "name": "linza", "scale": 1.071 },
+        { "name": "backLens", "scale": 1.071 }
+      ],
+      "mark": { "size": 1024, "black": [[503, 512, 521, 1024], [0, 529, 1024, 532]] },
+      "template": { "set": { "Zooms": [[4]], "ConflictingItems": [] } }
+    },
+    {
+      "about": "The mount: the rest of the scope's mesh (its two rings, the bracket below the tube and the plate with its lever that clamps the receiver's right side), and the rail it clamps, from the receiver's mesh (its pieces within x 0.95 to 1.85, y 2.2 to 3.3, z 6.0 to 17.5), which the first model has not. The donor is the SVT-40's mount for the PU: its slot mod_scope takes the ZF4 alone, its bone at the ZF4's own point, so that the ZF4 lies on it where the model has it. Its point on its slot is the top of the rail, mid-length.",
+      "id": "66f0a5740000000000000046",
+      "name": "mount_stg44_zf4_steel",
+      "short_name": "ZF4 Steel Mount",
+      "donor": "641dc35e19604f20c800be18",
+      "meshes": [
+        {
+          "model": "Stg44_scope_LOD00_Scope_0",
+          "outside": [[[-1.95, 7.55, 2.0], [1.95, 12.0, 21.1]], [[1.40, 8.40, 10.95], [2.50, 11.05, 13.60]]],
+          "also": [40, 48, 65, 216]
+        },
+        { "model": "Stg44_receiver_LOD00_Receiver_0", "inside": [[[0.95, 2.2, 6.0], [1.85, 3.3, 17.5]]] }
+      ],
+      "at_slot": [1.40, 3.24, 11.745],
+      "scale": 0.9,
+      "slots": [
+        { "name": "mod_scope", "takes": ["66f0a5740000000000000047"], "at": [0.111, 9.308, 8.178] }
+      ]
+    }
+  ]
+}

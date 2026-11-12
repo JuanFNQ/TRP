@@ -1,6 +1,6 @@
 # Blind fire: the weapon held over cover or out to the right
 
-Read 2026-10-25 (session 130) from the decompiled game, from the install through `probe` and from recorder
+How the character fires its weapon blind, held over cover or out to the right. Read 2026-10-25 from the decompiled game, from the install through `probe` and from recorder
 0.13.0's course 8 (`local\traces\courses6\8-blind-mount-*`: the MDR and the M60E6, steps `01-blind-above`,
 `02-blind-right`, `03-blind-refusals`, the M60E6's twice) and recorder 0.10.0's `courses2\4-blind-fire`
 (the M700, by hand). The reading before it: `local\blind_mount_s127.md`, section 1. Our own words.
@@ -78,10 +78,16 @@ lean (below), the tactical devices, the breath (which needs the sights up, so it
   launcher's), a magazine pulled out or put in through the inventory, a round put in a chamber or a
   cylinder, a discharge, a malfunction looked at or cleared, a part fitted or taken off, the stock
   folded, the bipod, the backpack dropped, the launcher switched, the weapon put away; the inventory
-  opening (`Player.SetInventoryOpened`, and the controller's `InventoryOpened`); a gesture of the hands
-  beginning (`SendHandsInteractionStateChanged`); the approach before a door (`ApproachState.Enter`);
-  lying down (`PronePlayerState.Enter`); a change of what is in the hands (`Player.TryProceed`).
+  opening (`Player.SetInventoryOpened`, and the controller's `InventoryOpened`); the approach before a
+  door (`ApproachState.Enter`); lying down (`PronePlayerState.Enter`); a change of what is in the hands
+  (`Player.TryProceed`).
 - **A start that is refused does not end it**: the gate leaves everything as it was.
+- **A gesture does not end it** (until then built as ending it, read from code): the player's
+  `SendHandsInteractionStateChanged`, which ends it, comes from the hands' own `Interact` (no caller for
+  one's own player) and the backpack's drop (which ends it by the weapon anyway); the body's gestures
+  (`MovementContext.SetInteractInHands`, the gestures' subsystem) never call it. Recorded:
+  `courses8\headlamp`, the head light's gesture in blind fire to the right at 27.62 s and over the top at
+  30.69 s, blind fire held through both.
 
 **The lean's quirk** (`Player.ToggleLean`): a lean key pressed (not the slow lean) puts only the body's
 animator's `BlindFire` to 0, then leans as ever. The body plays its way out and stands; the movement's
@@ -208,8 +214,8 @@ casings, the impacts only).
 
 The character's packet carries the side alone (`MovementInfoPacket`); another's view of it works the float
 out from the same curves (`ObservedPlayerBlindFireState`). The ribcage layer is the character's own eyes'
-only, so from outside the base layer and the aiming layer's blind-fire grids show. Built by the user's
-choice of 2026-10-25 ("Yes, from code"); read from code, not recorded.
+only, so from outside the base layer and the aiming layer's blind-fire grids show. Built by choice
+from the code; read from code, not recorded.
 
 ## The camera's own object
 
@@ -240,8 +246,8 @@ first frame off 0. Hung from the container, ours is the game's to 0.1 mm (below)
   state last entered at the time of the one being entered; entry (the sprint off, the lean to 0, the float
   by part), re-entry (part and side only), exit (the float to 0); the movement keys not handed on while
   the figure is set; the lean's quirk; the jump, the step aside and the stance as standing's; the vault
-  refused; the general speed cap; the ends by lying down, the approach, the inventory's opening and a
-  gesture shown. `Movement::blind_fire`, `blind_fire_animator`, `take_blind_fire`, `end_blind_fire`,
+  refused; the general speed cap; the ends by lying down, the approach and the inventory's opening (a
+  gesture shown ended it until 0.167.0, "What ends it"). `Movement::blind_fire`, `blind_fire_animator`, `take_blind_fire`, `end_blind_fire`,
   `camera_container`, `camera_frame` (the camera's push out of the world goes by it).
 - **The weapon** (`trp_sim::firearm`): `Firearm::can_set_blind_fire`, `set_blind_fire` (what the operation
   passes on; the sights down without `Event::Aimed`), `blind_fire`; refused while the flag is on: `set_aim`,
@@ -255,12 +261,12 @@ first frame off 0. Hung from the container, ours is the game's to 0.1 mm (below)
 - **The hand-over** (`trp_sim::blind_fire`): `tell` (after the movement's frame: the gate's value to the
   weapon, what it passes on to the motion) and `ended` (an operation's end of it).
 - **The switch**: `trp_sim::Systems::blind_fire` (off, the keys are not heard); the options' `BLIND FIRE`
-  under `SIMPLE`, after `TACTICAL DEVICES` (the user's choice, 2026-10-25, by multiple choice).
-- **The app** (`controller.rs`): `BlindShootAbove` and `BlindShootRight` (the install's `Alt`+`W`,
+  under `SIMPLE`, after `TACTICAL DEVICES`.
+- **The app** (`controller`): `BlindShootAbove` and `BlindShootRight` (the install's `Alt`+`W`,
   `Alt`+`S`) given and come up; a script's `cmd:ToggleBlindAbove`, `cmd:ToggleBlindRight`,
   `cmd:BlindShootEnd` (`--scenario`); the next-sight key held back; the camera hung in its container
-  (`Shown::camera_apart`, `hands_view`); third person plays the same states (the user's choice: "Yes,
-  from code").
+  (`Shown::camera_apart`, `hands_view`); third person plays the same states (by choice,
+  from the code).
 - **The replay** (`bin/replay`): the three `cmd:` presses; `blind` (the figure, the blender), `p_BlindFire`
   (from `bp`), `p_BlindFireFloat` and `cam_rot_zero` set beside the recording's; the eye and the weapon
   as the camera sees it from the container; a reload with no magazine within reach by the recorded
@@ -305,20 +311,61 @@ copied under the steps' names to `local\traces\courses6_second_s130`), set besid
 **Fixed by the comparison**: the blender read the previous frame's length on an uneven frame (0.068 off at
 9.75 s); the eye 9.5 to 12 cm off (the camera's own object, above).
 
-**Open**: **the weapon while the body carries it only in part** (blind fire's way in, 1.00 to 1.15 s, and
-the change of side, 8.5 to 8.9 s of `02`): up to 5 cm and 7 degrees apart, with the carrying weight, the
-body's weapon bone and the ribcage the game's to 0.0002. What the game blends from then is its procedural
-weapon, which it places before the ribcage is turned to the view (`ApplyFovAdjustments`, end of frame);
-ours is placed in the ribcage turned to the view. Not changed in this step: it touches the whole first-
-person rig. **The overlap's blind-fire line** was not compared: the M60E6's second runs have it (over the
+**The weapon while the body carries it only in part** (blind fire's way in, 1.00 to 1.38 s, and the change of
+side over the top to the right, 8.60 to 8.98 s of `02`, where the share the body carries the weapon by dips from 1
+to 0.595 while the float is 0): 49 mm and 7.0 degrees apart at 8.66 s on the MDR at 0.123.0 (the M60E6 47.5 mm and
+6.6 degrees), with the carrying weight, the body's weapon bone and the ribcage the game's to 0.0002. **Closed by
+0.167.0** (the first-person curve's branch of `Position_cache` and each curve held before the product:
+`left-shoulder.md`, "The weapon"), found 2026-11-08: run again, the MDR's change of side is 2.5 to 3.1 mm and 1.2 to 1.45 degrees off
+through the whole window, as the frames before it, its way in under 1 mm and 0.6 degrees; `02`'s worst is now
+3.1 mm at 3.22 s and 1.43 degrees at 9.94 s, the M60E6's 9.6 mm at 4.06 s and 1.21 degrees, neither in a window
+the body shares. courses8's AKM showed the same at the same change of side (45.8 mm, 6.62 degrees at 19.39 s up to
+the regression's `after210`, its worst out of blind fire from `after211`). Course 8's MDR and M60E6 runs are in the
+regression since 0.218.2 (`r46`, `r47`; the M60E6's second runs, made against walls the replay lacks, left out). The
+reason first given here (the game placing its procedural weapon before the ribcage is turned to the view) was wrong:
+the first-person rig is at the ribcage, turned to the view, before the shift, the frame ours uses.
+**The overlap's blind-fire line** was not compared: the M60E6's second runs have it (over the
 top the depth fell from 0.756 to 0 on the first frame off 0; to the right it came back at 0.537 past
 -0.95), but the replay's world is ground only.
 
-**Read from code only, not recorded**: the lean's quirk; a jump pressed in blind fire; lying down, the
-inventory, a gesture, the fold, the backpack, the put-away and the approach ending it (the weapon's ends
+**`courses8`, group 2** (recorder 0.14.0, by hand, 2026-10-27; compared 2026-10-31): the
+AKM's `akm-blind-up-side` (crouched: over the top with four bursts, then to the right with four),
+`akm-blind-restrictions` (standing, 66.5 s: every way in and out that could be found),
+`akm-blind-under-low-collision` and `akm-blind-third-person` (in a cramped place; first person
+throughout despite the name). Their keys were put through our model of the input manager by the
+install's bindings (`byhand --scenario`) and replayed on the recorded frames with the recorded build
+(`local\c8_blind_run_s167.sh`; kept as `r22` and `r23`):
+- **The keys**: every command on the game's frame. Alt+D or Alt+A pressed with Alt+W held ends blind
+  fire on the next frame (the slow lean's combination is the longer, and takes the keys), and the slow
+  lean then goes 0.1 a frame; Alt+S pressed with Alt+W held gives nothing (the held combination keeps
+  `Alt`); `W` and `S` swapped every 0.2 s give the end and the other side on the game's frames.
+- **Frame for frame, gap 0**: the movement's value, the animator's `BlindFire` and `BlindFireFloat`,
+  the blender, the movement state and the body's animator on all 1970 frames of `up-side` and on
+  `restrictions` to 50.78 s (where the crawl's clip, not blind fire's, ends a frame late); the camera's
+  turn within 0.19 degrees in blind fire (0.001 on most of it).
+- **Now recorded**: a jump pressed in blind fire (eleven presses of `Space`, 25.0 to 28.8 s) waits, and
+  goes at 33.78 s once the body stands again; lying down pressed in it (`X`, 47.9 s) is held until blind
+  fire ends and taken then (49.95 s); the mount (`V`) and the sprint's toggle refused in it; Alt+W in a
+  reload refused and the walk taken; blind fire's way out to the right entered from the way out over the
+  top in 0.19 s (a blend cut short: `body-animator.md`; ours was 0.146, fixed).
+- **Not comparable here**: the head's push (the head met a low ceiling and a wall in blind fire, pushing
+  the character 0.21 and 0.17 m; `head_push` on record) and the weapon against the cover at rest (the
+  overlap 0.49 m, 0 over the top): the replay's world has none of them, and their meshes are not
+  readable. So **the overlap's blind-fire line** is still not compared.
+
+**Read from code only, not recorded**: the lean's quirk (every lean key pressed in these recordings came
+outside blind fire or after its key was let go); the inventory, the fold, the backpack, the put-away and the approach ending it (the weapon's ends
 come to the movement a frame after the game's: after the movement's frame, by the weapon's event); the
 weapon's keys refused in it (but the aim: held 5.0 to 6.0 s of `01`, refused in both); the second camera
 pass (unseen: the camera rests then); looking far up (the strength); a pistol's clips; third person.
+
+**`courses8`'s group 3** (the tactical devices' recordings, replayed from their keys): blind fire
+to the right and over the top in `headlamp` (with a head light's gesture in each) and in
+`tactical-laser-dark`: the state, the side, the float and the blender the game's on every frame, held
+through the gestures. The weapon there goes to the body's bone by the body's `Position_cache` (1 in blind
+fire: `PlayerBones.ShiftWeaponRoot`, `left-shoulder.md`, "The weapon"), turn and all, gesture or not: the
+weapon's turn within 1.4 degrees over the top through the gesture (it fell to 0 before), and
+`akm-blind-restrictions` (r23) closer too (the weapon's place 46 to 17 mm, its turn 6.6 to 5.6 degrees).
 
 ## Not built, or not read
 

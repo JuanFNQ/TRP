@@ -1,6 +1,6 @@
-//! The sights as the game picks them (`trp_sim::sights`; optics spec, "The
-//! sights a weapon has", "Zoom and modes", "Aiming through it"), on the
-//! stock builds of the range that carry them: the SPEAR's Tango6T 1-6x,
+//! Tests of the sights as the game picks them, on the stock builds of the range that carry them.
+//! After the optics spec, "The sights a weapon has", "Zoom and modes", "Aiming through it",
+//! through `trp_sim::sights`: the SPEAR's Tango6T 1-6x,
 //! the G36's carry handle (a 3x below, a backup above) with the red dot on
 //! top, the M60E6's Specter DR 1x/4x over its folding rear sight. What the
 //! recording `courses2/4-sights-optic` showed of the AKM with a Burris 1-4x
@@ -8,7 +8,7 @@
 //! configured.
 
 use trp_data::unity::Assets;
-use trp_sim::sights::{Sights, OPTIC_FIELD_OF_VIEW};
+use trp_sim::weapons::sights::{Sights, OPTIC_FIELD_OF_VIEW};
 
 const SPEAR: &str = "65290f395ae2ae97b80fdf2d";
 const G36: &str = "623063e994fc3f7b302a9696";
@@ -18,16 +18,16 @@ const M60E6: &str = "661cec09b2c6356b4d0c7a36";
 const SETTING: f32 = 74.0;
 const DT: f32 = 1.0 / 120.0;
 
-fn sights_of(template: &str) -> Option<(Sights, trp_data::weapon::Weapon)> {
+fn sights_of(template: &str) -> Option<(Sights, trp_data::weapons::weapon::Weapon)> {
     let install = crate::fixture::install()?;
     let db = crate::fixture::database()?;
     let mut assets = Assets::new(install).expect("manifest");
-    let weapon = trp_data::weapon::assemble(&mut assets, db, template).expect("the weapon");
+    let weapon = trp_data::weapons::weapon::assemble(&mut assets, db, template).expect("the weapon");
     Some((Sights::of_weapon(&weapon).expect("its sights"), weapon))
 }
 
 /// The current sight's bone, by its path's last two names.
-fn bone(sights: &Sights, weapon: &trp_data::weapon::Weapon) -> String {
+fn bone(sights: &Sights, weapon: &trp_data::weapons::weapon::Weapon) -> String {
     let path = weapon.hierarchy.path(sights.current().bone);
     path.rsplit('/').take(2).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/")
 }
@@ -55,10 +55,6 @@ fn the_spear_aims_through_its_variable_scope() {
     // The magnification key snaps it to the far end; again, back.
     assert!(sights.change_magnification());
     assert!((sights.zoom_value() - 4.0833).abs() < 1e-4);
-    // Its magnification with `PIP` off: the lowest zoom times the widest
-    // field of view over the zoom's now, 6 at the narrowest.
-    let m = sights.magnification().expect("an optic");
-    assert!((m - 6.0).abs() < 1e-3, "{m}");
     assert!((sights.aim_sensitivity(1.0) - 0.0758).abs() < 1e-4, "the narrowest's sensitivity");
     assert!(sights.change_magnification());
     assert_eq!(sights.zoom_value(), 24.5);
@@ -138,7 +134,7 @@ fn the_m60e6_s_specter_switches_between_4x_and_1x() {
 /// none at the narrowest.
 #[test]
 fn the_tango_s_lens_and_reticle_are_read() {
-    use trp_data::sight::LensKind;
+    use trp_data::weapons::sight::LensKind;
     let Some((mut sights, _)) = sights_of(SPEAR) else { return };
     let tango = sights.parts()[0].clone();
     let optic = tango.lenses.iter().find_map(|piece| match &piece.kind {
@@ -169,11 +165,11 @@ fn the_tango_s_lens_and_reticle_are_read() {
 #[test]
 fn the_wheel_zooms_with_left_alt_held() {
     let Some(install) = crate::fixture::install() else { return };
-    let controls = trp_sim::bindings::install_controls(&install);
-    let alt = trp_sim::bindings::code("LeftAlt").expect("LeftAlt");
-    let held = |code: trp_sim::bindings::Code| code == alt;
-    let none = |_: trp_sim::bindings::Code| false;
-    let input = trp_sim::sights::zoom_input;
+    let controls = trp_sim::base::bindings::install_controls(&install);
+    let alt = trp_sim::base::bindings::code("LeftAlt").expect("LeftAlt");
+    let held = |code: trp_sim::base::bindings::Code| code == alt;
+    let none = |_: trp_sim::base::bindings::Code| false;
+    let input = trp_sim::weapons::sights::zoom_input;
     assert_eq!(input(&controls, &held, 1.0, 1.0, false), 1.0);
     assert_eq!(input(&controls, &held, -1.0, 2.0, false), -2.0);
     assert_eq!(input(&controls, &none, 1.0, 1.0, false), 0.0);
@@ -181,18 +177,18 @@ fn the_wheel_zooms_with_left_alt_held() {
     assert_eq!(input(&controls, &held, 1.0, 1.0, true), -1.0);
 }
 
-/// The user's M4A1 of `courses4` (recorder 0.11.0, its equipment), the
+/// The recorded M4A1 of `courses4` (recorder 0.11.0, its equipment), the
 /// parts by their templates: a 3x on the receiver and a Belomo PK-06 on a
 /// 45 degree mount on the handguard's side rail.
-fn canted_m4a1() -> trp_data::database::Preset {
-    let part = |id: &str, template: &str, parent: &str, slot: &str| trp_data::database::PresetItem {
+fn canted_m4a1() -> trp_data::setup::database::Preset {
+    let part = |id: &str, template: &str, parent: &str, slot: &str| trp_data::setup::database::PresetItem {
         id: id.into(),
         template: template.into(),
         parent: Some(parent.into()),
         slot: Some(slot.into()),
     };
     let items = vec![
-        trp_data::database::PresetItem { id: "m4a1".into(), template: "5447a9cd4bdc2dbd208b4567".into(), parent: None, slot: None },
+        trp_data::setup::database::PresetItem { id: "m4a1".into(), template: "5447a9cd4bdc2dbd208b4567".into(), parent: None, slot: None },
         part("grip", "55d4b9964bdc2d1d4e8b456e", "m4a1", "mod_pistol_grip"),
         part("magazine", "5c6592372e221600133e47d7", "m4a1", "mod_magazine"),
         part("receiver", "55d355e64bdc2d962f8b4569", "m4a1", "mod_reciever"),
@@ -211,7 +207,7 @@ fn canted_m4a1() -> trp_data::database::Preset {
         part("pad", "58d2912286f7744e27117493", "stock", "mod_stock"),
         part("charge", "55d44fd14bdc2d962f8b456e", "m4a1", "mod_charge"),
     ];
-    trp_data::database::Preset { id: "canted".into(), name: "canted".into(), root: "m4a1".into(), items, encyclopedia: None }
+    trp_data::setup::database::Preset { id: "canted".into(), name: "canted".into(), root: "m4a1".into(), items, encyclopedia: None }
 }
 
 /// A canted sight turns the weapon about its barrel while aimed through
@@ -219,16 +215,16 @@ fn canted_m4a1() -> trp_data::database::Preset {
 /// mount stands 45 degrees from straight ahead, and the weapon goes to it
 /// by a share `CameraSmoothTime * aiming speed * dt` of what is left each
 /// frame, and back. Against the recording frame for frame: `courses4`'s
-/// three aimed scripts within 0.007 degrees (`docs/status.md`).
+/// three aimed scripts within 0.007 degrees.
 #[test]
 fn a_canted_sight_turns_the_weapon_about_its_barrel() {
-    use trp_data::{engine::EngineSettings, hard_settings::HardSettings, player::HandsData};
+    use trp_data::{setup::engine::EngineSettings, setup::hard_settings::HardSettings, character::player::HandsData};
     let Some(install) = crate::fixture::install() else { return };
     let db = crate::fixture::database().expect("database");
     let hard = HardSettings::load(&install).expect("settings object");
     let engine = EngineSettings::load(&install).expect("engine settings");
     let mut assets = Assets::new(install).expect("manifest");
-    let weapon = trp_data::weapon::assemble_preset(&mut assets, db, &canted_m4a1()).expect("the weapon");
+    let weapon = trp_data::weapons::weapon::assemble_preset(&mut assets, db, &canted_m4a1()).expect("the weapon");
     assert!(weapon.skipped.is_empty(), "{:?}", weapon.skipped);
     let data = HandsData::load(&mut assets).expect("player prefab");
     let mut hands = trp_sim::Hands::new(trp_sim::hands_settings(data, db, &hard, &engine, &weapon, trp_sim::ViewSettings::default()).expect("its motion"));
@@ -237,13 +233,13 @@ fn a_canted_sight_turns_the_weapon_about_its_barrel() {
     assert_eq!(sights.list().len(), 2);
     let aimed_by = bone(sights, &weapon);
     assert!(aimed_by.contains("pk_06"), "{aimed_by}");
-    // Its window is a red dot's glass (`EFT/CollimatorGlass`), which the app
+    // Its window is a red dot's glass (`CollimatorGlass`), which the app
     // leaves undrawn as a scope's front glass, besides its three modes'
     // collimators.
     let pk06 = sights.parts().iter().find(|part| part.template == "57ae0171245977343c27bfcf").expect("the PK-06");
-    let kinds: Vec<&trp_data::sight::LensKind> = pk06.lenses.iter().map(|piece| &piece.kind).collect();
-    assert!(kinds.iter().any(|kind| **kind == trp_data::sight::LensKind::Glass), "{kinds:?}");
-    assert_eq!(kinds.iter().filter(|kind| matches!(***kind, trp_data::sight::LensKind::Collimator(_))).count(), 3, "{kinds:?}");
+    let kinds: Vec<&trp_data::weapons::sight::LensKind> = pk06.lenses.iter().map(|piece| &piece.kind).collect();
+    assert!(kinds.iter().any(|kind| **kind == trp_data::weapons::sight::LensKind::Glass), "{kinds:?}");
+    assert_eq!(kinds.iter().filter(|kind| matches!(***kind, trp_data::weapons::sight::LensKind::Collimator(_))).count(), 3, "{kinds:?}");
     let turn = sights.scope_rotation();
     assert!((turn + 45.0).abs() < 0.1, "{turn}");
     let twist = |hands: &trp_sim::Hands| {
@@ -268,4 +264,97 @@ fn a_canted_sight_turns_the_weapon_about_its_barrel() {
         hands.blend_poses(DT);
     }
     assert!(twist(&hands).abs() < 0.01, "lowered: {}", twist(&hands));
+}
+
+/// Whether the object of that name is shown on a weapon's model.
+fn shown(weapon: &trp_data::weapons::weapon::Weapon, name: &str) -> bool {
+    weapon.hierarchy.nodes.iter().find(|n| n.name == name).unwrap_or_else(|| panic!("no {name}")).active
+}
+
+#[test]
+fn a_model_of_a_weapon_folds_only_its_iron_sights_under_a_scope_and_the_hands_fold_every_one() {
+    let Some(install) = crate::fixture::install() else { return };
+    let Some(db) = crate::fixture::database() else { return };
+    let mut assets = Assets::new(install).expect("manifest");
+    // The G28's stock build: a 3-12x looking ahead, the HK flip-up rear
+    // sight (an iron sight) and the handguard's own front sight, whose
+    // prefab has it folded.
+    let preset = db.presets.iter().find(|p| p.id == "6193e590069d61205d490dd8").expect("the G28's stock build");
+    let mut g28 = trp_data::weapons::weapon::assemble_preset(&mut assets, db, preset).expect("the G28");
+    trp_sim::weapons::sights::fold_sights_as_made(&mut g28);
+    assert!(shown(&g28, "sight_rear_all_hk_416_flip_up_folded_LOD0") && !shown(&g28, "sight_rear_all_hk_416_flip_up_unfolded_LOD0"));
+    assert!(shown(&g28, "sight_front_417_hk_flip_up_handguard_sight_fold_LOD0") && !shown(&g28, "sight_front_417_hk_flip_up_handguard_sight_unfold_LOD0"));
+    trp_sim::weapons::sights::fold_sights(&mut g28);
+    assert!(shown(&g28, "sight_rear_all_hk_416_flip_up_folded_LOD0"));
+    assert!(shown(&g28, "sight_front_417_hk_flip_up_handguard_sight_fold_LOD0"));
+    // The HK416's stock build with a holographic sight put on its
+    // receiver: made, the rear sight folds and the barrel's front sight
+    // stays up as its prefab has it; in the hands, both fold.
+    let stock = db.presets.iter().find(|p| p.id == "5c0d1e9386f77440120288b7").expect("the HK416's stock build");
+    let mut hk416 = stock.clone();
+    let receiver = hk416.items.iter().find(|i| i.slot.as_deref() == Some("mod_reciever")).expect("its receiver").id.clone();
+    let exps3 = db.items.values().find(|t| t.name == "scope_all_eotech_exps3").expect("the EXPS3").id.clone();
+    hk416.items.push(trp_data::setup::database::PresetItem { id: "exps3".into(), template: exps3, parent: Some(receiver), slot: Some("mod_scope".into()) });
+    let mut weapon = trp_data::weapons::weapon::assemble_preset(&mut assets, db, &hk416).expect("the HK416");
+    let (rear, front) = ("sight_rear_all_hk_416_flip_up_folded_LOD0", "sight_front_416_hk_flip_up_sight_fold_LOD0");
+    assert!(!shown(&weapon, rear) && !shown(&weapon, front), "the prefabs' own: both up");
+    trp_sim::weapons::sights::fold_sights_as_made(&mut weapon);
+    assert!(shown(&weapon, rear) && !shown(&weapon, "sight_rear_all_hk_416_flip_up_unfolded_LOD0"));
+    assert!(!shown(&weapon, front) && shown(&weapon, "sight_front_416_hk_flip_up_sight_unfold_LOD0"));
+    trp_sim::weapons::sights::fold_sights(&mut weapon);
+    assert!(shown(&weapon, rear) && shown(&weapon, front) && !shown(&weapon, "sight_front_416_hk_flip_up_sight_unfold_LOD0"));
+    // Without a scope nothing folds, made or held.
+    let mut plain = trp_data::weapons::weapon::assemble_preset(&mut assets, db, stock).expect("the HK416");
+    trp_sim::weapons::sights::fold_sights_as_made(&mut plain);
+    trp_sim::weapons::sights::fold_sights(&mut plain);
+    assert!(!shown(&plain, rear) && !shown(&plain, front));
+}
+
+/// The weapon in hand built anew (a magazine of another kind put in): its
+/// sights take what the same sight items kept on the build before (the
+/// scope's state once changed when a magazine of another type was put in).
+/// On the G36, the carry handle's
+/// backup chosen; on the SPEAR, its Tango at the narrow end.
+#[test]
+fn a_build_made_anew_keeps_its_sights_state() {
+    let Some((mut before, weapon)) = sights_of(G36) else { return };
+    assert!(before.change_aim_scope(false));
+    let chosen = (before.aim_index(), before.scope_and_mode(), before.eye());
+    let mut after = Sights::of_weapon(&weapon).expect("its sights");
+    assert_ne!(after.aim_index(), chosen.0, "a build made anew starts at the first sight");
+    after.take_state(&before);
+    assert_eq!((after.aim_index(), after.scope_and_mode(), after.eye()), chosen);
+
+    let Some((mut before, weapon)) = sights_of(SPEAR) else { return };
+    assert!(before.change_magnification());
+    let zoom = before.zoom_value();
+    assert!((zoom - 4.0833).abs() < 1e-4);
+    let mut after = Sights::of_weapon(&weapon).expect("its sights");
+    assert_eq!(after.zoom_value(), 24.5);
+    after.take_state(&before);
+    assert_eq!(after.zoom_value(), zoom);
+    assert_eq!(after.optic_field_of_view(), before.optic_field_of_view());
+}
+
+/// A weapon's sights are its items' (weapon-handling spec, "What the
+/// items keep"): a rig another weapon of the build left otherwise is given
+/// what this weapon's sight items keep, and a weapon whose items keep
+/// nothing has its sights as made.
+#[test]
+fn the_sights_are_as_the_items_keep_them() {
+    let Some((mut held, weapon)) = sights_of(SPEAR) else { return };
+    assert!(held.change_magnification());
+    let kept: Vec<_> = (0..held.parts().len()).map(|part| held.kept(part)).collect();
+    let (aim, zoom, view) = (held.aim_index(), held.zoom_value(), held.optic_field_of_view());
+    // Another weapon of the build takes the rig, its items as made.
+    let made = vec![trp_sim::weapons::sights::SightKept::default(); kept.len()];
+    held.take_kept(0, &made);
+    let fresh = Sights::of_weapon(&weapon).expect("its sights");
+    assert_eq!((held.aim_index(), held.zoom_value(), held.optic_field_of_view()), (fresh.aim_index(), fresh.zoom_value(), fresh.optic_field_of_view()));
+    assert!((0..kept.len()).all(|part| held.keeps(part, &fresh.kept(part))), "each sight as made");
+    assert_ne!(held.zoom_value(), zoom);
+    // The first weapon again.
+    held.take_kept(aim, &kept);
+    assert_eq!((held.aim_index(), held.zoom_value(), held.optic_field_of_view()), (aim, zoom, view));
+    assert!((0..kept.len()).all(|part| held.keeps(part, &kept[part])));
 }

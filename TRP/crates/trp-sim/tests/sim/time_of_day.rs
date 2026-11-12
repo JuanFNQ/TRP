@@ -1,13 +1,13 @@
-//! Customs' time of day as the install sets it up, beside recorder
-//! 0.11.0's scene of Customs in the morning (course 0's second step, kept in
-//! `local/traces/courses3/0-light-outside`): every field of the sky
+//! Tests of Customs' time of day as the install sets it up, beside a recorded scene of it.
+//! The scene is recorder 0.11.0's of Customs in the morning, course 0's second step, kept in
+//! `local/traces/courses3/0-light-outside`: every field of the sky
 //! (`TOD_Sky`) and of the weather's time-of-day controller read from the
 //! level's scene against the recorder's copy of the same scripts (the
 //! fields the game changes while it runs are left out and named). Skipped
 //! where the recording or the install is not there.
 
-use trp_data::particles::Gradient;
-use trp_data::tod::{FieldValue, Fields, TimeOfDayLevel, WeightedCurve};
+use trp_data::drawing::particles::Gradient;
+use trp_data::level::tod::{FieldValue, Fields, TimeOfDayLevel, WeightedCurve};
 
 fn recorded() -> Option<serde_json::Value> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../local/traces/courses3/0-light-outside/light-outside.scene.json");
@@ -112,7 +112,7 @@ fn customs_time_of_day_is_read_as_the_game_has_it() {
 
 /// The weather's cloudiness when Customs' morning was recorded, as the
 /// contrast's top shows it (above): the app's.
-const RECORDED_CLOUDINESS: f32 = trp_sim::tod::CUSTOMS_RECORDED_MORNING.cloudiness;
+const RECORDED_CLOUDINESS: f32 = trp_sim::lighting::tod::CUSTOMS_RECORDED_MORNING.cloudiness;
 
 /// Customs' morning worked out by the game's rules from the install's
 /// figures, the recorded hour and the recorded moment's cloudiness, beside
@@ -129,10 +129,10 @@ fn customs_morning_is_worked_out_as_the_game_had_it() {
         return;
     };
     let level = TimeOfDayLevel::customs(&install).expect("Customs' time of day");
-    let sky = trp_sim::tod::Sky::of_level(&level).expect("the sky's figures");
+    let sky = trp_sim::lighting::tod::Sky::of_level(&level).expect("the sky's figures");
     let hour = f(&scene["sky"]["fields"]["<Cycle>k__BackingField"]["Hour"]);
-    assert_eq!(hour, trp_sim::tod::CUSTOMS_RECORDED_MORNING.hour);
-    let stored = trp_sim::tod::stored_atmosphere(&level.sky).unwrap();
+    assert_eq!(hour, trp_sim::lighting::tod::CUSTOMS_RECORDED_MORNING.hour);
+    let stored = trp_sim::lighting::tod::stored_atmosphere(&level.sky).unwrap();
     let state = sky.settle(hour, RECORDED_CLOUDINESS, stored, 12);
     let close = |what: &str, ours: &[f32], game: &[f32], within: f32| {
         let worst = ours.iter().zip(game).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -166,7 +166,7 @@ fn customs_morning_is_worked_out_as_the_game_had_it() {
         close(&format!("_SHB{channel}"), &packed.b[i], &global(&format!("_SHB{channel}")), 2e-5);
     }
     close("_SHC", &packed.c, &global("_SHC"), 2e-5);
-    close("_EFT_Ambient", &state.harmonics.top(), &global("_EFT_Ambient")[..3], 2e-5);
+    close("the top ambient", &state.harmonics.top(), &global("_EFT_Ambient")[..3], 2e-5);
 }
 
 /// Customs' camera (its level settings' camera prefab) is the recorded
@@ -178,7 +178,7 @@ fn customs_camera_and_flat_ambient_are_the_recorded() {
     let Ok(install) = crate::fixture::install().ok_or(()) else { return };
     let level = TimeOfDayLevel::customs(&install).expect("Customs' time of day");
     let file = level.file_of(level.settings.camera).expect("the camera's file");
-    let ours = trp_data::prism::PrismSettings::of_camera(&install, &file, level.settings.camera.1).expect("the camera's PRISM");
+    let ours = trp_data::drawing::prism::PrismSettings::of_camera(&install, &file, level.settings.camera.1).expect("the camera's PRISM");
     let game = scene["camera"]["components"].as_array().unwrap().iter().find(|c| c["type"] == "PrismEffects").expect("the recorded PRISM");
     let g = &game["fields"];
     let numbers = |v: &serde_json::Value| -> Vec<f32> { v.as_array().unwrap().iter().map(f).collect() };
@@ -191,7 +191,7 @@ fn customs_camera_and_flat_ambient_are_the_recorded() {
         assert_eq!(Some(on), g[name].as_bool(), "{name}");
     }
     // The camera's own colour filter, on as shipped and as it ran.
-    let filter = trp_data::prism::ColorFilter::of_camera(&install, &file, level.settings.camera.1).expect("the camera's filter").expect("a CC_Vintage");
+    let filter = trp_data::drawing::prism::ColorFilter::of_camera(&install, &file, level.settings.camera.1).expect("the camera's filter").expect("a CC_Vintage");
     let vintage = scene["camera"]["components"].as_array().unwrap().iter().find(|c| c["type"] == "CC_Vintage").expect("the recorded CC_Vintage");
     assert_eq!(Some(filter.enabled), vintage["enabled"].as_bool());
     assert_eq!(Some(filter.name().unwrap()), vintage["fields"]["filter"].as_str());
@@ -200,7 +200,7 @@ fn customs_camera_and_flat_ambient_are_the_recorded() {
     assert_eq!((table.width, table.height, table.rgba.len()), (512, 512, 512 * 512 * 4));
     eprintln!("the filter's table: clamped {:?}, point {}", table.clamp, table.point);
     // The camera's scattering over the scene, as shipped and as it ran.
-    let scattering = trp_data::prism::CameraScattering::of_camera(&install, &file, level.settings.camera.1).expect("the camera's scattering").expect("a TOD_Scattering");
+    let scattering = trp_data::drawing::prism::CameraScattering::of_camera(&install, &file, level.settings.camera.1).expect("the camera's scattering").expect("a TOD_Scattering");
     let ran = scene["camera"]["components"].as_array().unwrap().iter().find(|c| c["type"] == "TOD_Scattering").expect("the recorded TOD_Scattering");
     let g = &ran["fields"];
     assert_eq!(Some(scattering.enabled), ran["enabled"].as_bool());
@@ -236,8 +236,8 @@ fn customs_indoor_figures_are_the_installs() {
     eprintln!("the common indoor figures {common:?}, of {many}");
     assert_eq!((common.fade_time, common.exposure_speed, common.exposure_offset), (1.0, 4.0, 0.14));
     assert!(many >= 60);
-    let index = trp_data::screen::scene_paths(&install).unwrap().iter().position(|p| p.ends_with("custom_factoryStorageZone.unity")).unwrap();
-    let scene = trp_data::screen::Scene::load(&install, &format!("level{index}"), true).unwrap();
+    let index = trp_data::interface::screen::scene_paths(&install).unwrap().iter().position(|p| p.ends_with("custom_factoryStorageZone.unity")).unwrap();
+    let scene = trp_data::interface::screen::Scene::load(&install, &format!("level{index}"), true).unwrap();
     let warehouse = scene.behaviours.iter().find(|b| scene.path(b.node).ends_with("sklad_concrete/stencil") && scene.behaviour(b.node, "StencilShadow").is_some_and(|s| s.id == b.id)).expect("the warehouse's stencil");
     let fields = scene.fields(warehouse);
     let f = |at: usize| f32::from_le_bytes(fields[at..at + 4].try_into().unwrap());
@@ -252,9 +252,9 @@ fn customs_morning_sky_figures() {
     let Some(scene) = recorded() else { return };
     let Ok(install) = crate::fixture::install().ok_or(()) else { return };
     let level = TimeOfDayLevel::customs(&install).expect("Customs' time of day");
-    let sky = trp_sim::tod::Sky::of_level(&level).expect("the sky's figures");
+    let sky = trp_sim::lighting::tod::Sky::of_level(&level).expect("the sky's figures");
     let hour = f(&scene["sky"]["fields"]["<Cycle>k__BackingField"]["Hour"]);
-    let state = sky.settle(hour, RECORDED_CLOUDINESS, trp_sim::tod::stored_atmosphere(&level.sky).unwrap(), 12);
+    let state = sky.settle(hour, RECORDED_CLOUDINESS, trp_sim::lighting::tod::stored_atmosphere(&level.sky).unwrap(), 12);
     eprintln!("dome turn {:?} at {:?}, north {}", level.dome_rotation, level.dome_position, level.settings.north);
     eprintln!("sun zenith {} moon zenith {} lerp {}", state.sun_zenith, state.moon_zenith, state.lerp_value);
     eprintln!("sky {:?} moon sky {:?} ambient {:?} halo {:?}", state.sun_sky_color, state.moon_sky_color, state.ambient_color, state.moon_halo_color);

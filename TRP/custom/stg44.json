@@ -44,6 +44,14 @@
     { "name": "mod_align_front", "parent": "weapon", "at": [0.0, 19.98, -44.03] },
     { "name": "mod_aim_camera", "parent": "weapon", "at": [0.0, 19.95, 34.45], "turn_as": "aim_camera" }
   ],
+  "slots": [
+    {
+      "about": "The ZF4 Steel Mount of custom/parts/zf4.json, which takes the ZF4. Its point on the mount (the top of the rail it clamps, mid-length: 1.40, 3.24, 11.745 of the second model, STG44V2) laid on this model as the second lies on it: the bores on one line (the second's muzzle at y 0, this one's fireport at y 14.145) and the receivers' middles at one z (the second's receiver 32.43 cm long, from z -9.22, this one's 31.88, from -8.96; their sections at z 12 within a millimetre of each other).",
+      "name": "mod_mount",
+      "takes": ["66f0a5740000000000000046"],
+      "at": [1.40, 17.385, 11.745]
+    }
+  ],
   "hands": {
     "exponent": 3.0,
     "holds": [

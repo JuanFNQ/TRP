@@ -1,14 +1,14 @@
-//! Factory by day's light as the install sets it up, beside recorder
-//! 0.11.0's scene of Factory by day (course 0's first step, kept in
-//! `local/traces/courses3/0-light-factory`): the sun's turn, colour,
+//! Tests of Factory by day's light as the install sets it up, beside a recorded scene of it.
+//! The scene is recorder 0.11.0's, course 0's first step, kept in
+//! `local/traces/courses3/0-light-factory`: the sun's turn, colour,
 //! intensity and shadows, the level settings' ambient and fog, and the
 //! ambient harmonics the simple sky works out by the game's rule
 //! (`trp_sim::ambient::sky_simple`) against the shaders' `_SHAr` to `_SHC`
-//! and `_EFT_Ambient` as the game had them. Skipped where the recording or
+//! and the top ambient as the game had them. Skipped where the recording or
 //! the install is not there.
 
-use trp_data::level_light::LevelLight;
-use trp_sim::ambient::sky_simple;
+use trp_data::level::level_light::LevelLight;
+use trp_sim::lighting::ambient::sky_simple;
 
 fn recorded() -> Option<serde_json::Value> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../local/traces/courses3/0-light-factory/light-factory.scene.json");
@@ -68,7 +68,7 @@ fn factory_by_day_is_lit_as_the_game_lit_it() {
         close(&format!("_SHB{channel}"), &packed.b[i], &global(&scene, &format!("_SHB{channel}")), 2e-6);
     }
     close("_SHC", &packed.c, &global(&scene, "_SHC"), 2e-6);
-    close("_EFT_Ambient", &sh.top(), &global(&scene, "_EFT_Ambient")[..3], 2e-6);
+    close("the top ambient", &sh.top(), &global(&scene, "_EFT_Ambient")[..3], 2e-6);
     eprintln!("Factory by day: the ambient from above {:?}, sideways {:?}, from below {:?}", sh.top(), sh.at([1.0, 0.0, 0.0]), sh.at([0.0, -1.0, 0.0]));
 }
 
@@ -87,7 +87,7 @@ fn factorys_camera_is_the_recorded_camera() {
     };
     let light = LevelLight::factory_day(&install).expect("Factory by day's light");
     let file = light.file_of(light.settings.camera).expect("the camera's file");
-    let ours = trp_data::prism::PrismSettings::of_camera(&install, &file, light.settings.camera.1).expect("the camera's PRISM");
+    let ours = trp_data::drawing::prism::PrismSettings::of_camera(&install, &file, light.settings.camera.1).expect("the camera's PRISM");
     let game = scene["camera"]["components"].as_array().unwrap().iter().find(|c| c["type"] == "PrismEffects").expect("the recorded PRISM");
     let f = &game["fields"];
     let number = |name: &str| f[name].as_f64().unwrap_or_else(|| panic!("{name}")) as f32;

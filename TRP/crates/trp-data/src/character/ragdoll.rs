@@ -1,0 +1,434 @@
+//! The ragdoll a dead character becomes, as the player prefab sets it up.
+//! After the health spec, "Death": `PlayerPoolObject`'s `RigidbodySpawners` and `JointSpawners`,
+//! made into rigid bodies and character joints by `CorpseRagdoll`; each body on a bone with its mass and drag and the colliders
+//! it takes, and each joint between two of them with its axes and limits.
+//!
+//! A body's colliders are the body's hit colliders (`BodyPartCollider`):
+//! the one on its own bone, which is the one the corpse finds a body by
+//! (`CorpseRagdoll.FindRigidbodySpawner`), and those on objects hung under
+//! it that have no body of their own. The prefab keeps them switched off;
+//! a corpse switches its colliders on.
+
+use std::collections::HashMap;
+
+use anyhow::{anyhow, Context, Result};
+
+use crate::character::player::PLAYER_BUNDLE;
+use crate::unity::extract::{physic_material, quat_mul, script_class, PhysicMaterial};
+use crate::unity::{class, Assets, ObjRef, Value};
+
+/// The engine's collider classes.
+const BOX_COLLIDER: i32 = 65;
+const SPHERE_COLLIDER: i32 = 135;
+const CAPSULE_COLLIDER: i32 = 136;
+
+/// A collider's shape in its object's own axes, metres.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Shape {
+    /// Its axis along x, y or z (`m_Direction`: 0, 1, 2), its height end
+    /// to end with the caps.
+    Capsule { centre: [f32; 3], radius: f32, height: f32, direction: u32 },
+    Box { centre: [f32; 3], size: [f32; 3] },
+    Sphere { centre: [f32; 3], radius: f32 },
+}
+
+/// A collider a body takes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColliderData {
+    /// The object it is on.
+    pub object: String,
+    /// That object's place and turn (`xyzw`) in the body's bone: none for
+    /// one on the bone itself.
+    pub local: Option<([f32; 3], [f32; 4])>,
+    pub shape: Shape,
+    /// The body part its object's hit collider is of (`BodyPartCollider.
+    /// BodyPartType`: the game's numbers, head 0 to right leg 6).
+    pub part: Option<u8>,
+    /// The surface its hit collider says it is (`BaseBallistic.
+    /// SurfaceSound`, `ESurfaceSound`'s number), which a thing landing on
+    /// it plays by (`LootItem.CheckSurface`).
+    pub surface: u8,
+    /// The material the collider names (`flesh` on most, bouncing at
+    /// half; none on a few, which the engine gives its default).
+    pub material: Option<PhysicMaterial>,
+    /// A bone between the body's and the collider's object that has no
+    /// body of its own (the neck, for the neck's two), and the object's
+    /// place and turn in it: the engine places the collider by where that
+    /// bone stands when the corpse is made, as `courses2`'s deaths show
+    /// (`local` is where it stands at the skeleton's rest).
+    pub via: Option<(String, ([f32; 3], [f32; 4]))>,
+}
+
+/// A rigid body of the ragdoll (`RigidbodySpawner`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BodyData {
+    /// The bone it is on.
+    pub bone: String,
+    /// Where that bone stands in the prefab, at rest, in the prefab's own
+    /// axes: its place and turn (`xyzw`).
+    pub rest: ([f32; 3], [f32; 4]),
+    pub mass: f32,
+    pub drag: f32,
+    pub angular_drag: f32,
+    pub colliders: Vec<ColliderData>,
+}
+
+/// A soft limit (`SoftJointLimit`): degrees, and its bounce and contact
+/// distance.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Limit {
+    pub limit: f32,
+    pub bounciness: f32,
+    pub contact_distance: f32,
+}
+
+/// A joint between two bodies (`CharacterJointSpawner`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JointData {
+    /// The bone it is on, and the bone of the body it holds to.
+    pub bone: String,
+    pub connected: String,
+    /// In the bone's own axes: where the joint is, its twist axis and the
+    /// swing axis across it.
+    pub anchor: [f32; 3],
+    pub axis: [f32; 3],
+    pub swing_axis: [f32; 3],
+    pub low_twist: Limit,
+    pub high_twist: Limit,
+    pub swing1: Limit,
+    pub swing2: Limit,
+    /// Spring and damper of the twist's and the swings' limits.
+    pub twist_spring: [f32; 2],
+    pub swing_spring: [f32; 2],
+    pub enable_collision: bool,
+    pub projection: Option<[f32; 2]>,
+    /// Whether the connected body's anchor is worked out where the joint
+    /// is made (`autoConfigureConnectedAnchor`), and if not, where it is in
+    /// the connected body's axes.
+    pub auto_anchor: bool,
+    pub connected_anchor: [f32; 3],
+    /// Whether the engine's preprocessing is on (`enablePreprocessing`).
+    pub preprocessing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RagdollData {
+    pub bodies: Vec<BodyData>,
+    pub joints: Vec<JointData>,
+}
+
+fn vec3(v: &Value, name: &str) -> Result<[f32; 3]> {
+    v.req(name)?.as_vec3().with_context(|| format!("{name} is not a vector"))
+}
+
+fn float(v: &Value, name: &str) -> Result<f32> {
+    v.req(name)?.as_f32().with_context(|| format!("{name} is not a number"))
+}
+
+/// A point turned by a quaternion (`xyzw`).
+fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let [x, y, z, w] = q;
+    let t = [2.0 * (y * v[2] - z * v[1]), 2.0 * (z * v[0] - x * v[2]), 2.0 * (x * v[1] - y * v[0])];
+    [v[0] + w * t[0] + (y * t[2] - z * t[1]), v[1] + w * t[1] + (z * t[0] - x * t[2]), v[2] + w * t[2] + (x * t[1] - y * t[0])]
+}
+
+/// One object of the prefab's tree: its name, its parent, its place and
+/// turn in that parent, and its components.
+struct Node {
+    name: String,
+    parent: Option<ObjRef>,
+    place: [f32; 3],
+    turn: [f32; 4],
+    components: Vec<ObjRef>,
+}
+
+/// Every object of the player prefab by its own game object, with what it
+/// hangs from.
+fn prefab_nodes(assets: &mut Assets) -> Result<HashMap<ObjRef, Node>> {
+    let files = assets.load(PLAYER_BUNDLE)?;
+    let mut nodes: HashMap<ObjRef, Node> = HashMap::new();
+    let mut of_transform: HashMap<ObjRef, ObjRef> = HashMap::new();
+    let game_objects: Vec<ObjRef> = files.iter().flat_map(|&f| assets.objects_of(f, class::GAME_OBJECT)).collect();
+    let mut fathers = Vec::new();
+    for object in game_objects {
+        let v = assets.read(object)?;
+        let components: Vec<ObjRef> = v
+            .get("m_Component")
+            .and_then(Value::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|c| c.get("component")?.as_pptr())
+            .filter_map(|p| assets.resolve_loaded(object.file, p))
+            .collect();
+        let Some(transform) = components.iter().copied().find(|c| assets.class_id(*c) == Some(class::TRANSFORM)) else { continue };
+        let t = assets.read(transform)?;
+        of_transform.insert(transform, object);
+        if let Some(father) = t.get("m_Father").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(transform.file, p)) {
+            fathers.push((object, father));
+        }
+        nodes.insert(object, Node {
+            name: v.get("m_Name").and_then(Value::as_str).unwrap_or("").to_owned(),
+            parent: None,
+            place: vec3(&t, "m_LocalPosition")?,
+            turn: t.req("m_LocalRotation")?.as_vec4().context("a turn")?,
+            components,
+        });
+    }
+    for (object, father) in fathers {
+        let parent = of_transform.get(&father).copied();
+        if let Some(node) = nodes.get_mut(&object) {
+            node.parent = parent;
+        }
+    }
+    Ok(nodes)
+}
+
+/// A collider component's shape, none for another kind of component or a
+/// trigger.
+fn shape_of(assets: &Assets, component: ObjRef) -> Result<Option<Shape>> {
+    let kind = assets.class_id(component);
+    if !matches!(kind, Some(BOX_COLLIDER | SPHERE_COLLIDER | CAPSULE_COLLIDER)) {
+        return Ok(None);
+    }
+    let c = assets.read(component)?;
+    if c.get("m_IsTrigger").and_then(Value::as_i64).unwrap_or(0) != 0 {
+        return Ok(None);
+    }
+    Ok(Some(match kind {
+        Some(BOX_COLLIDER) => Shape::Box { centre: vec3(&c, "m_Center")?, size: vec3(&c, "m_Size")? },
+        Some(SPHERE_COLLIDER) => Shape::Sphere { centre: vec3(&c, "m_Center")?, radius: float(&c, "m_Radius")? },
+        _ => Shape::Capsule {
+            centre: vec3(&c, "m_Center")?,
+            radius: float(&c, "m_Radius")?,
+            height: float(&c, "m_Height")?,
+            direction: c.get("m_Direction").and_then(Value::as_i64).unwrap_or(1) as u32,
+        },
+    }))
+}
+
+/// One of a character's hit colliders as the player prefab has it (body
+/// hits spec, "The hit colliders"): a body part's (`BodyPartCollider`) or a
+/// plate's (`ArmorPlateCollider`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HitColliderData {
+    /// The object it is on.
+    pub object: String,
+    /// The skeleton's bone it is on or hangs under (a `Base Human` bone).
+    pub bone: String,
+    /// Its object's place and turn (`xyzw`) in that bone: none for one on
+    /// the bone itself.
+    pub local: Option<([f32; 3], [f32; 4])>,
+    pub shape: Shape,
+    /// Its body part (`BodyPartType`: head 0 to right leg 6), collider type
+    /// (`EBodyPartColliderType`) and plate (`EArmorPlateCollider`: 0 for a
+    /// body part's own).
+    pub part: u8,
+    pub collider_type: u8,
+    pub plate: u16,
+    /// The prefab's figures (`BallisticCollider`): penetration level,
+    /// penetration chance, ricochet chance, fragmentation chance,
+    /// deviation chance, deviation; and the damage share
+    /// (`penetrationDamageMod`). A body part's level, chance and share are
+    /// set again from the globals as a character is made (not here).
+    pub figures: [f32; 6],
+    pub damage_mod: f32,
+}
+
+impl RagdollData {
+    /// Every hit collider of the player prefab, body parts' and plates',
+    /// by their objects' names.
+    pub fn hit_colliders(assets: &mut Assets) -> Result<Vec<HitColliderData>> {
+        let nodes = prefab_nodes(assets)?;
+        let mut out = Vec::new();
+        for (&object, node) in &nodes {
+            let script = node.components.iter().copied().find(|c| {
+                assets.class_id(*c) == Some(class::MONO_BEHAVIOUR) && matches!(script_class(assets, *c).as_deref(), Some("BodyPartCollider" | "ArmorPlateCollider"))
+            });
+            let Some(script) = script else { continue };
+            let v = assets.read(script)?;
+            let int = |name: &str| v.get(name).and_then(Value::as_i64).unwrap_or(0);
+            let number = |name: &str| v.get(name).and_then(Value::as_f32).unwrap_or(0.0);
+            // Up to the bone: the object's place in it gathered on the way.
+            let (mut at, mut place, mut turn) = (object, [0.0f32; 3], [0.0, 0.0, 0.0, 1.0f32]);
+            while !nodes[&at].name.starts_with("Base Human") {
+                let here = &nodes[&at];
+                let moved = rotate(here.turn, place);
+                place = [here.place[0] + moved[0], here.place[1] + moved[1], here.place[2] + moved[2]];
+                turn = quat_mul(here.turn, turn);
+                match here.parent {
+                    Some(parent) => at = parent,
+                    None => break,
+                }
+            }
+            for component in &node.components {
+                let Some(shape) = shape_of(assets, *component)? else { continue };
+                out.push(HitColliderData {
+                    object: node.name.clone(),
+                    bone: nodes[&at].name.clone(),
+                    local: (at != object).then_some((place, turn)),
+                    shape,
+                    part: int("BodyPartType") as u8,
+                    collider_type: int("BodyPartColliderType") as u8,
+                    plate: int("ArmorPlateColliderType") as u16,
+                    figures: [
+                        number("PenetrationLevel"),
+                        number("PenetrationChance"),
+                        number("RicochetChance"),
+                        number("FragmentationChance"),
+                        number("TrajectoryDeviationChance"),
+                        number("TrajectoryDeviation"),
+                    ],
+                    damage_mod: number("penetrationDamageMod"),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.object.cmp(&b.object));
+        Ok(out)
+    }
+
+    /// The order a character's hit colliders are gathered in
+    /// (`PlayerBones.BodyPartColliders`, then `ArmorPlateColliders`), by
+    /// their objects' names: what a blast walks them in, and so the order
+    /// its parts' damage is given in (`AffectPlayersShared`'s
+    /// `_damagedParts`, a part where its first collider is).
+    pub fn hit_collider_order(assets: &mut Assets) -> Result<Vec<String>> {
+        let nodes = prefab_nodes(assets)?;
+        let name_of: HashMap<ObjRef, String> = nodes.values().flat_map(|node| node.components.iter().map(move |c| (*c, node.name.clone()))).collect();
+        let files = assets.load(PLAYER_BUNDLE)?;
+        let script = files
+            .iter()
+            .flat_map(|&f| assets.objects_of(f, class::MONO_BEHAVIOUR))
+            .find(|&obj| script_class(assets, obj).as_deref() == Some("PlayerBones"))
+            .ok_or_else(|| anyhow!("the player prefab has no PlayerBones"))?;
+        let fields = assets.read(script)?;
+        let mut out = Vec::new();
+        for list in ["BodyPartColliders", "ArmorPlateColliders"] {
+            for pointer in fields.get(list).and_then(Value::as_array).unwrap_or(&[]) {
+                if let Some(name) = pointer.as_pptr().and_then(|p| assets.resolve_loaded(script.file, p)).and_then(|obj| name_of.get(&obj)) {
+                    out.push(name.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The bones a corpse is made by: each body's, and those its
+    /// colliders hang under (`ColliderData::via`).
+    pub fn posed_bones(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self.bodies.iter().map(|b| b.bone.as_str()).collect();
+        for c in self.bodies.iter().flat_map(|b| &b.colliders) {
+            if let Some((bone, _)) = &c.via {
+                if !out.contains(&bone.as_str()) {
+                    out.push(bone);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn load(assets: &mut Assets) -> Result<Self> {
+        let nodes = prefab_nodes(assets)?;
+        let script_on = |assets: &Assets, node: &Node, wanted: &str| -> Option<ObjRef> {
+            node.components.iter().copied().find(|c| assets.class_id(*c) == Some(class::MONO_BEHAVIOUR) && script_class(assets, *c).as_deref() == Some(wanted))
+        };
+        // The bodies and the joints.
+        let mut bodies: Vec<BodyData> = Vec::new();
+        let mut body_of: HashMap<ObjRef, usize> = HashMap::new();
+        let mut joints = Vec::new();
+        let mut spawner_owner: HashMap<ObjRef, String> = HashMap::new();
+        for (&object, node) in &nodes {
+            if let Some(spawner) = script_on(assets, node, "RigidbodySpawner") {
+                let v = assets.read(spawner)?;
+                spawner_owner.insert(spawner, node.name.clone());
+                body_of.insert(object, bodies.len());
+                // The bone's rest in the prefab: its own place and turn,
+                // then each parent's over it.
+                let (mut place, mut turn) = (node.place, node.turn);
+                let mut above = node.parent;
+                while let Some(parent) = above {
+                    let p = &nodes[&parent];
+                    let moved = rotate(p.turn, place);
+                    place = [p.place[0] + moved[0], p.place[1] + moved[1], p.place[2] + moved[2]];
+                    turn = quat_mul(p.turn, turn);
+                    above = p.parent;
+                }
+                bodies.push(BodyData { bone: node.name.clone(), rest: (place, turn), mass: float(&v, "mass")?, drag: float(&v, "drag")?, angular_drag: float(&v, "angularDrag")?, colliders: Vec::new() });
+            }
+        }
+        for node in nodes.values() {
+            let Some(spawner) = script_on(assets, node, "CharacterJointSpawner") else { continue };
+            let v = assets.read(spawner)?;
+            let connected = v.get("connectedBody").and_then(Value::as_pptr).and_then(|p| assets.resolve_loaded(spawner.file, p)).and_then(|body| spawner_owner.get(&body).cloned()).unwrap_or_default();
+            let limit = |field: &str| -> Result<Limit> {
+                let l = v.req(field)?;
+                Ok(Limit { limit: float(l, "limit")?, bounciness: float(l, "bounciness")?, contact_distance: float(l, "contactDistance")? })
+            };
+            let spring = |field: &str| -> Result<[f32; 2]> {
+                let s = v.req(field)?;
+                Ok([float(s, "spring")?, float(s, "damper")?])
+            };
+            let projection = (v.get("enableProjection").and_then(Value::as_i64).unwrap_or(0) != 0).then(|| Some([float(&v, "projectionDistance").ok()?, float(&v, "projectionAngle").ok()?])).flatten();
+            joints.push(JointData {
+                bone: node.name.clone(),
+                connected,
+                anchor: vec3(&v, "anchor")?,
+                axis: vec3(&v, "axis")?,
+                swing_axis: vec3(&v, "swingAxis")?,
+                low_twist: limit("lowTwistLimit")?,
+                high_twist: limit("highTwistLimit")?,
+                swing1: limit("swing1Limit")?,
+                swing2: limit("swing2Limit")?,
+                twist_spring: spring("twistLimitSpring")?,
+                swing_spring: spring("swingLimitSpring")?,
+                enable_collision: v.get("enableCollision").and_then(Value::as_i64).unwrap_or(0) != 0,
+                projection,
+                auto_anchor: v.get("autoConfigureConnectedAnchor").and_then(Value::as_i64).unwrap_or(1) != 0,
+                connected_anchor: vec3(&v, "connectedAnchor").unwrap_or([0.0; 3]),
+                preprocessing: v.get("enablePreprocessing").and_then(Value::as_i64).unwrap_or(1) != 0,
+            });
+        }
+        // Each hit collider to the nearest body at or above it, with its
+        // place in that body's bone.
+        for (&object, node) in &nodes {
+            let Some(script) = script_on(assets, node, "BodyPartCollider") else { continue };
+            let read = assets.read(script)?;
+            let part = read.get("BodyPartType").and_then(Value::as_i64).and_then(|part| u8::try_from(part).ok());
+            let surface = read.get("SurfaceSound").and_then(Value::as_i64).and_then(|surface| u8::try_from(surface).ok()).unwrap_or(0);
+            let (mut at, mut place, mut turn) = (object, [0.0f32; 3], [0.0, 0.0, 0.0, 1.0f32]);
+            let mut via = None;
+            let body = loop {
+                if let Some(&body) = body_of.get(&at) {
+                    break Some(body);
+                }
+                let here = &nodes[&at];
+                if via.is_none() && at != object && here.name.starts_with("Base Human") {
+                    via = Some((here.name.clone(), (place, turn)));
+                }
+                // Up one level: this object's place in its parent, then
+                // what was gathered below it.
+                place = {
+                    let moved = rotate(here.turn, place);
+                    [here.place[0] + moved[0], here.place[1] + moved[1], here.place[2] + moved[2]]
+                };
+                turn = quat_mul(here.turn, turn);
+                match here.parent {
+                    Some(parent) => at = parent,
+                    None => break None,
+                }
+            };
+            let Some(body) = body else { continue };
+            for component in &node.components {
+                let Some(shape) = shape_of(assets, *component)? else { continue };
+                let local = (at != object).then_some((place, turn));
+                let material = physic_material(assets, *component, &assets.read(*component)?);
+                bodies[body].colliders.push(ColliderData { object: node.name.clone(), local, shape, part, surface, material, via: via.clone() });
+            }
+        }
+        bodies.sort_by(|a, b| a.bone.cmp(&b.bone));
+        joints.sort_by(|a, b| a.bone.cmp(&b.bone));
+        if bodies.is_empty() {
+            return Err(anyhow!("the player prefab has no ragdoll"));
+        }
+        Ok(Self { bodies, joints })
+    }
+}

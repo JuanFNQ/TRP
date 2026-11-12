@@ -1,6 +1,6 @@
 # Mounting and the bipod: the weapon rested on cover, or on its own legs
 
-Read 2026-10-25 (session 132) from the decompiled game (`EFT.WeaponMounting`, `IdleWeaponMountingState`,
+How a weapon is rested on cover or on its own bipod, and what that changes. Read 2026-10-25 from the decompiled game (`WeaponMounting`, `IdleWeaponMountingState`,
 `MovementContext`, `ProceduralWeaponAnimation`, `MountingStrategy`, the recoil, breath and motion effectors,
 `Physical`, `FirearmController`), from the install through `probe` (globals.json `MountingSettings`, the weapon
 and bipod templates, the body animator, the bipod's prefab) and from recorder 0.13.0's course 8
@@ -16,8 +16,9 @@ key). The M60E6's second `05-mount` (`-233241`): both presses found a forward po
 which was left in the same frame (`EnterMountedState`, then `ExitMountedState`, `ExitMountedStateHandler(0)`),
 leaving the stance where the mount had put it (0.578). `06-bipod`: the M60E6's bipod deployed lying down at
 2.50 s and folded at 12.00 s without a mount (the script never presses `V` lying down); on the MDR, which has
-no bipod, both presses did nothing. No recording has a side mount, a standing bipod mount, a prone bipod mount
-or third person.
+no bipod, both presses did nothing. Since 2026-10-27, `courses8` (by hand, recorder 0.14.0) has side mounts, a
+forward one held and fired, and prone bipod mounts held and fired ("Compared with"); still none has a standing
+bipod mount or third person.
 
 ## The keys
 
@@ -28,7 +29,7 @@ its command once (`ECommand.WeaponMounting`, `ToggleBipods`). The first goes to 
 
 **`Ctrl`+`V` ended a mount on the M700, which has no bipod** (`courses2\4-mount`, 18.39 s): read as `V`'s
 own binding taken beside the bipod's (the input manager's handling of a combination inside a longer one is
-`trp_sim::bindings`'). PROVISIONAL: the commands of that frame were not recorded (0.10.0).
+`trp_sim::bindings`'). PROVISIONAL: the commands of that frame were not recorded.
 
 ## Who may ask
 
@@ -187,7 +188,12 @@ player's axis by twice the turn and moved sideways by 0.25 m times the offset's 
 before it the character's capsule stood in for it, as it still does for settings made without the prefab).
 The view's limits are the mount's: yaw between its limits, pitch between the cut limits (the lower one, on a
 forward mount, put to the current pitch while the weapon sticks more than 1 cm into something:
-`CalculateDynamicDownLimit`), set at once each turn.
+`CalculateDynamicDownLimit`), set at once each turn. **The overlap is measured from the hands as placed**
+(`WeaponOverlapping`: the hands' place through the moved root), so a weapon on its point runs clear of what it
+rests on (recorded: nought on every mounted frame of `courses8`'s window and corners and `courses7`'s sill;
+built 0.144.0, `Movement::placed_weapon_overlap`: before it ours measured from the unmoved rig, the sill held
+the pitch by this limit, and the view stuttered as the stance followed). A host drawing between frames turns
+the view ahead by the mount's turn (`Movement::look_ahead`, `mount_look_ahead`), not the movement state's.
 
 **The stance follows the pitch** (`UpdatePoseLevel`, not lying): between the stance limits by where the pitch
 is between the cut pitch limits: looking down raises the body, up lowers it (recorded: 0.008 to 0.47 as the
@@ -204,13 +210,31 @@ M700: `tilt` ±5.00 at the yaw limits, `smoothed_tilt`, the body's `Tilt` and th
 **The weapon's place** (`MountingRotationFunction`, the rotation function while mounted): the hands' root
 turned to the view as ever, and moved from the ribcage toward the place that puts the pivot on the point
 (`WeaponMountingPos`: the root now plus the point, lowered by the side drop, less where the pivot is in the
-`Weapon_root`'s axes) by the transition's share (0 to 1 coming in, 1 to 0 going out; 1 held). **The pivot is
+`Weapon_root`'s axes) by the transition's share (0 to 1 coming in, 1 to 0 going out; 1 held), **held to 0..1**
+(`Vector3.Lerp`): the approach's last frame takes the share past 1 (`TransitionProgress` 1.01 recorded at 120
+frames a second, 1.0833 at 60) and the exit's last below 0, but the rig stops on its place (recorded, the M700 on
+its bipod: the camera on `CameraOffset` from `WeaponMountingPos` to 0.1 mm, where the share unheld would put it
+1.4 mm off; built 0.164.1, before it ours carried the rig 8% past at 60 frames a second). **The pivot is
 turned by the frame before's turn**: `Weapon_root.TransformPoint` reads the bone as the last frame left it, before
 the hands' root is turned to this frame's view, so on a frame that turns the view the pivot comes off the point by
 that frame's turn of its reach, and goes back on the next still frame (recorded, below). **The arms go with the
 weapon whole**: the shoulders leave the ribcage with it (recorded: the upper arms' reach to the palm and their
 distance to the weapon as off a mount while they move up to 0.53 m from the ribcage), so nothing between the
 collarbone and the hand is stretched.
+
+**The arms drawn in first person** (recorded 2026-10-27, `courses9\fp-mounted-akm`, recorder 0.15.0; built 0.145.3):
+the first-person squeeze along the view (0.664 at a field of view of 74) is put on twice, the weapon's rig about the
+rig's own root (`HandsHierarchy.Self`'s scale) and the body, whose arms are drawn, about the ribcage (its scale;
+`ApplyFovAdjustments`). Off a mount the rig's root is at the ribcage (`DefaultRotationFunction`) and the two are one;
+on a mount the root is moved off it (above), and the arms drawn stand (1 - s) of the root's offset along the view away
+from where the rig's squeeze would put them: whole, their shape kept, **the hands going along the weapon**. Recorded:
+the hand's offset from its marker along the view = -9.1 mm + 0.995 x that prediction on all 1,012 frames (correlation
+1.0000, 0.15 mm rms left over); the game's root 5 to 25 cm behind the ribcage there (its stance high at the press:
+the feet 0.756 m back from the point), the hands 19 to 84 mm forward along the weapon. A stance low at the press puts
+the feet further back (0.953 m from a full crouch), the root ahead of the ribcage and the hands back along the weapon.
+Seen from outside there is no squeeze: the body's hands stay on their markers (recorded, `courses9\outside`: the left
+60 mm off its grip's marker on every frame, the right on its own). In the app (`hands_view::squeeze_shift`): the arms'
+upper bones and the kept collarbones moved by it in the rig's root's axes; the simulation's figures untouched.
 
 ## What ends it, and what it ignores
 
@@ -224,6 +248,10 @@ the jump (which is then passed to the movement state); blind fire
 (passed on); a change of stance (passed on); the step aside (passed on); a reload of any kind, a magazine's
 unloading, the chamber's, the fire mode's look, the look all over, the magazine's look and the chamber's
 (`FirearmHandsInputTranslator`, `FirearmController`); a door's or moving platform's change under the point.
+**The reload's key leaves first, whatever follows** (`Reload`; `QuickReload` only at rest): a magazine found or
+none, a magazine of the weapon's own full or not, rounds within reach or none; only a weapon used once
+(`IsOneoff`) hears nothing. (Built 0.146.1, `Firearm::reload_key`: before, a magazine filled a round at a time
+never left, the M700 lying on its bipod among them; seen in the app, not recorded.)
 **Leaving at once** (`ExitMountedState`): lying down or getting up (the prone key, then passed on); a vault or
 a climb (passed on); the approach's own failures (above); the stock folded; the inventory opening; the
 backpack dropped; any change of the thing in hand (`HandsChangingEvent`). **Ignored**: the sprint, the
@@ -258,8 +286,11 @@ the M60E6's immediate exit). Recorded on the M700: both exits 0.200 s from the k
   person's; the hands' recoil turn added; the camera's recoil;
 - **the tactical reload's blend** runs to 1 (no delay, 4 a second) while mounted forward with the bipod out,
   as for an aimed reload, and back (0.2 s, 2 a second) when either ends (`UpdateTacticalReload`). It holds the
-  weapon bone toward its rest (`TacticalReloadStiffnes`, `TacticalReloadFixation`: `firing.md`) and takes the
-  camera's animated turn away by that share.
+  weapon bone toward its rest (`TacticalReloadStiffnes`, `TacticalReloadFixation`: `firing.md`, "The reload with
+  the sights up"), its turn about y put back about the bipod's pivot's depth, so a bolt is worked with the weapon
+  held nearly still. The mount's camera does not read the blend: it takes the clip's turn whole
+  and follows the sight where the held bone carries it (`MountedWeaponCamera`; read 2026-10-31, correcting this
+  line's "takes the camera's animated turn away", which is the first person's `LerpCamera`).
 
 **Recoil** (`NewRotationRecoilProcess`): each shot's push on the hands' rotation is multiplied by the
 template's `MountVerticalRecoilMultiplier` at a side (0.85 on the three), the bipod's `BipodRecoilMultiplier`
@@ -271,7 +302,14 @@ toward the weapon (`CameraSmoothRecoil`) by `MountCameraSnapMultiplier` (3), or 
 **Breath** (`BreathEffector`): no hip inaccuracy is added by a shot while mounted; the breath does not run at
 all while mounted unless the arms' stamina is at its floor or an arm is broken, and then at the template's
 `MountingVerticalOutOfBreathMultiplier` (0.8) at a side, the bipod's `BipodOutOfStaminaBreathMultiplier` (0.1)
-forward with it out, else `MountingHorizontalOutOfBreathMultiplier` (0.4). Held where it was, not zeroed.
+forward with it out, else `MountingHorizontalOutOfBreathMultiplier` (0.4). What the breath last put in the
+recoil's offset (the hip wander) is not held, though: **every `SetMountingData`** (entering, starting to leave,
+leaving) works the weapon's figures out again (`UpdateWeaponVariables`, `Shootingg.OnWeaponParametersChanged`,
+`RecalculateRecoilParamsOnChangeWeapon`), which ends in `HandRotationRecoil.Reset()`: its place, speed and offset
+to nought. Recorded on the M700 (`local\traces\m700-bipod`): the weapon turned 0.69 degrees in x lying, the hands'
+spring's 0.20 alone on the frame of the mount. Built 0.164.1 (`Hands::set_mounting`); before it ours froze the
+wander, 0.427 degrees about the pivot. The same reset follows the weapon's other recalculations (taken in hand, the
+stock folded, the weapon modified, an arm damaged, the armour's ergonomics): read, not built.
 
 **Sway** (`MotionEffector`): mounted forward with the bipod out, the movement and the mouse's sway at 0.15
 (`MountingSwayFactorModifier`).
@@ -305,11 +343,48 @@ Recorded on the M60E6 (`06-bipod`): `InteractionIndex` 33 on the press's frame, 
 from the next frame, the operation back to idling 0.567 s after the press, the way out 0.84 s after it.
 
 **Lying down with the bipod out and mounted**: the body's `ProneBipodsOn` sends the aiming layer's
-`Aiming_Prone` to `Prone_Bipods` (nine clips by `DeltaRotation`); the layer `Bipods` has weight 0.
+`Aiming_Prone` to `Prone_Bipods` (`Prone & ProneBipodsOn & !InventoryOperation`, a blend of a tenth of the state);
+the layer `Bipods` has weight 0. The state blends nine clips of 0.13 s, held at their ends, by `DeltaRotation`
+(-25 to 25) and `Aim_angle` (-4 to 6); each ramps `Hand_Left`, `Elbow_Left`, `Shoulder_Left` and
+`First_Person_Curve_Weight` from 0 to 1 (and the middle column `Weapon_3rd` too), which on the additive layer adds 1 to
+each (`Weapon_3rd` comes to 2). So **the left arm is the body's**: the hand off the weapon, down on the ground under the
+stock (recorded, `local\traces\m700-bipod`: `left_hand_first_person` 0 on every frame of six mounts, the curves at 1
+0.13 s after the mount's frame, the left palm 28 cm left of the right and 11 cm below it). **The weapon is not handed
+to the body's weapon bone on a mount**, whatever the curves (`ThirdPersonWeaponRootAuthority` nought in
+`IsInMountedState`), and **the shoulders are held on the rig only mounted upright** (`SetShoulders(1, 1)` mounted
+and not lying; lying, the clips' shoulder curves as ever). Built 0.146.0 (the state among those the body reads; the
+mount's two rules in `body`). Compared at the mount's middle and 6 degrees down (the game's 12.36 to 13.04 s):
+the body's weapon bone and ribcage the game's to 0.1 mm, the first-person weapon in the camera's axes within 6 mm.
+**The camera's place on this mount** (open from 0.146.0 to 0.164.1, 7.8 cm right of and 6.6 cm above the game's):
+the gap was the comparison's (the press scripted with the body on the look, on a floor at the feet), and the
+rig's share and the hip wander above; with the game's conditions the place is the game's ("Compared with").
 
-**Its legs**: moved by the bipod's own animator (the M60E6's prefab: an animator with four clips, a
-`StreamingAnimator`, `BipodViewController`, `BipodAudioController`), fed the hands' `Bipod`. Not read: its
-controller and clips.
+**Its legs**: moved by the bipod's own animator (an `Animator` on its prefab's root, with a `StreamingAnimator`,
+`BipodViewController`, `BipodAudioController`; read 2026-10-27, `probe partstates`): one flag `Bipod`;
+`BIPOD_IDLE_CLOSED` (0.333 s) to `BIPOD_OPEN` (1 s) when it is set, on to `BIPOD_IDLE_OPEN`, and back through
+`BIPOD_CLOSE` (1 s); no blend. The open and close clips carry the marks `BipodOpen` and `BipodClose` (the Atlas V8's at
+0.237 and 0.254 of its clips, the M60E6's at 0.265 and 0.358), which its sound player plays. The game runs it as one
+with the weapon's animator (`WeaponPrefab.UpdateAnimatorHierarchy`): `FirearmsAnimator.SetBipod` at the toggle reaches
+it whether or not the hands have the parameter. Recorded: the Atlas's unfold 0.242 s after the press and its fold
+0.262 s after (`local\traces\m700-bipod`), the M60E6's unfold 0.266 s after (`courses8`). Built 0.145.0
+(`WeaponAnimator`'s parts: the part's own controller on the bones under it, its pose over theirs, its marks with the
+weapon's).
+
+**The `_procedural` nodes** (read 0.224.1; `probe partbinds <template>`, `probe tree <bundle>`): six of the seven
+bipods the database fits hang each moving joint as a pair, a parent named `<joint>_procedural` that holds the joint's
+rest place and turn, and under it, unturned, its one child `<joint>`, which holds the meshes and the next pair (the
+Atlas V8's six: the vertical and horizontal axes, both side axes and both legs; the SV-98's four, the G36's three, the
+PK's and the RPD's four each, the M60's two; the Harris S-BRM has none, its clips turning its axes directly).
+**Nothing moves the parents.** Every curve of the 28 clips of the bipods' own animators binds a node of the prefab, and
+not one a `_procedural` one: the clips move the children and the buttons. The parents carry no script and no
+constraint, and the game's code names one bipod node only, `bipod_ground`. Of the hands' clips, only the RPD's bind
+its bipod's nodes, every one, each held in all 67 clips at the prefab's rest (the clips leave the bipod's root unturned, where the weapon
+hangs it a quarter turn about x, and its first node unturned, where the prefab turns it a quarter back: under the
+slot, the same place and turn). The PKM's, M60E4's, SV-98's, the G36's with
+its bipod and the M700's with the Atlas bind none (the PKP, PKTM, M60E6 and the Atlas's other hosts not read). So,
+folded or out, mounted or not, the parents stand at the prefab's rest. Their names suggest code that moves them; none
+is in this build, and why they are so named is not read. TRP does the same: the part's animator takes every node
+under the part as a bone at its prefab rest, and a bone no clip moves starts each update from it.
 
 **When the weapon changes** (`WeaponModified`): the bipod stays out only if there still is one.
 
@@ -323,25 +398,31 @@ controller and clips.
   handler). Recorded on the M700: `weap_vertical_mount_04` 0.459 s after the mount (approach 0.451) and
   `_02` 0.508 s after it (approach 0.507); `gear_medium` at each mount, each exit's start and its end. On the
   M60E6's immediate exit: two `gear_medium` clips on the one frame.
-- **The bipod's open and close** (`BipodAudioController.OnBipodOpen`, `OnBipodClose`) are events of the
-  hands' clips; the M60E6's hands have none: **its toggle is silent** (recorded: no source in `sounds` or
-  `plain_sounds` from 2.50 to 3.40 s or from 12.00 to 12.90 s of `06-bipod`).
+- **The bipod's open and close** (`BipodAudioController.OnBipodOpen`, `OnBipodClose`) come from the marks of the
+  bipod's own animator ("The bipod", its legs), not the hands'. (Read wrongly at 0.125.0 as silent on the M60E6:
+  `courses6`'s `06-bipod` held no source; `courses8` has `bipod_rpd_unfold_1` at 0.6, 0.266 s after the press.)
+- **The bipod's own player** (`BipodAudioController`, on the bipod's prefab; read 2026-10-27 with `probe bipodaudio`):
+  subscribed for as long as the part is fitted, out or folded. A forward mount starts a timer of the approach's
+  time (an exit stops it); at its end a line from the bipod toward the mount's point, 1 m at most, on the footsteps'
+  layers, gives the surface (concrete when it meets nothing), and that surface's set plays at the bipod: one clip at
+  random, at the set's volume, heard to its farthest (`PlayAtPoint`; stereo for the character's own eyes). The M60E6's
+  bipod: every surface the same five `bipod_stand_on_*` clips at 0.06, 20 m; open three clips at 0.6, close three at
+  0.75, 25 m. Recorded: `bipod_stand_on_1` at 0.06 with the weapon's mount sound on one frame (`courses8`, 14.269 s).
 
 ## Third person
 
 The mount's packet (`MountingPacket`) carries Enter (point, direction, approach time), Update (the side
 drop), StartLeaving and Exit; another's view lerps the weapon by time, sets `ProneBipodsOn`, and only a side
 mount rolls the camera. Seen from outside the character keeps its stance, tilt and body turn from the same
-movement; the weapon hangs from the third-person bone by the same rule. Built by the user's choice of
-2026-10-25 ("Yes, from code"); read from code, not recorded.
+movement; the weapon hangs from the third-person bone by the same rule. Built by choice from the code; read from code, not recorded.
 
 ## The battle screen's icon (`BattleUiBipodPanel`, `BattleStancePanel._bipodPanel`, `BattleUIScreen`; read and built 2026-10-25)
 
-The user, 2026-10-25: "There is a mounting icon that is missing in our app but present in tarkov/spt". It is the stance panel's (`MountStance` under `BattleStancePanel`, 100 by 100 at (185, 130) of the panel, `probe scenepanel level44 "EFTBattleUIScreen Variant/BattleStancePanel"`, `local\stancepanel_s133.txt`): `Mount` (`Icon_UI_Bipods`, 30 by 35, off in the scene), `UnavailableMount` (`Icon_UI_Bipods_Red`, the same place, on at alpha 0) and `MountDirections` with three arrows (`ForwardMount` under the icon, `LeftMount` and `RightMount` beside it, each off). Its script (`probe battle`, `local\mount_icon_probe_s133.txt`) pairs `ForwardMount` with the side 0, `LeftMount` with 1 and `RightMount` with -1 (the scene's pairing, kept as read: the game's `Left` is -1), and its flash lasts `_highlightDuration` 0.8 s.
+The game shows a mounting icon. It is the stance panel's (`MountStance` under `BattleStancePanel`, 100 by 100 at (185, 130) of the panel, `probe scenepanel level44 "BattleUIScreen Variant/BattleStancePanel"`, `local\stancepanel_s133.txt`): `Mount` (`Icon_UI_Bipods`, 30 by 35, off in the scene), `UnavailableMount` (`Icon_UI_Bipods_Red`, the same place, on at alpha 0) and `MountDirections` with three arrows (`ForwardMount` under the icon, `LeftMount` and `RightMount` beside it, each off). Its script (`probe battle`, `local\mount_icon_probe_s133.txt`) pairs `ForwardMount` with the side 0, `LeftMount` with 1 and `RightMount` with -1 (the scene's pairing, kept as read: the game's `Left` is -1), and its flash lasts `_highlightDuration` 0.8 s.
 
 **Shown** (`ChangeMountImage`), as the panel is shown and whenever the mount's data is set or cleared (`PlayerMountingPointData.SetData` at the mount, `ClearData` at the exit's end: `OnMountedStateChanged`): a flash under way stopped (its red image back to alpha 0), every arrow off, the icon on while mounted (`IsInMountedState`: the data held) and then the arrow whose side is the mount's. **Flashed** (`OnMountUnavailable`), whenever the mount finds nothing (`WeaponMountingComponent.NoPointFound`, `OnNothingFound`: the standing search answered with nothing, lying down without the bipod out or with a step aside or a walk key, or a point found and its data refused, which clears the data first), unless a flash is under way: the red image faded to whole in half the length and out in the other half (`DOFade`, DOTween's default ease). The battle screen raises the stance panel at both (`PullUpBattleStancePanel` on `OnMountedStateChanged` and `OnNothingFound`). A door being worked under the point gives neither.
 
-**Built** (0.126.0; `trp_data::screen::MountIcon`, `battle_view`, `Controller::mount_refusals`, with `TARKOV UI`): the icon and the mount's side's arrow while `Movement::mounted`, the flash on every `MountEvent::Refused`, the panel raised at both. Looked at: `local\shots\mount_icon_s133.png` (crouched at the window, mounted forward: the icon right of the figure, the forward arrow under it) and `mount_icon_red_s133.png` (standing there, refused: the red icon fading). Not compared with a recording (the recorder had not written the panel; 0.14.0 does).
+**Built** (`trp_data::screen::MountIcon`, `battle_view`, `Controller::mount_refusals`, with `TARKOV UI`): the icon and the mount's side's arrow while `Movement::mounted`, the flash on every `MountEvent::Refused`, the panel raised at both. Looked at: `local\shots\mount_icon_s133.png` (crouched at the window, mounted forward: the icon right of the figure, the forward arrow under it) and `mount_icon_red_s133.png` (standing there, refused: the red icon fading). Not compared with a recording (the recorder had not written the panel; 0.14.0 does).
 
 ## Built
 
@@ -356,7 +437,7 @@ The user, 2026-10-25: "There is a mounting icon that is missing in our app but p
   from the left hand's marker where `MountingPosition` is nought, the bipod's); `MountEvent`, `HandsMount`,
   `MountedMotion`, `drain`; `tell` (after the movement's frame: the weapon's `Mounted`, the weapon motion's
   mount and way, the skill's ergonomics gain, a canted sight swapped or the sights put down).
-- **The world**: `World::ray`, `sphere_clear`, `box_sweep`, `capsule_push` (the head's, 0.132.0), `turn_blocked` (without the prefab's head capsule; the ground alone unless a host
+- **The world**: `World::ray`, `sphere_clear`, `box_sweep`, `capsule_push` (the head's), `turn_blocked` (without the prefab's head capsule; the ground alone unless a host
   says); `collision::Block::sphere_overlaps`, `upright_box_overlaps`; the range's (its solids and doors).
 - **The mount's state** (`trp_sim::movement`, `movement/mount.rs`): the key (`Input::mount`, `mount_may`),
   the search answered before the animator, `enter_mount` (the slow lean, the lean and the step to 0, the
@@ -381,9 +462,8 @@ The user, 2026-10-25: "There is a mounting icon that is missing in our app but p
   numbers 18 to 21, animator 31 to 34) and their mark (`Acted::BipodToggled`).
 - **The stamina, the skills, the sounds**: `Stamina::set_aim_drain_by`; `WeaponBuffs::mount_ergonomics`;
   `StepSounds::kit_medium` (`GearMedium` at its bank's random volume).
-- **The switch**: `trp_sim::Systems::mounting`; the options' `MOUNTING` under `SIMPLE`, after `BLIND FIRE`
-  (the user's choice by multiple choice, 2026-10-25).
-- **The app** (`controller.rs`, `hands_view.rs`, `hands_sound.rs`): `WeaponMounting` (`V`) and `ToggleBipods`
+- **The switch**: `trp_sim::Systems::mounting`; the options' `MOUNTING` under `SIMPLE`, after `BLIND FIRE`.
+- **The app** (`controller`, `hands_view`, `hands_sound`): `WeaponMounting` (`V`) and `ToggleBipods`
   (`Ctrl`+`V`), a script's `cmd:WeaponMounting` and `cmd:ToggleBipods`; the rig moved onto the point in
   either view (`Shown::rig_apart`), the camera's object left at the ribcage; since 0.138.1 the rig's place worked
   out again for the view as drawn and the mount's camera moved with it (`Controller::rig_apart_drawn`,
@@ -391,18 +471,93 @@ The user, 2026-10-25: "There is a mounting icon that is missing in our app but p
   (`body_view::see_collarbones`); the kit's rattle at the mount,
   the exit's start and its end, the weapon's mount sound the approach's time after the mount (the frame of
   the mount not counted), at the aiming sound's volume; the sight key passing canted sights on a mount.
-  Third person plays the same body states and the moved rig (the user's choice: "Yes, from code").
+  Third person plays the same body states and the moved rig (by choice, from the code).
 - **The replay** (`bin/replay`): the two `cmd:` presses, the hand-over, the bipod's gesture and mark, the
   hands' rest flag, `mount`, `mount_target`, `mount_point`, `mount_limits`, `mount_approach`,
   `mount_transition`, `mount_figures`, `tilt`, `p_Tilt`, `p_ProneBipodsOn`, `interaction_shown`,
-  `bipod_operation`, `rig_apart`; a folder's `mount.txt` (`sill`, `floor`, `blocked`) for a world the
-  recorder does not keep. **`bin/mount`**: a recording's mounts by hand beside the rules.
-- **Tests**: `mounting::tests` (four), `tests/sim/mounting.rs` (five), `range::tests::the_window_sill_takes_a_mount_crouched`.
+  `bipod_operation`, `rig_apart`; a folder's `mount.txt` (`sill`, `floor`, `blocked`, and since 0.164.1
+  `terrain <depth>`: the terrain under the feet for a script with no trace of its own) for a world the
+  recorder does not keep; the rig's bones in the body's axes with the mount's move of the rig.
+  **`bin/mount`**: a recording's mounts by hand beside the rules.
+- **Tests**: `mounting::tests` (four), `tests/sim/mounting.rs` (five; the held pivot on its point since 0.164.1),
+  `tests/sim/hands.rs`'s `a_mount_drops_the_hip_wander`, `range::tests::the_window_sill_takes_a_mount_crouched`.
 
 ## Compared with
 
+**The M700 lying on its Atlas, `local\traces\m700-bipod`** (recorder 0.14.0, by hand): the first mount
+(12.15 to 28.87 s) replayed by script with the game's conditions at the press: the look 8.13 degrees right of the
+body (which lying down had stayed at 18.21 while the look went to 26.34), 13.04 down, the ground 6.71 cm under the
+feet (`ground_below`: the body rides over it), the recorded build, a field of view of 74 (`local\scenarios_place_s165`,
+`local\traces\m700_place_s165`; `local\place_cmp_s165.pl` sets every held game frame beside ours). **The point** at
+the press the game's to 0.1 mm (0.740 m along the look from the body's `Weapon_Root_Third`); the approach turns the
+body onto the look, the point staying put. **Held** at the mount's middle (26.34, 6.00), 90 frames: `camera_pos` and
+the eye within 0.06 mm; the weapon in the camera's axes, the right palm, upper arm and forearm within 1.5 mm, 0.5
+on average; the left palm (the body's) and the ribcage to 0.01 mm. Turned unaimed, (16.63, -4.00) and (19.34,
+0.03): within 1.5 mm at most; (14.87, -3.83), 194 frames: within 0.6 mm. Aimed through the scope at 35 degrees,
+(15.75, -1.38) and (13.53, -4.00), 51 and 139 frames: within 0.9 mm on average, 2.7 at most while the game's camera
+eases in. **The 6.7 cm** is the character riding over that road within its ground check, standing as lying (the
+recorder's rays down meet only the road's collider there; `movement.md`'s ride over ground that falls away, built):
+with the feet on the app's level floor the same press is refused, as the rule gives (the root 0.1988 m over it).
+**In the regression** since 0.164.2 (`r21`: `19-`, `22-` and `23-` with `held.txt`, the replay setting the six held
+moments above beside the game's frames, gaps in mm). **After the aim** the game's camera seemed to hold one place
+through every look: the recording is in the third person's view from 22.703 s to 50.766 s,
+where the game moves no first-person camera, as the replay does from outside. On a mount
+in the first person the camera rides the moved rig after an aim and a shot too (`courses2\4-mount`: 12.7 and 11.4 mm
+of camera a degree of look), as built.
+
+**Recorder 0.14.0's `courses8`** (by hand, 2026-10-27): `mount-on-window` (the AKM, one forward mount
+held 22 s, four aimed bursts), `mount-on-corners` (the AKM, four side mounts at a wall's corner, three left and one
+right), `m60-mounting-with-bipod` (the M60E6 with its bipod out from the start: three standing presses, 30 searches lying,
+three prone bipod mounts, a 19-round burst and two short ones on it), `pressing-v-on-open-ground` (the AKM: 43
+presses standing, in a sprint, a jump, a reload and lying down). `bin/mount` (now taking side and lying mounts as
+`movement/mount.rs` does; `local\mount_c8_*_s142.txt`):
+- **All eight mounts' data** as the game's: the target within 0.1 mm, the look's target yaw, the yaw, pitch and
+  stance limits, the approach (0.28889, 0.39950, 0.34087, 0.31752, 0.39047 s; lying 0.2 s), the target the feet
+  lying down. **The entry**: the target yaw (a side's the look's own where it is in the span), the target pitch
+  (the look's held to the movement's limits), the yaw shift, the entry lean (-1.8662, -4.2280, -1.2800, 0) and the
+  stance at the start (0.8329, 0.2202, 0.8422, 0.9827 at the corners) gap 0.0000.
+- **The approach** on every frame: the share, the look, the lean toward the entry tilt and a side's drop gap
+  0.0000; the movement's pitch limits easing to the mount's at 5 a second of the player's clock gap 0.0000 (standing
+  first on the frame after the mount's, lying on its own: the order ours has), holding the look as they close in
+  lying down (from 25 to the bipod's 6 degrees).
+- **Held** (2,511, 189, 350, 600, 363, 2, 820, 1,229 frames): the stance by the pitch within 0.00001, the lean by
+  the yaw within 0.0001 (a side's only toward the wall, -5 at its end), a side's drop (-0.1 m at the span's end)
+  0.0000; lying down nothing moved, as the rule says. The camera's tilt is the lean on every frame at a side; the
+  weapon's lean is the frame before's (ours by the same order).
+- **The exits** 0.2001 to 0.2070 s: by the key (the window, the three on the bipod), by a stance key (the corners,
+  3.600 and 9.165 s: the stance set to 1 on the frame), by a held walk key (19.103 and 25.796 s: the exit asked on
+  every frame, the walk taken up on the frame after the state is off); a side mount's lean left as the lean (-5,
+  0.037). The sounds: the kit's rattle and the weapon's mount sound on our frames.
+- **The search**: found 2 frames after the key (five) and once 3 (a side point, the corners at 13.740 s: a top cast
+  first or the coarse layer, which only the corner's geometry can say), nothing 3 frames after (37); a point found
+  and refused by the data once (the corners at 21.675 s: the point is not recorded on a refusal, not checked).
+  **Refusals** as ours: in the air, in a reload (the key goes no further than the player), lying down without the
+  bipod (nothing found on the key's frame); a sprint does not refuse the search. **Lying with the bipod out** the
+  point was found only where the body's `Weapon_root` stood over 0.2 m above the ground, the sphere's radius
+  (found at 0.204, 0.217, 0.225 m, looking 12 to 24 degrees down; 27 refused, at 0.198 m at most): ours
+  the same rule, refusing at a level look and mounting at 21 degrees down on the replay's level floor. The game's
+  feet lay 1.6 cm over the ground after a crawl and ours on it, so on level ground ours
+  needs about 2 degrees more of a look down.
+- **The camera's snap** (`camera_smooth`): 21 at the forward mount's shots against 7 unmounted (×3), 7 on the
+  bipod (×1).
+- **Recoil on the bipod**, the recorded build fired by a script on the replay's floor (60 frames a second against
+  the game's 120; `local\scenarios_bipod_s142`): single aimed shots climbing 0.119 to 0.162 degrees against the
+  game's 0.110 to 0.173, the camera 0.358 to 0.452 against 0.354 to 0.448, back 18 to 25 mm against 17 to 25; a
+  19-round burst building to the same plateau, rounds 6 to 19 on average 0.570 degrees against 0.586, back 47.3 mm
+  against 51.4, the camera 1.367 degrees against 1.448. **On the window mount** (forward, the AKM, its build, on a
+  `mount.txt` sill): ours exactly 0.60 of ours unmounted round by round (the template's
+  `MountHorizontalRecoilMultiplier`); the game's climb over ours by 9% on the first round and 17% on the fifth
+  (0.69 to 0.88 against 0.63 to 0.76 degrees; 3.45 and 3.51 against 2.74 to 3.03), its pushes back within ours'
+  spread. **Open**: four bursts against three, and the game's unmounted baseline only from another recording
+  (recording12's stock AKM, 60 frames a second: the mounted climb 0.64 to 0.72 of it). One take with the same
+  weapon fired aimed mounted and not would settle it.
+- **Not in these**: a standing bipod mount (the M60E6's three standing presses found nothing), third person, the
+  breath and sway on a mount (no recording held the breath or ran the arms down mounted), the skill's ergonomics
+  gain (the profile's class skills are at 0: `TotalErgonomics` never moved, as the rule gives), the bipod's sound
+  on the ground (recorded, `bipod_stand_on_1` at the approach's end; not built).
+
 **Recorder 0.14.0's `courses7\10-anything`** (the M4A1 on a window sill by hand, 2026-10-25; three takes with
-mounts, `anything`, `-212814`, `-212842`; 0.138.1):
+mounts, `anything`, `-212814`, `-212842`):
 - **The data, with `bin/mount`** (`local\mount_c7_*_s137.txt`): on all twelve mounts the target within 0.2 mm, the
   look's target yaw within 0.015 degrees, the yaw, pitch and stance limits, the approach (0.33216 s against 0.33216),
   the stance at the start; the approach's share and look (0.0000 but one mount's 0.26 degree in pitch); held, the
@@ -465,19 +620,39 @@ stepped up to the sill and the weapon low over it (`mount_window_s132.png`), and
 the handguard just over the sill (`mount_window_aim_s132.png`). From outside not taken: the range has nothing at
 mount height with room for the watching camera.
 
-**Read from code only, not recorded**: a side mount; a standing bipod mount and the prone one (`Prone_Bipods`,
-the tactical blend); every exit but the key's and the walk's lock (the walk keys, the lean, lying down, the
-jump, blind fire, a reload, the looks, the fold, the inventory, the backpack); the recoil, breath and sway on a
-mount; the arms' drain; the skill's ergonomics gain; the dynamic lower limit; the turn's collision check; the
-canted sight's swap; the bipod's refusals; third person.
+**The bipod's `_procedural` nodes**. **Measured holstered**: in `courses9\fp-mounted-akm` and
+`courses9\outside` (recorder 0.15.0, 8.7 and 10.0 s) the M700's Atlas hangs on the back, and each of its six is
+written once, at first sight, with the prefab's values (`axis_left_procedural` at 0.0241, -0.0004, -0.0076,
+`leg_left_procedural` at 0.0042, -0.0909, 0, `axis_horizontal_procedural` at z 0.0207), and never again (the skeleton
+writes a node only when it moves); in `courses8\m4a1-left-shoulder-canted` the holstered M60E6's two keep one
+value. **In hand, by eye only**: `m700-bipod`'s pictures 13, 25 and 27 (the prone mount's entry, turned to +15 and
+to -14.8 on it) show the Atlas's legs keeping one relation to the stock through the pan, no axis panning or canting
+against the weapon; ours (`local\shots\m700_prone_s165.png`) has the leg where picture 13 has it on the screen, by
+eye. No recording has a bipod in the hands' rig (`m700-bipod` is recorder 0.14.0, before the rig was written).
+**Tested**: the seven bipods' clips bind none of them (`install::no_bipod_clip_binds_a_procedural_node`, trp-data);
+on all 180 frames of the Atlas going out and folding on the M700 (the build of `m700-bipod`) each of its six stands
+at its rest within 1e-6, while the left axis turns 90 degrees and the left leg slides 5.95 cm
+(`mounting::the_bipod_s_procedural_nodes_stay_at_rest`); the RPD's hands' animator alone puts its bipod's four where
+the rest puts them under the slot, within 1 µm and 0.0002 degrees, its root turned 90 degrees from the rest
+(`mounting::the_rpd_s_hands_hold_its_bipod_at_rest`).
+
+**Read from code only, not recorded**: a standing bipod mount; the prone one's body (`Prone_Bipods`) and the
+tactical blend; every exit but the key's, the walk's lock, the walk keys and a stance key (the lean, lying down,
+the jump, blind fire, a reload, the looks, the fold, the inventory, the backpack); the recoil on a side mount; the
+breath and sway on a mount; the arms' drain; the skill's ergonomics gain above level 0; the dynamic lower limit;
+the turn's collision check; the canted sight's swap; the bipod's refusals; the standing search against the
+world it meets (the colliders' record of `courses8` could rebuild the corner for it); third person.
 
 ## Not built, or not read
 
-- **The tactical reload's stiffening** of the weapon bone and the camera's (`ApplyTacticalReloadTransformations`;
-  `firing.md`): the blend runs forward on the bipod, nothing reads it yet.
-- **The bipod's legs** (its own animator, fed `Bipod`: its controller and clips not read); **the bipod's
-  surface sound** after a forward mount (`BipodAudioController`, on the M60E6's bipod) and its open and close
-  on weapons whose hands have the clips. (The battle screen's mount icon: built 0.126.0, above.)
+- (The tactical reload's stiffening, which gave the SV-98 a different chambering animation on a mount: built 0.163.1 and compared with `local\traces\m700-bipod`'s three shots, `firing.md`,
+  "The reload with the sights up". The SV-98's controller has no mounted state of its own: the difference was
+  the weapon held toward its rest while the bolt is worked, where ours had swung with the clip.)
+- (The bipod's `_procedural` nodes: read 0.224.1, moved by nothing, "The bipod". The bipod's legs and sounds: built
+  0.144.0 and 0.145.0. The battle screen's mount icon: built 0.126.0.)
+- **The RPD's bipod out, in first person**: its hands' clips hold the bipod's inner joints folded on every frame
+  while its own animator unfolds them; ours lets the bipod's win. Which of two animators writing one node
+  Unity lets win was not read, and no recording has the RPD's bipod out.
 - A door or a moving platform under the point; a stationary weapon (the left stance turned off at the mount: built
   0.127.0, `left-shoulder.md`);
   the left hand's item; a bot; the `MountingPacket` and others' view of it.

@@ -1,86 +1,76 @@
-# TRP (Tushonka Runtime Project): the brief for an agent working in the public copy
+# TRP (Tushonka Runtime Project)
 
-Escape from Tarkov's first-person character controller, rebuilt in Rust on Bevy as a reusable
-runtime; STALKER GAMMA is its first intended host. The workspace is `TRP\`, its four crates under
-`TRP\crates\`: `trp-data` reads the install, `trp-sim` is the controller with no engine types,
-`trp-physics` the game's own PhysX 4.1, `trp-app` the Bevy app (`trp.exe`). It reads its data at
-runtime from the person's own Single Player Tushonka (SPT) install; the repository holds code,
-documents and the figures of the app's own weapons and outfits (`TRP\custom\`), nothing of a game.
-"Exact" means measured against the real game, not judged by feel.
+TRP rebuilds Escape From Tushonka's first-person character controller in Rust on Bevy. It reads all game data at runtime from the player's own Single Player Tushonka (SPT) install, so the repository holds code and documents only. It is meant to be hosted by other games, and STALKER GAMMA is the first intended host. "Matches Tarkov" means measured against a recording of the real game.
 
-**This is the public copy.** The maintainer's private repository also holds their working brief
-and agent skills (`.claude\`), the recorder that made the recordings of the game (`hosts\`), the
-recordings (`local\traces`), the log (`history.md`), the scratch tools (`workbench.md`) and the
-decisions (`decisions.md`): a pointer to any of these names that repository. So a claim of
-"compared with the game" cannot be run again here; what can be run is the app, its tests and its
-tools, against the person's own install. The words the documents use, who "the user" is, and what
-can be verified here: `TRP\README.md`, "Reading this repository".
+## Layout
 
-## Rules that hold for any change
+The Cargo workspace is `TRP/`. Run every command from there.
 
-1. **Research before code.** Prefer, in order: documented format, published source, decompilation.
-   Before touching a part, read its spec in `TRP\docs\spec\` (the section, never the whole file).
-2. **The installs are inputs.** Never write into SPT's, Anomaly's or GAMMA's folders.
-3. **No game content in the repository.** No assets, extracted files, decompiler output or pasted
-   game code. Scratch goes in `TRP\local\` (ignored by git; make the folder).
-4. **Spec, then implement.** Behaviour read from the game goes into `docs\spec\` in our own words,
-   then original code is written from that. The README's "What was learned, and how" must stay true.
-5. **Every constant has a source:** the install, or the spec. A guess is marked `ESTIMATE`, an
-   unconfirmed rule `PROVISIONAL`; both are listed in `docs\status.md`, "Placeholders, marked in
-   the code".
-6. **Claims are measured.** "Matches Tarkov" needs a recording of the game beside the simulation.
-   Without one, say what was read from code, what was run, and what was not.
-7. **Ask the person before** launching a game or installing a toolchain. Running the app, its tests
-   and its tools is fine.
-8. **Do not depart from Tarkov.** Where the game's code or a recording says what the game does, do
-   that, even where it looks worse. The only liberty is how results are drawn between and across
-   frames, and that must leave the simulation's results unchanged. A departure on purpose (the
-   features' EXPERIMENTAL list) is the maintainer's call: ask first.
-9. **Every system has a switch** among the options' features ("restart required"): set to off, the
-   system does nothing at all. A new one follows the existing ones in `trp-app`'s
-   `options_view.rs` (`Features`); the rules: `docs\spec\settings.md`, "Features: what is switched".
-
-## Working here
-
-Run from `TRP\`. The install's path comes from `EFT_DIR` or `local\eft_dir.txt`; the app asks for
-it when run from a console without either (`Install.bat` runs that question).
-
-```
-cargo build --workspace                                cargo test --workspace
-cargo run -p trp-app                                   (keys and options: docs\manual.md)
-cargo run -p trp-data --bin probe -- states 61a4c8884f95bc3b2c5dc96f reload
-```
-
-- **The documents are long** (`findings.md` 460 KB, `status.md` 220 KB, a spec up to 215 KB; each
-  line a paragraph, so a few lines are many tokens): never read one whole. List its headings first
-  (the lines that begin with `#`), then read the one section, by its line numbers. A source file
-  over 2,000 lines may have `// ==== ... ====` lines for its sections: list them first.
-  `findings.md`'s dated sections are newest last.
-- **Before taking a figure or a rule from the game**, look in the install with the probe (`cargo
-  run -p trp-data --bin probe`; `manual.md`, "Inspecting the install") rather than guess.
-- **The tests**: the unit tests need nothing; those in the `tests\` folders of `trp-data`,
-  `trp-sim` and `trp-physics` run against the configured install and pass with a note when there
-  is none; a few need recordings that are not published, and pass without them.
-- **After a change to `trp-sim` or `trp-physics`**, the maintainer's regression over the kept
-  recordings cannot be run here: say so in what you report, and say what you did check.
-- **Keep each file's line ends** as you find them. With PowerShell 5.1: no `2>&1` on cargo
-  (redirect `*>` to a file); no `Set-Content` for a source file (it adds a byte-order mark). Bevy
-  is pinned to 0.18, `physx-sys` to 0.8.2 (PhysX 4.1).
-- **The version** is one number for the whole of TRP, `version` under `[workspace.metadata.trp]`
-  in `TRP\Cargo.toml`, below 1.0, raised with every change the maintainer lands (`manual.md`,
-  "Versions"); a contribution leaves the number alone and says what it changes for a player in
-  `PATCH_NOTES.md`, short and plain.
-- **Licence**: Apache-2.0 (`LICENSE`, at the top) for the code and the documents alike: copy either
-  with the notice. It grants nothing in the games this reads.
-
-## Where the rest is (under `TRP\`)
-
-| For | Read |
+| Path | What it holds |
 |---|---|
-| What is built, how to run it, the layout, how the knowledge came; the project's words | `README.md` |
-| What each step was compared with ("The account"); every placeholder | `docs\status.md` |
-| What is missing, by feature | `docs\backlog.md` |
-| Every key, option and tool; looking into the install; recording and comparing | `docs\manual.md` |
-| How the game behaves, part by part, and what each part was compared with | `docs\spec\*.md` |
-| What the install, the code and the recordings have shown; traps | `docs\findings.md` |
-| What changed in each release, for a player | `..\PATCH_NOTES.md` |
+| `crates/trp-data` | Reads the install: Unity bundles, the SPT database, animators, screens, sounds. |
+| `crates/trp-sim` | The controller as a plain simulation with no engine types. |
+| `crates/trp-physics` | PhysX 4.1 set up as the game sets it up: ragdolls and loose things. |
+| `crates/trp-app` | The Bevy app (`trp.exe`): the range, the weapons, the screens. |
+| `crates/trp-tools` | The probe: a command-line tool that looks into the install. |
+| `custom` | Figures for weapons and outfits that are not the install's. |
+| `docs` | `index.md`, `features.md`, `manual.md` and `spec/`. |
+| `tools` | `index.sh` writes the index. `section.sh` reads one section of a long spec. |
+| `local` | Machine settings, logs and scratch. Ignored by git. |
+
+Each crate's `src/` is split into feature folders, for example `trp-app/src/screens` and `trp-sim/src/weapons`. A feature that needs more than one file is a folder with a `mod.rs` that names its parts.
+
+## Rules
+
+1. **Research before code.** Prefer a documented format, then published source, then decompilation.
+2. **The installs are inputs.** Never write into the SPT, Anomaly or GAMMA folders.
+3. **No game content in the repository.** No assets, extracted files, decompiler output or pasted game code. Scratch goes in `local/`.
+4. **Spec, then implement.** Write the game's behaviour into `docs/spec/` in your own words, then write original code from that.
+5. **Every constant has a source:** the install or the spec. Mark a guess `ESTIMATE` and an unconfirmed rule `PROVISIONAL` in the code.
+6. **Claims are measured.** Say what was compared with a recording, what was only read from code, and what was not run.
+7. **Do not depart from Tarkov.** Where the game's code or a recording shows what the game does, do that. The one liberty is how results are drawn between frames, and it must not change the simulation's results.
+8. **Ask first** before launching a game, installing a toolchain, committing or publishing.
+
+## Commands
+
+```
+cargo build --workspace
+cargo test --workspace
+cargo run -p trp-app                                  the app (keys and flags: docs/manual.md)
+cargo run -p trp-tools --bin probe -- <what> ...      look into the install
+bash tools/index.sh                                   rewrite docs/index.md
+```
+
+The install's path comes from `SPT_DIR` or `local/spt_dir.txt`. A run writes its log to `local/logs/`.
+
+## Finding things
+
+- **A file:** search `docs/index.md` for a word. It lists every source file with one line on what it holds.
+- **A feature:** `docs/features.md` names its spec and its switch.
+- **A rule of the game:** `bash tools/section.sh <spec>` lists a spec's headings, and with a heading it prints that section. `bash tools/section.sh --find <word>` searches every document. The specs are long, so read a section and not the whole file.
+- **A figure in the install:** use the probe before reading decompiled code.
+
+## Changing things
+
+1. Find the files in the index and read the matching section of the spec.
+2. If the behaviour changes, change the spec first.
+3. Keep a source file under about 500 lines. A file holds one piece of a feature and opens with a `//!` sentence that says what it holds. When a file outgrows the limit, turn it into a folder and split it by meaning.
+4. Write a helper once. Search the index before adding one.
+5. A new system gets a switch in `Features` (`trp-app/src/screens/options_view`). Only a switch a player has a reason to use goes on a menu page.
+6. Run the tests. The recorder and its recordings are not in this copy, so say which of your changes could not be compared with the game.
+7. Raise the version (`[workspace.metadata.trp]` in `Cargo.toml`), add a line to `CHANGELOG.md`, and run `bash tools/index.sh`.
+
+## Working notes
+
+- Source files use Windows line ends (CRLF). Keep them.
+- In PowerShell 5.1, do not put `2>&1` on cargo, and do not write a source file with `Set-Content` because it adds a byte-order mark.
+- If cargo cannot replace `trp.exe`, the app is open. Wait for it to close.
+- Bevy is pinned to 0.18 and `physx-sys` to 0.8.2 (PhysX 4.1).
+- In decompiled code, check that something creates or calls a class before taking a rule from it.
+- Look at a screenshot before judging a rendering change (`--screenshot`, in the manual).
+- A helper of a Bevy system takes a resource as `Mut<T>` (`resource.reborrow()`), never as `&mut T`. A plain reference marks the resource changed on every call, and whatever watches it then runs every frame.
+- What is hidden for long is parked (`platform/park`): it leaves the engine's work until shown. A system that must keep a parked thing's state adds `EvenParked` to its query.
+
+## Status
+
+Version 0.262.0. `docs/features.md` lists what is built and what is not.

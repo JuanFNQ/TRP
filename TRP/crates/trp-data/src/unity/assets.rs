@@ -10,7 +10,7 @@ use super::bundle::Bundle;
 use super::reader::Reader;
 use super::serialized::{ObjectInfo, SerializedFile};
 use super::value::{PPtr, Value};
-use crate::install::{Install, Manifest};
+use crate::setup::install::{Install, Manifest};
 
 /// Shared bundles every asset depends on. They are large and are only opened
 /// when a reference actually lands in one.

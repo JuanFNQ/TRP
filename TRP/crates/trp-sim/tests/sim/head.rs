@@ -1,15 +1,15 @@
-//! The head's push out of walls (`docs/spec/movement.md`, "The head's push
-//! out of walls"), with the install's prefab, movement and body animator: the
+//! Tests of the head's push out of walls, with the install's prefab, movement and body animator.
+//! After `docs/spec/movement.md`, "The head's push out of walls": the
 //! two capsules as the prefab has them, and a walk into a wall that the head
 //! meets before the body's capsule does. These pass trivially, with a note,
 //! where no install is configured.
 
-use trp_data::engine::EngineSettings;
-use trp_data::hard_settings::HardSettings;
-use trp_data::player::HeadCollidersData;
+use trp_data::setup::engine::EngineSettings;
+use trp_data::setup::hard_settings::HardSettings;
+use trp_data::character::player::HeadCollidersData;
 use trp_data::unity::Assets;
-use trp_sim::collision::{Block, Site};
-use trp_sim::movement::Capsule;
+use trp_sim::locomotion::collision::{Block, Site};
+use trp_sim::locomotion::movement::Capsule;
 use trp_sim::{Input, Movement, World};
 
 const DT: f32 = 1.0 / 120.0;
@@ -21,7 +21,7 @@ fn movement() -> Option<Movement> {
     let hard = HardSettings::load(&assets.install).expect("settings object");
     let engine = EngineSettings::load(&assets.install).expect("engine settings");
     let settings = trp_sim::load_movement_settings(&mut assets, db, &hard, &engine, 0.0).expect("movement settings");
-    let body = trp_sim::body::BodyData::load(&mut assets).expect("body animator");
+    let body = trp_sim::locomotion::body::BodyData::load(&mut assets).expect("body animator");
     Some(Movement::new(settings, trp_sim::Body::new(&body, 5.0)))
 }
 
@@ -44,11 +44,6 @@ struct Wall {
     site: Site,
 }
 
-impl Wall {
-    fn at(face: f32) -> Self {
-        Self { site: Site { ground: 0.0, blocks: vec![Block::square([-2.0, 0.0, face], [2.0, 2.5, face + 0.3])] } }
-    }
-}
 
 impl World for Wall {
     fn ground_height(&self, x: f32, z: f32) -> f32 {
@@ -67,7 +62,7 @@ impl World for Wall {
         let mut push = [0.0; 3];
         for (way, depth) in self.site.blocks.iter().filter_map(|b| b.capsule_push(ends, radius)) {
             for k in 0..3 {
-                push[k] += way[k] * (depth + trp_sim::movement::pom::MARGIN);
+                push[k] += way[k] * (depth + trp_sim::locomotion::movement::pom::MARGIN);
             }
         }
         push
@@ -79,7 +74,7 @@ fn a_lean_into_a_wall_is_pushed_off_by_the_head() {
     let Some(mut m) = movement() else { return };
     // Facing +z, a wall to the right, its face 0.4 m from the axis: the
     // body's capsule (0.366) clear of it, the head leaned into it.
-    let world = Wall { site: Site { ground: 0.0, blocks: vec![Block::square([0.4, 0.0, -2.0], [0.7, 2.5, 2.0])] } };
+    let world = Wall { site: Site { ground: 0.0, blocks: vec![Block::square([0.4, 0.0, -2.0], [0.7, 2.5, 2.0])], others: Vec::new() } };
     for _ in 0..60 {
         m.step(DT, &Input::default(), &world);
     }

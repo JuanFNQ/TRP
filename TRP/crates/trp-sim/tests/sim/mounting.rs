@@ -1,15 +1,15 @@
-//! Mounting (`docs/spec/mounting.md`) with the install's body animator, on a
-//! sill set before the character: the search's frames, the approach to the
+//! Tests of mounting with the install's body animator, on a sill set before the character.
+//! After `docs/spec/mounting.md`: the search's frames, the approach to the
 //! target place, the stance by the pitch and the lean by the yaw while held,
 //! the exits with and without the 0.2 s, the walk's lock, and the bipod's
 //! gesture and its mark. These pass trivially, with a note, where no install
 //! is configured.
 
-use trp_data::engine::EngineSettings;
-use trp_data::hard_settings::HardSettings;
+use trp_data::setup::engine::EngineSettings;
+use trp_data::setup::hard_settings::HardSettings;
 use trp_data::unity::Assets;
-use trp_sim::collision::Block;
-use trp_sim::mounting::{Hit, Layer, MountEvent, Side, WeaponMount};
+use trp_sim::locomotion::collision::Block;
+use trp_sim::weapons::mounting::{Hit, Layer, MountEvent, Side, WeaponMount};
 use trp_sim::{Acted, Flat, Input, Movement, World};
 
 const DT: f32 = 1.0 / 60.0;
@@ -21,7 +21,7 @@ fn movement() -> Option<Movement> {
     let hard = HardSettings::load(&assets.install).expect("settings object");
     let engine = EngineSettings::load(&assets.install).expect("engine settings");
     let settings = trp_sim::load_movement_settings(&mut assets, db, &hard, &engine, 0.0).expect("movement settings");
-    let body = trp_sim::body::BodyData::load(&mut assets).expect("body animator");
+    let body = trp_sim::locomotion::body::BodyData::load(&mut assets).expect("body animator");
     let mut m = Movement::new(settings, trp_sim::Body::new(&body, 5.0));
     // A rifle's figures: the pivot 0.69 m ahead of the weapon's root and
     // 4 cm under it, as the M700's left hand's marker puts it.
@@ -127,7 +127,7 @@ fn held_the_stance_follows_the_pitch_and_the_lean_the_yaw() {
 /// place").
 #[test]
 fn the_pivot_is_turned_by_the_frame_before_s_turn() {
-    use trp_sim::math::quat_rotate;
+    use trp_sim::base::math::quat_rotate;
     let Some(mut m) = movement() else { return };
     run(&mut m, 0.5, armed(), &Sill);
     press(&mut m, &Sill);
@@ -144,10 +144,12 @@ fn the_pivot_is_turned_by_the_frame_before_s_turn() {
     let point = view.point;
     let off = |a: [f32; 3]| -> [f32; 3] { std::array::from_fn(|k| a[k] - point[k]) };
     let size = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    // Held still: off the point only by the share's overshoot past 1 (the
-    // game's too: recorded 1.0055), along the line from the ribcage.
+    // Held still: on the point, though the share has passed 1 on the
+    // approach's last frame: the rig's move takes it held to 1
+    // (`Vector3.Lerp`; recorded on the M700's bipod, its camera on the
+    // mount's place to 0.1 mm at a share of 1.01).
     let still = off(pivot_at(&m));
-    assert!(view.progress > 1.0 && size(still) < 0.01, "{still:?} at {view:?}");
+    assert!(view.progress > 1.0 && size(still) < 1e-4, "{still:?} at {view:?}");
     // One frame turning a degree to the right: off further by the frame's
     // turn of the reach.
     let yaw = m.yaw;
@@ -220,4 +222,116 @@ fn the_bipod_s_gesture_passes_its_mark() {
     // Recorded on the M60E6: the operation back to idling 0.567 s after the key.
     let at = toggled.expect("the mark passed");
     assert!((at - 0.567).abs() < 0.05, "{at}");
+}
+
+/// The recorded M700 build of `m700-bipod`: the Atlas V8 on the Hogue
+/// stock's `mod_tactical`.
+const M700_ATLAS: &str = "5bfea6e90db834001b7347f3[mod_stock=5bfeb32b0db834001a6694d9[mod_tactical=6644920d49817dc7d505ca71[]]]";
+
+/// The angle in degrees between two turns, taken from the sine of the half
+/// angle (exact near nought, where the cosine of a dot is not in `f32`).
+fn turn_between(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let q = trp_sim::base::math::quat_mul([-a[0], -a[1], -a[2], a[3]], b);
+    2.0 * (q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt().min(1.0).asin().to_degrees()
+}
+
+/// The nodes of a weapon's tree below `top` (not it) whose name ends so.
+fn below_named(weapon: &trp_data::weapons::weapon::Weapon, top: usize, end: &str) -> Vec<usize> {
+    let tree = &weapon.hierarchy;
+    let root = format!("{}/", tree.path(top));
+    (0..tree.nodes.len()).filter(|&i| tree.path(i).starts_with(&root) && tree.nodes[i].name.ends_with(end)).collect()
+}
+
+/// The bipod's `_procedural` nodes (spec, "The bipod"): no clip moves them,
+/// so on every frame of the Atlas's legs going out (1.5 s, through
+/// `BIPOD_OPEN` into `BIPOD_IDLE_OPEN`) and folding again they stand at the
+/// prefab's rest in the pose given out, while the joints inside them move:
+/// out, the left axis turned a quarter and the left leg slid 6 cm.
+#[test]
+fn the_bipod_s_procedural_nodes_stay_at_rest() {
+    use trp_sim::weapons::weapon_animator::{WeaponAnimator, WeaponAnimatorData};
+    let Some(install) = crate::fixture::install() else { return };
+    let db = crate::fixture::database().expect("database");
+    let mut assets = Assets::new(install).expect("manifest");
+    let weapon = trp_data::weapons::weapon::assemble_key(&mut assets, db, M700_ATLAS).expect("the M700 with the Atlas");
+    let bipod = weapon.bipod.as_ref().expect("its bipod");
+    assert_eq!(bipod.template, "6644920d49817dc7d505ca71");
+    let tree = &weapon.hierarchy;
+    let procedural = below_named(&weapon, bipod.node, "_procedural");
+    assert_eq!(procedural.len(), 6, "the Atlas's six");
+    let named = |name: &str| *below_named(&weapon, bipod.node, name).iter().find(|&&i| tree.nodes[i].name == name).expect(name);
+    let (axis, leg) = (named("mod_bipod_axis_left"), named("mod_bipod_leg_left"));
+    let data = WeaponAnimatorData::load(&assets, &weapon).expect("its animator");
+    let mut animator = WeaponAnimator::new(&data);
+    let mut frames = 0;
+    for (out, seconds) in [(true, 1.5f32), (false, 1.5)] {
+        animator.set_flag("Bipod", out);
+        for _ in 0..(seconds / DT).round() as usize {
+            animator.update(DT);
+            for &i in &procedural {
+                let (at, turn) = animator.pose()[i];
+                let rest = &tree.nodes[i];
+                let off = (0..3).map(|k| (at[k] - rest.translation[k]).abs()).chain((0..4).map(|k| (turn[k] - rest.rotation[k]).abs())).fold(0.0f32, f32::max);
+                assert!(off < 1e-6, "{} off its rest by {off} (bipod {out}): {at:?} {turn:?}", rest.name);
+            }
+            frames += 1;
+        }
+        let swung = turn_between(animator.pose()[axis].1, tree.nodes[axis].rotation);
+        let (at, rest) = (animator.pose()[leg].0, tree.nodes[leg].translation);
+        let slid = ((0..3).map(|k| (at[k] - rest[k]).powi(2)).sum::<f32>()).sqrt();
+        println!("bipod {out}: the left axis {swung:.1} deg and the left leg {slid:.4} m from their rest");
+        if out {
+            assert!(swung > 45.0 && slid > 0.03, "the legs went out: the axis {swung} deg, the leg {slid} m from their rest");
+        }
+    }
+    assert_eq!(frames, 180);
+}
+
+/// The RPD's own clips are the only hands' clips that write a bipod's nodes
+/// (spec, "The bipod"), and they write its rest: with the hands' animator
+/// alone (the bipod's own left out), each of the bipod's `_procedural`
+/// nodes, carried up to the slot that holds the bipod, stands where the
+/// prefab's rest puts it, within 0.1 mm and 0.01 deg, though the clips set
+/// the bipod's root and first node otherwise (the root unturned).
+#[test]
+fn the_rpd_s_hands_hold_its_bipod_at_rest() {
+    use trp_sim::base::math::{quat_mul, quat_rotate};
+    use trp_sim::weapons::weapon_animator::{WeaponAnimator, WeaponAnimatorData};
+    let Some(install) = crate::fixture::install() else { return };
+    let db = crate::fixture::database().expect("database");
+    let mut assets = Assets::new(install).expect("manifest");
+    let mut weapon = trp_data::weapons::weapon::assemble_key(&mut assets, db, "6513ef33e06849f06c0957ca").expect("the RPD's stock build");
+    let top = weapon.bipod.take().expect("its bipod").node;
+    let procedural = below_named(&weapon, top, "_procedural");
+    assert_eq!(procedural.len(), 4, "the RPD bipod's four");
+    let data = WeaponAnimatorData::load(&assets, &weapon).expect("its hands' animator");
+    let mut animator = WeaponAnimator::new(&data);
+    for _ in 0..30 {
+        animator.update(DT);
+    }
+    let tree = &weapon.hierarchy;
+    let rest: Vec<([f32; 3], [f32; 4])> = tree.nodes.iter().map(|node| (node.translation, node.rotation)).collect();
+    // A node's place and turn in the frame of the slot holding `top`.
+    let in_slot = |pose: &[([f32; 3], [f32; 4])], node: usize| {
+        let mut chain = vec![node];
+        while *chain.last().unwrap() != top {
+            chain.push(tree.nodes[*chain.last().unwrap()].parent.expect("below the bipod's root"));
+        }
+        chain.iter().rev().fold(([0.0f32; 3], [0.0, 0.0, 0.0, 1.0f32]), |(at, turn), &i| {
+            let (local_at, local_turn) = pose[i];
+            let moved = quat_rotate(turn, local_at);
+            ([at[0] + moved[0], at[1] + moved[1], at[2] + moved[2]], quat_mul(turn, local_turn))
+        })
+    };
+    let pose = animator.pose();
+    let root_turn = turn_between(pose[top].1, rest[top].1);
+    println!("the bipod's root: {root_turn:.2} deg from its rest in the hands' pose");
+    assert!(root_turn > 45.0, "the hands' clips write the bipod's root (unturned): {root_turn} deg from its rest");
+    for &i in &procedural {
+        let (held, rested) = (in_slot(pose, i), in_slot(&rest, i));
+        let off = (0..3).map(|k| (held.0[k] - rested.0[k]).abs()).fold(0.0f32, f32::max);
+        let turned = turn_between(held.1, rested.1);
+        println!("{}: {off:.6} m, {turned:.4} deg from the prefab's rest", tree.nodes[i].name);
+        assert!(off < 1e-4 && turned < 0.01, "{} held {off} m, {turned} deg from its rest", tree.nodes[i].name);
+    }
 }

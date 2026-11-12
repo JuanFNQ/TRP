@@ -1,16 +1,15 @@
 # Reactive targets: the hideout range's poppers
 
-The user, 2026-10-26: "can we put the range finder somewhere along with some reactive targets far
-away?" The game's own reactive target is the **popper** of the hideout's shooting range: a steel
+The reactive targets far down the range, after the hideout's poppers. The game's own reactive target is the **popper** of the hideout's shooting range: a steel
 plate on a hinge that folds back when its face is hit and stands up again. This file is what the
 game does with one, read from its code and its install; how the app lays them out is at the end.
 The rangefinder: `rangefinder.md` (not built yet).
 
 ## What the game has
 
-Read 2026-10-26 from the game's code (`EFT.Hideout.ShootingRange`: `PopperTargets`, `PopperTarget`,
+Read 2026-10-26 from the game's code (`Hideout.ShootingRange`: `PopperTargets`, `PopperTarget`,
 `FoldingPopperTarget`, `HideoutTargetBallisticCollider`, `PaperTarget`, `PopperTargetControl`,
-`PopperTargetStandScenario`, `FoldingTargetState`; `EFT.TweenExtensions.AsTask`) and from the hideout
+`PopperTargetStandScenario`, `FoldingTargetState`; `TweenExtensions.AsTask`) and from the hideout
 scene `bunker_2.unity` (`level161`), with `probe screen`, `fields`, `raw` and `sceneprops`
 (`local\range_*_s138t.txt`). The tween library the poppers move by, DOTween, is not the game's:
 its published source was read for the two rules below that are its own (`PureQuaternionPlugin`,
@@ -68,7 +67,7 @@ its published source was read for the two rules below that are its own (`PureQua
   decals the plate's own `DecalSystem` lays (the hit's metal decal is the ballistics'); the
   training's scoring (`ShootTrainingScenario`, `PopperPhaseTraining`), not built.
 
-## Built (0.142.0)
+## Built
 
 `REACTIVE TARGETS`, a switch of the `SIMPLE` list (on as the app comes; restart required): off,
 none is made and nothing of them is read.
@@ -79,14 +78,13 @@ none is made and nothing of them is read.
   bundle and their data from `sharedassets161.resource`.
 - **The behaviour in the simulation** (`trp_sim::popper`): the moves, the rock, the waits and their
   ending as above; the turns by the curves above (`PROVISIONAL` where marked).
-- **On the range** (`poppers.rs`), down the lanes (the user's range of 2026-10-26, drawn over the
-  map; "Farther, along the lanes"): a row of three poppers 1.6 m apart at each of 25, 50, 100, 200
+- **On the range** (`poppers`), down the lanes (TRP's range, drawn over the
+  map, farther along the lanes): a row of three poppers 1.6 m apart at each of 25, 50, 100, 200
   and 300 m past the knee-high wall, 6.3 m left of the lanes' line, facing the firing line as the
   game's rows face theirs. The places are the app's (`PROVISIONAL`: the game's rows are 6, 13.6 and
   20 m from its firing line, in a room). The floor drawn 800 m across for them (400 until 0.142.0).
-- **Each row's sign** (the user: "Add range markers for each step up, so people can tell how far
-  they are"; then "can we make a white sign with black text?" and "just put all the signs on the
-  left of each pair of targets"): a white board on a post just left of the row, its distance
+- **Each row's sign** (a marker at each step of distance, so that a player can tell how far each row is, white with
+  black words, on the left of each row of targets): a white board on a post just left of the row, its distance
   painted on it in black in the app's own dot letters, facing the firing line; 1.2 by 0.6 m at
   25 m and larger as the square root of how much farther (a stronger growth put the far boards
   behind the near ones from the firing line). No solid: bullets pass through it. The app's.
@@ -97,6 +95,6 @@ none is made and nothing of them is read.
 
 ## Compared with
 
-Nothing of the game: no recording of the hideout's range. Seen in captures (`workbench.md`, 0.142.0).
+Nothing of the game: no recording of the hideout's range. Seen in captures (`workbench.md`).
 Tested: the curves' values at their keys, a fold's and an unfold's length and end, a rock's end,
 a second hit mid-fold, a miss mid-fold, a miss while down (`trp_sim::popper`'s tests).

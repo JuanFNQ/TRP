@@ -8,6 +8,8 @@
 !/crates/
 !/docs/
 !/hosts/
+# The tools that read the documents (section.sh), in the public copy too.
+!/tools/
 # The weapons that are not the install's: one file of figures each, and
 # nothing else from that folder (a model belongs in local/).
 !/custom/
@@ -18,3 +20,7 @@
 !/custom/outfits/
 /custom/outfits/*
 !/custom/outfits/*.json
+# And the parts that are not the install's, which a custom weapon's file names.
+!/custom/parts/
+/custom/parts/*
+!/custom/parts/*.json

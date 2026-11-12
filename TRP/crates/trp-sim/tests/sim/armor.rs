@@ -1,14 +1,42 @@
-//! The armour read from the install and dressed as the game gathers it
-//! (`docs/spec/body-hits.md`), and the player prefab's hit colliders.
+//! Tests of the armour read from the install and dressed as the game gathers it, and of the hit colliders.
+//! After `docs/spec/body-hits.md`; the colliders are the player prefab's.
 
 use std::sync::Arc;
 
-use trp_data::ragdoll::RagdollData;
+use trp_data::character::ragdoll::RagdollData;
 use trp_data::unity::Assets;
-use trp_sim::armor::{collider_type, plate, ArmorRules, Kind, VestSkills, Wearer, Worn};
+use trp_sim::condition::armor::{collider_type, plate, ArmorRules, Kind, VestSkills, Wearer, Worn};
 
 fn worn(template: &str, slot: &str, children: Vec<Worn>) -> Worn {
-    Worn { template: template.to_owned(), slot: slot.to_owned(), children }
+    Worn { template: template.to_owned(), slot: slot.to_owned(), children, ..Worn::default() }
+}
+
+/// Every helmet the install gives no stock build (the FLUX, the Strike,
+/// the winter 6B47, the Christmas Maska-1SCh: six) made as the game makes
+/// one of every item (`Item::fill_locked`): its locked slots hold the
+/// inserts their filters name, so nothing vital is missing and it can be
+/// worn. Made bare, each was refused: such helmets could not be equipped.
+#[test]
+fn a_helmet_with_no_stock_build_comes_with_its_inserts() {
+    use trp_sim::items::inventory::{Equipment, Item, Kind as ItemKind};
+    let Ok(_install) = crate::fixture::install().ok_or(()) else { return };
+    let db = crate::fixture::database().expect("database");
+    let bare: Vec<&str> = db.items.values().filter(|item| item.prefab_key().is_some() && db.is_a(item, "Headwear") && db.default_preset(&item.id).is_err()).map(|item| item.id.as_str()).collect();
+    let mut filled = 0;
+    for template in bare {
+        let mut helmet = Item::new(Arc::new(ItemKind::of(db, template).expect("the helmet")));
+        let locked = helmet.kind.slots.iter().filter(|slot| slot.locked && slot.plate.is_some()).count();
+        if locked == 0 {
+            continue;
+        }
+        assert!(helmet.missing_vital(), "{template} bare");
+        helmet.fill_locked(db).expect("its inserts");
+        assert_eq!(helmet.slots.iter().flatten().count(), locked, "{template}");
+        assert!(!helmet.missing_vital(), "{template} filled");
+        assert_eq!(Equipment::empty(db).unwrap().can_wear("Headwear", &helmet), Ok(()), "{template}");
+        filled += 1;
+    }
+    assert!(filled >= 6, "{filled} helmets filled");
 }
 
 /// Tagilla's recorded kit (`courses3`, `3-bot-armour`): his cap, his welding
@@ -49,7 +77,7 @@ fn tagilla_is_dressed_in_the_game_s_order() {
     assert!((front.destructibility - 0.4125).abs() < 1e-6);
     let mask = &wearer.pieces[2];
     assert!(mask.covers(collider_type("ParietalHead").unwrap(), 0) && !mask.covers(collider_type("RibcageUp").unwrap(), 0));
-    assert_eq!(mask.material, trp_sim::ballistics::material::HELMET);
+    assert_eq!(mask.material, trp_sim::combat::ballistics::material::HELMET);
     let insert = &wearer.pieces[3];
     assert_eq!((insert.plates, insert.locked, insert.blunt_soft, insert.kind), (chest, true, false, Kind::Light));
 }
@@ -66,7 +94,7 @@ fn a_helmet_that_stops_a_round_still_concusses() {
     let rules = Arc::new(ArmorRules::new(&db.config).expect("the armour's globals"));
     let mut wearer = Wearer::dress(&db, rules, &[worn("60a7ad3a0c5cb24b0134664a", "FaceCover", Vec::new())], VestSkills::default());
     let mask = wearer.pieces[0].id;
-    let shot = trp_sim::armor::Shot {
+    let shot = trp_sim::condition::armor::Shot {
         damage: 60.0,
         penetration: 20.0,
         armor_damage: 0.4,
@@ -81,18 +109,76 @@ fn a_helmet_that_stops_a_round_still_concusses() {
     let taken = wearer.take_shot(&shot, collider_type("ParietalHead").unwrap(), 0, true);
     println!("blocked: {} through, {} taken", taken.damage, taken.absorbed);
     assert!(!taken.penetrated && taken.damage > 0.0 && taken.absorbed >= 10.0, "{taken:?}");
-    let settings = Arc::new(trp_sim::health::HealthSettings::new(&db.config).expect("config.Health"));
-    let mut health = trp_sim::health::Health::new(settings.clone(), 1);
-    health.apply_damage(trp_sim::health::Part::Head, taken.damage, trp_sim::health::DamageKind::Bullet);
-    health.blunt_contusion(trp_sim::health::Part::Head, taken.absorbed);
-    let contusion = health.existing(trp_sim::health::Kind::Contusion, Some(trp_sim::health::Part::Head)).expect("concussed");
+    let settings = Arc::new(trp_sim::condition::health::HealthSettings::new(&db.config).expect("config.Health"));
+    let mut health = trp_sim::condition::health::Health::new(settings.clone(), 1);
+    health.apply_damage(trp_sim::condition::health::Part::Head, taken.damage, trp_sim::condition::health::DamageKind::Bullet);
+    health.blunt_contusion(trp_sim::condition::health::Part::Head, taken.absorbed);
+    let contusion = health.existing(trp_sim::condition::health::Kind::Contusion, Some(trp_sim::condition::health::Part::Head)).expect("concussed");
     assert_eq!((contusion.delay, contusion.strength), (0.1, 0.5));
     assert!((contusion.work - taken.absorbed / 4.0).abs() < 1e-4 && (contusion.residue - taken.absorbed / 4.0).abs() < 1e-4);
     // The chest's armour, or less than 10 taken: none.
-    let mut health = trp_sim::health::Health::new(settings, 1);
-    health.blunt_contusion(trp_sim::health::Part::Chest, 40.0);
-    health.blunt_contusion(trp_sim::health::Part::Head, 9.9);
-    assert!(health.existing(trp_sim::health::Kind::Contusion, None).is_none());
+    let mut health = trp_sim::condition::health::Health::new(settings, 1);
+    health.blunt_contusion(trp_sim::condition::health::Part::Chest, 40.0);
+    health.blunt_contusion(trp_sim::condition::health::Part::Head, 9.9);
+    assert!(health.existing(trp_sim::condition::health::Kind::Contusion, None).is_none());
+}
+
+/// The ZSh-1-2M with its face shield (`5aa7e3abe5b5b000171d064d`) and the
+/// FAST MT with its visor (`5a16b672fcdbcb001912fa83`), as the install has
+/// them: each shield glass, a face shield, its own piece with its item's
+/// number. Lowered, a bullet over the eyes marks it once; raised it is no
+/// armour (`CompositeArmorComponent.ShotMatches`); a blast marks it from
+/// 0.4 of its template durability on (20 of the ZSh's 50, 8 of the FAST's
+/// 20: body hits spec, "A face shield's marks").
+#[test]
+fn a_face_shield_is_marked_lowered_and_no_armour_raised() {
+    use trp_sim::combat::ballistics::material;
+    let Ok(_install) = crate::fixture::install().ok_or(()) else { return };
+    let db = crate::fixture::database().expect("database");
+    let rules = Arc::new(ArmorRules::new(&db.config).expect("the armour's globals"));
+    let helmet = |helmet: &str, shield: &str, up: bool| {
+        let slot = if helmet == "5a154d5cfcdbcb001a3b00da" { "mod_equipment_000" } else { "mod_equipment" };
+        let shield = Worn { template: shield.to_owned(), slot: slot.to_owned(), item: Some(7), up, ..Worn::default() };
+        Worn { template: helmet.to_owned(), slot: "Headwear".to_owned(), children: vec![shield], item: Some(6), ..Worn::default() }
+    };
+    let eyes = collider_type("Eyes").unwrap();
+    for (name, helmet_template, shield_template, needed) in [("ZSh-1-2M", "5aa7e454e5b5b0214e506fa2", "5aa7e3abe5b5b000171d064d", 20.0), ("FAST MT", "5a154d5cfcdbcb001a3b00da", "5a16b672fcdbcb001912fa83", 8.0)] {
+        let mut wearer = Wearer::dress(&db, rules.clone(), &[helmet(helmet_template, shield_template, false)], VestSkills::default());
+        let shield = wearer.pieces.iter().find(|p| p.template == shield_template).unwrap_or_else(|| panic!("{name}'s shield is armour"));
+        assert!(shield.face_shield && shield.material == material::GLASS_VISOR && shield.on && shield.item == Some(7), "{name}: {shield:?}");
+        assert!((shield.template_durability * 0.4 - needed).abs() < 1e-4 && (shield.explosion_destructibility - 0.6).abs() < 1e-6, "{name}: {shield:?}");
+        assert!(shield.covers(eyes, 0), "{name} over the eyes");
+        let shot = trp_sim::condition::armor::Shot {
+            damage: 40.0,
+            penetration: 25.0,
+            armor_damage: 0.4,
+            deflected_by: None,
+            blocked_by: None,
+            stamina_burn: 0.0,
+            heavy_bleeding: 0.0,
+            light_bleeding: 0.0,
+            weapon: true,
+            melee: false,
+        };
+        wearer.take_shot(&shot, eyes, 0, true);
+        assert_eq!(wearer.drain().iter().map(|m| m.item).collect::<Vec<_>>(), [Some(7)], "{name}: one mark, on the shield");
+        // A blast's share just under and at the threshold (the eyes' armour
+        // value times the glass's 0.6).
+        let at = |share: f32| (eyes, 0u16, share / 0.6);
+        let mut under = Wearer::dress(&db, rules.clone(), &[helmet(helmet_template, shield_template, false)], VestSkills::default());
+        under.take_blast(&[at(needed - 0.1)]);
+        assert!(under.drain().is_empty(), "{name}: under the threshold");
+        let mut over = Wearer::dress(&db, rules.clone(), &[helmet(helmet_template, shield_template, false)], VestSkills::default());
+        over.take_blast(&[at(needed + 0.001)]);
+        assert_eq!(over.drain().len(), 1, "{name}: at the threshold");
+        // Raised: no armour at all.
+        let mut raised = Wearer::dress(&db, rules.clone(), &[helmet(helmet_template, shield_template, true)], VestSkills::default());
+        let shield = raised.pieces.iter().find(|p| p.template == shield_template).expect("still gathered");
+        assert!(!shield.on && !shield.covers(eyes, 0), "{name} raised");
+        raised.take_shot(&shot, eyes, 0, true);
+        raised.take_blast(&[at(needed * 2.0)]);
+        assert!(raised.drain().is_empty(), "{name} raised: no mark");
+    }
 }
 
 /// The prefab's 27 body colliders and 12 plates, the forearm's figures as

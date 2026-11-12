@@ -1,14 +1,15 @@
-//! The sounds of moving (`docs/spec/footsteps.md`) asked for by the game's
+//! Tests of the sounds of moving as the game's rules ask for them.
+//! After `docs/spec/footsteps.md`: the sounds asked for by the game's
 //! rules as the real body animator walks, sprints, stops, jumps and
 //! crawls. These pass trivially, with a note, where no install is
 //! configured.
 //!
 //! Run with `cargo test -p trp-sim --test sim steps:: -- --nocapture` for the numbers.
 
-use trp_data::engine::EngineSettings;
-use trp_data::hard_settings::HardSettings;
+use trp_data::setup::engine::EngineSettings;
+use trp_data::setup::hard_settings::HardSettings;
 use trp_data::unity::Assets;
-use trp_sim::steps::{BankOf, Play, CONCRETE, GEAR, GEAR_FAST, JUMP, LANDING, PRONE, RUN, SPRINT, STOP};
+use trp_sim::sound::steps::{BankOf, Play, CONCRETE, GEAR, GEAR_FAST, JUMP, LANDING, PRONE, RUN, SPRINT, STOP};
 use trp_sim::{Flat, Input, Movement, State};
 
 const DT: f32 = 1.0 / 120.0;
@@ -21,10 +22,10 @@ fn movement() -> Option<Movement> {
     let hard = HardSettings::load(&install).expect("settings object");
     let engine = EngineSettings::load(&install).expect("engine settings");
     let mut assets = Assets::new(install).expect("manifest");
-    let body = trp_sim::body::BodyData::load(&mut assets).expect("body animator");
+    let body = trp_sim::locomotion::body::BodyData::load(&mut assets).expect("body animator");
     let settings = trp_sim::load_movement_settings(&mut assets, &db, &hard, &engine, 0.0).expect("movement");
     // The client's multipliers are read (SPT's settings.json): the run's is 0.85.
-    assert!((settings.steps.multipliers[trp_sim::steps::Kind::Run as usize] - 0.85).abs() < 1e-6);
+    assert!((settings.steps.multipliers[trp_sim::sound::steps::Kind::Run as usize] - 0.85).abs() < 1e-6);
     Some(Movement::new(settings, trp_sim::Body::new(&body, 2.0)))
 }
 
@@ -105,4 +106,42 @@ fn walking_sprinting_jumping_and_crawling_are_heard() {
     assert!(movement.state == State::ProneMove);
     assert!(crawls.len() >= 4, "two marks a cycle of the crawl");
     assert!(gaps.iter().all(|g| *g >= 0.5 - 1e-3));
+}
+
+/// A corpse's fall (`trp_sim::landing`'s): asked at 0.59 (the drop sounds'
+/// curve at 50, rounded), each surface's prone drop from a `Character`
+/// source (3, which plays in `CommonSounds`) heard to 66.5 m; the recorded
+/// falls' clips are in the banks of the surfaces they were played on, and
+/// their volumes and pitches within those banks' draws (courses2's four
+/// deaths of the player, `3-bot-shots`, `3-bot-blast`).
+#[test]
+fn a_corpse_falls_with_its_surfaces_prone_drop() {
+    let Some(install) = crate::fixture::install() else { return };
+    let sounds = trp_data::audio::sound::movement_sounds(&install, None, false).expect("the sounds of moving");
+    let curve = trp_data::audio::sound::drop_volume_curve(&install).expect("the drop sounds' curve");
+    let asked = trp_sim::sound::landing::body_fall_volume(&curve);
+    assert_eq!(asked, 0.59);
+    let clips_of = |at: usize| -> Vec<&str> { sounds.banks[at].lists[0].iter().map(|&c| sounds.clips[c].0.as_str()).collect() };
+    for set in &sounds.surfaces {
+        let at = trp_sim::sound::landing::body_fall_bank(&sounds, Some(set.surface)).expect("every surface's set has a prone drop");
+        let bank = &sounds.banks[at];
+        assert_eq!(bank.source_type, 3, "{}", bank.name);
+        assert!((bank.rolloff - 66.5).abs() < 1e-4, "{}", bank.name);
+    }
+    // (surface, clip, volume, pitch) as recorded.
+    let recorded = [
+        (0u8, "bodydrop_concrete1", 0.418177724f32, 0.9999472f32),
+        (18, "body_drop_wood_thin_01", 0.414944023, 1.04899073),
+        (3, "soil_bodydrop_01", 0.303468078, 1.11291766),
+        (3, "soil_bodydrop_01", 0.3506123, 0.8844082),
+        (0, "bodydrop_concrete2", 0.4230597, 1.13085771),
+        (0, "bodydrop_concrete1", 0.467676, 0.9649011),
+    ];
+    for (surface, clip, volume, pitch) in recorded {
+        let at = trp_sim::sound::landing::body_fall_bank(&sounds, Some(surface)).expect("a bank");
+        assert!(clips_of(at).contains(&clip), "{clip} in {:?}", clips_of(at));
+        let (volumes, pitches) = trp_sim::sound::landing::drawn_ranges(&sounds.banks[at], asked);
+        assert!(volume >= volumes[0] - 1e-4 && volume <= volumes[1] + 1e-4, "{clip}: {volume} in {volumes:?}");
+        assert!(pitch >= pitches[0] - 1e-4 && pitch <= pitches[1] + 1e-4, "{clip}: {pitch} in {pitches:?}");
+    }
 }

@@ -80,7 +80,7 @@ Either mode is one shot a press (`Idling.SetTriggerPressed`: `single`, `doublet`
 
 ## Being drawn
 
-As `firing.md` has it, with the state by the mode: a weapon with shells in its tube and none in its chamber takes one over as the draw starts, and the animator plays `PA OUT TO IDLE ARM` or `SA OUT TO IDLE ARM` (1.5 s, the action worked, `AddAmmoInChamber` giving it the new counts) in place of `OUT TO IDLE` (1.0 s). **This is what a weapon found in a container does when it is first taken in hand** (the user, 2026-10-12: such a weapon has no round in its chamber; and no stock preset in the install's database has one).
+As `firing.md` has it, with the state by the mode: a weapon with shells in its tube and none in its chamber takes one over as the draw starts, and the animator plays `PA OUT TO IDLE ARM` or `SA OUT TO IDLE ARM` (1.5 s, the action worked, `AddAmmoInChamber` giving it the new counts) in place of `OUT TO IDLE` (1.0 s). **This is what a weapon found in a container does when it is first taken in hand**.
 
 ## The stock
 
@@ -105,7 +105,7 @@ The stock preset's stock (`6259c3387d6aab70bc23a18d`, the telescoping one) folds
 
 ## Built (2026-10-12)
 
-- **Later the same day, after the user ran it:** the eye is lined up with the ghost ring and the front sight (`weapon-handling.md`, "The sights"); it had gone to the shotgun's own aim bone, 13.3 mm from the sights' line, which with the stock folded put the eye inside the collapsed stock's pad. And the pistol grip, a part of its own that hangs on the stock, is put on its bone by the game's rule (`hands-on-weapon.md`, "A part on its bone"); it had been drawn a quarter turn round, under the receiver ahead of the trigger guard.
+- **Later the same day, after it was run by hand:** the eye is lined up with the ghost ring and the front sight (`weapon-handling.md`, "The sights"); it had gone to the shotgun's own aim bone, 13.3 mm from the sights' line, which with the stock folded put the eye inside the collapsed stock's pad. And the pistol grip, a part of its own that hangs on the stock, is put on its bone by the game's rule (`hands-on-weapon.md`, "A part on its bone"); it had been drawn a quarter turn round, under the receiver ahead of the trigger guard.
 - `trp-data/src/weapon.rs`: `Weapon::fold` (the build folded: the parts' recoil, the width, whether it is then held closer) and `held_closer`. `trp-sim`: `Firearm::fold_stock`, `Operation::Fold`, `Event::Folded`, `start_folded`; `Hands::set_folded` (the recoil's strengths, the closer hold with its rest and its swing point). The app: `L` with `Left Alt`, as the install binds it.
 - `trp-sim/src/firearm.rs`: `FireMode::SemiAuto`; the fire state by the mode; `Operation::Shells` with `reload_shells` (the key, with how many rounds are within reach), its marks, its cutting short by the trigger, the inventory and a put-away, and `Event::RoundsTaken` for what leaves the character's stock (one for an empty chamber as it begins, the rest as it ends); `set_fire_mode` with the bolt's refusal; `check_chamber`; `set_bolt_catch` and `bolt_caught`; `start_in_mode` and `start_with` for a replay that begins where a recording stood. **Marks are now answered one at a time** (`WeaponAnimator::deliver_next`), for every weapon.
 - `FirearmSettings`: `semi_fire_state`, `internal_magazine`, `no_fire_mode_on_bolt_catch`, read from the item (`trp_sim::firearm_settings`).

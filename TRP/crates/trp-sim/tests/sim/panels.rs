@@ -1,13 +1,13 @@
-//! What the battle screen's ammunition panel is told by the hands
-//! (inventory spec, "What the ammunition's panel says"; `ShowAmmoDetails`,
-//! `ShowFireMode`): a magazine's count in words by the look's level, and
+//! Tests of what the battle screen's ammunition panel is told by the hands.
+//! After the inventory spec, "What the ammunition's panel says", the game's `ShowAmmoDetails`
+//! and `ShowFireMode`: a magazine's count in words by the look's level, and
 //! the way of firing named by the fire mode key, the look at the selector
 //! and the force to automatic. The words pass without an install; the
 //! AKM's events pass trivially, with a note, where none is configured.
 
-use trp_data::hard_settings::HardSettings;
+use trp_data::setup::hard_settings::HardSettings;
 use trp_data::unity::Assets;
-use trp_sim::inventory::{ammo_words, AmmoWords as W};
+use trp_sim::items::inventory::{ammo_words, AmmoWords as W};
 use trp_sim::{Firearm, FirearmEvent, FireMode};
 
 #[test]
@@ -39,8 +39,8 @@ fn akm() -> Option<Firearm> {
     let db = crate::fixture::database()?;
     let hard = HardSettings::load(&install).expect("settings object");
     let mut assets = Assets::new(install).expect("manifest");
-    let weapon = trp_data::weapon::assemble(&mut assets, db, "59d6088586f774275f37482f").expect("the AKM");
-    let animator = trp_sim::weapon_animator::WeaponAnimatorData::load(&assets, &weapon).expect("its animator");
+    let weapon = trp_data::weapons::weapon::assemble(&mut assets, db, "59d6088586f774275f37482f").expect("the AKM");
+    let animator = trp_sim::weapons::weapon_animator::WeaponAnimatorData::load(&assets, &weapon).expect("its animator");
     let mut firearm = Firearm::new(trp_sim::firearm_settings(&assets, db, &hard, &weapon).expect("its settings"), &animator);
     firearm.start_drawn();
     Some(firearm)

@@ -1,13 +1,13 @@
-//! A character seen from outside, measured with the real install's data
-//! and the stock AKM (`docs/spec/third-person.md`). These pass trivially,
+//! Tests of a character seen from outside, measured with the real install's data and the stock AKM.
+//! After `docs/spec/third-person.md`. These pass trivially,
 //! with a note, where no install is configured.
 //!
 //! Run with `cargo test -p trp-sim --test sim third_person:: -- --nocapture` for
 //! the numbers.
 
-use trp_data::engine::EngineSettings;
-use trp_data::hard_settings::HardSettings;
-use trp_data::player::{effector, HandsData};
+use trp_data::setup::engine::EngineSettings;
+use trp_data::setup::hard_settings::HardSettings;
+use trp_data::character::player::{effector, HandsData};
 use trp_data::unity::Assets;
 use trp_sim::{Firearm, FirearmEvent, Flat, Hands, HandsInput, Input, Movement, PointOfView, State, ViewSettings};
 
@@ -22,15 +22,15 @@ fn rig() -> Option<(Hands, Movement, Firearm)> {
     let hard = HardSettings::load(&install).expect("settings object");
     let engine = EngineSettings::load(&install).expect("engine settings");
     let mut assets = Assets::new(install).expect("manifest");
-    let weapon = trp_data::weapon::assemble(&mut assets, &db, AKM).expect("weapon");
+    let weapon = trp_data::weapons::weapon::assemble(&mut assets, &db, AKM).expect("weapon");
     let data = HandsData::load(&mut assets).expect("player prefab");
     let hands = Hands::new(
         trp_sim::hands_settings(data, &db, &hard, &engine, &weapon, ViewSettings::default()).expect("hands settings"),
     );
-    let animator = trp_sim::weapon_animator::WeaponAnimatorData::load(&assets, &weapon).expect("the weapon's animator");
+    let animator = trp_sim::weapons::weapon_animator::WeaponAnimatorData::load(&assets, &weapon).expect("the weapon's animator");
     let mut firearm = Firearm::new(trp_sim::firearm_settings(&assets, &db, &hard, &weapon).expect("firearm settings"), &animator);
     firearm.start_drawn();
-    let body = trp_sim::body::BodyData::load(&mut assets).expect("body animator");
+    let body = trp_sim::locomotion::body::BodyData::load(&mut assets).expect("body animator");
     let movement = Movement::new(
         trp_sim::load_movement_settings(&mut assets, &db, &hard, &engine, 0.0).expect("movement"),
         trp_sim::Body::new(&body, weapon.cell_width as f32),
@@ -211,6 +211,86 @@ fn the_body_has_a_part_in_a_weapon_drawn_and_put_away() {
     println!("its own eyes: {}", layer(&own, "Weapon"));
     assert!(layer(&own, "Weapon").contains("weight 0.00"));
     assert!(length(std::array::from_fn(|k| after.0[k] - before.0[k])) < 1e-6);
+}
+
+/// The body's part in a draw plays at the weapon skill's draw speed, which
+/// the weapon says each time its own animator is told it
+/// (`SetAnimatorAndProceduralValues`: with the skills, at every idling's
+/// start and on an arm's damage, 1 with an arm damaged). A weapon not in
+/// hand says nothing, and neither does a quick draw until it idles.
+#[test]
+fn the_body_s_draw_goes_by_the_weapon_skill_s_speed() {
+    let Some((_, mut m, mut firearm)) = rig() else { return };
+    let told = |events: Vec<FirearmEvent>| events.into_iter().filter_map(|event| if let FirearmEvent::BodyDrawSpeed(speed) = event { Some(speed) } else { None }).collect::<Vec<_>>();
+    firearm.step(DT);
+    firearm.set_skill_speeds(1.2, 1.4);
+    assert_eq!(told(firearm.step(DT)), vec![1.4], "the skills read with the weapon in hand");
+    firearm.set_arms_damaged(true, false);
+    assert_eq!(told(firearm.step(DT)), vec![1.0], "an arm damaged");
+    firearm.set_arms_damaged(false, false);
+    assert_eq!(told(firearm.step(DT)), vec![1.4], "and mended");
+
+    // Away, it has no controller to tell the body; drawn, it tells it as
+    // the draw begins and again as it idles.
+    let mut away = |firearm: &mut Firearm| {
+        firearm.hide(false);
+        for _ in 0..240 {
+            if firearm.step(DT).contains(&FirearmEvent::Hidden) {
+                break;
+            }
+        }
+    };
+    away(&mut firearm);
+    firearm.set_skill_speeds(1.1, 1.3);
+    assert_eq!(told(firearm.step(DT)), Vec::<f32>::new(), "a weapon not in hand");
+    firearm.draw();
+    let mut said = Vec::new();
+    for _ in 0..240 {
+        said.extend(told(firearm.step(DT)));
+    }
+    println!("drawn: the body was told {said:?}");
+    assert_eq!(said, vec![1.3, 1.3]);
+
+    // Drawn quick, the weapon's animator alone is told, until it idles.
+    away(&mut firearm);
+    firearm.draw();
+    firearm.draw_quick(1.5);
+    assert_eq!(firearm.animator().get("SpeedDraw"), 1.5);
+    assert_eq!(told(firearm.step(DT)), Vec::<f32>::new(), "a quick draw's start");
+    let mut said = Vec::new();
+    for _ in 0..240 {
+        said.extend(told(firearm.step(DT)));
+    }
+    println!("drawn quick: the body was told {said:?}");
+    assert_eq!(said, vec![1.3]);
+
+    // The body's state for the draw goes by it: 1.4 times as far in the
+    // same time.
+    m.body.set_point_of_view(PointOfView::ThirdPerson);
+    let mut advance = |speed: Option<f32>| {
+        m.body.set_weapon_action(2);
+        run(&mut m, 1.5, Input::default());
+        if let Some(speed) = speed {
+            m.body.set_draw_speed(speed);
+        }
+        m.body.set_weapon_action(1);
+        let mut at = Vec::new();
+        for _ in 0..60 {
+            m.step(DT, &Input::default(), &Flat);
+            if let Some((state, time, None)) = m.body.layer_state("Weapon") {
+                if state.ends_with("out_to_idle") {
+                    at.push(time);
+                }
+            }
+        }
+        run(&mut m, 3.0, Input::default());
+        assert!(at.len() > 12, "the body's draw was seen for {} frames", at.len());
+        (at[10] - at[0]) / 10.0
+    };
+    let (untold, slow, fast) = (advance(None), advance(Some(1.0)), advance(Some(1.4)));
+    println!("out_to_idle a frame: {untold:.5} untold, {slow:.5} at 1, {fast:.5} at 1.4 ({:.4} times)", fast / slow);
+    assert!((untold - slow).abs() < 1e-6, "untold, the body's animator has 1");
+    assert!((fast / slow - 1.4).abs() < 0.01);
 }
 
 /// The reach for the vest is weighed by how near the left hand's marker

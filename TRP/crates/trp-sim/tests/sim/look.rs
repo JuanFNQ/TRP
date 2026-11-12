@@ -1,7 +1,7 @@
+//! Tests of a weapon's animations drawn on curves without corners, and of the result left unchanged.
 //! The look all over a weapon as it is drawn: on curves without corners
 //! through the clip's samples, where the engine joins them by straight
-//! lines (the user, 2026-10-13: "Can we add interpolation the inspect to
-//! make it smooth?"; `docs/findings.md` of that day), and since 2026-10-14
+//! lines, to make it smooth, and
 //! every animation of the weapon so, or none, as the host asks (the
 //! options' switch `SMOOTH FIRST PERSON ANIMATIONS`). **How the result is
 //! drawn, and no part of the result**: these check both halves on the
@@ -12,7 +12,7 @@
 //! figures.
 
 use trp_data::unity::Assets;
-use trp_sim::weapon_animator::{WeaponAnimator, WeaponAnimatorData};
+use trp_sim::weapons::weapon_animator::{WeaponAnimator, WeaponAnimatorData};
 use trp_sim::Firearm;
 
 const AKM: &str = "59d6088586f774275f37482f";
@@ -25,9 +25,9 @@ fn akm() -> Option<(Firearm, WeaponAnimatorData)> {
         return None;
     };
     let db = crate::fixture::database().expect("database");
-    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("settings object");
+    let hard = trp_data::setup::hard_settings::HardSettings::load(&install).expect("settings object");
     let mut assets = Assets::new(install).expect("manifest");
-    let weapon = trp_data::weapon::assemble(&mut assets, &db, AKM).expect("the weapon");
+    let weapon = trp_data::weapons::weapon::assemble(&mut assets, &db, AKM).expect("the weapon");
     let data = WeaponAnimatorData::load(&assets, &weapon).expect("its controller");
     let settings = trp_sim::firearm_settings(&assets, &db, &hard, &weapon).expect("its settings");
     Some((Firearm::new(settings, &data), data))
@@ -117,7 +117,7 @@ fn a_pose_for_drawing_changes_nothing_but_what_is_drawn() {
 }
 
 /// The weapon draws on curves without corners when its host asks, through
-/// every animation (the user, 2026-10-14: the options' switch `SMOOTH
+/// every animation (the options' switch `SMOOTH
 /// FIRST PERSON ANIMATIONS`), and as the engine has it when not asked.
 /// Two of the same weapon, one asked and one not, stepped through a draw,
 /// the rest, shots, a reload and the look all over: the same pose, the

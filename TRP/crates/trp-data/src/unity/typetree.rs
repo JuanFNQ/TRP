@@ -1,3 +1,5 @@
+//! Type trees: the field layout a serialized file carries, and the reader that follows it.
+//!
 //! Type trees: the per-class field layout a serialized file carries, and the
 //! generic reader that turns object bytes into a [`Value`] by following one.
 

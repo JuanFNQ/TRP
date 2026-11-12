@@ -1,6 +1,6 @@
-//! Texture formats: where each mip level sits in the data, and decoding of
-//! the block-compressed formats the weapons use, and of Unity's crunched
-//! ones (`texture2ddecoder`'s port of Unity's crunch).
+//! Texture formats: where each mip level sits, and decoding of the block-compressed and crunched ones.
+//! The block-compressed formats are those the weapons use; Unity's crunched ones are decoded by
+//! `texture2ddecoder`'s port of Unity's crunch.
 
 use anyhow::{bail, Result};
 
@@ -89,6 +89,17 @@ pub fn decode_rgba(tex: &TextureData, mip: Mip) -> Result<Vec<u8>> {
             let mut pixels = vec![0u32; w * h];
             texture2ddecoder::decode_unity_crunch(src, w, h, &mut pixels).map_err(|e| anyhow::anyhow!("texture {:?}: {e}", tex.name))?;
             for (dst, pixel) in out.chunks_exact_mut(4).zip(&pixels) {
+                let [b, g, r, a] = pixel.to_le_bytes();
+                dst.copy_from_slice(&[r, g, b, a]);
+            }
+        }
+        format::BC7 => {
+            // `texture2ddecoder` packs each pixel as the crunch decoder does
+            // (blue, green, red, alpha), and writes a level smaller than a
+            // block into a block's room.
+            let mut pixels = vec![0u32; w.max(4) * h.max(4)];
+            texture2ddecoder::decode_bc7(src, w, h, &mut pixels).map_err(|e| anyhow::anyhow!("texture {:?}: {e}", tex.name))?;
+            for (dst, pixel) in out.chunks_exact_mut(4).zip(&pixels[..w * h]) {
                 let [b, g, r, a] = pixel.to_le_bytes();
                 dst.copy_from_slice(&[r, g, b, a]);
             }
@@ -434,7 +445,7 @@ pub(crate) fn decode_color_block(block: &[u8], punch_through: bool) -> [[u8; 4];
     std::array::from_fn(|i| palette[(bits >> (i * 2)) as usize & 3])
 }
 
-pub(crate) fn decode_alpha_block(block: &[u8]) -> [u8; 16] {
+pub fn decode_alpha_block(block: &[u8]) -> [u8; 16] {
     let (a0, a1) = (block[0] as u32, block[1] as u32);
     let mut palette = [a0 as u8, a1 as u8, 0, 0, 0, 0, 0, 255];
     if a0 > a1 {

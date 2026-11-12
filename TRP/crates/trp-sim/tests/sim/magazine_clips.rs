@@ -1,11 +1,11 @@
-//! A magazine's own clips (`magAnimationIndex`; firing spec, "Which
-//! magazine"): the build's fitted magazine gives the settings' index; a
+//! Tests of a magazine's own clips, by the fitted magazine and through a reload.
+//! After the firing spec, "Which magazine", through `magAnimationIndex`: the build's fitted magazine gives the settings' index; a
 //! reload tells the animator the fitted one's as the old and the incoming
 //! one's as the new, the new one's kept from its `MagIn` and on the next
 //! draw. Those that need the install pass trivially, with a note, where
 //! none is configured.
 
-use trp_sim::weapon_animator::WeaponAnimatorData;
+use trp_sim::weapons::weapon_animator::WeaponAnimatorData;
 use trp_sim::{Firearm, FirearmEvent};
 
 const AKM: &str = "59d6088586f774275f37482f";
@@ -19,15 +19,15 @@ fn a_reload_plays_the_incoming_magazines_clips() {
         return;
     };
     let db = crate::fixture::database().expect("database");
-    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("settings object");
+    let hard = trp_data::setup::hard_settings::HardSettings::load(&install).expect("settings object");
     let mut assets = trp_data::unity::Assets::new(install).expect("manifest");
 
     // The build's magazine names the clips: the stock 30-round's 0, the
     // drum's 5.
-    let drum = trp_data::weapon::assemble_key(&mut assets, db, AKM_DRUM).expect("the AKM with a drum");
+    let drum = trp_data::weapons::weapon::assemble_key(&mut assets, db, AKM_DRUM).expect("the AKM with a drum");
     assert_eq!(drum.magazine_animation, Some(5));
     assert_eq!(trp_sim::firearm_settings(&assets, db, &hard, &drum).expect("its settings").magazine_variant, 5);
-    let weapon = trp_data::weapon::assemble(&mut assets, db, AKM).expect("the AKM");
+    let weapon = trp_data::weapons::weapon::assemble(&mut assets, db, AKM).expect("the AKM");
     assert_eq!(weapon.magazine_animation, Some(0));
     let data = WeaponAnimatorData::load(&assets, &weapon).expect("its controller");
     let settings = trp_sim::firearm_settings(&assets, db, &hard, &weapon).expect("its settings");

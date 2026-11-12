@@ -2,6 +2,7 @@
 
 pub mod anim;
 pub mod assets;
+pub mod bc7;
 pub mod bundle;
 pub mod extract;
 pub mod reader;

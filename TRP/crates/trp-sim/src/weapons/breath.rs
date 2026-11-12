@@ -1,0 +1,384 @@
+//! The weapon's breathing.
+//! As specified in `docs/spec/weapon-handling.md`: the slow
+//! rise and fall of the weapon, small random pushes on it, and the wander
+//! of the muzzle when not aiming, which a shot from the hip widens.
+//!
+//! Tiredness and a held breath are in: the hands' and the breath's
+//! levels come from the stamina. So are a tremor, a broken arm, a mounted
+//! weapon (the hands' share) and the stiff draw (`DrawElite`).
+
+use trp_data::formats::curve::Curve;
+use trp_data::character::player::{BreathData, SmoothRandomData};
+
+use crate::weapons::hands::Blender;
+use crate::weapons::recoil::Rng;
+
+/// Where the wander's turn rate rests between shots.
+const RESTING_HARDNESS: f32 = 0.1;
+/// How strong the breath and the random pushes are with the breath held.
+const HELD: f32 = 0.15;
+/// How long the stiff draw holds the breath, from the sights coming up
+/// (`ProceduralWeaponAnimation.IsAiming`'s setter: `StiffUntill` is now
+/// and 3 s).
+const STIFF_FOR: f32 = 3.0;
+/// How much of itself the breath keeps while stiff, the last second easing
+/// it back to whole; more with a tremor or a broken arm
+/// (`BreathEffector.Process`).
+const STIFF_FLOOR: f32 = 0.3;
+const STIFF_FLOOR_SHAKEN: f32 = 0.5;
+
+/// What the breath goes by besides the weapon: how rested the hands count
+/// as (`Stamina::breath_stamina`), how much breath there is
+/// (`Stamina::breath_oxygen`), and whether it is being held.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Wind {
+    pub stamina: f32,
+    pub oxygen: f32,
+    pub held: bool,
+    /// A tremor at work and no painkiller (`BreathEffector.TremorOn`), and
+    /// a broken or destroyed arm (`Fracture`): health spec, "What health
+    /// does to the character".
+    pub tremor: bool,
+    pub fracture: bool,
+}
+
+impl Default for Wind {
+    /// Rested, with breath to spare, and sound.
+    fn default() -> Self {
+        Self { stamina: 1.0, oxygen: 1.0, held: false, tremor: false, fracture: false }
+    }
+}
+
+/// A value that picks a new random target every so often and turns toward
+/// it (`CW2.Animations.SmoothRandom.GetValue`). The hand shake has its own
+/// (`crate::hand_shake`).
+#[derive(Debug, Clone)]
+pub(crate) struct SmoothRandom {
+    amplitude: f32,
+    delay: [f32; 2],
+    hardness: f32,
+    count_down: f32,
+    current: f32,
+    increase: f32,
+}
+
+impl SmoothRandom {
+    pub(crate) fn new(data: SmoothRandomData) -> Self {
+        Self {
+            amplitude: data.amplitude,
+            delay: data.delay,
+            hardness: data.hardness,
+            count_down: 0.0,
+            current: 0.0,
+            increase: 0.0,
+        }
+    }
+
+    pub(crate) fn value(&mut self, dt: f32, rng: &mut Rng) -> f32 {
+        self.count_down -= dt;
+        if self.count_down < 0.0 {
+            self.count_down = rng.range(self.delay[0], self.delay[1]);
+            let wanted = (rng.range(-self.amplitude, self.amplitude) - self.current) / self.count_down;
+            self.increase += (wanted - self.increase) * self.hardness;
+        }
+        self.current += self.increase * dt;
+        self.current
+    }
+}
+
+/// What one step of breathing asks for.
+#[derive(Debug, Clone, Default)]
+pub struct BreathStep {
+    /// Pushes on the springs: target (0 camera rotation, 1 hands position,
+    /// 2 hands rotation), component, value.
+    pub pushes: Vec<(u8, u8, f32)>,
+    /// Where the recoil rotation's rest point should be.
+    pub muzzle_offset: [f32; 3],
+}
+
+#[derive(Debug, Clone)]
+pub struct Breath {
+    data: BreathData,
+    x: SmoothRandom,
+    y: SmoothRandom,
+    hip_x: SmoothRandom,
+    hip_z: SmoothRandom,
+    /// The hands' tremor, which takes the wander's place while it shakes
+    /// them or an arm is broken.
+    tremor: [SmoothRandom; 3],
+    /// Clock of each breath curve.
+    clocks: Vec<f32>,
+    /// How much shots from the hip have widened the wander.
+    gain: Blender,
+    hardness: Blender,
+    gain_per_shot: f32,
+    gain_delay: f32,
+    muzzle_offset: [f32; 3],
+    /// How fast the breath's clock ran in the last step that was not
+    /// held, and how much of the breath reached the camera: a held breath
+    /// leaves both as they were.
+    breath_rate: f32,
+    camera_share: f32,
+    /// The stiff draw is the character's (`DrawElite`: Aim Drills' elite,
+    /// or the class's of the last firearm drawn). The game keeps it with the
+    /// weapon motion's buffs, given anew only as a firearm is drawn
+    /// (`InitWeaponData`); hands that hold none keep the last firearm's.
+    stiff_draw: bool,
+    /// What is left of a stiff draw, in seconds by the frame's clock
+    /// (`StiffUntill` less the engine's `Time.time`, which the breath reads
+    /// once a frame, the same for each of the frame's steps).
+    stiff_left: f32,
+    rng: Rng,
+}
+
+impl Breath {
+    /// `gain` is what a hip shot adds, how long it holds and how fast it
+    /// fades, as the weapon gives them.
+    pub fn new(data: BreathData, gain: [f32; 3], seed: u64) -> Self {
+        let mut hardness = Blender::new(0.0, data.hardness_speed);
+        hardness.set_target(RESTING_HARDNESS, 0.0);
+        Self {
+            x: SmoothRandom::new(data.x),
+            y: SmoothRandom::new(data.y),
+            hip_x: SmoothRandom::new(data.hip_x),
+            hip_z: SmoothRandom::new(data.hip_z),
+            tremor: data.tremor.map(SmoothRandom::new),
+            clocks: data.curves.iter().map(|c| c.time_shift).collect(),
+            gain: Blender::new(0.0, gain[2]),
+            hardness,
+            gain_per_shot: gain[0],
+            gain_delay: gain[1],
+            muzzle_offset: [0.0; 3],
+            breath_rate: 0.0,
+            camera_share: 0.0,
+            stiff_draw: false,
+            stiff_left: 0.0,
+            rng: Rng::new(seed),
+            data,
+        }
+    }
+
+    /// A weapon's own figures for hip shots given afresh (`InitWeaponData`:
+    /// `HipInnaccuracyGain`, `HipAccuracyRestorationDelay`, `...Speed`), the
+    /// wander as it stands kept: an underbarrel launcher's ghost's as its
+    /// switch ends, the rifle's again coming back.
+    pub fn set_gain(&mut self, gain: [f32; 3]) {
+        (self.gain_per_shot, self.gain_delay) = (gain[0], gain[1]);
+        self.gain.set_speed(gain[2]);
+    }
+
+    /// The hip wander's scale (`Breath.HipPenalty`): the prefab's until the
+    /// weapon works its own out (`tactical::hip_penalty`; the game never
+    /// keeps the prefab's once a weapon is drawn).
+    pub fn set_hip_penalty(&mut self, penalty: f32) {
+        self.data.hip_penalty = penalty;
+    }
+
+    pub fn hip_penalty(&self) -> f32 {
+        self.data.hip_penalty
+    }
+
+    /// How long the breath takes to come round, in seconds, at rest: the
+    /// longest of its curves' loops.
+    pub(crate) fn period(&self) -> f32 {
+        let span = |c: &Curve| c.keys.last().map_or(0.0, |last| last.time - c.keys[0].time);
+        self.data.curves.iter().map(|entry| span(&entry.curve)).fold(0.0, f32::max)
+    }
+
+    /// A shot was fired. From the hip it widens the wander and throws the
+    /// muzzle's rest point.
+    pub fn on_shot(&mut self, now: f32, intensity: f32, aiming: bool) {
+        if aiming {
+            return;
+        }
+        let mut gain = self.gain.value(now);
+        gain += (self.gain_per_shot - 0.2 * (gain.sqrt() - 1.0)).max(0.0);
+        self.gain.jump(gain, self.gain_delay, now);
+        self.hardness.jump(self.data.shot_hardness, 0.0, now);
+        let base = self.data.base_hip_amplitudes;
+        self.hip_x.amplitude = (base[0] + gain).clamp(0.0, 3.0);
+        self.hip_z.amplitude = (base[1] + gain).clamp(0.0, 3.0);
+        self.hip_x.hardness = self.data.shot_hardness;
+        self.hip_z.hardness = self.data.shot_hardness;
+        let between = self.data.random_between;
+        let step = self.rng.range(between[0], between[1]);
+        let up = self.hip_x.value(step, &mut self.rng);
+        let step = self.rng.range(between[0], between[1]);
+        let aside = self.hip_z.value(step, &mut self.rng);
+        let scale = intensity * self.data.hip_penalty;
+        self.muzzle_offset = [self.muzzle_offset[0].min(up) * scale, 0.0, aside / 2.0 * scale];
+    }
+
+    /// The breath tied to a rig just taken in hand (`BreathEffector.Initialize`,
+    /// in `InitTransforms`): its curves' processors are made anew, so the
+    /// loop starts again from each curve's shift (weapon-handling spec, "A
+    /// change of hands starts the breath again"). Its hardness is asked back
+    /// to rest there too, which ours always is; the wander, the hip's gain
+    /// and a stiff draw go on.
+    pub fn restart_loop(&mut self) {
+        self.clocks = self.data.curves.iter().map(|c| c.time_shift).collect();
+    }
+
+    /// The muzzle's rest point as another effector of the step left it: the
+    /// game's breath reads the recoil's `Offset` itself each step, so what
+    /// the hand shake wrote after it is where its next step starts from.
+    pub(crate) fn set_muzzle_offset(&mut self, offset: [f32; 3]) {
+        self.muzzle_offset = offset;
+    }
+
+    /// Whether the sights brought up hold the breath stiff (`WeaponBuffsInfo.
+    /// StiffDraw`), as the firearm just drawn has it.
+    pub fn set_stiff_draw(&mut self, stiff: bool) {
+        self.stiff_draw = stiff;
+    }
+
+    pub fn stiff_draw(&self) -> bool {
+        self.stiff_draw
+    }
+
+    /// The sights have come up: with the stiff draw, the breath is held
+    /// stiff for the next 3 s, from whole again if one was under way.
+    pub fn sights_up(&mut self) {
+        if self.stiff_draw {
+            self.stiff_left = STIFF_FOR;
+        }
+    }
+
+    /// A frame has passed, `frame_dt` long: the stiff draw's clock runs on.
+    pub fn pass_frame(&mut self, frame_dt: f32) {
+        self.stiff_left = (self.stiff_left - frame_dt).max(0.0);
+    }
+
+    /// How much of itself the stiff draw leaves the breath, 1 with none
+    /// under way: the floor for its first 2 s, then up to whole over the
+    /// last (`BreathEffector.Process`).
+    pub fn stiffness(&self, shaken: bool) -> f32 {
+        if self.stiff_left <= 0.0 {
+            return 1.0;
+        }
+        let floor = if shaken { STIFF_FLOOR_SHAKEN } else { STIFF_FLOOR };
+        (1.0 - self.stiff_left).clamp(floor, 1.0)
+    }
+
+    /// One physics step. `intensity` is the stance's factor times the
+    /// aiming factor; `head_bobbing` is the player's setting; `wind` is
+    /// how tired the character is and whether it holds its breath.
+    pub fn step(&mut self, dt: f32, now: f32, intensity: f32, aiming: bool, head_bobbing: f32, wind: Wind) -> BreathStep {
+        let (mut stamina, oxygen) = (wind.stamina, wind.oxygen);
+        // A broken arm lets the hands count as rested so far and no
+        // further (`StaminaLevel`'s top, `EnergyFractureLimit`).
+        if wind.fracture {
+            stamina = stamina.min(self.data.fracture_limit);
+        }
+        let mut out = BreathStep::default();
+
+        let widened = self.gain.value(now).sqrt();
+        let base = self.data.base_hip_amplitudes;
+        self.hip_x.amplitude = (base[0] + widened).clamp(0.0, 3.0);
+        self.hip_z.amplitude = (base[1] + widened).clamp(0.0, 3.0);
+        let hardness = self.hardness.value(now);
+        self.hip_x.hardness = hardness;
+        self.hip_z.hardness = hardness;
+
+        // Short of oxygen the breath is deeper and faster and reaches the
+        // camera. Held, it and the random pushes are a small part of
+        // themselves, whatever the stance, and its pace and its reach to
+        // the camera stay as the last breath had them. A stiff draw comes
+        // before a held breath: the breath and the pushes at its share
+        // (with the stance's), pace and reach kept the same way, and the
+        // tremor's pace cut by it as well.
+        let shaken = wind.tremor || wind.fracture;
+        let stiff = self.stiffness(shaken);
+        let (breath_intensity, shake) = if self.stiff_left > 0.0 {
+            (stiff * intensity, stiff)
+        } else if wind.held {
+            (HELD, HELD)
+        } else {
+            let t = self.data.lack_of_oxygen.evaluate(oxygen);
+            let rest = if aiming { 0.75 } else { 1.0 };
+            self.breath_rate = (4.0 + (1.0 - 4.0) * t).clamp(1.0, 2.5) * dt;
+            self.camera_share = (2.0 - 2.0 * t) * intensity;
+            ((4.0 + (rest - 4.0) * t).clamp(1.0, 1.5) * intensity, 1.0)
+        };
+        let (breath_rate, camera_share) = (self.breath_rate, self.camera_share);
+
+        // Small random pushes on the weapon's roll and yaw.
+        self.y.amplitude = self.data.amplitude_by_stamina.evaluate(stamina);
+        let delay = self.data.delay_by_stamina.evaluate(stamina);
+        self.x.delay = [delay / 2.0, delay];
+        self.y.delay = [delay / 2.0, delay];
+        self.y.hardness = self.data.hardness_by_stamina.evaluate(stamina);
+        let roll = self.y.value(dt, &mut self.rng);
+        let yaw = self.x.value(dt, &mut self.rng);
+        let tired = (-roll).max(0.0) * (1.0 - stamina) * 2.0;
+        for (component, value) in [tired, roll, yaw].into_iter().enumerate() {
+            out.pushes.push((2, component as u8, value * shake * intensity));
+        }
+
+        // The muzzle wanders when the weapon is not at the shoulder. A
+        // tremor or a broken arm shakes it instead, aimed or not: the
+        // tremor at half its pace for a broken arm alone (and at the stiff
+        // draw's share of it), and a broken arm
+        // not aimed throws it up by the breath's roll, the more the more
+        // rested the hands (`BreathEffector.Process`).
+        let wander = if shaken {
+            let step = (if wind.tremor { dt } else { dt / 2.0 }) * stiff;
+            let mut shake = [0.0; 3];
+            for (value, random) in shake.iter_mut().zip(self.tremor.iter_mut()) {
+                *value = random.value(step, &mut self.rng);
+            }
+            if wind.fracture && !aiming {
+                let limit = self.data.fracture_limit;
+                shake[0] += roll.max(0.0) * (1.0 + (100.0 / limit - 1.0) * stamina);
+            }
+            shake.map(|value| value * intensity)
+        } else if aiming {
+            [0.0; 3]
+        } else {
+            let scale = intensity * self.data.hip_penalty;
+            [self.hip_x.value(dt, &mut self.rng) * scale, 0.0, self.hip_z.value(dt, &mut self.rng) * scale]
+        };
+        let apart: f32 = (0..3).map(|i| (wander[i] - self.muzzle_offset[i]).powi(2)).sum();
+        self.muzzle_offset = if apart > 0.01 {
+            std::array::from_fn(|i| self.muzzle_offset[i] + (wander[i] - self.muzzle_offset[i]) * 0.1)
+        } else {
+            wander
+        };
+        out.muzzle_offset = self.muzzle_offset;
+
+        // The breath itself.
+        for (index, entry) in self.data.curves.iter().enumerate() {
+            let strength = if index == 0 { breath_intensity } else { breath_intensity * camera_share };
+            self.clocks[index] += breath_rate;
+            // By the curve's own wraps (both of the install's start over).
+            let value = entry.at(self.clocks[index]) * strength;
+            if value.abs() < 1e-6 {
+                continue;
+            }
+            for val in &entry.vals {
+                let setting = if val.target == 0 { head_bobbing } else { 1.0 };
+                out.pushes.push((val.target, val.component, value * val.intensity * setting));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wandering_value_stays_near_its_amplitude() {
+        let mut r = SmoothRandom::new(SmoothRandomData { amplitude: 1.0, delay: [0.2, 0.7], hardness: 0.1 });
+        let mut rng = Rng::new(3);
+        let (mut low, mut high) = (0.0f32, 0.0f32);
+        for _ in 0..60 * 120 {
+            let v = r.value(1.0 / 60.0, &mut rng);
+            low = low.min(v);
+            high = high.max(v);
+        }
+        assert!(high > 0.2 && low < -0.2, "it does not move: {low}..{high}");
+        assert!(high < 2.5 && low > -2.5, "it runs away: {low}..{high}");
+    }
+}

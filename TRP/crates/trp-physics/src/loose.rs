@@ -1,5 +1,5 @@
-//! Things let fall and thrown (`docs/spec/physics.md`, "Loose things"):
-//! where the game sets one going and how (`GameWorld.ThrowItem`, the quick
+//! Things let fall and thrown: how the game sets one going, its rigid body and when it is taken away.
+//! After `docs/spec/physics.md`, "Loose things": where the game sets one going and how (`GameWorld.ThrowItem`, the quick
 //! reload's `DropMod`), the rigid body it gives it
 //! (`LootItem.CreateLootWithRigidbody`), and when it takes the body away
 //! again (`LootItem.IsRigidbodyDone`). The host makes the colliders from the
@@ -67,6 +67,15 @@ pub fn euler(x: f32, y: f32, z: f32) -> Q4 {
     mul(mul(about([0.0, 1.0, 0.0], y), about([1.0, 0.0, 0.0], x)), about([0.0, 0.0, 1.0], z))
 }
 
+/// The thrower's `WeaponRoot` at a throw, as every recorded throw has it:
+/// the look (`Quaternion.Euler(pitch, yaw, 0)`, the pitch not held) turned
+/// back 90 degrees about its x, so that the thing thrown is turned as the
+/// look (18 throws of `courses2`'s course 1, every one within 0.01
+/// degrees, the hands' own root off the look by 1 to 29 degrees).
+pub fn look_root(pitch: f32, yaw: f32) -> Q4 {
+    mul(euler(pitch, yaw, 0.0), euler(-90.0, 0.0, 0.0))
+}
+
 /// The character as a throw needs it: where it looks, where its capsule's
 /// axis is at 0.65 of its height (`PlayerColliderPointOnCenterAxis(0.65)`:
 /// the capsule's centre across, 0.65 of its height over the feet), its
@@ -106,6 +115,25 @@ pub fn thrown(by: &Thrower, down: bool, dice: &mut Dice) -> Start {
 pub fn let_fall(at: V3, turn: Q4, dice: &mut Dice) -> Start {
     let spin = [dice.range(-3.0, 3.0), dice.range(-3.0, 3.0), dice.range(-3.0, 3.0)];
     Start { at, turn, velocity: [0.0, -0.01, 0.0], spin }
+}
+
+/// A live round the weapon throws out (`Firearms.ThrowPatronAsLoot`: the
+/// round the action worked by hand takes out, the chambered round of a
+/// filling with the bolt open, a cylinder's live rounds in its quick
+/// reload, a barrel's round with no room in the rig): from the weapon's
+/// first shell port where it is (`at`, turned `port`), turned as the port
+/// and then 90 degrees about its x; at a velocity of the port's own turn
+/// applied to the port's move in its parent from where it was as the
+/// weapon was made (`moved`) times the round's multiplier, plus a force
+/// drawn in the round's ranges (`PatronExtractionSettings`), with nothing
+/// of the character's velocity; spun as drawn in the round's turn ranges
+/// (the turn drawn first, as the game draws it). The port's scale is taken
+/// as one (`TransformVector`; the first person's squeeze is not on when the
+/// hands' marks are heard).
+pub fn from_port(at: V3, port: Q4, moved: V3, throw: &trp_data::weapons::weapon::Extraction, dice: &mut Dice) -> Start {
+    let spin: V3 = std::array::from_fn(|k| dice.range(throw.turn[k][0], throw.turn[k][1]));
+    let force: V3 = std::array::from_fn(|k| moved[k] * throw.multiplier + dice.range(throw.force[k][0], throw.force[k][1]));
+    Start { at, turn: mul(port, euler(90.0, 0.0, 0.0)), velocity: rotate(port, force), spin }
 }
 
 /// The volume of the box round a loose thing's colliders under which the
@@ -164,7 +192,7 @@ pub fn bounds(colliders: &[Collider]) -> Option<(V3, V3)> {
                 half[(*direction).min(2) as usize] = height.max(2.0 * radius) / 2.0;
                 (0..8).map(|i| [if i & 1 == 0 { -half[0] } else { half[0] }, if i & 2 == 0 { -half[1] } else { half[1] }, if i & 4 == 0 { -half[2] } else { half[2] }]).collect()
             }
-            Shape::Convex { points, scale } => points.iter().map(|p| [p[0] * scale[0], p[1] * scale[1], p[2] * scale[2]]).collect(),
+            Shape::Convex { points, scale } | Shape::Mesh { points, scale, .. } => points.iter().map(|p| [p[0] * scale[0], p[1] * scale[1], p[2] * scale[2]]).collect(),
         };
         for corner in corners {
             let p = rotate(c.turn, corner);
@@ -222,15 +250,7 @@ pub fn collider(c: &NodeCollider, at: V3, turn: Q4, scale: V3, points: &mut dyn 
         ColliderShape::Mesh { .. } => return None,
     };
     let centre = rotate(turn, [centre[0] * s[0], centre[1] * s[1], centre[2] * s[2]]);
-    let material = c.material.map_or_else(Material::default, |m| {
-        let combine = |mode: u32| match mode {
-            1 => Combine::Minimum,
-            2 => Combine::Multiply,
-            3 => Combine::Maximum,
-            _ => Combine::Average,
-        };
-        Material { dynamic_friction: m.dynamic_friction, static_friction: m.static_friction, bounciness: m.bounciness, friction_combine: combine(m.friction_combine), bounce_combine: combine(m.bounce_combine) }
-    });
+    let material = Material::of(c.material);
     Some(Collider { shape, at: [at[0] + centre[0], at[1] + centre[1], at[2] + centre[2]], turn, material })
 }
 
@@ -238,29 +258,106 @@ pub fn collider(c: &NodeCollider, at: V3, turn: Q4, scale: V3, points: &mut dyn 
 /// (`ObjectsFactory.CreateLootPrefab`, which switches every collider on but
 /// a flare's), in its first object's axes, that object's own place, turn
 /// and scale left out (the game sets them): those of objects that are on,
-/// triggers left out (they push nothing; that Unity leaves them out of the
-/// centre of mass too is `PROVISIONAL`).
+/// triggers left out (they push nothing, and Unity leaves them out of the
+/// centre of mass: the game's things' colliders stand from it as ours,
+/// `courses2`'s course 1).
 pub fn colliders(hierarchy: &Hierarchy, points: &mut dyn FnMut(ObjRef) -> Option<std::sync::Arc<[V3]>>) -> Vec<Collider> {
-    let mut placed: Vec<(V3, Q4, V3, bool)> = Vec::with_capacity(hierarchy.nodes.len());
-    let mut out = Vec::new();
+    colliders_named(hierarchy, points).into_iter().map(|(_, c)| c).collect()
+}
+
+/// The same, each with the name of the object it is on (`bin/loose` pairs
+/// them with the recorded).
+pub fn colliders_named(hierarchy: &Hierarchy, points: &mut dyn FnMut(ObjRef) -> Option<std::sync::Arc<[V3]>>) -> Vec<(String, Collider)> {
+    colliders_at(hierarchy, &Placed::ORIGIN, points)
+}
+
+/// An object of a model in its body's axes: its place, its turn, its
+/// scale as the engine has it (its parents' times its own), and whether it
+/// is on (it and every parent).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placed {
+    pub at: V3,
+    pub turn: Q4,
+    pub scale: V3,
+    pub on: bool,
+}
+
+impl Placed {
+    /// The body's own axes.
+    pub const ORIGIN: Placed = Placed { at: [0.0; 3], turn: [0.0, 0.0, 0.0, 1.0], scale: [1.0; 3], on: true };
+
+    /// A child of this object at its own place, turn and scale.
+    pub fn child(&self, translation: V3, rotation: Q4, scale: V3, active: bool) -> Placed {
+        let offset = rotate(self.turn, [translation[0] * self.scale[0], translation[1] * self.scale[1], translation[2] * self.scale[2]]);
+        Placed {
+            at: [self.at[0] + offset[0], self.at[1] + offset[1], self.at[2] + offset[2]],
+            turn: mul(self.turn, rotation),
+            scale: [self.scale[0] * scale[0], self.scale[1] * scale[1], self.scale[2] * scale[2]],
+            on: self.on && active,
+        }
+    }
+}
+
+/// Each object of a model placed in its first object's axes, that
+/// object's own place, turn and scale left out (the game sets them).
+pub fn placed(hierarchy: &Hierarchy) -> Vec<Placed> {
+    placed_from(hierarchy, &Placed::ORIGIN)
+}
+
+/// Each object of a model whose first object stands at `root`, its own
+/// place, turn and scale left out.
+fn placed_from(hierarchy: &Hierarchy, root: &Placed) -> Vec<Placed> {
+    let mut placed: Vec<Placed> = Vec::with_capacity(hierarchy.nodes.len());
     for (index, node) in hierarchy.nodes.iter().enumerate() {
         let here = match node.parent.filter(|_| index > 0) {
-            None => ([0.0; 3], [0.0, 0.0, 0.0, 1.0], [1.0; 3], node.active),
-            Some(parent) => {
-                let (at, turn, scale, on) = placed[parent];
-                let offset = rotate(turn, [node.translation[0] * scale[0], node.translation[1] * scale[1], node.translation[2] * scale[2]]);
-                let own = [scale[0] * node.scale[0], scale[1] * node.scale[1], scale[2] * node.scale[2]];
-                ([at[0] + offset[0], at[1] + offset[1], at[2] + offset[2]], mul(turn, node.rotation), own, on && node.active)
-            }
+            None => Placed { on: root.on && node.active, ..*root },
+            Some(parent) => placed[parent].child(node.translation, node.rotation, node.scale, node.active),
         };
         placed.push(here);
-        let (at, turn, scale, on) = here;
-        if !on || node.scripts.iter().any(|script| script == "SingleFlareController") {
+    }
+    placed
+}
+
+/// Where a round or a part with nothing to say otherwise is put on the
+/// object it hangs on (`ContainerCollectionView.SlotView.InsertItem` for a
+/// weapon's chambered round; `SpringMagazineVisual.FillAmmoObjectsOnStart`
+/// for a magazine's): at its origin, a quarter turn about its x, at its own
+/// size, on.
+pub fn hung(on: &Placed) -> Placed {
+    on.child([0.0; 3], euler(90.0, 0.0, 0.0), [1.0; 3], true)
+}
+
+/// The colliders of a model whose first object stands at `root` (a
+/// round hung on a magazine's point: `hung`), as `colliders_named` takes
+/// them, each with the name of the object it is on.
+pub fn colliders_at(hierarchy: &Hierarchy, root: &Placed, points: &mut dyn FnMut(ObjRef) -> Option<std::sync::Arc<[V3]>>) -> Vec<(String, Collider)> {
+    let mut out = Vec::new();
+    for (node, here) in hierarchy.nodes.iter().zip(placed_from(hierarchy, root)) {
+        if !here.on || node.scripts.iter().any(|script| script == "SingleFlareController") {
             continue;
         }
         for c in node.colliders.iter().filter(|c| !c.trigger) {
-            out.extend(collider(c, at, turn, scale, points));
+            out.extend(collider(c, here.at, here.turn, here.scale, points).map(|c| (node.name.clone(), c)));
         }
+    }
+    out
+}
+
+/// The colliders of the rounds a loose thing shows (`LootItem`'s body
+/// takes every collider of every object in it: `ObjectsFactory.
+/// CreateLootPrefab`, each pool object's): each round as an unspent round,
+/// its `full` objects on and its `shell` ones off, hung on its object of
+/// the thing (`hung`): a magazine's point, a weapon's magazine's, or the
+/// weapon's chamber. `placed` is the thing's objects (`placed`); each of
+/// `rounds` the object it hangs on and its model. Each is named with that
+/// object's name before its own (`patron_001/patron_762x39_fmj_full_LOD1`),
+/// for `bin/loose` to pair them with the recorded.
+pub fn rounds_colliders(placed: &[Placed], names: &[&str], rounds: &[(usize, &Hierarchy)], points: &mut dyn FnMut(ObjRef) -> Option<std::sync::Arc<[V3]>>) -> Vec<(String, Collider)> {
+    let mut out = Vec::new();
+    for &(on, round) in rounds {
+        let Some(at) = placed.get(on) else { continue };
+        let point = names.get(on).copied().unwrap_or("");
+        out.extend(colliders_at(round, &hung(at), points).into_iter().map(|(name, c)| (format!("{point}/{name}"), c)));
     }
     out
 }
@@ -268,6 +365,23 @@ pub fn colliders(hierarchy: &Hierarchy, points: &mut dyn FnMut(ObjRef) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A round thrown from a port turned a quarter about y (its forward
+    /// along +x): its force in the port's axes comes out turned, the port's
+    /// move counted by the multiplier, its spin drawn in its ranges, and it
+    /// hangs as the port turned a further quarter about x.
+    #[test]
+    fn a_round_leaves_the_port_by_its_own_throw() {
+        let throw = trp_data::weapons::weapon::Extraction { force: [[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]], turn: [[2.0, 2.0], [-1.0, -1.0], [0.0, 0.0]], multiplier: 10.0 };
+        let port = euler(0.0, 90.0, 0.0);
+        let start = from_port([1.0, 2.0, 3.0], port, [0.0, 0.1, 0.0], &throw, &mut Dice::new(7));
+        assert_eq!(start.at, [1.0, 2.0, 3.0]);
+        let v = start.velocity;
+        assert!((v[0] - 1.0).abs() < 1e-5 && (v[1] - 1.0).abs() < 1e-5 && v[2].abs() < 1e-5, "{v:?}");
+        assert_eq!(start.spin, [2.0, -1.0, 0.0]);
+        let hung = mul(port, euler(90.0, 0.0, 0.0));
+        assert!(start.turn.iter().zip(hung).all(|(a, b)| (a - b).abs() < 1e-6));
+    }
 
     #[test]
     fn euler_is_unitys() {

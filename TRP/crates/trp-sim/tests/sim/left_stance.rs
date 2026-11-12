@@ -1,14 +1,14 @@
-//! The left shoulder (`docs/spec/left-shoulder.md`) with the install's body
-//! animator: the key, the body's `LS` layer and its curve in and out, the
+//! Tests of the left shoulder with the install's body animator.
+//! After `docs/spec/left-shoulder.md`: the key, the body's `LS` layer and its curve in and out, the
 //! sprint's taking it off and its end's putting it back at once, lying
 //! down's refusal, a hands operation's taking it off, blind fire's refusal
 //! and the mount's ending it. These pass trivially, with a note, where no
 //! install is configured.
 
-use trp_data::engine::EngineSettings;
-use trp_data::hard_settings::HardSettings;
+use trp_data::setup::engine::EngineSettings;
+use trp_data::setup::hard_settings::HardSettings;
 use trp_data::unity::Assets;
-use trp_sim::left_stance::{Call, HandsStart};
+use trp_sim::weapons::left_stance::{Call, HandsStart};
 use trp_sim::{Flat, Input, Movement};
 
 const DT: f32 = 1.0 / 60.0;
@@ -20,7 +20,7 @@ fn movement() -> Option<Movement> {
     let hard = HardSettings::load(&assets.install).expect("settings object");
     let engine = EngineSettings::load(&assets.install).expect("engine settings");
     let settings = trp_sim::load_movement_settings(&mut assets, db, &hard, &engine, 0.0).expect("movement settings");
-    let body = trp_sim::body::BodyData::load(&mut assets).expect("body animator");
+    let body = trp_sim::locomotion::body::BodyData::load(&mut assets).expect("body animator");
     let mut m = Movement::new(settings, trp_sim::Body::new(&body, 5.0));
     // A firearm at rest in hand: its idle's start put the animation back.
     m.step(DT, &armed(), &Flat);

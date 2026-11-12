@@ -1,5 +1,5 @@
-//! A recorded death set beside the engine's own (`bin/corpse`, a test of
-//! the four kept deaths): a trace of recorder 0.8.0 on, its first frame
+//! A recorded death set beside the engine's own, body by body and frame by frame.
+//! For `bin/corpse` and a test of the four kept deaths: a trace of recorder 0.8.0 on, its first frame
 //! after the death taken as the corpse's start, the corpse rebuilt as
 //! `corpse::build` builds it, stepped as the game steps it, and each
 //! body's place set beside the recorded one frame by frame.
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
-use trp_data::ragdoll::RagdollData;
+use trp_data::character::ragdoll::RagdollData;
 
 use crate::*;
 
@@ -20,6 +20,10 @@ pub const DEPENETRATION: f32 = 4.0;
 pub struct Frame {
     pub dead_t: f32,
     pub dt: f32,
+    /// The physics' step on this frame, where recorded.
+    pub step: Option<f32>,
+    /// Each body's place and turn by bone (on the first frame, the
+    /// bodiless bones' too).
     pub bodies: HashMap<String, (V3, Q4)>,
 }
 
@@ -44,7 +48,7 @@ pub struct Trace {
     /// The push the game gave the corpse (`ApplyCorpseImpulse`): on the
     /// body of the collider hit, at the hit, along the shot, so strong.
     pub push: Option<(String, V3, V3, f32)>,
-    pub physics: trp_data::engine::PhysicsSettings,
+    pub physics: trp_data::setup::engine::PhysicsSettings,
 }
 
 pub fn read(path: &str) -> Result<Trace> {
@@ -80,14 +84,27 @@ pub fn read(path: &str) -> Result<Trace> {
                 bodies.insert(name.clone(), (at, turn));
             }
         }
-        frames.push(Frame { dead_t: dead_t as f32, dt: v.get("dt").and_then(Value::as_f64).unwrap_or(0.0) as f32, bodies });
+        // On the first, the bones without a body that colliders hang under
+        // (the neck), where the recording has them (0.10.0 on).
+        if frames.is_empty() {
+            for (name, b) in v.get("bones").and_then(Value::as_object).into_iter().flatten() {
+                let a = b.as_array().ok_or_else(|| anyhow!("a bone is not a list"))?;
+                if let (false, Some(at), Some(turn)) = (bodies.contains_key(name), a.first().and_then(v3), a.get(1).and_then(q4)) {
+                    bodies.insert(name.clone(), (at, turn));
+                }
+            }
+        }
+        // The step the game took on this frame (`phys`: its smooth step,
+        // 0.10.0 on).
+        let step = v.get("phys").and_then(|p| p.get(0)).and_then(Value::as_f64).map(|s| s as f32);
+        frames.push(Frame { dead_t: dead_t as f32, dt: v.get("dt").and_then(Value::as_f64).unwrap_or(0.0) as f32, step, bodies });
     }
     if frames.is_empty() {
         return Err(anyhow!("no frame after a death in {path}"));
     }
     dts.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let step = dts.get(dts.len() / 2).copied().unwrap_or(1.0 / 60.0);
-    let physics = trp_data::engine::PhysicsSettings::load(&trp_data::Install::locate()?)?;
+    let physics = trp_data::setup::engine::PhysicsSettings::load(&trp_data::Install::locate()?)?;
     Ok(Trace { frames, ground, velocity, step, push, physics })
 }
 
@@ -116,7 +133,7 @@ pub fn simulate(data: &RagdollData, trace: &Trace, convention: JointConvention, 
     }
     let bodies = crate::corpse::build(&mut world, &data, &trace.frames[0].bodies, trace.velocity, DEPENETRATION, deadbody);
     let mut places = Vec::new();
-    for (index, _) in trace.frames.iter().skip(1).enumerate() {
+    for (index, frame) in trace.frames.iter().skip(1).enumerate() {
         // The push, the frame after the corpse is made
         // (`CorpseRagdoll.WorkingCycle`): on the body whose own collider was
         // hit.
@@ -127,7 +144,7 @@ pub fn simulate(data: &RagdollData, trace: &Trace, convention: JointConvention, 
                 }
             }
         }
-        world.step(trace.step);
+        world.step(frame.step.unwrap_or(trace.step));
         places.push(bodies.iter().map(|(name, body)| (name.clone(), world.pose(*body).0)).collect());
     }
     Run { places }

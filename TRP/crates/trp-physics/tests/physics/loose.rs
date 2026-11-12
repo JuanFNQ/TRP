@@ -1,5 +1,5 @@
-//! Things of the install's let fall as the game lets them fall: each one's
-//! colliders from its model as it lies loose (`loose::colliders`, a convex
+//! Tests of the install's things let fall as the game lets them fall, each to rest on the ground.
+//! Each one's colliders from its model as it lies loose (`loose::colliders`, a convex
 //! mesh's points read with it), let go from a metre and a half with the
 //! quick reload's start, and stepped as the game steps until its watch
 //! says it is done. Each comes to rest on the ground within the game's 15
@@ -19,13 +19,13 @@ const THINGS: [&str; 2] = ["55d480c04bdc2d1d4e8b456a", "5ab8ebf186f7742d8b372e80
 fn things_let_fall_come_to_rest() {
     let Ok(install) = trp_data::Install::locate() else { return };
     let db = trp_data::Database::load(&install).expect("the database");
-    let physics = trp_data::engine::PhysicsSettings::load(&install).expect("the physics settings");
+    let physics = trp_data::setup::engine::PhysicsSettings::load(&install).expect("the physics settings");
     let mut assets = trp_data::unity::Assets::new(install).expect("the install's assets");
     let mut dice = Dice::new(3);
     for template in THINGS {
         let item = db.item(template).expect(template);
         let key = item.prefab_key().expect("a model").to_owned();
-        let (hierarchy, _) = trp_data::icon::model_of(&mut assets, &key).expect("the model");
+        let (hierarchy, _) = trp_data::interface::icon::model_of(&mut assets, &key).expect("the model");
         let colliders = {
             let assets = &assets;
             let mut points = |mesh| trp_data::unity::extract::read_mesh(assets, mesh).ok().map(|m| Arc::from(m.positions));

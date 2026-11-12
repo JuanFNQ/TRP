@@ -54,7 +54,7 @@ The frame's length is the engine's.
 
 ## Compared with what
 
-**With the game: the user's recording of course 8** (recorder 0.8.0, `local\traces\courses1\8-free-look`, made 2026-10-15, read 2026-10-16; `cargo run -p trp-sim --bin byhand -- local\traces\courses1\8-free-look`, and `the_recorded_free_look_is_followed` in `crates/trp-sim/tests/free_look.rs`). 38 s at 120 frames a second, the free look's key pressed ten times, the head taken to every limit: across to 40 either way, up to 50, down to 20, and across to 28 with the sights up (990 frames of it aimed). The recorded keys go through the input manager as written here, by the install's bindings; the recorded mouse axes go to the look or the turn by `Preset::mouse`; the look's share, times the look's bindings (5, the axis up and down the other way about), goes to `HeadLook::frame` with the recorded frame time. On **all 4,552 frames**:
+**With the game: the recording of course 8** (recorder 0.8.0, `local\traces\courses1\8-free-look`, made 2026-10-15, read 2026-10-16; `cargo run -p trp-sim --bin byhand -- local\traces\courses1\8-free-look`, and `the_recorded_free_look_is_followed` in `free_look`). 38 s at 120 frames a second, the free look's key pressed ten times, the head taken to every limit: across to 40 either way, up to 50, down to 20, and across to 28 with the sights up (990 frames of it aimed). The recorded keys go through the input manager as written here, by the install's bindings; the recorded mouse axes go to the look or the turn by `Preset::mouse`; the look's share, times the look's bindings (5, the axis up and down the other way about), goes to `HeadLook::frame` with the recorded frame time. On **all 4,552 frames**:
 
 - **the head's rotation is the game's** (both figures, within a ten-thousandth of a degree), through the turns, the limits, the cut-back of the look down as the head turns aside, and the ten ways back;
 - **whether the mouse has the head and whether the head is looking are the game's**;
@@ -63,7 +63,7 @@ The frame's length is the engine's.
 
 **Seen in the same recording and not set beside the model frame for frame**: with the sights up the field of view goes from the aimed 59 to the hip's 74 within half a second of the mouse taking the head, and back to 59 as it lets go.
 
-Before the recording, tried against the install (`crates/trp-sim/tests/free_look.rs`, and the unit tests of `head_look.rs` and `bindings.rs`):
+Before the recording, tried against the install (`free_look`, and the unit tests of `head_look` and `bindings`):
 
 - the install's limits are the code's own: -40 to 40, -50 to 20, 0.7;
 - thirty degrees across and ten up: the head's rotation is exactly that, held for a second with the mouse still, and the neck's and the head's bones are each turned 15.81 degrees (half of the turn's 31.62); with the key up it is back to nothing in 0.48 s;

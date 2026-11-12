@@ -1,12 +1,12 @@
-//! Slopes and sliding (`docs/spec/movement.md`, "Slopes and sliding"), and
-//! the sprint's slide, with the install's movement and body animator: ground
+//! Tests of slopes, sliding and the sprint's slide, with the install's movement and body animator.
+//! After `docs/spec/movement.md`, "Slopes and sliding": ground
 //! too steep to stand on carries the character down it, ground that is not
 //! is stood on, a walk down a slope keeps to it, and a crouch in a sprint
 //! is the crouched way out of it. These pass trivially, with a note, where
 //! no install is configured.
 
-use trp_data::engine::EngineSettings;
-use trp_data::hard_settings::HardSettings;
+use trp_data::setup::engine::EngineSettings;
+use trp_data::setup::hard_settings::HardSettings;
 use trp_data::unity::Assets;
 use trp_sim::{Input, Movement, State, World};
 
@@ -19,7 +19,7 @@ fn movement() -> Option<Movement> {
     let hard = HardSettings::load(&assets.install).expect("settings object");
     let engine = EngineSettings::load(&assets.install).expect("engine settings");
     let settings = trp_sim::load_movement_settings(&mut assets, db, &hard, &engine, 0.0).expect("movement settings");
-    let body = trp_sim::body::BodyData::load(&mut assets).expect("body animator");
+    let body = trp_sim::locomotion::body::BodyData::load(&mut assets).expect("body animator");
     Some(Movement::new(settings, trp_sim::Body::new(&body, 5.0)))
 }
 

@@ -1,5 +1,6 @@
-//! A corpse as the game makes one (`Corpse.CreateCorpse`, `CorpseRagdoll`;
-//! health spec, "Death"; `docs/spec/physics.md`): the player prefab's
+//! A corpse as the game makes one, from the player prefab's ragdoll.
+//! `Corpse.CreateCorpse`, `CorpseRagdoll`, after the health spec, "Death", and
+//! `docs/spec/physics.md`: the player prefab's
 //! bodies, colliders and joints (`trp_data::ragdoll`) on the bones where
 //! they stand, all on the `Deadbody` layer, each body set going with the
 //! character's velocity held to 2 m/s, pushed out of what it is in at most
@@ -11,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use trp_data::ragdoll::{ColliderData, RagdollData, Shape as Rshape};
+use trp_data::character::ragdoll::{ColliderData, RagdollData, Shape as Rshape};
 
 use crate::{inverse, mul, rotate, Body, BodyDesc, CharacterJointDesc, Collider, Material, Shape, World, Q4, V3};
 
@@ -19,11 +20,29 @@ use crate::{inverse, mul, rotate, Body, BodyDesc, CharacterJointDesc, Collider, 
 /// (`CorpseRagdoll.Start`; straight up, a metre a second).
 pub const MOST_SPEED: f32 = 2.0;
 /// Unity's projection of a character joint, which `CorpseRagdoll` switches
-/// on: its default distance and angle (the prefab's spawners leave them
-/// at Unity's defaults, `PROVISIONAL` until recorder 0.9.0's set-up is read).
+/// on: its default distance and angle, as `courses2`'s deaths have every
+/// joint's.
 pub const PROJECTION: [f32; 2] = [0.1, 180.0];
 
-/// A collider of the prefab's in its body's axes.
+/// The weapon let go (`Player.DropItemDead`, `CorpseRagdoll.AttachWeapon`,
+/// `StrapAttach`, `HandAttach`; health spec, "Death"; as `courses2`'s
+/// deaths have it): a body of 1 kg, or 2 kg for a pistol, which is held
+/// fast to the right forearm; anything else hangs from the pelvis on a
+/// spring (33, damped by 3, its tolerance PhysX's 0.025, its two bodies
+/// meeting) between a point by the right palm in the weapon's axes and a
+/// point of the pelvis, in the game's axes. Each joint with its mass scale,
+/// the connected body's mass over the weapon's; its drags a new
+/// `Rigidbody`'s (none, and Unity's 0.05 for the spin).
+pub const WEAPON_MASS: f32 = 1.0;
+pub const PISTOL_MASS: f32 = 2.0;
+pub const STRAP_SPRING: f32 = 33.0;
+pub const STRAP_DAMPER: f32 = 3.0;
+pub const STRAP_BY_PALM: [f32; 3] = [0.0, 0.1, -0.1];
+pub const STRAP_ON_PELVIS: [f32; 3] = [-0.215, 0.164, -0.159];
+pub const UNITY_ANGULAR_DRAG: f32 = 0.05;
+
+/// A collider of the prefab's in its body's axes, with the material it
+/// names (`flesh`: bouncing at half, as `courses2`'s deaths have it).
 pub fn collider(c: &ColliderData) -> Collider {
     let (at, turn) = c.local.unwrap_or(([0.0; 3], [0.0, 0.0, 0.0, 1.0]));
     let (shape, centre) = match c.shape {
@@ -32,7 +51,20 @@ pub fn collider(c: &ColliderData) -> Collider {
         Rshape::Capsule { centre, radius, height, direction } => (Shape::Capsule { radius, height, direction: direction as u8 }, centre),
     };
     let moved = rotate(turn, centre);
-    Collider { shape, at: [at[0] + moved[0], at[1] + moved[1], at[2] + moved[2]], turn, material: Material::default() }
+    Collider { shape, at: [at[0] + moved[0], at[1] + moved[1], at[2] + moved[2]], turn, material: Material::of(c.material) }
+}
+
+/// A collider of the prefab's in its body's axes, where the bones stand in
+/// `poses` (the body's own at `body`): one under a bone without a body of
+/// its own (the neck) where that bone stands, if `poses` has it, else at
+/// the skeleton's rest.
+pub fn collider_posed(c: &ColliderData, body: (V3, Q4), poses: &HashMap<String, (V3, Q4)>) -> Collider {
+    let Some(((place, turn), (bone_at, bone_turn))) = c.via.as_ref().and_then(|(bone, local)| Some((*local, *poses.get(bone)?))) else { return collider(c) };
+    let moved = rotate(bone_turn, place);
+    let (at, turn) = ([bone_at[0] + moved[0], bone_at[1] + moved[1], bone_at[2] + moved[2]], mul(bone_turn, turn));
+    let back = inverse(body.1);
+    let local = (rotate(back, [at[0] - body.0[0], at[1] - body.0[1], at[2] - body.0[2]]), mul(back, turn));
+    collider(&ColliderData { local: Some(local), ..c.clone() })
 }
 
 /// The velocity a corpse's bodies start with.
@@ -49,8 +81,9 @@ pub fn start_velocity(v: V3) -> V3 {
 }
 
 /// The corpse's bodies and joints in a world, the bodies where `poses`
-/// has their bones (in the game's axes); a bone it lacks has no body. The
-/// bodies by bone.
+/// has their bones (in the game's axes); a bone it lacks has no body. A
+/// collider under a bone with no body (the neck) goes where `poses` has
+/// that bone (`RagdollData::posed_bones` names them). The bodies by bone.
 pub fn build(world: &mut World, data: &RagdollData, poses: &HashMap<String, (V3, Q4)>, velocity: V3, depenetration: f32, layer: u16) -> HashMap<String, Body> {
     let speed = start_velocity(velocity);
     let mut bodies: HashMap<String, Body> = HashMap::new();
@@ -60,7 +93,7 @@ pub fn build(world: &mut World, data: &RagdollData, poses: &HashMap<String, (V3,
         let body = world.add_body(&BodyDesc {
             at: *at,
             turn: *turn,
-            colliders: b.colliders.iter().map(collider).collect(),
+            colliders: b.colliders.iter().map(|c| collider_posed(c, (*at, *turn), poses)).collect(),
             mass: b.mass,
             drag: b.drag,
             angular_drag: b.angular_drag,

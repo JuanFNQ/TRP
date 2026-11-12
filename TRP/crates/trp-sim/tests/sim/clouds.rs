@@ -1,16 +1,16 @@
-//! Customs' clouds and moon as the install sets them up, beside recorder
-//! 0.11.0's scene of Customs in the morning (`local/traces/courses3/
-//! 0-light-outside`): the cloud controller's ambient gradient, the wind
+//! Tests of Customs' clouds and moon as the install sets them up, beside a recorded scene.
+//! The scene is recorder 0.11.0's of Customs in the morning, `local/traces/courses3/
+//! 0-light-outside`: the cloud controller's ambient gradient, the wind
 //! controller's multipliers, the sun's cookie (its name and size, its
 //! light's place), the moon's way; and the figures the clouds' passes take
 //! at the recorded moment, printed. The passes' pictures were not recorded.
 //! Skipped where the recording or the install is not there.
 
-use trp_data::clouds::{LevelClouds, LevelMoon};
-use trp_data::tod::TimeOfDayLevel;
+use trp_data::level::clouds::{LevelClouds, LevelMoon};
+use trp_data::level::tod::TimeOfDayLevel;
 use trp_data::Install;
-use trp_sim::clouds::{CloudFigures, CloudInput, CloudsQuality};
-use trp_sim::tod::CUSTOMS_RECORDED_MORNING;
+use trp_sim::lighting::clouds::{CloudFigures, CloudInput, CloudsQuality};
+use trp_sim::lighting::tod::CUSTOMS_RECORDED_MORNING;
 
 fn recorded() -> Option<serde_json::Value> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../local/traces/courses3/0-light-outside/light-outside.scene.json");
@@ -83,8 +83,8 @@ fn customs_clouds_are_read_as_the_game_has_them() {
 fn customs_morning_clouds_figures() {
     let Some((scene, install, level)) = setup() else { return };
     let clouds = LevelClouds::read(&install, &level).expect("Customs' clouds");
-    let sky = trp_sim::tod::Sky::of_level(&level).unwrap();
-    let stored = trp_sim::tod::stored_atmosphere(&level.sky).unwrap();
+    let sky = trp_sim::lighting::tod::Sky::of_level(&level).unwrap();
+    let stored = trp_sim::lighting::tod::stored_atmosphere(&level.sky).unwrap();
     let m = CUSTOMS_RECORDED_MORNING;
     let state = sky.settle(m.hour, m.cloudiness, stored, 12);
     let input = CloudInput {
@@ -104,7 +104,7 @@ fn customs_morning_clouds_figures() {
     // The cookie's axes are the recorded light's.
     let sun = scene["lights"].as_array().unwrap().iter().find(|l| l["name"] == "Weather/Sky Dome/Light").unwrap();
     let turn: Vec<f32> = sun["rot"].as_array().unwrap().iter().map(f).collect();
-    let rotate = |v: [f32; 3]| trp_data::level_light::rotate([turn[0], turn[1], turn[2], turn[3]], v);
+    let rotate = |v: [f32; 3]| trp_data::level::level_light::rotate([turn[0], turn[1], turn[2], turn[3]], v);
     let shadows = figures.shadows.expect("the clouds cast shadows at low");
     close("the light's right", &shadows.sun_right, &rotate([1.0, 0.0, 0.0]), 2e-4);
     close("the light's up", &shadows.sun_up, &rotate([0.0, 1.0, 0.0]), 2e-4);

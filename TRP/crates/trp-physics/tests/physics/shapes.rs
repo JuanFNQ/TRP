@@ -1,3 +1,5 @@
+//! Tests that every kind of shape is made and stepped, a convex hull resting as its box would.
+
 use trp_physics::*;
 
 fn body(world: &mut World, shape: Shape) -> Body {

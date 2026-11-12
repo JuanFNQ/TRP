@@ -1,6 +1,6 @@
 //! The install, read once for the whole binary. `Database::load` parses the item database (tens
-//! of megabytes of JSON) and nearly every test called it for itself, forty-two times a run; since
-//! 0.100.3 the tests borrow the one copy. The assets are not shared: `Assets` caches as it reads
+//! of megabytes of JSON) and nearly every test called it for itself, forty-two times a run; now
+//! the tests borrow the one copy. The assets are not shared: `Assets` caches as it reads
 //! and the tests take it by `&mut`, so each makes its own from the install.
 use std::sync::OnceLock;
 use trp_data::{Database, Install};
@@ -15,7 +15,7 @@ pub fn install() -> Option<Install> {
         .get_or_init(|| match Install::locate() {
             Ok(install) => Some(install),
             Err(_) => {
-                eprintln!("skipped: no install configured (set EFT_DIR or local/eft_dir.txt)");
+                eprintln!("skipped: no install configured (set SPT_DIR or local/spt_dir.txt)");
                 None
             }
         })

@@ -1,6 +1,6 @@
 # Tactical devices: weapon lights, lasers, combo units, the head light
 
-Read 2026-10-24 (session 127) from the decompiled game and the install through `probe`; the reading's
+How the weapon's lights, lasers and combo units and the head light are switched and drawn. Read 2026-10-24 from the decompiled game and the install through `probe`; the reading's
 notes and outputs: `local\tactical_s127.md`, `local\tactical_s127\`. Our own words. Conventions:
 Unity's (y up, z ahead); "normalised" animator times are fractions of a state's clip.
 
@@ -40,7 +40,10 @@ parts included.
   sound where accepted. **T up** (Hold mode only): where any is on, all off, forced past any refusal, not
   animated, the sound. Hold mode's lights also go off, forced, with the sound, when the hands change, on a
   death, on any screen but the battle screen (the inventory), on the window's focus lost, on quitting and
-  on the voice chat starting.
+  on the voice chat starting: each an event, once (`GamePlayerOwner.ReleaseTactical`), the hands' change
+  as it begins (`Player.HandsChangingEvent`, the old weapon still in hand), the hip penalty worked out
+  again on that frame (recorded: `courses8\tactical-hold`, the inventory at 5.777 s and the switch's
+  `Remove` at 9.903 s, the lights off and the penalty back on each one's frame).
 - **Ctrl+T** (either mode): every device's mode one up, each wrapping by its own count (an off device's too,
   unseen; a one-mode device stays at 0), animated.
 
@@ -117,7 +120,8 @@ H flips each head device's on, Ctrl+H adds one to its mode, **written on the ite
 gesture `HelmetRailGear` (the body's `15 Helmetrail`, 1.00 s) is asked, refused as any gesture is (a
 sprint, the hands not at rest). Whether or not it played, **at 0.8 s** the sound and the model's switch,
 **at 1.4 s** the lock lifted. **In first person** (one's own player, any point of view): the head device's
-meshes are hidden for good, and each of its lights and lasers is placed every frame at the camera, 0.2 m
+meshes are hidden for good, and each of its lights and lasers is placed every frame (in `Update`, before
+the camera's own move: by the camera as the frame before left it, a frame behind the view) at the camera, 0.2 m
 to its side (right or left by where it sits), up and ahead, turned 10 degrees down and 3 in, plus a term
 below a field of view of 50. Only a light that is on is moved, each along its own turn of the frame it was
 last moved, so one lit for the first time moves along its model's turn on that frame. **As recorded**
@@ -125,11 +129,28 @@ last moved, so one lit for the first time moves along its model's turn on that f
 after the press and the lock lifted 1.401 to 1.411 s after it, each on the frame our coroutine gives, the
 first wait counted from the press's frame and the second from the switch's; the gesture's flag
 (`IsInteraction`, `InteractionIndex` 15) up 1.008 to 1.012 s; the item's state written at the press, the
-light shown at the switch.
+light shown at the switch. **Recorded again** (`courses2\6-helmet`, recorder 0.10.0, a WF-501B on the Galvion
+Caiman's rail; the key itself not recorded): eight gestures, four of them walking, each 1.008 s (one 1.010),
+and `weapon_light_switcher1` 0.800 s after each began; the gestures replayed as begun, every frame the game's;
+the devices not run there (the replay has none where a recording lists none: inventory spec, "A switch on the
+head").
+
+**Seen from outside, and put away** (read 2026-11-08). The head's lights and lasers are moved to the
+camera by the player's owner alone (`GamePlayerOwner.LateUpdate` calls `HeadLightsValidator`, which holds the
+head's lights from `ParentedModelChangeHandler`); another player's stay where their model has them, on the
+device on the helmet, turned as the helmet is, its meshes drawn and its `mode_*` objects switched as any model's.
+The hideout, the one place the game shows its own player from outside, pauses the moving there
+(`HideoutPlayerOwner`: `SetPause(!FirstPersonMode)`). A view from outside shows the character as others see it
+(`third-person.md`), so there the head's lights, lasers and flares are on their objects on the model of what is
+worn. **A weapon put away** hangs its whole model on its slot's bone (`PlayerBody.SlotView.CreateAndParent`, the
+body animator spec's "Weapons on the body"); for its own player the game switches that model's renderers off and
+nothing else, so its devices' objects, lights and flares stay as its item's state has them, and its lasers too
+(`LaserBeam.LateUpdate` draws them itself, `Graphics.DrawMesh`, no renderer of the model). A slung rifle's light
+so shines from the back, down and behind the character, in first person as from outside.
 
 ## The light shaft and the flare
 
-Read 2026-10-25 (session 128) from the decompiled game, the install and the published source of the
+Read 2026-10-25 from the decompiled game, the install and the published source of the
 shaft's origin; the notes and outputs: `local\flare_shaft_s128.md`, `local\flare_s128\`.
 
 **The shaft** is SlightlyMad's published `VolumetricLights` (BSD licence) as the game changed it: the
@@ -143,7 +164,7 @@ times a phase of Henyey-Greenstein with g 0.014 (all but flat); extinction, nois
 sum times the light's colour and intensity; the depth halved by a checkerboard of its least and most, a
 13-tap blur that keeps to the depth both ways, an upsample that keeps to edges past 1.5 m, and the shaft
 added to the picture before the bloom and the tonemap: a faint haze, about 0.036 of the light's colour
-over 5 m. **The user's game has the option off**: in course 7 the component is on a light only until it
+over 5 m. **The recorded game has the option off**: in course 7 the component is on a light only until it
 is first lit (the WF-501B's `light_002` before 4.31 s, then gone), so no shaft is drawn there.
 
 **The flare** (`FlareLight` on each mode's `NewMultiFlareLight`, drawn by one manager for every light of
@@ -151,8 +172,70 @@ the scene): screen-aligned quads at the light's place, moved 0.1 m toward the ca
 atlas, after the transparent things; their size an angle; their brightness by the distance and by how
 much of 23 depth taps around the light are clear. `SingleFlareController` moves its alpha at 2 a second
 (15 for a laser) toward `(dot(toward the camera, the light's way) − 0.6) / 0.4` (0.999 for a laser), not
-held at nothing: **behind one's own light the alpha sinks below nothing and no flare is ever drawn**, so the
-flares are another's lights' (a bot's), and wait for one.
+held at nothing: **behind one's own light the alpha sinks below nothing and no flare is ever drawn**, so in
+first person the flares are another's lights' (a bot's, the dummies' here); seen from outside, one's own light
+faced shows its flare as another's would.
+
+**A light's flares** (read again 2026-11-08 with the install: `probe devices <device>` lists them). On each mode's
+`NewMultiFlareLight`, at the lens with the light's turn (its z the beam's axis): `FlareLight`'s own size and alpha
+for all its flares (`_totalScale`, 1.2 to 2.1 by device; `_totalAlpha`, which the controller replaces each
+frame), and its flares, each with a size both ways, an alpha, a colour, a kind (`FlareType`: 0 normal, 1 off
+screen, 2 noise, 3 flashlight), a near and a far distance and its size and alpha at each, and a picture's number
+in the level's atlas. A white light has four: three flashlights (a hot point with a very wide faint halo, size 2;
+a hard disc, alpha 0.1 to 0.3; a thin many-rayed star) and one noise flare (the star again, size 2, alpha 0.2 to
+0.3, out by 15 m); the Klesch-2U's light 1.5. An infrared light's flares (`IkLight.FlareLight` names them) are put
+to −1 in every view without night vision, so never shown here. A light enters the drawn set while its object is
+on: switched on, its alpha starts from nothing and climbs at its speed (2 a second for a white light).
+
+**Each flare's figures** (`PrepareGpuData`, for a light on): its colour the flare's times the light's alpha, its
+own least and alpha and the batch's alpha factor, held within 0 and 1, the light's alpha itself kept beside it;
+its size the flare's times its least size, the light's size and the batch's size factor; its distance curve's
+start, one over its length, and its size's and alpha's change over it as shares of their nearest. **The
+flashlights crowd** (`ManageFlareOverlap`, their batch's alone, not under night vision): each one's size times
+`lerp(1, 0.25, n / 5)`, `n` the sum over the other flashlight flares within 0.5 m of one less their distance over
+0.5, at most 5; a lone light's three at one point count 2 each and draw at 0.7. **The eyes' protection**
+(`FlareBlindnessController`, `Player.GetBlindnessProtection`): the largest `BlindnessProtection` of the armoured
+things in the eyewear, headwear and face cover slots, whatever their switch, then of the headwear and all fitted
+to it, one at least as high with no face shield, or whose shield has no switch or is down; at the level's start
+at once, at a change 0.6 s later and then at 4 a second (a change before that begins the wait anew); every batch's
+alpha and size then times one less it (the level's factors 1; under night vision 1).
+
+**The shaders** (one quad a flare at its light's place, facing the screen, added to the picture after the
+transparent things, no depth test, both faces). `Custom/multiFlare` (the normal and flashlight flares): the
+point moved 0.1 m toward the camera; none where the light's alpha is under 0.01 or the point is outside the view;
+23 taps of the scene's depth around it, spread by the projection's scales times 0.003 over its depth, a tap
+counting where the point is nearer than the scene there; the share counted (none, none drawn) shrinks it and
+dims it; the screen's edge fades it over the outer eighteenth each way; past its near distance its size and alpha
+go toward their far figures; its half size the projection's scales times its size times its distance from the
+near plane times the share and the size's change, so a fixed angle on the screen, larger zoomed; its colour the
+flare's times the alpha's change, the edge, the light's alpha again and the share; the picture times that times
+0.6. `Custom/ShitOnScreen` (the noise flare): the point moved 1 m toward the camera (so none for a light under a
+metre off); its taps and its distance taken as compiled, two of its tests not turned for the reversed depth, so
+nearly every tap counts and its distance is the near plane's (a size in the world, about 3 cm a unit of its size
+at a metre); a silhouette: from a point 0.4 m toward the camera, probes 1.25 cm apart, seven each way along the
+view's x and y, each way the nearest clear one's eighth (1 where none is clear), the two ways multiplied where
+the scene hides the point itself, one less that its share; a fine grain (the level's "Noise", 2 by 2 across the
+screen, moved every frame) times 5 over its picture.
+
+**Built** (2026-11-08: a flashlight shone on the camera blinds it, and for the light to come from, the dummies'
+guns get a light): `trp_data::tactical` (`DeviceFlare`, `Flare`,
+`FlareController`, `flare_pictures`: the atlas "Atlas2", `sharedassets3.assets` #11, and "Noise",
+`resources.assets` #1379, read by number and checked by name), `trp_sim::flare` (the alpha, each flare's
+figures, the crowding, the protection; the atlas's ten rectangles and the two shaders' figures as the level's
+materials set them), `trp_sim::inventory::blindness_protection`, the app's `flare_view` (each frame once
+everything is placed, on the main camera and the optic's) and `flare.wgsl` in `muzzle_view`'s pass, under
+`TACTICAL DEVICES` with the dummies. The light: the dummies' AKM is the stock build with a Zenit B-10M handguard
+and the Klesch-2U in its `mod_tactical` (`dummy::build`, in hand and in their kit), its model, its spot light and
+its flares shown by `tactical_view::show_dummy_devices` in its first mode while the debug panel's `LIGHTS` is on
+(`--dummy-lights` from the start). `PROVISIONAL`: each light's place and way as the frame leaves them (the game
+moves the alpha in its `Update`, before the frame's animation); drawn after Bevy's tonemapping on the frame
+encoded for the camera's effects, as the muzzle flash is, where the game adds them before its bloom and
+tonemapping; the depth taps held to the screen's edge (the engine's sampler not read); the taps' pattern with
+the screen's y down. **Seen** (`local\shots\flare_dummy_s229.png`: 3.5 m before the standing dummy, the light a
+hot point in a wide bluish glare; `flare_side_s229.png`: from 3 m to its side, none). **Tested** (the flare
+module's four: the alpha by the facing, sinking to −4 and two seconds back; a flare's figures; the crowding at
+0.7 and further; the protection's wait and pace; `the_flares_protection_is_what_the_head_wears` with glasses
+and the Altyn's shield up and down). **Not compared with the game**: no recording has a bot's light.
 
 **The HUD** (`TacticalInteractionPanel`) shows only on T+B: "Press" or "Hold", lower right, text size 50.
 Nothing shows on a toggle or a mode change.
@@ -166,14 +249,18 @@ wander's scale (weapon-handling spec). Worked out when the controller is made (a
 taken; the game never keeps the prefab's 1 once a weapon is drawn (E 50 gives 0.95, E 100 0.75). **As
 recorded** on every change of five weapons (`courses6`: the M60E6 FDE at E 4.75, 1 and 0.288125; the M4A1
 at 45.57 and 47.53, 0.96772, 0.186075 and 0.95988; the MDR at 76.26, 0.84496; the SPEAR at 30.69 and 29.76,
-1), the rule to the last figure. **Ours** (0.120.0) on the simulation's total ergonomics, which lacks the
-gear's ergonomics penalty: the M60E6 build's 5 against the game's 4.75 (0.2875 for 0.288125).
+1), the rule to the last figure. **Ours** on the simulation's total ergonomics, which lacks the
+gear's ergonomics penalty: the M60E6 build's 5 against the game's 4.75 (0.2875 for 0.288125). **A firearm
+drawn** after other hands works its own out as its controller is made since 0.223.2 (`Hands::firearm_made`,
+the host passing whether a combo unit on that weapon is on; before, it kept the last hands' figure unless
+the combo state differed): weapon-handling spec, "The hip penalty, each weapon's own".
 
 ## State
 
 On the item (`upd.Light`), no battery and no timer. In Press mode only the keys change it: it stays through
 weapon switches, the inventory and saving, and a weapon drawn comes out with its device on; by the code a
-slung weapon's light stays on (to be seen in a recording). In Hold mode, off at every event above.
+slung weapon's light stays on ("Seen from outside, and put away", above; to be seen in a recording). In Hold
+mode, off at every event above.
 
 ## Not read, or not settled
 
@@ -182,8 +269,10 @@ the game's T alone also fires with Ctrl held is not read); the clips' motion (`t
 of the IR lights' switch against the recorder's frame, and of the lasers against the head light's placement
 (a helmet laser may lag a frame); the HUD panel's own fade (ours the optic panel's: 0.5 s in, 3 s, 0.5 s
 out); which of the two spots of the X400, the Klesch-2P and the DBAL is which mode's (the WF-501B's:
-recorded, above); whether a reload's change of magazine works the hip penalty out again
-(`WeaponModified`); the one frame at nothing of a light first lit; the flare's and the shaft's figures not
+recorded, above); when within a reload its change of magazine works the hip penalty out again
+(`WeaponModified`, which does, called by `InsertMagOperation`, `PullOutMagOperation` and
+`ReloadExternalMagOperation`: read 2026-11-08; the app's build changed mid-reload keeps the old build's
+figure, PROVISIONAL); the one frame at nothing of a light first lit; the flare's and the shaft's figures not
 listed above (`local\flare_shaft_s128.md`, "Not read, or uncertain").
 
 ## Built
@@ -205,7 +294,7 @@ listed above (`local\flare_shaft_s128.md`, "Not read, or uncertain").
   and the lock; the player's tactical sound (`TOGGLE_SOUNDS`' `SwitchHeadlights`) for Hold mode and the
   head light, played whole (`PROVISIONAL`: the game's is placed 1.2 m over the feet, rolloff 5).
 - **The hip penalty** by ergonomics for every weapon (`Hands::update_hip_inaccuracy`), lower with a combo
-  unit on.
+  unit on; a firearm drawn works its own out (`Hands::firearm_made`).
 - **The look**: each device's model by its state (`mode_000` off, its mode's object on), with the switch
   off too; its lights as Bevy's spot and point lights with the cookie (`SpotLightTexture`; the game's
   shading reads its alpha over the cone's square, `game_shading.wgsl`), soft shadows by Bevy's filtering,
@@ -216,16 +305,34 @@ listed above (`local\flare_shaft_s128.md`, "Not read, or uncertain").
   lasers dark (no night vision here). Since 0.121.0, with `CUSTOMS LIGHT` off, a light is multiplied by
   2^9.7 for the camera's own exposure (`tactical_view::exposure_gain`; `lighting.md`, "The range's own
   light by the hour"): until then it was worked out for the game's exposure and barely showed.
-- **Not built**: the light shaft (the user's game has it off; to come with a graphics option of its own);
-  the flare (never drawn for one's own lights: with a bot's); the one frame at nothing of a light first
-  lit; a slung weapon's lights.
+- **Since 0.167.0** the keys, Hold mode's let-go, the head light's coroutine and the hip penalty are the
+  simulation's (`trp_sim::tactical::Devices`, one frame at a time, `Keys` and `Around` in, `Event`s out),
+  run by the app (`tactical_view::tactical_keys`) and by the replay alike; the hip penalty worked out
+  again whenever a request changes a combo unit's on, a let-go's too with the keys unheard; Hold mode let
+  go as a change of the hands begins (`HandsHeld::changes`). The lasers' figures from a hit are the
+  simulation's too (`tactical::laser_figures`, `laser_light_at`); the head's lights and lasers are placed
+  by the camera as the frame before left it (`Tactical::head_camera`).
+- **Since 0.218.0**: seen from outside, the head's lights and lasers on their objects on the body's model
+  of what is worn (`body_view::HeadModels::device_on_body`: a fitted part's tree is hung in its prefab's
+  order, so its object n is the hung tree's root plus n), and the head devices' `mode_*` objects there as
+  their state shows; one's own flares gathered with the dummies' (`flare_view`: the weapon in hand's, the
+  weapons hung on the body's, the head's from outside; in first person the head's are not gathered, since
+  they face away from the eyes); the weapons hung on the body (`slung_view`, under `WEAPONS ON THE BODY`)
+  with their devices as their items have them (`show_slung_devices`: the `mode_*` objects, the lights,
+  the lasers; their figures read with the model, `icons::Model::devices`). **Seen**: the head light's
+  pool ahead from the helmet and its flare from the front, the gun light's flare from the front, the
+  slung AKM's light on the floor behind the character, the AKM drawn again still lit (`workbench.md`,
+  0.218.0). **Not compared**: no recording has one's own light from outside nor a slung weapon's light.
+- **Not built**: the light shaft, left out (by choice: the recorded
+  game has the graphics option off); the one frame at
+  nothing of a light first lit. (The flare is built: "The light shaft and the flare", 0.214.0.)
 
 ## Compared with
 
 `courses6` (recorder 0.13.0, 2026-10-24), course 7's six scripts with the M60E6 FDE (a Klesch-2P and an
 X400, a WF-501B on the helmet) and with the M4A1 (an Olight Baldr Pro; its `05-refusals` from 2.8 s and its
 `06-modes-off` with the SPEAR, the script having drawn the first primary), by `cargo run -p trp-sim --bin
-tactical -- <folder>` (0.120.0; `local\compare_c7_m60_s128.txt`, `compare_c7_m4_s128.txt`):
+tactical -- <folder>` (`local\compare_c7_m60_s128.txt`, `compare_c7_m4_s128.txt`):
 
 - **Every press** (29 with each weapon): the devices' states our keys give from the
   recorded states before it, refused or not by our rule on the recorded operation, are the recorded ones
@@ -245,3 +352,25 @@ tactical -- <folder>` (0.120.0; `local\compare_c7_m60_s128.txt`, `compare_c7_m4_
   and the lock by hand (course 7's steps made by hand were not run); a capture beside the game's
   pictures in daylight only (`local\shots\c7_m60_mode1_s128.png` beside the game's
   `01-toggle-pic2.png`: the two faint beams leaving the two devices).
+
+`courses8`'s group 3 (recorder 0.14.0, by hand): `2017-tactical-lights` (the M4A1 with an X400
+and a PEQ-15, Ctrl+T through their modes, a canted sight), `rifle-with-only-one-light` (the SKS's XC1, one
+mode), `pistol-tactical-light` (the USP's X400, twelve presses in 2.1 s), `tactical-laser-dark`,
+`tactical-hold` (Hold mode, the inventory, a weapon switch, T+B), `headlamp` (the WF-501B: H and Ctrl+H
+standing, prone, in blind fire, leaning, with presses in its lock) and `headlamp-sprint-reload` (refused in
+the sprint, taken in a reload without the gesture). Their keys through our model of the input manager
+(`byhand --scenario`), replayed on the recorded frames (`local\c8_tac_run_s169.sh`; the regression's
+`r25` to `r31`, `tactical-hold` to 5.70 s), and `bin/tactical`:
+- **Every frame of all seven**: each device's on and mode, the hands' `MOD SWITCH` (every press at rest,
+  the pistol's quick ones, a one-mode device's Ctrl+T), every switch's sound (the hands' and the player's),
+  the head light's lock and the gesture's flag (presses in the lock and in the sprint refused, the one in
+  a reload taken without the gesture), the hip penalty and its ergonomics: the game's.
+- **The weapon's devices**: all 27 states seen, each light lit with all its figures (the PEQ-15's
+  indicator too), the models' `mode_*` objects and the lasers drawn, the game's; 13,173 lasers' beam,
+  dot and dot's light by our figures from the recorded hit, to the fifth decimal, the light's place within
+  0.05 mm.
+- **The head light**: its way within 0.028 degrees by the camera as the frame before left it (2.6 by the
+  frame's own), its place 5.3 and 4.7 mm rms in the two that walk, prone and sprint.
+- **Not compared**: the weapon's lights' and lasers' own place and way frame by frame; the let-go by the
+  inventory and the weapon switch (the replay plays neither; seen in the recording's timeline, the rule
+  read from code); the T+B panel; Hold mode's own sound's place.

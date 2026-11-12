@@ -1,11 +1,10 @@
-//! A thing's figures as the inspect window lists them
-//! (`trp_sim::item_attributes`; inspect-window spec), from the install.
-//! These pass trivially, with a note, where no install is configured.
+//! Tests of a thing's figures as the inspect window lists them, from the install.
+//! After the inspect-window spec, through `trp_sim::item_attributes`. These pass trivially, with a note, where no install is configured.
 
-use trp_data::inventory::Loadout;
+use trp_data::character::inventory::Loadout;
 use trp_data::Database;
-use trp_sim::inventory::{Item, Kind};
-use trp_sim::item_attributes::{figures, Show};
+use trp_sim::items::inventory::{Item, Kind};
+use trp_sim::items::item_attributes::{figures, Show};
 
 const AKM: &str = "59d6088586f774275f37482f";
 /// 7.62x39 PS.
@@ -61,6 +60,45 @@ fn a_weapon_s_figures() {
 
 /// A round: its damage, its penetration as a dropdown, its calibre, its
 /// speed, each where it has one.
+/// A repair buff in the inspect window (`BuffComponent`, `RepairBuffAttribute`;
+/// read from code): the AKM at 90 with a Common spread buff of 0.945 and a
+/// threshold of 74.25 lists it last, "REDUCES WEAPON SPREAD (COMMON)",
+/// "5 %", enhanced, its tooltip the durability left to two places in the
+/// enhancement's blue; ACCURACY enhanced with the same tooltip, its MOA and
+/// its change by the deviation times 0.945 once. A protection buff marks
+/// no other row.
+#[test]
+fn a_repair_buff_s_rows() {
+    use trp_sim::items::repair::{BuffKind, Rarity, RepairBuff};
+    let Some(db) = db() else { return };
+    let words = |key: &str| match key {
+        "WEAPON SPREAD COMMON BUFF" => Some("REDUCES WEAPON SPREAD (COMMON)".to_owned()),
+        "UI/ModifiedByRepairKitEnhancement" => Some("Enhanced by a repair kit".to_owned()),
+        "UI/DurabilityLeft" => Some("Durability left:".to_owned()),
+        _ => None,
+    };
+    let mut rifle = stock(&db, AKM);
+    if let Some(wear) = rifle.repairable.as_mut() {
+        wear.durability = 90.0;
+    }
+    let plain = figures(&rifle, &db, &words);
+    rifle.buff = Some(RepairBuff { rarity: Rarity::Common, kind: BuffKind::WeaponSpread, value: 0.945, threshold: 74.25 });
+    let shown = figures(&rifle, &db, &words);
+    let last = shown.rows.last().expect("rows");
+    assert_eq!((last.id, last.name.as_str(), last.value.as_deref(), last.show.clone(), last.enhanced), ("WeaponSpreadCommonBuff", "REDUCES WEAPON SPREAD (COMMON)", Some("5 %"), Show::Compact, true));
+    assert_eq!(last.tip.len(), 1);
+    assert_eq!(last.tip[0].text, "<color=#54c1ff>Enhanced by a repair kit (Durability left: 15.75)</color>");
+    let (before, after) = (&plain.rows[1], &shown.rows[1]);
+    assert!(after.id == "CenterOfImpact" && after.enhanced && after.tip == last.tip && !before.enhanced);
+    let moa = |row: &trp_sim::items::item_attributes::Row| row.value.as_deref().and_then(|value| value.split(' ').next()?.parse::<f32>().ok()).expect("a figure");
+    assert!((moa(after) - moa(before) * 0.945).abs() < 0.011, "{:?} {:?}", before.value, after.value);
+    let (Show::Bar { delta: d0, .. }, Show::Bar { delta: d1, .. }) = (&before.show, &after.show) else { panic!("bars") };
+    assert!(d1 < d0, "the deviation's change smaller: {d0} {d1}");
+    rifle.buff = Some(RepairBuff { rarity: Rarity::Rare, kind: BuffKind::MalfunctionProtections, value: 0.8, threshold: 70.0 });
+    let protected = figures(&rifle, &db, &words);
+    assert_eq!(protected.rows.iter().filter(|row| row.enhanced).map(|row| (row.id, row.value.clone())).collect::<Vec<_>>(), [("MalfunctionProtectionsRareBuff", Some("19 %".to_owned()))], "(1 - 0.8) × 100 = 19.99..., cut to 19");
+}
+
 #[test]
 fn a_round_s_figures() {
     let Some(db) = db() else { return };
@@ -96,7 +134,7 @@ fn an_armour_s_figures() {
 }
 
 /// An armoured rig (the Bagariy): ARMOR POINTS, then CONTAINER SIZE (its
-/// grids' cells, 25 as the user's capture of the game shows), then its
+/// grids' cells, 25 as a capture of the game shows), then its
 /// penalties; its zones and class last.
 #[test]
 fn an_armoured_rig_s_figures() {
@@ -110,7 +148,7 @@ fn an_armoured_rig_s_figures() {
 }
 
 /// A round's penetration dropdown (`MultiLineInfo(penetrationPower)`): the
-/// PS's 35, as the user's capture of the game shows for the SPP's 35: very
+/// PS's 35, as a capture of the game shows for the SPP's 35: very
 /// high through classes 1 to 3, low through 4, very low through 5 and 6.
 #[test]
 fn a_round_s_penetration_lines() {
@@ -132,15 +170,15 @@ fn a_round_s_penetration_lines() {
     );
 }
 
-/// Medicine as the game's inspect window lists it (the user's captures of
-/// 2026-10-26, `local\GrizzlyInspect.png`, `Calok Inspecty.png`,
+/// Medicine as the game's inspect window lists it (captures of the game,
+/// `local\GrizzlyInspect.png`, `Calok Inspecty.png`,
 /// `Stimulant Inspect.png`, `Stimulant Inspect2.png`): every row's name and
 /// value, in its order, in the install's English words.
 #[test]
 fn medicine_s_figures_are_the_captures() {
     let Some(db) = db() else { return };
     let install = crate::fixture::install().expect("install");
-    let texts = trp_data::inventory::item_texts(&install, "en").expect("texts");
+    let texts = trp_data::character::inventory::item_texts(&install, "en").expect("texts");
     let rows = |template: &str, resource: Option<f32>| -> Vec<(String, String)> {
         let mut item = Item::new(std::sync::Arc::new(Kind::of(db, template).expect("the item")));
         item.resource = resource;
@@ -190,4 +228,30 @@ fn medicine_s_figures_are_the_captures() {
     let water = figures(&Item::new(std::sync::Arc::new(Kind::of(db, "5448fee04bdc2dbc018b4567").expect("water"))), db, &|key| texts.say(key));
     let hydration = water.rows.iter().find(|row| row.name == "HYDRATION").expect("its hydration");
     assert_eq!((hydration.value.as_deref(), hydration.colored), (Some("60"), Some(60.0)));
+}
+
+/// A backpack (`Backpack`, its `EquipmentPenaltyComponent`): CONTAINER
+/// SIZE, then each of its penalties that is not nought, "%" after and
+/// coloured by its sign; none where it has none.
+#[test]
+fn a_backpack_s_figures() {
+    let Some(db) = db() else { return };
+    let names = ["speedPenaltyPercent", "mousePenalty", "weaponErgonomicPenalty"];
+    let packs: Vec<&str> = db.items.values().filter(|template| db.is_a(template, "Backpack")).map(|template| template.id.as_str()).collect();
+    let pack = *packs.iter().find(|id| names.iter().all(|name| prop(db, id, name) != 0.0)).expect("a backpack with all three penalties");
+    let item = Item::new(std::sync::Arc::new(Kind::of(db, pack).expect("its kind")));
+    let shown = figures(&item, db, &|_| None);
+    let ids: Vec<&str> = shown.rows.iter().map(|row| row.id).filter(|id| *id != "LimitedDiscard").collect();
+    assert_eq!(ids, ["ContainerSize", "ChangeMovementSpeed", "ChangeTurningSpeed", "Ergonomics"], "{pack}");
+    let ergonomics = prop(db, pack, "weaponErgonomicPenalty");
+    let row = shown.rows.iter().find(|row| row.id == "Ergonomics").expect("its ergonomics");
+    assert_eq!(row.value.as_deref(), Some(format!("{ergonomics} %").as_str()));
+    assert_eq!(row.colored, Some(ergonomics));
+    assert_eq!(row.show, Show::Compact);
+    // One with none of the three lists its size alone.
+    if let Some(plain) = packs.iter().find(|id| names.iter().all(|name| prop(db, id, name) == 0.0)) {
+        let item = Item::new(std::sync::Arc::new(Kind::of(db, plain).expect("its kind")));
+        let shown = figures(&item, db, &|_| None);
+        assert!(shown.rows.iter().all(|row| !["ChangeMovementSpeed", "ChangeTurningSpeed", "Ergonomics"].contains(&row.id)), "{plain}");
+    }
 }

@@ -1,5 +1,5 @@
-//! Health read from the install (`docs/spec/health.md`): its figures, and
-//! every medical item, food and drink of the database as a thing to use.
+//! Tests of the health read from the install, its figures and every thing to use on it.
+//! After `docs/spec/health.md`: its figures, and every medical item, food and drink of the database as a thing to use.
 //! Passes with a note where no install is configured.
 //!
 //! `cargo test -p trp-sim --test sim health:: -- --nocapture` prints them.
@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use trp_data::Database;
-use trp_sim::health::{Cure, DamageKind, Health, HealthSettings, MedClass, Medicine, Part};
+use trp_sim::condition::health::{Cure, DamageKind, Health, HealthSettings, MedClass, Medicine, Part};
 
 fn database() -> Option<&'static Database> {
     let Ok(_install) = crate::fixture::install().ok_or(()) else {

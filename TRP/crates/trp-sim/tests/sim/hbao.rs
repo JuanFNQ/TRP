@@ -1,11 +1,11 @@
-//! The game's ambient occlusion (`trp_sim::hbao`) beside recorder 0.11.0's
-//! scene of Customs (course 0's second step, kept in
-//! `local/traces/courses3/0-light-outside`): the camera's `HBAO` component
-//! as the game ran it at the user's setting (`FastestPerformance`), and the
+//! Tests of the game's ambient occlusion beside a recorded scene of Customs.
+//! Through `trp_sim::hbao`, beside recorder 0.11.0's scene of Customs (course 0's second
+//! step, kept in `local/traces/courses3/0-light-outside`): the camera's `HBAO` component
+//! as the game ran it at the recorded setting (`FastestPerformance`), and the
 //! camera's far plane. The rest against the compiled passes' constants.
 //! The recording's part is skipped where it is not there.
 
-use trp_sim::hbao::{self, Blur, Quality, SsaoMode, FAR_PLANE};
+use trp_sim::lighting::hbao::{self, Blur, Quality, SsaoMode, FAR_PLANE};
 
 fn recorded() -> Option<serde_json::Value> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../local/traces/courses3/0-light-outside/light-outside.scene.json");

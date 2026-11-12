@@ -1,14 +1,15 @@
-//! Zeroing (`trp_sim::sights`; optics spec, "Zeroing"): the points on the
+//! Tests of zeroing on the range's stock builds.
+//! After the optics spec, "Zeroing", through `trp_sim::sights`: the points on the
 //! default round's flight, the keys through a scope's distances, the turns
 //! toward the point of the optics' cameras, the collimators and the M32A1's
 //! part turned by distance, a launcher's line, the shot's squeeze, and what
 //! the battle screen is told, on the range's stock builds. Those that need
 //! the install pass trivially, with a note, where none is configured.
 
-use trp_sim::ballistics::{Round, Trajectory};
-use trp_sim::math::{quat_euler, quat_mul, quat_rotate};
-use trp_sim::rig::WeaponRig;
-use trp_sim::sights::{zeroing_points, SightHud, Sights};
+use trp_sim::combat::ballistics::{Round, Trajectory};
+use trp_sim::base::math::{quat_euler, quat_mul, quat_rotate};
+use trp_sim::base::rig::WeaponRig;
+use trp_sim::weapons::sights::{zeroing_points, SightHud, Sights};
 
 const SPEAR: &str = "65290f395ae2ae97b80fdf2d";
 const G28: &str = "6176aca650224f204c1da3fb";
@@ -37,10 +38,11 @@ fn m855() -> Round {
         accuracy: 0,
         projectiles: 1,
         penetration_damage_mod: 0.0,
-        explosive: false,
+        fuse: None,
         stamina_burn: 0.0,
         heavy_bleeding: 0.0,
         light_bleeding: 0.0,
+        tracer: None,
     }
 }
 
@@ -79,11 +81,11 @@ fn zeroing_points_are_the_first_samples_of_the_flight_past_each_distance() {
 
 /// A weapon's sights with their zeroing points, from the item database and
 /// the assembled build; and the build.
-fn zeroed(template: &str) -> Option<(Sights, trp_data::weapon::Weapon)> {
+fn zeroed(template: &str) -> Option<(Sights, trp_data::weapons::weapon::Weapon)> {
     let install = crate::fixture::install()?;
     let db = crate::fixture::database()?;
     let mut assets = trp_data::unity::Assets::new(install).expect("manifest");
-    let weapon = trp_data::weapon::assemble(&mut assets, db, template).expect("the weapon");
+    let weapon = trp_data::weapons::weapon::assemble(&mut assets, db, template).expect("the weapon");
     let mut sights = Sights::of_weapon(&weapon).expect("its sights");
     let props = &db.items[template].props;
     let round = props.get("defAmmo").and_then(|v| v.as_str()).and_then(|id| db.items.get(id)).and_then(Round::of);
@@ -93,7 +95,7 @@ fn zeroed(template: &str) -> Option<(Sights, trp_data::weapon::Weapon)> {
 }
 
 /// The weapon's tree at rest with the zeroing's turns on it.
-fn turned_rig(sights: &Sights, weapon: &trp_data::weapon::Weapon) -> WeaponRig {
+fn turned_rig(sights: &Sights, weapon: &trp_data::weapons::weapon::Weapon) -> WeaponRig {
     let mut rig = WeaponRig::new(&weapon.hierarchy);
     for (node, turn) in sights.turns() {
         let place = rig.local(node).0;
@@ -104,7 +106,7 @@ fn turned_rig(sights: &Sights, weapon: &trp_data::weapon::Weapon) -> WeaponRig {
 
 /// The zeroing point in the tree (`GetWorldCalibrationPoint`), worked out
 /// here from the fireport: no cant on these builds.
-fn point_in_tree(sights: &Sights, weapon: &trp_data::weapon::Weapon, rig: &WeaponRig) -> [f32; 3] {
+fn point_in_tree(sights: &Sights, weapon: &trp_data::weapons::weapon::Weapon, rig: &WeaponRig) -> [f32; 3] {
     let h = &weapon.hierarchy;
     let fireport = (0..h.nodes.len()).find(|&i| h.nodes[i].name == "fireport").expect("a fireport");
     let (at, turn) = rig.placed(fireport);
@@ -264,7 +266,7 @@ fn the_m32a1_lifts_its_barrel_to_the_distance() {
     let near = sights.launcher_line().expect("a launcher's line").angle;
     let turned: Vec<(usize, [f32; 4])> = sights.turns().collect();
     let (_, turn) = turned.iter().find(|(node, _)| *node == axis).expect("the part turned");
-    let x = trp_sim::math::quat_to_euler(*turn)[0];
+    let x = trp_sim::base::math::quat_to_euler(*turn)[0];
     assert!((x + 87.0).abs() < 0.01, "{x}");
     while sights.step_zeroing(true, true) {}
     assert_eq!(sights.zeroing_distance(), Some(400));
@@ -272,7 +274,7 @@ fn the_m32a1_lifts_its_barrel_to_the_distance() {
     let far = sights.launcher_line().expect("a launcher's line").angle;
     let turned: Vec<(usize, [f32; 4])> = sights.turns().collect();
     let (_, turn) = turned.iter().find(|(node, _)| *node == axis).expect("the part turned");
-    let x = trp_sim::math::quat_to_euler(*turn)[0];
+    let x = trp_sim::base::math::quat_to_euler(*turn)[0];
     assert!((x + 68.5).abs() < 0.01, "{x}");
     assert!(far.abs() > near.abs() + 5.0, "50 m: {near} degrees, 400 m: {far}");
     eprintln!("the M32A1's line of sight: {near} degrees at 50 m, {far} at 400 m");

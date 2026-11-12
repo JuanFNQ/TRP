@@ -1,12 +1,12 @@
-//! Speed limits from armour and from being hit (`docs/spec/movement.md`,
-//! "Speed limits"), with the install's movement and database. These pass
+//! Tests of the speed limits from armour and from being hit, with the install's movement and database.
+//! After `docs/spec/movement.md`, "Speed limits". These pass
 //! trivially, with a note, where no install is configured.
 
-use trp_data::engine::EngineSettings;
-use trp_data::hard_settings::HardSettings;
+use trp_data::setup::engine::EngineSettings;
+use trp_data::setup::hard_settings::HardSettings;
 use trp_data::unity::Assets;
-use trp_sim::armor::{speed_penalty, VestSkills, Worn};
-use trp_sim::health::{DamageKind, Part};
+use trp_sim::condition::armor::{speed_penalty, VestSkills, Worn};
+use trp_sim::condition::health::{DamageKind, Part};
 use trp_sim::{Flat, Input, Movement, State};
 
 const DT: f32 = 1.0 / 120.0;
@@ -18,7 +18,7 @@ fn movement() -> Option<Movement> {
     let hard = HardSettings::load(&assets.install).expect("settings object");
     let engine = EngineSettings::load(&assets.install).expect("engine settings");
     let settings = trp_sim::load_movement_settings(&mut assets, db, &hard, &engine, 0.0).expect("movement settings");
-    let body = trp_sim::body::BodyData::load(&mut assets).expect("body animator");
+    let body = trp_sim::locomotion::body::BodyData::load(&mut assets).expect("body animator");
     Some(Movement::new(settings, trp_sim::Body::new(&body, 5.0)))
 }
 
@@ -33,7 +33,7 @@ fn plates_slow_by_their_penalties_less_the_vest_skills() {
     let Some(db) = crate::fixture::database() else { return };
     // `courses3\3-bot-armour`'s four plates, each counted where it sits in
     // an armour slot: two light (-1.5 and -1.0 %), two heavy (-0.5, -0.75).
-    let plate = |template: &str| Worn { template: template.to_owned(), slot: "ArmorVest".to_owned(), children: Vec::new() };
+    let plate = |template: &str| Worn { template: template.to_owned(), slot: "ArmorVest".to_owned(), children: Vec::new(), ..Worn::default() };
     let kit = ["656fafe3498d1b7e3e071da4", "656fb21fa0dce000a2020f7c", "6557458f83942d705f0c4962", "64afd81707e2cf40e903a316"].map(plate);
     assert!((speed_penalty(db, &kit, &VestSkills::default()) + 3.75).abs() < 1e-5);
     // Light Vests at 40 take 24 % off the light ones, Heavy Vests at 40 20 %

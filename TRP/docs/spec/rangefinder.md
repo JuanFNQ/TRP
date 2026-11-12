@@ -1,7 +1,6 @@
 # The handheld rangefinder (Vortex Ranger 1500)
 
-The user, 2026-10-26: "can we put the range finder somewhere along with some reactive targets far
-away?" The game's one handheld rangefinder, taken in hand from a quick slot, aimed through to read
+The game's one handheld rangefinder, taken in hand from a quick slot, aimed through to read
 the distance to what it points at. Read 2026-10-26 from the game's code and the install
 (`local\rangefinder_research_s138.md`, the probe's outputs `local\rf_*_s138r.txt`). Nothing of it
 is recorded: a recorder course would need it bound and aimed at known distances.
@@ -58,12 +57,12 @@ is recorded: a recorder course would need it bound and aimed at known distances.
   the mark `rangefinder_reticle` (`optics.md`, "The lens": built). Its magnification is given
   nowhere (about 7x by the field of view, `ESTIMATE`; the real device's is 6x).
 
-## Built (0.143.0)
+## Built
 
 - **Where it is on the range**: in the grenades' table's box, with the knives (the box of melee
   weapons); picked up, it goes where a pick-up puts it, and is bound to a quick key from the pockets
   or the vest as anything bindable is (hover it in the inventory, press the key).
-- **The hands** (`trp_sim::rangefinder::RangefinderHands`; `weapon.rs`, `RigKind::Rangefinder`): its
+- **The hands** (`trp_sim::rangefinder::RangefinderHands`; `weapon`, `RigKind::Rangefinder`): its
   prefab's own rig and animator, drawn from a quick key, put away by anything else asked for; the aim
   key's toggle or hold as the binding says; the examine key's `LOOK`; the aim dropped as a weapon's
   sights are (a sprint, a state that cannot aim, a long fall, a vault, the inventory). Its aim speed
@@ -73,14 +72,14 @@ is recorded: a recorder course would need it bound and aimed at known distances.
   `ScopePrefabCache`) forced live while its controller has the optic on (`Sights::force_optic`), so
   the quirk shows: the optic picture is drawn whenever the aim was asked, taken or not
   (`HandsRig::optic_seen`).
-- **The readout** (`rangefinder_view.rs`): the ray from the optic object placed as the optic camera
+- **The readout** (`rangefinder_view`): the ray from the optic object placed as the optic camera
   is, along its forward, to 999 m, against the range's boxes, doors and ground, the dummies' hit
   colliders and the poppers; the text a UI node aimed at the optic camera, in the build's Bender
   Italic at 125, red, its box 200 by 50 centred 35 right and 194 up of the 1024 picture's middle.
 - **The stamina**: the aim weighs 1 at `AimRangeFinderDrainRate` while it is in hand
   (`Stamina::set_rangefinder`), and the walk is held to the aim's 0.33 as the sights hold it.
 - **Not built**: the digits' equal widths (`SetMonospaceText`: Bevy's text has no `<mspace>`; the
-  figures move by a pixel or two as they change), the readout with `PIP` off (no optic picture is
+  figures move by a pixel or two as they change), the readout with `ATTACHMENTS` off (no optic picture is
   drawn then), the canvas's 1 m cull, its depth at 2 m (`PROVISIONAL` in the research: drawn over
   everything here), the turn-away (not given to this rig), the third person's own rig.
 

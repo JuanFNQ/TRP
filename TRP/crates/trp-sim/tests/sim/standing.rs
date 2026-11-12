@@ -1,7 +1,8 @@
-//! The character as the game's own screens stand it (`BodyData::load_standing`).
+//! Tests of the character as the game's own screens stand it.
+//! Through `BodyData::load_standing`.
 
 use trp_data::unity::Assets;
-use trp_sim::math::{quat_mul, quat_rotate};
+use trp_sim::base::math::{quat_mul, quat_rotate};
 
 const SPINE: &str = "Root_Joint/Base HumanPelvis/Base HumanSpine1/Base HumanSpine2/Base HumanSpine3/Base HumanRibcage";
 
@@ -30,7 +31,7 @@ fn the_character_stands_as_the_game_s_screens_stand_it() {
     }
     chain(&mut paths, "Root_Joint/Base HumanPelvis/Base HumanSpine1/Base HumanSpine2/Base HumanSpine3/Base HumanNeck/Base HumanHead");
     let started = std::time::Instant::now();
-    let (_, standing) = trp_sim::body::BodyData::load_standing(&mut assets, &[], &paths).expect("body animator");
+    let (_, standing) = trp_sim::locomotion::body::BodyData::load_standing(&mut assets, &[], &paths).expect("body animator");
     let pose = standing.expect("asked for").expect("the figure");
     println!("the body's animator and the standing figure read in {:.0} ms", started.elapsed().as_secs_f32() * 1000.0);
     assert_eq!(pose.len(), paths.len());

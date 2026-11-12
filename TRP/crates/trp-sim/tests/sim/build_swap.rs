@@ -1,11 +1,12 @@
-//! A reload through the weapon's build made anew (`Firearm::carry_on_from`;
-//! firing spec, "A build made anew in a reload"): the SCAR-L reloading a
+//! Tests of a reload that goes on through the weapon's build made anew.
+//! After the firing spec, "A build made anew in a reload", through `Firearm::carry_on_from`:
+//! the SCAR-L reloading a
 //! PMAG Gen M3 40 from its stock 30-round, its build changed for the
 //! 40-round's while no magazine is in sight, goes on as the same reload
 //! left alone does, state for state, mark for mark, to its end. Those that
 //! need the install pass trivially, with a note, where none is configured.
 
-use trp_sim::weapon_animator::WeaponAnimatorData;
+use trp_sim::weapons::weapon_animator::WeaponAnimatorData;
 use trp_sim::{Firearm, FirearmEvent};
 
 const SCAR_L: &str = "6184055050224f204c1da540";
@@ -19,10 +20,10 @@ fn a_reload_goes_on_through_a_build_made_anew() {
         return;
     };
     let db = crate::fixture::database().expect("database");
-    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("settings object");
+    let hard = trp_data::setup::hard_settings::HardSettings::load(&install).expect("settings object");
     let mut assets = trp_data::unity::Assets::new(install).expect("manifest");
-    let stock = trp_data::weapon::assemble(&mut assets, db, SCAR_L).expect("the SCAR-L");
-    let forty = trp_data::weapon::assemble_key(&mut assets, db, SCAR_L_40).expect("the SCAR-L with a 40-round");
+    let stock = trp_data::weapons::weapon::assemble(&mut assets, db, SCAR_L).expect("the SCAR-L");
+    let forty = trp_data::weapons::weapon::assemble_key(&mut assets, db, SCAR_L_40).expect("the SCAR-L with a 40-round");
     let (data, data_forty) = (WeaponAnimatorData::load(&assets, &stock).expect("its controller"), WeaponAnimatorData::load(&assets, &forty).expect("its controller"));
     let (settings, settings_forty) = (trp_sim::firearm_settings(&assets, db, &hard, &stock).expect("settings"), trp_sim::firearm_settings(&assets, db, &hard, &forty).expect("settings"));
     assert_eq!(settings_forty.magazine_variant, 3);
@@ -73,18 +74,18 @@ fn the_weapons_motion_goes_on_through_a_build_made_anew() {
         return;
     };
     let db = crate::fixture::database().expect("database");
-    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("settings object");
-    let engine = trp_data::engine::EngineSettings::load(&install).expect("engine settings");
+    let hard = trp_data::setup::hard_settings::HardSettings::load(&install).expect("settings object");
+    let engine = trp_data::setup::engine::EngineSettings::load(&install).expect("engine settings");
     let mut assets = trp_data::unity::Assets::new(install).expect("manifest");
-    let data = trp_data::player::HandsData::load(&mut assets).expect("player prefab");
-    let stock = trp_data::weapon::assemble(&mut assets, db, SCAR_L).expect("the SCAR-L");
+    let data = trp_data::character::player::HandsData::load(&mut assets).expect("player prefab");
+    let stock = trp_data::weapons::weapon::assemble(&mut assets, db, SCAR_L).expect("the SCAR-L");
     // (Its whole stock build, the 40-round for its magazine: the hands need
     // its barrel's muzzle.)
     let mut preset = db.default_preset(SCAR_L).expect("its preset").clone();
     for item in preset.items.iter_mut().filter(|item| item.slot.as_deref() == Some("mod_magazine")) {
         item.template = "544a378f4bdc2d30388b4567".to_owned();
     }
-    let forty = trp_data::weapon::assemble_preset(&mut assets, db, &preset).expect("the SCAR-L with a 40-round");
+    let forty = trp_data::weapons::weapon::assemble_preset(&mut assets, db, &preset).expect("the SCAR-L with a 40-round");
     let hands_of = |weapon| Hands::new(trp_sim::hands_settings(data.clone(), db, &hard, &engine, weapon, ViewSettings::default()).expect("hands settings"));
     const DT: f32 = 1.0 / 60.0;
     let still = HandsInput { idle: true, pose_level: 1.0, smoothed_pose_level: 1.0, ..HandsInput::default() };

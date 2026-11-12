@@ -1,21 +1,23 @@
+//! Tests that replay the recorded medicine courses and set the health beside the game's.
 //! Every recording of recorder 0.8.0's medicine course (course 1, kept in
-//! `local/traces/courses1/1-*`) replayed (`trp_sim::health_replay`): each
+//! `local/traces/courses1/1-*`) replayed through `trp_sim::health_replay`: each
 //! effect's states come at the game's times within two frames (those at
 //! work before the recording began left out), each part's points within
 //! 0.01 and its maximum too (but a mended part's, a random share), energy
 //! and hydration within 0.01; and each item's hands (`MedsHands` on the
 //! item's own rig): their animator's states and `Active` on the game's
 //! frames, how far each state has played within a ten-thousandth, and the
-//! item gone from the hands at its put-away's mark (the game's next hands
-//! made from then to three frames on). Skipped where the recordings or the
-//! install are not there.
+//! item gone from the hands on the frame the game's next hands come: the
+//! later of its put-away's mark and the way back's 0.6 s from its finish
+//! (the second Salewa's, three frames after its mark). Skipped where the
+//! recordings or the install are not there.
 
 use trp_data::unity::Assets;
-use trp_sim::health::HealthSkills;
-use trp_sim::health_replay::{read, run};
+use trp_sim::condition::health::HealthSkills;
+use trp_sim::recordings::health_replay::{read, run};
 
 /// The recorded character's skills as the recordings were made
-/// (2026-10-15, the user's profile): level 40 in each that health uses.
+/// (the recording profile's): level 40 in each that health uses.
 fn recorded_skills() -> HealthSkills {
     HealthSkills::of_levels(|name| match name {
         "Health" | "Metabolism" | "StressResistance" | "Immunity" | "Surgery" | "Vitality" => 40,
@@ -69,12 +71,70 @@ fn the_medicine_course_is_followed() {
             assert!(same(&flags(&hands.game_active), &flags(&hands.ours_active)), "{path}: {}'s Active: the game's {:?}, ours {:?}", hands.template, hands.game_active, hands.ours_active);
             assert!(hands.worst.0 <= 1e-4 && hands.compared > 300, "{path}: {}'s times {:?} over {}", hands.template, hands.worst, hands.compared);
             let (Some(game), Some(ours)) = (hands.gone[0], hands.gone[1]) else { panic!("{path}: {} gone {:?}", hands.template, hands.gone) };
-            assert!(game >= ours - 0.001 && game <= ours + 0.03, "{path}: {} gone from the hands, the game's at {game}, ours at {ours}", hands.template);
+            assert!((game - ours).abs() <= 0.001, "{path}: {} gone from the hands, the game's at {game}, ours at {ours}", hands.template);
             uses += 1;
         }
         println!("{path}: followed");
     }
     assert_eq!(uses, 12, "the hands of twelve uses");
+}
+
+/// `courses8`'s group 4 made by hand (recorder 0.14.0:
+/// `pain-and-analgin`, `stimulant-and-inventory`,
+/// `hunger-and-fatigue-eating-food`; each taken up mid-raid, every item put
+/// to use from a rifle or the pistol in hand): every effect's states on the
+/// game's own frames, those at work before the recording began too (taken up
+/// as recorded, with their time left, and starving's and existence's loops
+/// set to tick where the game's do), but for the hideout's muscle pain,
+/// which a raid's health does nothing with; every part, energy and
+/// hydration within 0.01; each item's hands on the game's frames and within
+/// a ten-thousandth, and gone on the frame the game's next hands come (the
+/// Propital's 0.24 s after its put-away's mark, the way back's 0.6 s from
+/// its finish).
+#[test]
+fn the_recordings_made_by_hand_are_followed() {
+    let folder = concat!(env!("CARGO_MANIFEST_DIR"), "/../../local/traces/courses8");
+    let Ok(install) = crate::fixture::install().ok_or(()) else { return };
+    if !std::path::Path::new(folder).exists() {
+        return;
+    }
+    let db = crate::fixture::database().expect("database");
+    let mut assets = Assets::new(install.clone()).expect("the assets");
+    let mut uses = 0;
+    for name in ["pain-and-analgin", "stimulant-and-inventory", "hunger-and-fatigue-eating-food"] {
+        let path = format!("{folder}/{name}/anything.jsonl");
+        let (scenario, frames) = read(&path).expect("the trace");
+        let replay = run(&db, Some(&mut assets), recorded_skills(), &scenario, &frames, 1, None).expect("the replay");
+        for (key, game) in &replay.recorded {
+            if trp_sim::condition::health::Kind::of_name(&key.0).is_none() {
+                assert_eq!(key.0, "SevereMusclePain", "{name}: an effect not built");
+                continue;
+            }
+            let ours = replay.simulated.get(key).cloned().unwrap_or_default();
+            let states = |log: &[(String, f32)]| log.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>();
+            assert_eq!(states(game), states(&ours), "{name}: {} on {}: the game's {game:?}, ours {ours:?}", key.0, key.1);
+            for ((state, t_game), (_, t_ours)) in game.iter().zip(&ours) {
+                assert!((t_game - t_ours).abs() <= 0.001, "{name}: {} on {} {state}: the game's at {t_game}, ours at {t_ours}", key.0, key.1);
+            }
+        }
+        for (i, (gap, t)) in replay.worst.iter().enumerate() {
+            assert!(*gap <= 0.01, "{name}: part {i} {gap} off at {t}");
+        }
+        assert!(replay.worst_energy.0 <= 0.01, "{name}: energy {:?}", replay.worst_energy);
+        assert!(replay.worst_hydration.0 <= 0.01, "{name}: hydration {:?}", replay.worst_hydration);
+        for hands in &replay.hands {
+            let same = |game: &[(String, f32)], ours: &[(String, f32)]| game.len() == ours.len() && game.iter().zip(ours).all(|(g, o)| g.0 == o.0 && (g.1 - o.1).abs() <= 0.001);
+            assert!(same(&hands.game, &hands.ours), "{name}: {}'s states: the game's {:?}, ours {:?}", hands.template, hands.game, hands.ours);
+            let flags = |list: &[(bool, f32)]| list.iter().map(|(a, t)| (a.to_string(), *t)).collect::<Vec<_>>();
+            assert!(same(&flags(&hands.game_active), &flags(&hands.ours_active)), "{name}: {}'s Active: the game's {:?}, ours {:?}", hands.template, hands.game_active, hands.ours_active);
+            assert!(hands.worst.0 <= 1e-4 && hands.compared > 200, "{name}: {}'s times {:?} over {}", hands.template, hands.worst, hands.compared);
+            let (Some(game), Some(ours)) = (hands.gone[0], hands.gone[1]) else { panic!("{name}: {} gone {:?}", hands.template, hands.gone) };
+            assert!((game - ours).abs() <= 0.001, "{name}: {} gone from the hands, the game's at {game}, ours at {ours}", hands.template);
+            uses += 1;
+        }
+        println!("{name}: followed");
+    }
+    assert_eq!(uses, 4, "the hands of four uses");
 }
 
 /// Recorder 0.8.0's course 2 (falls and barbed wire, `2-*`): each fall

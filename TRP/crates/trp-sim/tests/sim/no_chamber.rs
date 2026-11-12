@@ -1,11 +1,12 @@
-//! A weapon with no chamber (`FirearmSettings::no_chamber`; more-weapons
-//! spec, "A weapon with no chamber"): the nine of the install's that have
+//! Tests of a weapon with no chamber, which fires straight off its box.
+//! After the more-weapons spec, "A weapon with no chamber", through
+//! `FirearmSettings::no_chamber`: the nine of the install's that have
 //! none have the flag and the AKM has not; the M60E6 holds its box's
 //! rounds and no more, fires them straight off it with the trigger held,
 //! and a reload chambers nothing. Those that need the install pass
 //! trivially, with a note, where none is configured.
 
-use trp_sim::weapon_animator::WeaponAnimatorData;
+use trp_sim::weapons::weapon_animator::WeaponAnimatorData;
 use trp_sim::{Firearm, FirearmEvent};
 
 const AKM: &str = "59d6088586f774275f37482f";
@@ -31,10 +32,10 @@ fn the_weapons_with_no_chamber_are_the_games() {
         return;
     };
     let db = crate::fixture::database().expect("database");
-    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("settings object");
+    let hard = trp_data::setup::hard_settings::HardSettings::load(&install).expect("settings object");
     let mut assets = trp_data::unity::Assets::new(install).expect("manifest");
     for template in NO_CHAMBER.iter().chain([&AKM]) {
-        let weapon = trp_data::weapon::assemble(&mut assets, db, template).expect("the weapon");
+        let weapon = trp_data::weapons::weapon::assemble(&mut assets, db, template).expect("the weapon");
         let settings = trp_sim::firearm_settings(&assets, db, &hard, &weapon).expect("its settings");
         assert_eq!(settings.no_chamber, *template != AKM, "{} ({template})", weapon.name);
     }
@@ -47,9 +48,9 @@ fn the_m60e6_fires_straight_off_its_box() {
         return;
     };
     let db = crate::fixture::database().expect("database");
-    let hard = trp_data::hard_settings::HardSettings::load(&install).expect("settings object");
+    let hard = trp_data::setup::hard_settings::HardSettings::load(&install).expect("settings object");
     let mut assets = trp_data::unity::Assets::new(install).expect("manifest");
-    let weapon = trp_data::weapon::assemble(&mut assets, db, M60E6_FDE).expect("the M60E6");
+    let weapon = trp_data::weapons::weapon::assemble(&mut assets, db, M60E6_FDE).expect("the M60E6");
     let data = WeaponAnimatorData::load(&assets, &weapon).expect("its controller");
     let settings = trp_sim::firearm_settings(&assets, db, &hard, &weapon).expect("its settings");
     let capacity = settings.magazine_capacity;

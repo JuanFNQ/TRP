@@ -11,10 +11,10 @@ edition = "2021"
 publish = false
 
 [workspace.metadata.trp]
-# One number for the whole of TRP, raised with every change (docs\manual.md, "Versions"; in the
-# private repository, .claude\skills\land\check.sh reads and bumps it). trp-app's build.rs reads
-# it from here and the app prints it first (`TRP_VERSION`).
-version = "0.143.1"
+# One number for the whole of TRP, raised with every change (docs/manual.md, "Versions";
+# tools/check.sh reads and bumps it). trp-app's build.rs reads it from here and the app prints
+# it first (`TRP_VERSION`).
+version = "0.262.0"
 
 [workspace.dependencies]
 anyhow = "1"

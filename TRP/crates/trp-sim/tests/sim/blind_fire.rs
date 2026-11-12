@@ -1,15 +1,15 @@
-//! Blind fire (`docs/spec/blind-fire.md`) with the install's body animator,
-//! the stock AKM and its motion: the state and its float by the install's
+//! Tests of blind fire with the install's body animator, the stock AKM and its motion.
+//! After `docs/spec/blind-fire.md`: the state and its float by the install's
 //! curves, the gate's refusals, the keys it holds back, the lean's quirk,
 //! the change of side, the blender and the camera's rest, and the weapon's
 //! refusals and the operations that end it. These pass trivially, with a
 //! note, where no install is configured.
 
-use trp_data::engine::EngineSettings;
-use trp_data::hard_settings::HardSettings;
-use trp_data::player::HandsData;
+use trp_data::setup::engine::EngineSettings;
+use trp_data::setup::hard_settings::HardSettings;
+use trp_data::character::player::HandsData;
 use trp_data::unity::Assets;
-use trp_sim::math::quat_euler;
+use trp_sim::base::math::quat_euler;
 use trp_sim::{FireMode, Firearm, FirearmEvent, Flat, Hands, Input, Movement, State, ViewSettings};
 
 const AKM: &str = "59d6088586f774275f37482f";
@@ -22,7 +22,7 @@ fn movement() -> Option<Movement> {
     let hard = HardSettings::load(&assets.install).expect("settings object");
     let engine = EngineSettings::load(&assets.install).expect("engine settings");
     let settings = trp_sim::load_movement_settings(&mut assets, db, &hard, &engine, 0.0).expect("movement settings");
-    let body = trp_sim::body::BodyData::load(&mut assets).expect("body animator");
+    let body = trp_sim::locomotion::body::BodyData::load(&mut assets).expect("body animator");
     Some(Movement::new(settings, trp_sim::Body::new(&body, 5.0)))
 }
 
@@ -151,10 +151,10 @@ fn weapon() -> Option<(Hands, Firearm)> {
     let hard = HardSettings::load(&install).expect("settings object");
     let engine = EngineSettings::load(&install).expect("engine settings");
     let mut assets = Assets::new(install).expect("manifest");
-    let weapon = trp_data::weapon::assemble(&mut assets, db, AKM).expect("weapon");
+    let weapon = trp_data::weapons::weapon::assemble(&mut assets, db, AKM).expect("weapon");
     let data = HandsData::load(&mut assets).expect("player prefab");
     let hands = Hands::new(trp_sim::hands_settings(data, db, &hard, &engine, &weapon, ViewSettings::default()).expect("hands settings"));
-    let animator = trp_sim::weapon_animator::WeaponAnimatorData::load(&assets, &weapon).expect("the weapon's animator");
+    let animator = trp_sim::weapons::weapon_animator::WeaponAnimatorData::load(&assets, &weapon).expect("the weapon's animator");
     let mut firearm = Firearm::new(trp_sim::firearm_settings(&assets, db, &hard, &weapon).expect("firearm settings"), &animator);
     firearm.start_drawn();
     Some((hands, firearm))
@@ -165,7 +165,7 @@ fn the_blender_and_the_camera_s_rest() {
     let Some((mut hands, _)) = weapon() else { return };
     let frame = 1.0 / 120.0;
     let bone = quat_euler([-90.0, 0.0, 0.0]);
-    let mut step = |hands: &mut Hands| _ = hands.frame_on_clock(frame, frame, bone, None);
+    let step = |hands: &mut Hands| _ = hands.frame_on_clock(frame, frame, bone, None);
     // The prefab's speed: 3 a second, from the next frame.
     hands.start_blind_fire(1);
     step(&mut hands);
@@ -226,4 +226,20 @@ fn the_weapon_refuses_its_keys_and_the_fold_ends_it() {
     assert!(firearm.reloading() && !firearm.can_set_blind_fire());
     assert_eq!(firearm.set_blind_fire(1), 0);
     assert!(!firearm.blind_fire());
+}
+
+/// A gesture leaves blind fire as it is: the gestures' subsystem never tells
+/// the player's hands (recorded: `courses8\helmet-headlamp`, the head
+/// light's gesture in blind fire at 27.62 s and 30.69 s; blind-fire spec,
+/// "What ends it").
+#[test]
+fn a_gesture_leaves_blind_fire_as_it_is() {
+    let Some(mut m) = movement() else { return };
+    let input = Input { hands_idle: true, ..armed() };
+    press(&mut m, 1, input);
+    run(&mut m, 0.5, input);
+    assert!(m.set_interaction(trp_sim::Interaction::HelmetRailGear), "the gesture plays in blind fire");
+    run(&mut m, 0.2, input);
+    assert!(m.interaction_playing());
+    assert_eq!((m.blind_fire(), m.state), (1, State::BlindFire), "blind fire held through it");
 }

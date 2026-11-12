@@ -11,4 +11,5 @@ anyhow.workspace = true
 # compiler; 0.8.2 is the last release of the bindings on PhysX 4 (0.10 moved to 5).
 physx-sys = "=0.8.2"
 trp-data = { path = "../trp-data" }
+trp-sim = { path = "../trp-sim" }
 serde_json.workspace = true

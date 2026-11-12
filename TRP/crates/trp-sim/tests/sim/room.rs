@@ -1,14 +1,14 @@
-//! Room to move (`docs/spec/movement.md`, "Room to move"), with the install's
-//! movement and body animator: the step aside, the roll, lying down,
+//! Tests of the room to move, with the install's movement and body animator.
+//! After `docs/spec/movement.md`, "Room to move": the step aside, the roll, lying down,
 //! standing up and the crawl refused where something is in the way or the
 //! ground is not there, in a world of level ground, upright boxes and a
 //! drop. These pass trivially, with a note, where no install is configured.
 
-use trp_data::engine::EngineSettings;
-use trp_data::hard_settings::HardSettings;
+use trp_data::setup::engine::EngineSettings;
+use trp_data::setup::hard_settings::HardSettings;
 use trp_data::unity::Assets;
-use trp_sim::collision::Block;
-use trp_sim::math::quat_rotate;
+use trp_sim::locomotion::collision::Block;
+use trp_sim::base::math::quat_rotate;
 use trp_sim::{Input, Movement, State, World};
 
 const DT: f32 = 1.0 / 120.0;
@@ -20,7 +20,7 @@ fn movement() -> Option<Movement> {
     let hard = HardSettings::load(&assets.install).expect("settings object");
     let engine = EngineSettings::load(&assets.install).expect("engine settings");
     let settings = trp_sim::load_movement_settings(&mut assets, db, &hard, &engine, 0.0).expect("movement settings");
-    let body = trp_sim::body::BodyData::load(&mut assets).expect("body animator");
+    let body = trp_sim::locomotion::body::BodyData::load(&mut assets).expect("body animator");
     Some(Movement::new(settings, trp_sim::Body::new(&body, 5.0)))
 }
 
@@ -165,5 +165,7 @@ fn a_crawl_toward_an_edge_is_turned_back() {
     // The body needs steady ground 0.6 m past the capsule's side ahead.
     assert!(furthest > 0.2 && furthest < 1.2, "crawled to {furthest}");
     println!("crawled to {furthest:.3} m of the 1.2 m to the edge");
-    assert!(m.position[1].abs() < 1e-3, "still on the top: {:?}", m.position);
+    // On the top, lifted by what the lying capsule reaches under the feet
+    // (0.366 round about its middle 0.35 up).
+    assert!((m.position[1] - 0.016).abs() < 1e-3, "still on the top: {:?}", m.position);
 }

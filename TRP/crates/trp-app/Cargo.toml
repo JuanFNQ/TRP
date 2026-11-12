@@ -1,6 +1,6 @@
 [package]
 name = "trp-app"
-description = "The runtime: a Bevy application that plays the controller with data read from the user's install"
+description = "The runtime: a Bevy application that plays the controller with data read from the player's install"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -57,10 +57,23 @@ wgpu-types = "27"
 # starts (`backend.rs`): Bevy's version, with features Bevy's already has.
 wgpu = { version = "27", default-features = false, features = ["dx12", "vulkan"] }
 
+# The window given the exe's icon (`window_icon.rs`): the version Bevy's winit is.
+winit = { version = "0.30", default-features = false }
+
+[build-dependencies]
+# The exe's icon (`build.rs`): its picture read from the install, written as PNGs in an icon
+# file, and compiled with the Windows SDK's resource compiler.
+trp-data = { path = "../trp-data" }
+png.workspace = true
+embed-resource = "3"
+
 [features]
 # Every system's and schedule's span written as a Chrome trace, to the file `TRACE_CHROME` names
 # (`docs/workbench.md`, "Profiling"): for profiling alone, the spans cost time of their own.
 profile = ["bevy/trace_chrome"]
+# The engine keeps the source line of every change, so that a warning can name who wrote to a
+# resource on every frame. For finding such a writer alone: it costs time and memory.
+track = ["bevy/track_location"]
 
 [dev-dependencies]
 # The sound source tested through the audio library Bevy plays it with, at the version it uses.

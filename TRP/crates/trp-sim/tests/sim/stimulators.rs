@@ -1,13 +1,13 @@
-//! Stimulators' and buffed foods' sets of buffs as the install has them
-//! (`docs/spec/health.md`, "Buffs"): each item used to its end, then the
+//! Tests of stimulators' and buffed foods' sets of buffs as the install has them.
+//! After `docs/spec/health.md`, "Buffs": each item used to its end, then the
 //! set's buffs at work, timed by its delays and durations. Passes with a
 //! note where no install is configured.
 
 use std::sync::Arc;
 
 use trp_data::Database;
-use trp_sim::health::{Health, HealthSettings, Kind, Medicine, Part};
-use trp_sim::skills::{Skill, SkillLevels};
+use trp_sim::condition::health::{Health, HealthSettings, Kind, Medicine, Part};
+use trp_sim::condition::skills::{Skill, SkillLevels};
 
 const PROPITAL: &str = "5c0e530286f7747fa1419862";
 const SJ1: &str = "5c0e531286f7747fa54205c2";
@@ -64,7 +64,7 @@ fn every_set_an_item_names_is_in_the_install() {
 fn propital_heals_raises_three_skills_then_shakes_the_hands() {
     let Some(db) = database() else { return };
     let mut health = health(db);
-    health.apply_damage(Part::LeftArm, 20.0, trp_sim::health::DamageKind::Fall);
+    health.apply_damage(Part::LeftArm, 20.0, trp_sim::condition::health::DamageKind::Fall);
     let hurt = health.part(Part::LeftArm).current;
     take(db, &mut health, PROPITAL);
     assert!(health.skill_boosts().is_empty(), "a second's delay");
@@ -135,8 +135,8 @@ fn zagustin_stops_blood_loss_while_it_works() {
     assert!(health.blood_loss_blocked());
     assert!(health.existing(Kind::HeavyBleeding, None).is_none(), "the bleeding ended");
     for _ in 0..10 {
-        health.apply_damage(Part::RightLeg, 5.0, trp_sim::health::DamageKind::Bullet);
-        health.apply_damage(Part::LeftLeg, 5.0, trp_sim::health::DamageKind::Bullet);
+        health.apply_damage(Part::RightLeg, 5.0, trp_sim::condition::health::DamageKind::Bullet);
+        health.apply_damage(Part::LeftLeg, 5.0, trp_sim::condition::health::DamageKind::Bullet);
     }
     assert!(health.existing(Kind::LightBleeding, None).is_none() && health.existing(Kind::HeavyBleeding, None).is_none(), "no bleeding drawn");
     run(&mut health, 181.0);
@@ -157,11 +157,70 @@ fn a_skill_s_summary_level_takes_the_buff_and_metabolism_shortens_side_effects()
     // Metabolism at 50: SJ1's side effects (200 s) last half as long.
     let mut health = health(db);
     levels.set_level(Skill::Metabolism, 50);
-    health.skills = trp_sim::health::HealthSkills::of(&levels);
+    health.skills = trp_sim::condition::health::HealthSkills::of(&levels);
     take(db, &mut health, SJ1);
     let stim = health.existing(Kind::Stimulator, None).and_then(|e| e.stim.as_ref()).expect("its state");
-    let energy = stim.buffs.iter().find(|b| b.personal.kind == trp_sim::health::BuffKind::EnergyRate).expect("the energy's");
+    let energy = stim.buffs.iter().find(|b| b.personal.kind == trp_sim::condition::health::BuffKind::EnergyRate).expect("the energy's");
     assert!((energy.personal.duration - 100.0).abs() < 1e-3, "{}", energy.personal.duration);
     let strength = stim.buffs.iter().find(|b| b.personal.skill.as_deref() == Some("Strength")).expect("Strength's");
     assert_eq!(strength.personal.duration, 180.0, "a buff's is left");
+}
+
+/// The HEALTH tab's two icons of a stimulator (`StimulatorHelper.
+/// GetDisplayableVariations`, `EffectIcon.VariationBuffs`): the Propital's
+/// four buffs at work after its second's delay, each its name, its figure
+/// in the buff's colour and its seconds left; no side effect until 270 s,
+/// then its tremor and tunnel vision, which have no figure.
+#[test]
+fn propital_s_icons_list_its_buffs_then_its_side_effects() {
+    use trp_sim::items::item_attributes::stimulator_lines;
+    let Some(db) = database() else { return };
+    let mut health = health(db);
+    take(db, &mut health, PROPITAL);
+    run(&mut health, 1.1);
+    let words = |key: &str| key.to_owned();
+    // Seconds left of a buff ending at `end` on the stimulator's clock.
+    let left = |health: &Health, end: f32| (end - health.existing(Kind::Stimulator, None).expect("on").whole).round_ties_even() as i32;
+    let listing = health.stimulator_listing(false);
+    assert_eq!(listing.len(), 1, "one stimulator");
+    let n = left(&health, 1.0 + 300.0);
+    let blue = |figure: &str| format!("<color=#54C1FFFF>{figure}</color>");
+    let wanted: Vec<String> = [("HealthRate", "+1"), ("Metabolism", "+20"), ("Health", "+20"), ("Vitality", "+20")].iter().map(|(name, figure)| format!("{name} ({}) ({n})", blue(figure))).collect();
+    assert_eq!(stimulator_lines(&listing, &words), wanted);
+    assert!(health.stimulator_listing(true).iter().all(Vec::is_empty), "no side effect yet");
+    run(&mut health, 275.0 - 1.1);
+    let n = left(&health, 270.0 + 30.0);
+    assert_eq!(n, 25);
+    assert_eq!(stimulator_lines(&health.stimulator_listing(true), &words), [format!("HandsTremor ({n})"), format!("QuantumTunnelling ({n})")]);
+}
+
+/// Two stimulators' lists merged as the game's (`EffectDescription.Add`):
+/// the first's, then each one's again, a line taking the place of the
+/// first of the same words; words a set says twice stay twice; a red side
+/// effect's figure, a weight's units, and no seconds past two hours.
+#[test]
+fn stimulators_lists_merge_by_their_words() {
+    use trp_sim::condition::health::{BuffDef, BuffKind};
+    use trp_sim::items::item_attributes::stimulator_lines;
+    let def = |kind: BuffKind, value: f32, absolute: bool, skill: Option<&str>| BuffDef { kind, chance: 1.0, delay: 0.0, duration: 60.0, value, absolute, skill: skill.map(str::to_owned), applies_to: Vec::new() };
+    let words = |key: &str| key.to_owned();
+    let endurance = def(BuffKind::SkillRate, 20.0, true, Some("Endurance"));
+    let pain = def(BuffKind::Pain, 0.0, true, None);
+    let hydration = def(BuffKind::HydrationRate, -0.05, true, None);
+    let weight = def(BuffKind::WeightLimit, 0.1, false, None);
+    let weight_kg = def(BuffKind::WeightLimit, 5.0, true, None);
+    let first = vec![(&endurance, Some(30)), (&pain, Some(10)), (&pain, Some(40))];
+    let second = vec![(&endurance, Some(90)), (&hydration, Some(7300)), (&weight, None), (&weight_kg, Some(0))];
+    let lines = stimulator_lines(&[first, second], &words);
+    assert_eq!(
+        lines,
+        [
+            "Pain (10)".to_owned(),
+            "Pain (40)".to_owned(),
+            "Endurance (<color=#54C1FFFF>+20</color>) (90)".to_owned(),
+            "HydrationRate (<color=#C40000FF>-0.1</color>)".to_owned(),
+            "WeightLimit (<color=#54C1FFFF>+10%</color>)".to_owned(),
+            "WeightLimit (<color=#54C1FFFF>+5  kg</color>)".to_owned(),
+        ]
+    );
 }

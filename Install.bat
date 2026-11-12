@@ -17,7 +17,7 @@ echo   1. Checks for the C++ build tools and Rust, and offers to install what is
 echo   2. Builds TRP (several minutes the first time).
 echo   3. Asks where each of your games' folders is: SPT, then GAMMA and Anomaly if you have them.
 echo.
-echo  You need your own Escape from Tarkov with SPT 4.1 installed over it, and about 10 GB free.
+echo  You need your own Escape From Tushonka with SPT 4.1 installed over it, and about 10 GB free.
 echo  Nothing is installed or built until you press a key. To stop now, close this window.
 echo.
 echo  Press any key to begin . . .

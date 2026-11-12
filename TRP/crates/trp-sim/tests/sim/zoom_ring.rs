@@ -1,11 +1,11 @@
-//! A variable scope's ring turned by its zoom (`trp_sim::sights::Sights::
-//! ring_turns`; optics spec, "The ring"): the SPEAR's Tango6T the long way
+//! Tests of a variable scope's ring turned by its zoom.
+//! After the optics spec, "The ring", through `trp_sim::sights::Sights::ring_turns`: the SPEAR's Tango6T the long way
 //! round (`InverseRotation`), the VUDU on the SPEAR's mount the short way
 //! with its start turned over; the game's own slerp. Those that need the
 //! install pass trivially, with a note, where none is configured.
 
-use trp_sim::math::quat_mul;
-use trp_sim::sights::{game_slerp, Sights};
+use trp_sim::base::math::quat_mul;
+use trp_sim::weapons::sights::{game_slerp, Sights};
 
 const SPEAR: &str = "65290f395ae2ae97b80fdf2d";
 /// The SPEAR with the VUDU on its Alpha4 mount (no preset carries it).
@@ -27,7 +27,7 @@ fn sights_of(key: &str) -> Option<Sights> {
     let install = crate::fixture::install()?;
     let db = crate::fixture::database()?;
     let mut assets = trp_data::unity::Assets::new(install).expect("manifest");
-    let weapon = trp_data::weapon::assemble_key(&mut assets, db, key).expect("the weapon");
+    let weapon = trp_data::weapons::weapon::assemble_key(&mut assets, db, key).expect("the weapon");
     Some(Sights::of_weapon(&weapon).expect("its sights"))
 }
 
