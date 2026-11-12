@@ -17,7 +17,7 @@ It is a re-implementation in the way OpenMW is of Morrowind's engine: it needs t
 2. Double-click `Install.bat` once. It installs what is missing, builds TRP, and asks where your game folders are. The first build takes several minutes and about 10 GB of disk.
 3. Double-click `Play.bat` to play. After an update it rebuilds by itself.
 
-You start on a test range. The crate ahead holds a rifle, a vest and a backpack, and the tables along the wall hold every weapon of your install. `F1` shows the keys.
+You start on a test range. The tables along the wall hold every weapon of your install. `~` shows the debug menu.
 
 ## What is in it
 
